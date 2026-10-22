@@ -135,6 +135,8 @@ final class AppModel: ObservableObject {
     let push = PushManager()
  /// Deep-link session lookup table, refreshed from every `session/list` load.
     private var deepLinkResolver = SessionDeepLinkResolver()
+ /// 通知 tap 的 deep link 在未配对时就到达（冷启动/配对前）：先记住，配对完成再跳。
+    private var pendingDeepLinkSessionId: String?
     private var cancellables = Set<AnyCancellable>()
 
  // MARK: - P0-4/P0-5 first screen + foreground resume
@@ -315,6 +317,17 @@ final class AppModel: ObservableObject {
  // publisher above, so nothing is handled twice.
         for route in PushActionInbox.shared.drain() {
             handlePushApprovalRoute(route)
+        }
+ // 通知 tap 冷启动：UIKit 可能在 AppModel 创建前就投递了 deep link，上面那次
+ // NotificationCenter post 会丢失，默认 `.workspaces` 路由就会覆盖掉它
+ // （用户报障：点通知只进工作区列表）。这里领取 delegate 停放的 sessionId。
+        PushDeepLinkInbox.shared.markLive()
+        if let parkedSessionId = PushDeepLinkInbox.shared.drain() {
+            if link.credentials == nil {
+                pendingDeepLinkSessionId = parkedSessionId
+            } else {
+                openSession(parkedSessionId)
+            }
         }
     }
 
@@ -555,13 +568,26 @@ final class AppModel: ObservableObject {
 
     func didPair() {
         subagentRoute = nil
-        route = .workspaces
+ // 配对前点过通知：配对完成后再补跳会话详情，而不是丢掉这次意图。
+        if let pending = pendingDeepLinkSessionId {
+            pendingDeepLinkSessionId = nil
+            openSession(pending)
+        } else {
+            route = .workspaces
+        }
         push.bootstrap()
     }
 
  /// Opens a session by id (list taps and notification deep links).
     func openSession(_ sessionId: String) {
         subagentRoute = nil
+ // 未配对时没有会话可看：先停在这里，配对成功（didPair）后再跳，避免
+ // 落到一个打不开的详情页或丢掉这次 deep link。
+        guard link.credentials != nil else {
+            pendingDeepLinkSessionId = sessionId
+            route = .pairing
+            return
+        }
         route = .session(sessionAddress(forDeepLink: sessionId))
     }
 

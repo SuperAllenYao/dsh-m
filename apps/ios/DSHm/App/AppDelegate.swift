@@ -70,6 +70,10 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
             PushActionInbox.shared.store(route)
             NotificationCenter.default.post(name: .dshmPushApprovalAction, object: route)
         case .deepLink(let sessionId):
+ // Cold launch: AppModel may not exist yet, so park the id for
+ // `AppModel.init` to drain; the NotificationCenter post remains the
+ // primary path when the app is already running.
+            PushDeepLinkInbox.shared.store(sessionId)
             NotificationCenter.default.post(name: .dshmPushNotificationTapped, object: sessionId)
         case .ignored:
             break
