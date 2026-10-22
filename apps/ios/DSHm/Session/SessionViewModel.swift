@@ -299,6 +299,16 @@ final class SessionViewModel: ObservableObject {
         self.init(address: .session(sessionId: sessionId))
     }
 
+    // MARK: - 会话流排障日志（DSHM_DEBUG_STREAM=1 时才有输出）
+
+    private static let debugStreamLogging =
+        ProcessInfo.processInfo.environment["DSHM_DEBUG_STREAM"] == "1"
+
+    private func dbg(_ message: @autoclosure () -> String) {
+        guard Self.debugStreamLogging else { return }
+        NSLog("[STREAMDBG] %@", message())
+    }
+
     // MARK: - M2b-2 cold-start window cache
 
     /// Rebuilds the journal from the cached snapshot + following events. A cache that
@@ -307,11 +317,12 @@ final class SessionViewModel: ObservableObject {
     private func restoreCachedWindow() {
         let started = Date()
         defer { cacheLoadMilliseconds = Date().timeIntervalSince(started) * 1000 }
-        guard let cached = windowCache.load(sessionId: sessionId) else { return }
+        guard let cached = windowCache.load(sessionId: sessionId) else { dbg("cache miss"); return }
         do {
             let frame = try SessionStreamFrame.decode(cached.payload.snapshot)
             guard case .snapshot(let snapshot) = frame else { return }
             journal.apply(snapshot: snapshot)
+            dbg("cache restore: snapshotRecords=" + String(snapshot.records.count) + " events=" + String(journal.events.count) + " olderFrames=" + String(cached.payload.olderEvents?.count ?? 0))
             // v3: replay the loaded older range *before* the live tail, so the
             // restored window is [oldestLoadedSeq, cursor] instead of only the
             // newest message window (cold start must not regress to 40 messages).
@@ -557,6 +568,7 @@ final class SessionViewModel: ObservableObject {
     private func openStream() {
         guard let link else { return }
         guard link.phase.isConnected else {
+            dbg("openStream deferred: phase=" + String(describing: link.phase) + " busy=" + String(link.phase.isBusy) + " sections=" + String(sections.count))
             isLoading = sections.isEmpty
             streamErrorText = link.phase.isBusy ? nil : "连接未就绪"
             return
@@ -585,6 +597,7 @@ final class SessionViewModel: ObservableObject {
                     "turnWindow": turnWindow.jsonValue,
                 ]),
             ]
+            dbg("session/follow send: messages=" + String(messages) + " turnWindow=" + String(describing: turnWindow) + " sections=" + String(sections.count) + " cache=" + String(didRestoreWindowFromCache) + " hasLive=" + String(hasLiveSnapshot))
             stream = try link.openStream(
                 endpoint: "session/follow",
                 args: args,
@@ -592,9 +605,11 @@ final class SessionViewModel: ObservableObject {
                     self?.handleItem(value)
                 },
                 onEnd: { [weak self] in
+                    self?.dbg("session/follow ended by host")
                     self?.streamErrorText = "会话流已结束"
                 },
                 onError: { [weak self] error in
+                    self?.dbg("session/follow error: " + error.code + " " + error.message)
                     self?.streamErrorText = error.message.isEmpty ? error.code : error.message
                     self?.isLoading = false
                 },
@@ -919,6 +934,7 @@ final class SessionViewModel: ObservableObject {
             let frame = try SessionStreamFrame.decode(value)
             switch frame {
             case .snapshot(let snapshot):
+                dbg("snapshot: records=" + String(snapshot.records.count) + " cursor=" + String(snapshot.cursor) + " hasMore=" + String(describing: snapshot.hasMore) + " isFill=" + String(isFill))
                 let previousSnapshotFrame = cachedSnapshotFrame
                 let newSnapshotOldest = Self.snapshotOldestSeq(in: value)
                 let update = journal.apply(snapshot: snapshot)
@@ -962,6 +978,7 @@ final class SessionViewModel: ObservableObject {
                     scheduleBackgroundFillIfNeeded()
                 }
             case .event(let event):
+                dbg("event: " + event.type + " seq=" + String(event.seq))
                 let update = journal.apply(event: event)
                 applyJournalUpdate(update)
                 // M2b-2: cache only events the journal actually appended, so the
@@ -992,6 +1009,7 @@ final class SessionViewModel: ObservableObject {
         } catch {
             // Include the frame type and the failing coding path: the bare
             // Foundation text ("The data couldn't be read…") names nothing.
+            dbg("frame decode failed: " + FrameDecodeFailure.describe(error, frame: value))
             streamErrorText = "帧解析失败: \(FrameDecodeFailure.describe(error, frame: value))"
         }
     }
@@ -1037,6 +1055,7 @@ final class SessionViewModel: ObservableObject {
 
     private func rebuildRows() {
         sections = SessionRowBuilder.build(events: journal.events)
+        dbg("rebuild: events=" + String(journal.events.count) + " sections=" + String(sections.count) + " hasMoreOlder=" + String(journal.hasMoreOlder))
         hasMoreOlder = journal.hasMoreOlder
         title = journal.title
         permissionsValue = journal.permissionsValue
