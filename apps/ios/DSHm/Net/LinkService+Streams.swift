@@ -1,0 +1,647 @@
+import Foundation
+
+/// LinkService: $events subscription, approval answers, unary calls and
+/// logical stream opening.
+extension LinkService {
+ /// Human-readable last transport error (empty when none).
+    var statusDetail: String { lastErrorText ?? "" }
+
+
+ // MARK: - $events ready handshake
+
+ /// Opens `$events` and waits for its `ready` frame.
+ ///
+ /// v0.1.1 (Bug 1): first-launch audits showed attempts where mux/api auth
+ /// succeeded but no `ready` frame ever reached the client, so the UI sat on
+ /// 「正在连接 Mac…」 until the 15s timeout failed the whole candidate — and the
+ /// reconnect cycle repeated (which also flickered the pending cards, Bug 2).
+ /// Before failing the candidate, reopen `$events` once on the same mux: a
+ /// lost open/ready frame is a stream-level fault, so a fresh stream can
+ /// recover without paying for a new TLS + mux-token round.
+    func openEventsAndWaitReady(mux: RemoteMux) async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            self.readyContinuation = continuation
+            self.readyHandshakeGeneration &+= 1
+            self.readyReopenUsed = false
+            self.openEventsStream(
+                mux: mux,
+                generation: self.readyHandshakeGeneration,
+                timeout: 15
+            )
+        }
+    }
+
+ /// One `$events` open plus its `ready` wait (15s first try, 5s after the
+ /// one-shot reopen, so a dead candidate still fails within a bounded window).
+    private func openEventsStream(mux: RemoteMux, generation: Int, timeout: TimeInterval) {
+        do {
+            self.eventsStream = try mux.openStream(
+                endpoint: "$events",
+                args: [:],
+                onItem: { [weak self] value in
+                    self?.handleRemoteEventItem(value, readyGeneration: generation)
+                },
+                onEnd: { [weak self] in
+                    self?.failReady(
+                        LinkError.transport(L10n.t("$events 流被服务端结束")),
+                        generation: generation
+                    )
+                },
+                onError: { [weak self] error in
+                    self?.failReady(LinkError.remote(error), generation: generation)
+                },
+                onClose: { [weak self] _, _ in
+                    self?.failReady(
+                        LinkError.transport(L10n.t("$events 流随连接关闭")),
+                        generation: generation
+                    )
+                }
+            )
+        } catch {
+            guard let continuation = self.readyContinuation else { return }
+            self.readyContinuation = nil
+            continuation.resume(throwing: error)
+            return
+        }
+        self.readyTimeoutTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+            guard let self, !Task.isCancelled else { return }
+            self.handleReadyTimeout(mux: mux, generation: generation)
+        }
+    }
+
+ /// First timeout reopens `$events` on the same mux; the second fails the
+ /// candidate and the regular legacy reconnect path takes over.
+    private func handleReadyTimeout(mux: RemoteMux, generation: Int) {
+        guard generation == readyHandshakeGeneration, readyContinuation != nil else { return }
+        guard !readyReopenUsed else {
+            failReady(LinkError.timeout("$events ready"))
+            return
+        }
+        readyReopenUsed = true
+ // Retire the abandoned stream: its late ready/close callbacks must not
+ // resume or fail the handshake armed by the reopened stream.
+        readyHandshakeGeneration &+= 1
+        eventsStream?.cancel()
+        eventsStream = nil
+        openEventsStream(mux: mux, generation: readyHandshakeGeneration, timeout: 5)
+    }
+
+ /// Fails the current ready wait. Transport-loss paths call this
+ /// generation-agnostically; `$events` stream callbacks go through the
+ /// generation-checked overload below.
+    func failReady(_ error: Error) {
+        readyTimeoutTask?.cancel()
+        readyTimeoutTask = nil
+ // Retire every callback still holding this handshake's generation so a
+ // late frame cannot touch the next connection attempt.
+        readyHandshakeGeneration &+= 1
+        guard let continuation = readyContinuation else { return }
+        readyContinuation = nil
+        eventsStream?.cancel()
+        eventsStream = nil
+        continuation.resume(throwing: error)
+    }
+
+ /// Stream-callback variant: only the handshake that armed the callback may
+ /// fail it (a cancelled stale stream stays silent).
+    private func failReady(_ error: Error, generation: Int) {
+        guard generation == readyHandshakeGeneration else { return }
+        failReady(error)
+    }
+
+ /// P1 variant of the `$events` handshake: on dsh-m/2 the `welcome` frame is
+ /// already the ready signal, so this only subscribes to `$events` (forwarded
+ /// approvals/questions) and seeds `clientId`. No 15s wait, no continuation.
+    func openEventsAndWaitReadyP1(channel: P1Channel) throws {
+        guard let welcome = channel.welcome else { throw LinkError.notConnected }
+        clientId = welcome.deviceId
+        readyTimeoutTask?.cancel()
+        readyTimeoutTask = nil
+        eventsStream = try channel.openStream(
+            endpoint: "$events",
+            args: [:],
+            onItem: { [weak self] value in
+                self?.handleRemoteEventItem(value)
+            },
+            onEnd: { [weak self] in
+ // The connection itself stays up (welcome already made it ready);
+ // only the approval/question waterfall is affected.
+                self?.noteP1EventsStreamLoss(L10n.t("$events 流被服务端结束"))
+            },
+            onError: { [weak self] error in
+                self?.noteP1EventsStreamLoss(error.message)
+            }
+        )
+    }
+
+ // MARK: - Forwarded events (approval waterfall)
+
+ /// - Parameter readyGeneration: legacy `$events` handshake generation that
+ /// owns this item (nil on the dsh-m/2 path, where `welcome` is the ready
+ /// signal). A stale stream from an abandoned handshake must not resume a
+ /// newer continuation.
+    func handleRemoteEventItem(_ value: JSONValue?, readyGeneration: Int? = nil) {
+        guard let value else { return }
+        let event = ForwardedRemoteEvent.decode(value)
+        if case .ready(let ready) = event {
+            if let readyGeneration, readyGeneration != readyHandshakeGeneration { return }
+            clientId = ready.clientId
+            readyTimeoutTask?.cancel()
+            readyTimeoutTask = nil
+            if let continuation = readyContinuation {
+                readyContinuation = nil
+                continuation.resume()
+            }
+            return
+        }
+ // Cancel frames (turn aborted / session cancelled) must drop the pending
+ // waterfalls so the card disappears without an error (T10).
+        var approvals = pendingApprovals
+        var questions = pendingUserQuestions
+        ForwardedWaterfallQueue.apply(event, approvals: &approvals, questions: &questions)
+        if approvals != pendingApprovals { pendingApprovals = approvals }
+        if questions != pendingUserQuestions { pendingUserQuestions = questions }
+    }
+
+ /// Answers a pending approval waterfall via the unary `$events/result` method.
+ /// Only `allowed-once` permits the tool; `rejected` fails closed.
+    func respondApproval(_ approval: ApprovalWaterfall, outcome: ApprovalOutcome) async throws {
+        guard let clientId else { throw LinkError.notConnected }
+        _ = try await unary(
+            "$events/result",
+            args: EventsResultArgs.outcome(clientId: clientId, eventId: approval.eventId, value: outcome)
+        )
+        pendingApprovals.removeAll { $0.eventId == approval.eventId }
+    }
+
+ // MARK: - User questions (§3.7.2)
+
+ /// Answers a `continued` user-question call through the unary
+ /// `userQuestions/answer` method. Returns the Host's boolean: `true` means
+ /// the call was still pending and the batch was accepted; `false` means the
+ /// call no longer exists (answered elsewhere or expired).
+    func answerUserQuestions(
+        sessionId: String,
+        callId: String,
+        answers: [UserQuestionAnswer]
+    ) async throws -> Bool {
+        let value = try await unary("userQuestions/answer", args: [
+            "agentId": .string(sessionId),
+            "callId": .string(callId),
+            "answer": UserQuestionAnswersBatch(answers: answers).jsonValue(),
+        ])
+        if let accepted = value.boolValue { return accepted }
+        if let accepted = value["accepted"]?.boolValue { return accepted }
+        return false
+    }
+
+ /// Answers an `open` user-question call through the live forwarded-events
+ /// waterfall (`$events/result`). Requires the `$events` ready `clientId`.
+    func answerUserQuestionsLive(eventId: String, answers: [UserQuestionAnswer]) async throws {
+        guard let clientId else { throw LinkError.notConnected }
+ // The Host may have cancelled/settled this waterfall while the user was
+ // composing an answer (turn aborted, answered elsewhere); never send a
+ // stale $events/result.
+        guard pendingUserQuestions.contains(where: { $0.eventId == eventId }) else {
+            throw UserQuestionSubmitError.noLiveRequest
+        }
+        _ = try await unary(
+            "$events/result",
+            args: EventsResultArgs.userQuestionOutcome(
+                clientId: clientId,
+                eventId: eventId,
+                answers: answers
+            )
+        )
+        pendingUserQuestions.removeAll { $0.eventId == eventId }
+    }
+
+ /// Live user-question waterfalls for one session (missing agentId matches all).
+    func pendingUserQuestionWaterfalls(forSession sessionId: String) -> [UserQuestionWaterfall] {
+        pendingUserQuestions.filter { $0.agentId == nil || $0.agentId == sessionId }
+    }
+
+ // MARK: - Unary + streams
+
+ /// Remote unary call. On dsh-m/2 the call rides the ready single WSS as an
+ /// `rpc` frame (no bearer token, no gzip/HTTP pool; the `client-request`
+ /// envelope is byte-identical). Otherwise this is the legacy pinned-HTTPS
+ /// path with a short-lived api bearer token; on `auth/token-expired`/
+ /// `auth/invalid` the token is refreshed once and the call retried (the
+ /// protocol has no automatic retry contract, but token refresh is
+ /// transport-level auth, not a business mutation).
+    func unary(_ endpoint: String, args: [String: JSONValue] = [:], timeout: TimeInterval = 20) async throws -> JSONValue {
+        if let p1 = p1Channel, p1.isReady {
+            do {
+                let result = try await p1.unary(endpoint: endpoint, args: args, timeout: timeout)
+                return try P1UnaryMapping.jsonValue(from: result)
+            } catch let failure as P1Failure {
+                throw P1UnaryMapping.linkError(from: failure)
+            } catch let protocolError as P1ProtocolError {
+                throw LinkError.transport(protocolError.localizedDescription)
+            }
+        }
+        guard let credentials else { throw LinkError.notPaired }
+        guard let origin = credentials.originURL else { throw LinkError.transport(L10n.t("配对 origin 非法")) }
+        var token = try await ensureAPIToken()
+        do {
+            return try await HTTPSClient.unaryJSON(
+                origin: origin,
+                endpoint: endpoint,
+                args: args,
+                token: token,
+                leafPin: credentials.leafPin,
+                caCertBase64: credentials.caCertBase64,
+                timeout: timeout
+            )
+        } catch let error as LinkError {
+            if case .httpStatus(let status, let body) = error,
+               status == 401,
+               body.contains("auth/token-expired") || body.contains("auth/invalid") {
+                token = try await ensureAPIToken(forceRefresh: true)
+                return try await HTTPSClient.unaryJSON(
+                    origin: origin,
+                    endpoint: endpoint,
+                    args: args,
+                    token: token,
+                    leafPin: credentials.leafPin,
+                    caCertBase64: credentials.caCertBase64,
+                    timeout: timeout
+                )
+            }
+            throw error
+        }
+    }
+
+ /// Opens one logical stream over whichever transport is active. Consumers keep
+ /// the same `RemoteStreamHandle` surface (send/end/cancel).
+ ///
+ /// `onClose` parity: on both transports it fires only when the stream is
+ /// dropped without a protocol `end`/`error` — legacy mux close, or a P1
+ /// epoch reset/fresh welcome / hard teardown. A plain dsh-m/2 socket loss
+ /// deliberately leaves the stream registered so `hello{resume}` replay can
+ /// continue it (design §5); the business layer must NOT see a close there.
+    func openStream(
+        endpoint: String,
+        args: [String: JSONValue],
+        onItem: @escaping (JSONValue?) -> Void,
+        onEnd: @escaping () -> Void,
+        onError: @escaping (RemoteError) -> Void,
+        onClose: @escaping (Int, String) -> Void
+    ) throws -> RemoteStreamHandle {
+        if let p1 = p1Channel, p1.isReady {
+            return try p1.openStream(
+                endpoint: endpoint,
+                args: args,
+                onItem: onItem,
+                onEnd: onEnd,
+                onError: onError,
+                onClose: onClose
+            )
+        }
+        guard phase.isConnected, let mux else { throw LinkError.notConnected }
+        return try mux.openStream(endpoint: endpoint, args: args, onItem: onItem, onEnd: onEnd, onError: onError, onClose: onClose)
+    }
+
+ // MARK: - APNs device token registration (plugin PAIRING §5.3)
+
+    struct PushTokenRegistration: Equatable {
+        var deviceId: String?
+        var mode: String?
+        var environment: String?
+        var topic: String?
+        var tokenFingerprint: String?
+        var renamed: Bool?
+    }
+
+ /// `POST /devices/push-token` with `{"deviceToken":"<64-256 hex>",
+ /// "environment":"sandbox"|"production", "name":"<device>"}`.
+ /// Caller passes the raw APNs token hex; only the short fingerprint comes
+ /// back in the response (the full token is never logged by the app).
+    @discardableResult
+    func registerPushToken(
+        _ rawToken: String,
+        environment: String = "sandbox",
+        name: String? = nil
+    ) async throws -> PushTokenRegistration {
+        guard APNsTokenValidator.isValidHex(rawToken) else {
+            throw LinkError.transport(L10n.t("APNs deviceToken 必须是 64–256 位十六进制"))
+        }
+        let hexToken = rawToken.replacingOccurrences(of: " ", with: "").lowercased()
+        guard let credentials, let origin = credentials.originURL else { throw LinkError.notPaired }
+        var fields: [String: JSONValue] = [
+            "deviceToken": .string(hexToken),
+            "environment": .string(environment),
+        ]
+        if let name, !name.isEmpty {
+            fields["name"] = .string(String(name.prefix(64)))
+        }
+        let body = JSONValue.object(fields)
+
+        func attempt(_ apiToken: String) async throws -> (Int, JSONValue?) {
+            let result = try await HTTPSClient.json(
+                origin: origin,
+                method: "POST",
+                path: "/devices/push-token",
+                headers: ["authorization": "Bearer \(apiToken)"],
+                body: body,
+                leafPin: credentials.leafPin,
+                caCertBase64: credentials.caCertBase64,
+                timeout: 15
+            )
+            return (result.status, result.json)
+        }
+
+        var apiToken = try await ensureAPIToken()
+        var (status, json) = try await attempt(apiToken)
+        let firstErrorCode = json?["error"]?.stringValue ?? ""
+ // auth/revoked must not be retried (the device is blacklisted: re-pair).
+        if status == 401, firstErrorCode == "auth/revoked" {
+            throw LinkError.remote(RemoteError(code: firstErrorCode, message: L10n.t("设备已被撤销，请重新配对")))
+        }
+        if status == 401 {
+            apiToken = try await ensureAPIToken(forceRefresh: true)
+            (status, json) = try await attempt(apiToken)
+        }
+        let errorCode = json?["error"]?.stringValue ?? "push-token-registration-failed"
+        if status == 200, json?["ok"]?.boolValue == true {
+            return PushTokenRegistration(
+                deviceId: json?["deviceId"]?.stringValue,
+                mode: json?["mode"]?.stringValue,
+                environment: json?["environment"]?.stringValue,
+                topic: json?["topic"]?.stringValue,
+                tokenFingerprint: json?["tokenFingerprint"]?.stringValue,
+                renamed: json?["renamed"]?.boolValue
+            )
+        }
+        if status == 401, errorCode == "auth/revoked" {
+            throw LinkError.remote(RemoteError(code: errorCode, message: L10n.t("设备已被撤销，请重新配对")))
+        }
+        if status == 400 {
+            let message: String
+            switch errorCode {
+            case "push-token-invalid": message = L10n.t("APNs token 格式非法")
+            case "push-environment-invalid": message = L10n.t("APNs environment 非法")
+            default: message = errorCode
+            }
+            throw LinkError.remote(RemoteError(code: errorCode, message: message))
+        }
+        throw LinkError.httpStatus(status, errorCode)
+    }
+
+ // MARK: - Session permission switch (M5)
+
+ /// `POST /session/permission` with `{"sessionId":"<id>","preset":"<value>"}`
+ /// against the plugin's own TLS origin (not the remote relay), authorized with
+ /// the short-lived api bearer token.
+ ///
+ /// 401 refreshes the token once and retries (token expiry is transport auth,
+ /// not a business mutation); `auth/revoked` is never retried — the device is
+ /// blacklisted and must re-pair. Every non-200 is surfaced as
+ /// `LinkError.remote(RemoteError(code:message:))` so the sheet can render the
+ /// plugin's business code with localized text.
+    func setSessionPermission(
+        sessionId: String,
+        preset: String,
+        timeout: TimeInterval = 15
+    ) async throws -> SessionPermissionUpdate {
+        guard let credentials, let origin = credentials.originURL else { throw LinkError.notPaired }
+        let body = JSONValue.object([
+            "sessionId": .string(sessionId),
+            "preset": .string(preset),
+        ])
+
+        func attempt(_ apiToken: String) async throws -> (Int, JSONValue) {
+            let result = try await HTTPSClient.json(
+                origin: origin,
+                method: "POST",
+                path: "/session/permission",
+                headers: ["authorization": "Bearer \(apiToken)"],
+                body: body,
+                leafPin: credentials.leafPin,
+                caCertBase64: credentials.caCertBase64,
+                timeout: timeout
+            )
+            return (result.status, result.json)
+        }
+
+        func revokedError() -> LinkError {
+            LinkError.remote(RemoteError(
+                code: "auth/revoked",
+                message: PermissionSwitchErrorText.message(forCode: "auth/revoked")
+            ))
+        }
+
+        var apiToken = try await ensureAPIToken()
+        var (status, json) = try await attempt(apiToken)
+ // auth/revoked must not be retried (the device is blacklisted: re-pair).
+        if status == 401, json["error"]?.stringValue == "auth/revoked" { throw revokedError() }
+        if status == 401 {
+            apiToken = try await ensureAPIToken(forceRefresh: true)
+            (status, json) = try await attempt(apiToken)
+            if status == 401, json["error"]?.stringValue == "auth/revoked" { throw revokedError() }
+        }
+        if status == 200 {
+            let update: SessionPermissionUpdate
+            do {
+                update = try json.decode(SessionPermissionUpdate.self)
+            } catch {
+                throw LinkError.malformedEnvelope(
+                    L10n.f("session/permission 响应解析失败: %@", error.localizedDescription)
+                )
+            }
+            guard update.ok else {
+                throw LinkError.remote(RemoteError(
+                    code: "permission/failed",
+                    message: PermissionSwitchErrorText.message(forCode: "permission/failed")
+                ))
+            }
+            return update
+        }
+        let code = json["error"]?.stringValue ?? ""
+        let effectiveCode = code.isEmpty ? "permission/failed" : code
+        throw LinkError.remote(RemoteError(
+            code: effectiveCode,
+            message: PermissionSwitchErrorText.message(
+                forCode: effectiveCode,
+                serverMessage: json["message"]?.stringValue
+            )
+        ))
+    }
+
+ // MARK: - Exact-fetch routes (§3.9: changes.summary / changes.diff)
+
+ /// GET an allowlisted exact-fetch route through the link proxy with the
+ /// short-lived api token (auto-refresh once on 401).
+    func exactFetchJSON(path: String, query: [String: String], timeout: TimeInterval = 20) async throws -> JSONValue? {
+        guard let credentials, let origin = credentials.originURL else { throw LinkError.notPaired }
+        var token = try await ensureAPIToken()
+        do {
+            let result = try await HTTPSClient.exactGETJSON(
+                origin: origin,
+                path: path,
+                query: query,
+                token: token,
+                leafPin: credentials.leafPin,
+                caCertBase64: credentials.caCertBase64,
+                timeout: timeout
+            )
+            guard result.status == 200 else {
+                throw LinkError.httpStatus(result.status, result.body)
+            }
+            return result.json
+        } catch let error as LinkError {
+            if case .httpStatus(let status, let body) = error,
+               status == 401,
+               body.contains("auth/token-expired") || body.contains("auth/invalid") {
+                token = try await ensureAPIToken(forceRefresh: true)
+                let result = try await HTTPSClient.exactGETJSON(
+                    origin: origin,
+                    path: path,
+                    query: query,
+                    token: token,
+                    leafPin: credentials.leafPin,
+                    caCertBase64: credentials.caCertBase64,
+                    timeout: timeout
+                )
+                guard result.status == 200 else {
+                    throw LinkError.httpStatus(result.status, result.body)
+                }
+                return result.json
+            }
+            throw error
+        }
+    }
+
+ /// File-change summary for one `workspace/changes` event seq.
+ /// Throws `LinkError.httpStatus(404,...)` when the Host no longer holds it.
+    func changesSummary(sessionId: String, seq: Int) async throws -> ChangesSummaryValue {
+        guard let value = try await exactFetchJSON(
+            path: "/api/changes.summary",
+            query: ["sessionId": sessionId, "seq": String(seq)]
+        ) else {
+            throw LinkError.malformedEnvelope(L10n.t("changes.summary 响应为空"))
+        }
+        return try value.decode(ChangesSummaryValue.self)
+    }
+
+ /// Diff for one file index inside a `workspace/changes` event.
+    func changesDiff(sessionId: String, seq: Int, index: Int) async throws -> ChangesDiffValue {
+        guard let value = try await exactFetchJSON(
+            path: "/api/changes.diff",
+            query: ["sessionId": sessionId, "seq": String(seq), "index": String(index)]
+        ) else {
+            throw LinkError.malformedEnvelope(L10n.t("changes.diff 响应为空"))
+        }
+        return try value.decode(ChangesDiffValue.self)
+    }
+
+ // MARK: - Attachments (§8.2 session/attachment)
+
+    struct AttachmentValue: Decodable {
+        struct Attachment: Decodable {
+            var attachmentId: String?
+            var mediaType: String?
+            var name: String?
+            var width: Int?
+            var height: Int?
+            var bytes: Int?
+        }
+        var attachment: Attachment?
+        var data: String?
+    }
+
+ /// Fetches image bytes as described in §8.2 / §6:
+ /// unary session/attachment {request:{sessionId, attachmentId}} -> {attachment, data(base64)}.
+    func attachmentData(sessionId: String, attachmentId: String) async throws -> (data: Data, mediaType: String?) {
+        let value = try await unary("session/attachment", args: [
+            "request": .object([
+                "sessionId": .string(sessionId),
+                "attachmentId": .string(attachmentId),
+            ]),
+        ])
+        let decoded = try value.decode(AttachmentValue.self)
+        guard let base64 = decoded.data, let data = Data(base64Encoded: base64) else {
+            throw LinkError.malformedEnvelope(L10n.t("session/attachment 缺少 base64 data"))
+        }
+        return (data, decoded.attachment?.mediaType)
+    }
+}
+
+/// Pure mapping from the dsh-m/2 unary frames to the error/JSON types the rest of
+/// the App already consumes on the M1 path (design §3.4):
+///
+/// - `rpc/result.status == 200` + `server-response` envelope -> the same
+/// `JSONValue` the HTTPS unary path returns (including business errors as
+/// `LinkError.remote`);
+/// - non-200 status -> existing `LinkError.httpStatus` branch (body passed through);
+/// - `rpc/error` -> `LinkError.remote` for business-ish codes, `LinkError.transport`
+/// for upstream/plugin failures, `LinkError.timeout` for `rpc/timeout`.
+///
+/// Kept as free functions so the mapping is unit-tested without a socket.
+enum P1UnaryMapping {
+ /// Decodes one `rpc/result` into the legacy unary result value.
+    static func jsonValue(from result: P1RPCResult) throws -> JSONValue {
+        guard result.status == 200 else {
+            throw LinkError.httpStatus(result.status, bodyText(of: result))
+        }
+        guard let body = result.body else {
+ // HTTP 200 with a non-JSON body cannot be a `server-response` envelope.
+            throw LinkError.malformedEnvelope(L10n.t("dsh-m/2 rpc/result 缺少 JSON body"))
+        }
+        let envelope: ServerResponseEnvelope
+        do {
+            envelope = try body.decode(ServerResponseEnvelope.self)
+        } catch {
+            throw LinkError.malformedEnvelope("server-response 解析失败: \(error.localizedDescription)")
+        }
+        guard envelope.type == "server-response" else {
+            throw LinkError.malformedEnvelope("type != server-response")
+        }
+        switch envelope.result {
+        case .ok(let value):
+            return value
+        case .failure(let error):
+            throw LinkError.remote(error)
+        }
+    }
+
+ /// Maps a `P1Channel.unary` failure onto the legacy transport error surface.
+    static func linkError(from failure: P1Failure) -> LinkError {
+        switch failure {
+        case .notConnected:
+            return .notConnected
+        case .timeout:
+            return .timeout("rpc")
+        case .cancelled:
+            return .cancelled
+        case .rpcError(_, let error):
+            if error.code == "rpc/timeout" { return .timeout("rpc") }
+            if error.code.hasPrefix("upstream/") {
+                return .transport(error.message.isEmpty ? error.code : error.message)
+            }
+            return .remote(error)
+        case .frameTooLarge(let reason):
+            return .transport(L10n.f("dsh-m/2 帧过大：%@", reason))
+        case .protocolViolation(let message):
+            return .transport(L10n.f("dsh-m/2 协议异常：%@", message))
+        default:
+            return .transport(failure.userMessage)
+        }
+    }
+
+ /// Raw error body for `LinkError.httpStatus` (what the HTTP path would have
+ /// passed as `response.bodyText`).
+    private static func bodyText(of result: P1RPCResult) -> String {
+        if let text = result.bodyText { return text }
+        if let body = result.body {
+            if case .string(let text) = body { return text }
+            if let data = try? JSONEncoder().encode(body),
+               let text = String(data: data, encoding: .utf8) {
+                return text
+            }
+        }
+        return ""
+    }
+}
