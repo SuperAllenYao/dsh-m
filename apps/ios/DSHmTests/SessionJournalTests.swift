@@ -260,17 +260,20 @@ final class SessionJournalTests: XCTestCase {
 
     func testReconnectSnapshotDropsStalePrefixWhenDiscontinuous() {
         let journal = SessionJournal()
+        // 首个快照已到 seq 0 -> 粘滞终止位已置（task-6）。
         journal.apply(snapshot: snapshot(cursor: 5, eventSeqs: 0...5, hasMore: false))
+        XCTAssertTrue(journal.hasReachedOldest)
         // The Host's window moved past the loaded events (a long gap): keeping the
-        // stale prefix would render a hole, so it is dropped and pagination restarts
-        // from the new snapshot instead.
+        // stale prefix would render a hole, so it is dropped. The terminal state is
+        // sticky: even this wholesale window reset must not re-arm "load earlier".
         XCTAssertEqual(
             journal.apply(snapshot: snapshot(cursor: 20, eventSeqs: 18...20, hasMore: true)),
             .snapshotReplaced
         )
         XCTAssertEqual(journal.events.map(\.seq), Array(18...20))
         XCTAssertEqual(journal.oldestSeq, 18)
-        XCTAssertTrue(journal.hasMoreOlder)
+        XCTAssertTrue(journal.hasReachedOldest, "粘滞终止位不回退")
+        XCTAssertFalse(journal.hasMoreOlder, "到过 seq 0 后不再提示更早历史")
     }
 
     func testSnapshotReplacementWithoutPrefixAdoptsSnapshotHasMore() {
@@ -285,5 +288,65 @@ final class SessionJournalTests: XCTestCase {
         fresh.apply(snapshot: snapshot(cursor: 4, eventSeqs: 2...4, hasMore: true))
         XCTAssertTrue(fresh.hasMoreOlder, "空 journal 的首个快照直接采用 hasMore")
         XCTAssertEqual(fresh.oldestSeq, 2)
+    }
+
+    // MARK: - task-6: 到达最早事件后终止分页（粘滞）
+
+    func testReachingFirstEventIsStickyAcrossSnapshots() {
+        let journal = SessionJournal()
+        journal.apply(snapshot: snapshot(cursor: 20, eventSeqs: 9...20, hasMore: true))
+        XCTAssertTrue(journal.hasMoreOlder)
+        XCTAssertFalse(journal.hasReachedOldest)
+
+        journal.prepend(page: page(records: Array(0...8), hasMore: false))
+        XCTAssertTrue(journal.hasReachedOldest, "到达第一条事件 -> 粘滞终止")
+        XCTAssertFalse(journal.hasMoreOlder)
+        XCTAssertEqual(journal.oldestSeq, 0)
+
+        // 重连/后台 fill：新快照只覆盖最新窗口且 hasMore=true；这里故意让它与已加载
+        // 窗口不连续（preserved.isEmpty 分支），终止状态也不得被重新武装。
+        journal.apply(snapshot: snapshot(cursor: 60, eventSeqs: 55...60, hasMore: true))
+        XCTAssertTrue(journal.hasReachedOldest, "粘滞位永不回退")
+        XCTAssertFalse(journal.hasMoreOlder, "snapshot.hasMore=true 不得复活\"加载更早\"")
+    }
+
+    func testConservativePageContainingFirstEventWinsOverHasMoreTrue() {
+        let journal = SessionJournal()
+        journal.apply(snapshot: snapshot(cursor: 20, eventSeqs: 10...20, hasMore: true))
+        // Host 保守/异常：一页已经含 seq 0，却仍报 hasMore=true。
+        XCTAssertEqual(
+            journal.prepend(page: page(records: Array(0...9), hasMore: true)),
+            .olderPrepended(Array(0...9))
+        )
+        XCTAssertTrue(journal.hasReachedOldest)
+        XCTAssertFalse(journal.hasMoreOlder, "页内含 seq 0 即证明没有更早历史")
+    }
+
+    func testPageHasMoreFalseTerminatesPaginationEvenWithoutFirstEvent() {
+        let journal = SessionJournal()
+        journal.apply(snapshot: snapshot(cursor: 20, eventSeqs: 12...20, hasMore: true))
+        journal.prepend(page: page(records: Array(1...11), hasMore: false))
+        XCTAssertTrue(journal.hasReachedOldest, "hasMore=false 是 Host 的\"日志到头\"信号")
+        XCTAssertFalse(journal.hasMoreOlder)
+
+        // 后续 live 事件 / 快照都不会复活。
+        journal.apply(event: TestJSON.event("step/end", seq: 21))
+        journal.apply(snapshot: snapshot(cursor: 30, eventSeqs: 20...30, hasMore: true))
+        XCTAssertFalse(journal.hasMoreOlder)
+        XCTAssertTrue(journal.hasReachedOldest)
+    }
+
+    func testCacheRestoreStickyFlagIsOneWay() {
+        let journal = SessionJournal()
+        journal.setHasReachedOldest(false)
+        XCTAssertFalse(journal.hasReachedOldest)
+        journal.setHasReachedOldest(true)
+        XCTAssertTrue(journal.hasReachedOldest)
+        XCTAssertFalse(journal.hasMoreOlder)
+
+        // 之后的任何快照（哪怕 hasMore=true）都不得清除粘滞终止位。
+        journal.apply(snapshot: snapshot(cursor: 5, eventSeqs: 1...5, hasMore: true))
+        XCTAssertTrue(journal.hasReachedOldest)
+        XCTAssertFalse(journal.hasMoreOlder)
     }
 }

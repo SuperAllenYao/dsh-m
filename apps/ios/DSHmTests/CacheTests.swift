@@ -63,7 +63,8 @@ final class CacheTests: XCTestCase {
         p1Sid: Int64? = nil,
         olderEvents: [JSONValue]? = nil,
         oldestSeq: Int? = nil,
-        hasMoreOlder: Bool? = nil
+        hasMoreOlder: Bool? = nil,
+        hasReachedOldest: Bool? = nil
     ) -> SessionWindowCachePayload {
         SessionWindowCachePayload(
             schemaVersion: schemaVersion,
@@ -78,7 +79,8 @@ final class CacheTests: XCTestCase {
             p1Sid: p1Sid,
             olderEvents: olderEvents,
             oldestSeq: oldestSeq,
-            hasMoreOlder: hasMoreOlder
+            hasMoreOlder: hasMoreOlder,
+            hasReachedOldest: hasReachedOldest
         )
     }
 
@@ -1486,13 +1488,41 @@ final class CacheTests: XCTestCase {
             hasMore: true,
             olderEvents: older,
             oldestSeq: 0,
-            hasMoreOlder: true
+            hasMoreOlder: true,
+            hasReachedOldest: false
         ))
         let loaded = try XCTUnwrap(store.load(sessionId: "s1"))
         XCTAssertEqual(loaded.payload.schemaVersion, SessionWindowCacheStore.schemaVersion)
         XCTAssertEqual(loaded.payload.olderEvents, older)
         XCTAssertEqual(loaded.payload.oldestSeq, 0)
         XCTAssertEqual(loaded.payload.hasMoreOlder, true)
+        XCTAssertEqual(loaded.payload.hasReachedOldest, false)
+    }
+
+    // MARK: - task-6: 粘滞终止位（v4）
+
+    func testSessionWindowCacheRoundTripsStickyReachedOldest() throws {
+        let store = windowStore()
+        XCTAssertTrue(store.save(
+            sessionId: "s1",
+            snapshot: snapshotJSON(cursor: 10, events: windowEvents()),
+            events: [],
+            olderEvents: [rawEvent("tool/call", seq: 0)],
+            oldestSeq: 0,
+            hasMoreOlder: true,
+            hasReachedOldest: true
+        ))
+        let loaded = try XCTUnwrap(store.load(sessionId: "s1"))
+        XCTAssertEqual(loaded.payload.hasReachedOldest, true)
+
+        // v3 payload（无该字段）仍可读，交给 VM 从 oldestSeq / 首条记录推导。
+        var v3 = loaded.payload
+        v3.schemaVersion = SessionWindowCacheStore.olderRangeSchemaVersion
+        v3.hasReachedOldest = nil
+        XCTAssertTrue(CacheIO.writeAtomically(v3, to: store.fileURL(for: "s1")))
+        let legacy = try XCTUnwrap(store.load(sessionId: "s1"), "v3 缓存必须可读")
+        XCTAssertEqual(legacy.payload.schemaVersion, SessionWindowCacheStore.olderRangeSchemaVersion)
+        XCTAssertNil(legacy.payload.hasReachedOldest)
     }
 
     func testSessionWindowCacheReadsLegacyV2Payload() throws {

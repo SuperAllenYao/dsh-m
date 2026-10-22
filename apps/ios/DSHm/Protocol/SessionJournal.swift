@@ -54,7 +54,22 @@ final class SessionJournal {
     /// The Host still has events older than `oldestSeq` (last `session/page`
     /// `hasMore`, or the opening snapshot's `hasMore`). False = history start
     /// reached (or no snapshot yet).
-    private(set) var hasMoreOlder: Bool = false
+    ///
+    /// Task-6: this is **derived** and structurally terminal — false whenever the
+    /// window reaches the session's first event or `hasReachedOldest` is set. A
+    /// reconnect / background-fill snapshot can therefore never re-arm the "load
+    /// earlier" entry after the user scrolled to turn 1.
+    var hasMoreOlder: Bool { hasMoreOlderFlag && !hasReachedOldest }
+
+    /// Sticky "the session's first event has been loaded": once true it never resets
+    /// for the lifetime of the journal (task-6 acceptance: reaching the earliest
+    /// event must terminate pagination for good, no matter which snapshot arrives
+    /// afterwards — a reconnect/fill snapshot only describes the newest window and
+    /// its `hasMore` must not resurrect the entry).
+    private(set) var hasReachedOldest: Bool = false
+    /// Raw paging state behind `hasMoreOlder` (only meaningful while the first
+    /// event has not been reached).
+    private var hasMoreOlderFlag: Bool = false
     private(set) var projections: [String: JSONValue] = [:]
     private(set) var projectionsAsOfSeq: Int64?
     private(set) var assistantRevision: Int = 0
@@ -131,12 +146,13 @@ final class SessionJournal {
         // The snapshot's own `hasMore` only describes its message window. When a
         // loaded prefix was preserved, the paging state (whether *more* history
         // exists before it) is already known and must win; otherwise the snapshot is
-        // the first word on older history.
+        // the first word on older history. `markReachedOldestIfNeeded` keeps the
+        // terminal state sticky (task-6): once seq 0 is loaded, a later snapshot with
+        // `hasMore = true` must not re-arm the entry.
         if preserved.isEmpty {
-            hasMoreOlder = snapshot.hasMore ?? false
-        } else if events.first?.seq == 0 {
-            hasMoreOlder = false
+            hasMoreOlderFlag = snapshot.hasMore ?? false
         }
+        markReachedOldestIfNeeded()
         snapshotCount += 1
         liveAssistantText = ""
         return .snapshotReplaced
@@ -248,20 +264,47 @@ final class SessionJournal {
         events = merged
         if inserted.isEmpty {
             // Nothing new: stop pagination instead of asking the same page forever.
-            self.hasMoreOlder = false
+            hasMoreOlderFlag = false
         } else {
-            self.hasMoreOlder = hasMoreOlder
+            hasMoreOlderFlag = hasMoreOlder
         }
-        if events.first?.seq == 0 {
-            self.hasMoreOlder = false
+        // `page.hasMore == false` is the Host telling us this page starts the log;
+        // reaching seq 0 proves the same thing even if a (conservative/buggy) Host
+        // still reports `hasMore = true` (task-6).
+        if !hasMoreOlder {
+            hasReachedOldest = true
         }
+        markReachedOldestIfNeeded()
         return .olderPrepended(inserted)
     }
 
     /// Restores the paging state from an on-disk window cache (see
     /// `SessionWindowCachePayload`); never touches the event window itself.
     func setHasMoreOlder(_ value: Bool) {
-        hasMoreOlder = events.first?.seq == 0 ? false : value
+        hasMoreOlderFlag = value
+        if !value {
+            hasReachedOldest = true
+        }
+        markReachedOldestIfNeeded()
+    }
+
+    /// Restores the sticky `hasReachedOldest` flag from a window cache (task-6).
+    /// One-way: `false` is ignored — the journal only learns "reached the earliest
+    /// event", it never forgets it.
+    func setHasReachedOldest(_ value: Bool) {
+        if value {
+            hasReachedOldest = true
+            hasMoreOlderFlag = false
+        }
+        markReachedOldestIfNeeded()
+    }
+
+    /// Window mutations that can move the front call this: once `events.first` is
+    /// the session's first event, pagination is over for good (sticky).
+    private func markReachedOldestIfNeeded() {
+        guard events.first?.seq == 0 else { return }
+        hasReachedOldest = true
+        hasMoreOlderFlag = false
     }
 
     /// Applies an assistant-stream frame; enforces strictly monotonic revision.

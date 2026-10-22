@@ -645,4 +645,134 @@ final class SessionPaginationTests: XCTestCase {
             turnWindow: SessionWindowPolicy.TurnWindow(minMessages: 11, minTurns: 1)
         ), "minMessages > maxMessages 必须被拒绝")
     }
+
+    // MARK: - 10. task-6：到达最早事件后必须终止分页
+
+    /// 事件序列 [0..N] 上连续 session/page 直到覆盖 seq 0：必须彻底终止。
+    @MainActor
+    func testReachingFirstEventTerminatesPaginationForGood() async throws {
+        let host = FixtureSessionHost(events: fixtureEvents())
+        let store = makeStore()
+        let viewModel = makeViewModel(host: host, store: store, firstWindow: 16)
+        var requests: [(throughSeq: Int, beforeSeq: Int)] = []
+        viewModel.olderPageLoader = hostLoader(host: host) { throughSeq, beforeSeq in
+            requests.append((throughSeq, beforeSeq))
+        }
+
+        var iterations = 0
+        while viewModel.hasMoreOlder {
+            iterations += 1
+            XCTAssertLessThan(iterations, 20, "分页循环必须有界")
+            await viewModel.loadOlderPageNowForTesting()
+        }
+
+        XCTAssertEqual(viewModel.oldestLoadedSeq, 0, "必须覆盖到首条事件 seq 0")
+        XCTAssertEqual(viewModel.eventSeqs, Array(0...host.cursor))
+        XCTAssertTrue(viewModel.reachedFirstEvent, "已到最早应置粘滞终止位")
+        XCTAssertFalse(viewModel.hasMoreOlder, "到达最早后 hasMoreOlder 必须为 false")
+        XCTAssertFalse(viewModel.isLoadingOlder)
+        XCTAssertFalse(requests.contains { $0.beforeSeq == 0 }, "永不发 beforeSeq=0 的请求")
+
+        // 高频重复调用（下拉手势/按钮连点）不再发请求，也不会留加载态。
+        let requestsAtTermination = requests.count
+        for _ in 0..<20 { viewModel.loadOlderIfNeeded() }
+        try? await Task.sleep(nanoseconds: 200_000_000)
+        XCTAssertEqual(requests.count, requestsAtTermination, "到达最早后不得再发 session/page")
+        XCTAssertFalse(viewModel.hasMoreOlder)
+        XCTAssertFalse(viewModel.isLoadingOlder)
+    }
+
+    /// Host 保守/异常边界：一页已经含 seq 0，却仍报 hasMore=true —— 也必须收敛。
+    @MainActor
+    func testConservativePageContainingFirstEventConverges() async throws {
+        let host = FixtureSessionHost(events: fixtureEvents())
+        let viewModel = makeViewModel(host: host, store: makeStore(), firstWindow: 16)
+        let openingOldest = try XCTUnwrap(viewModel.oldestLoadedSeq)
+        var calls = 0
+        viewModel.olderPageLoader = { _ in
+            calls += 1
+            let records: [JSONValue] = (0..<openingOldest).map { seq in
+                .object(["type": .string("event"), "event": self.wireEvent(host.events[seq])])
+            }
+            return .object(["records": .array(records), "hasMore": .bool(true)])
+        }
+
+        await viewModel.loadOlderPageNowForTesting()
+        XCTAssertEqual(calls, 1)
+        XCTAssertEqual(viewModel.oldestLoadedSeq, 0)
+        XCTAssertFalse(viewModel.hasMoreOlder, "page.hasMore=true 但页内已含 seq 0 必须收敛")
+        XCTAssertFalse(viewModel.isLoadingOlder)
+
+        // 后续调用不再请求。
+        await viewModel.loadOlderPageNowForTesting()
+        viewModel.loadOlderIfNeeded()
+        try? await Task.sleep(nanoseconds: 100_000_000)
+        XCTAssertEqual(calls, 1)
+        XCTAssertFalse(viewModel.hasMoreOlder)
+    }
+
+    /// Lead 回归 (a)：分页到 seq 0 后，来一个 preserved.isEmpty（不连续窗口）且
+    /// hasMore=true 的新快照 —— 终止状态不得被重新武装。
+    @MainActor
+    func testTerminatedPaginationSurvivesDiscontinuousSnapshot() async throws {
+        let host = FixtureSessionHost(events: fixtureEvents())
+        let viewModel = makeViewModel(host: host, store: makeStore(), firstWindow: 16)
+        var calls = 0
+        viewModel.olderPageLoader = hostLoader(host: host) { _, _ in calls += 1 }
+        while viewModel.hasMoreOlder { await viewModel.loadOlderPageNowForTesting() }
+        XCTAssertFalse(viewModel.hasMoreOlder)
+
+        // 窗口整体跳到更晚的一段（与已加载 0...239 不连续）：preserved.isEmpty 分支。
+        let laterHost = FixtureSessionHost(events: fixtureEvents(turns: 80))
+        viewModel.applyStreamValue(laterHost.openingSnapshot(
+            maxMessages: 16,
+            turnWindow: SessionWindowPolicy.firstWindowTurnWindow(messages: 16)
+        ))
+        XCTAssertGreaterThan(try XCTUnwrap(viewModel.oldestLoadedSeq), 0, "窗口按不连续策略被替换")
+        XCTAssertTrue(viewModel.reachedFirstEvent, "粘滞位不因窗口替换而回退")
+        XCTAssertFalse(viewModel.hasMoreOlder, "新快照 hasMore=true 不得复活入口")
+
+        let callsAfterSnapshot = calls
+        for _ in 0..<10 { viewModel.loadOlderIfNeeded() }
+        try? await Task.sleep(nanoseconds: 150_000_000)
+        XCTAssertEqual(calls, callsAfterSnapshot, "终止后不再发请求")
+    }
+
+    /// Lead 回归 (b)：缓存恢复（含旧 v3 schema 缺粘滞字段）后若已到 seq 0 → false
+    /// 且 loadOlderIfNeeded 不再发请求。
+    @MainActor
+    func testCachedWindowAtFirstEventRestoresTerminated() async throws {
+        let host = FixtureSessionHost(events: fixtureEvents())
+        let store = makeStore()
+        let viewModel = makeViewModel(host: host, store: store, firstWindow: 16)
+        viewModel.olderPageLoader = hostLoader(host: host)
+        while viewModel.hasMoreOlder { await viewModel.loadOlderPageNowForTesting() }
+        XCTAssertTrue(viewModel.reachedFirstEvent)
+        viewModel.saveWindowCacheNow()
+
+        // 旧 v3 payload：没有 hasReachedOldest 字段，必须按 oldestSeq==0 推导。
+        var legacy = try XCTUnwrap(store.load(sessionId: "fixture")?.payload)
+        legacy.schemaVersion = SessionWindowCacheStore.olderRangeSchemaVersion
+        legacy.hasReachedOldest = nil
+        XCTAssertTrue(CacheIO.writeAtomically(legacy, to: store.fileURL(for: "fixture")))
+
+        let reopened = SessionViewModel(address: .session(sessionId: "fixture"), windowCache: store)
+        XCTAssertTrue(reopened.isShowingCachedWindow)
+        XCTAssertEqual(reopened.oldestLoadedSeq, 0)
+        XCTAssertTrue(reopened.reachedFirstEvent, "旧 schema 按已到 seq 0 推导粘滞终止")
+        XCTAssertFalse(reopened.hasMoreOlder)
+
+        var calls = 0
+        reopened.olderPageLoader = { _ in calls += 1; return .object([:]) }
+        for _ in 0..<10 { reopened.loadOlderIfNeeded() }
+        try? await Task.sleep(nanoseconds: 150_000_000)
+        XCTAssertEqual(calls, 0, "恢复后已到最早，loadOlderIfNeeded 不得发请求")
+        XCTAssertFalse(reopened.hasMoreOlder)
+        XCTAssertFalse(reopened.isLoadingOlder)
+    }
+
+    private func wireEvent(_ event: SessionEvent) -> JSONValue {
+        let data = try! JSONEncoder().encode(event)
+        return try! JSONValue.jsonObject(from: data)
+    }
 }

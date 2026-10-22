@@ -158,6 +158,10 @@ struct SessionWindowCachePayload: Codable, Equatable {
     /// before `oldestSeq` (the user can keep scrolling up). Nil on v2 payloads,
     /// which are interpreted from the legacy `hasMore` field instead.
     var hasMoreOlder: Bool?
+    /// v4 (task-6): sticky "the session's first event has already been loaded".
+    /// Once true, a cold open must not show the "load earlier" entry again. Nil on
+    /// v2/v3 payloads: derived as `oldestSeq == 0 || replayed front seq == 0`.
+    var hasReachedOldest: Bool?
 }
 
 /// One file per session (`window-<stable-hash>.json`) inside the cache directory.
@@ -166,16 +170,21 @@ final class SessionWindowCacheStore {
     /// would slow the next open instead of speeding it up.
     static let maxPayloadBytes = 4 * 1024 * 1024
 
-    /// Window payload schema. **v3** (task session-history) adds the loaded older
-    /// range (`olderEvents` / `oldestSeq` / `hasMoreOlder`). v2 payloads stay
-    /// readable: they mean "the legacy 40-message window", i.e.
-    /// `oldestSeq = earliest record` and `hasMoreOlder = legacy hasMore`
-    /// (interpreted by `SessionViewModel.restoreCachedWindow`). The shared
+    /// Window payload schema.
+    /// - **v3** (task session-history) adds the loaded older range
+    ///   (`olderEvents` / `oldestSeq` / `hasMoreOlder`);
+    /// - **v4** (task-6) adds the sticky `hasReachedOldest` termination flag.
+    ///
+    /// v2/v3 payloads stay readable: v2 means "the legacy 40-message window"
+    /// (`oldestSeq = earliest record`, `hasMoreOlder = legacy hasMore`), v3 lacks
+    /// only the sticky flag (derived from the replayed front seq). The shared
     /// `CacheSchema.version` is deliberately untouched: the session-list payloads
     /// have their own schema and must not be invalidated by this change.
-    static let schemaVersion = 3
+    static let schemaVersion = 4
     /// Versions `load` accepts (v2 = legacy 40-message window, upgraded in memory).
-    static let readableSchemaVersions: Set<Int> = [2, 3]
+    static let readableSchemaVersions: Set<Int> = [2, 3, 4]
+    /// First schema that carries the older-range fields (`olderEvents` etc.).
+    static let olderRangeSchemaVersion = 3
 
     struct Loaded {
         var payload: SessionWindowCachePayload
@@ -247,7 +256,8 @@ final class SessionWindowCacheStore {
         p1Sid: Int64? = nil,
         olderEvents: [JSONValue] = [],
         oldestSeq: Int? = nil,
-        hasMoreOlder: Bool? = nil
+        hasMoreOlder: Bool? = nil,
+        hasReachedOldest: Bool? = nil
     ) -> Bool {
         guard let identity = identity() else { return false }
         var payload = SessionWindowCachePayload(
@@ -263,7 +273,8 @@ final class SessionWindowCacheStore {
             p1Sid: p1Sid,
             olderEvents: olderEvents.isEmpty ? nil : olderEvents,
             oldestSeq: oldestSeq,
-            hasMoreOlder: hasMoreOlder
+            hasMoreOlder: hasMoreOlder,
+            hasReachedOldest: hasReachedOldest
         )
         guard var data = CacheIO.encode(payload) else { return false }
         // A long session can accumulate more loaded older history than the cold-start

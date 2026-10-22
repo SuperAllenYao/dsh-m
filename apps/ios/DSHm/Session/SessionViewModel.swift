@@ -105,6 +105,10 @@ final class SessionViewModel: ObservableObject {
     /// Oldest event seq currently loaded (front of the window), read-only view
     /// contract: the detail can anchor/verify the scroll position against it.
     var oldestLoadedSeq: Int? { journal.oldestSeq }
+    /// Sticky "the session's first event has been loaded" (task-6): once true the
+    /// detail must hide the "load earlier" entry forever — even if a reconnect /
+    /// background-fill snapshot with `hasMore = true` arrives afterwards.
+    var reachedFirstEvent: Bool { journal.hasReachedOldest }
     /// M2b-2: cache read + journal replay + first row rebuild inside `init`, in ms.
         private(set) var cacheLoadMilliseconds: Double = 0
     private let windowCache: SessionWindowCacheStore
@@ -343,7 +347,7 @@ final class SessionViewModel: ObservableObject {
                     return
                 }
             }
-            if cached.payload.schemaVersion >= SessionWindowCacheStore.schemaVersion {
+            if cached.payload.schemaVersion >= SessionWindowCacheStore.olderRangeSchemaVersion {
                 journal.setHasMoreOlder(cached.payload.hasMoreOlder ?? journal.hasMore)
             } else {
                 // Legacy v2 payload = the old 40-message window: no older range was
@@ -351,6 +355,13 @@ final class SessionViewModel: ObservableObject {
                 // `hasMoreOlder` is the old `hasMore` (snapshot hasMore fallback).
                 journal.setHasMoreOlder(cached.payload.hasMore ?? journal.hasMore)
             }
+            // task-6: restore the sticky termination flag. v4 payloads carry it
+            // explicitly; older payloads derive it (Lead-agreed rule): a cached front
+            // at seq 0 proves the earliest event was loaded.
+            journal.setHasReachedOldest(
+                cached.payload.hasReachedOldest
+                    ?? (cached.payload.oldestSeq == 0 || journal.oldestSeq == 0)
+            )
             cachedSnapshotFrame = cached.payload.snapshot
             cachedEventFrames = cached.payload.events
             cachedOlderEventFrames = olderFrames
@@ -359,7 +370,7 @@ final class SessionViewModel: ObservableObject {
             isShowingCachedWindow = true
             cachedWindowIsStale = cached.isStale
             isLoading = false
-            hasMoreOlder = journal.hasMoreOlder
+            syncOlderState()
             rebuildRows()
             contextPressure = journal.contextPressure
         } catch {
@@ -428,7 +439,10 @@ final class SessionViewModel: ObservableObject {
             p1Sid: channel?.lastAppliedSid,
             olderEvents: cachedOlderEventFrames,
             oldestSeq: restoredOldest,
-            hasMoreOlder: journal.hasMoreOlder || cachedOlderFramesTruncated
+            hasMoreOlder: journal.hasMoreOlder || cachedOlderFramesTruncated,
+            // task-6: sticky — a cold open must not show "load earlier" again after
+            // the user already reached the session's first event.
+            hasReachedOldest: journal.hasReachedOldest
         )
     }
 
@@ -745,6 +759,9 @@ final class SessionViewModel: ObservableObject {
     /// request is already in flight, no snapshot/cursor exists yet, or the link is
     /// offline — the next scroll callback simply retries.
     func loadOlderIfNeeded() {
+        // task-6: settle the terminal state before deciding anything, so a stale
+        // cache/restore flag can never resurrect the entry after seq 0 is loaded.
+        syncOlderState()
         guard canStartOlderPageLoad else { return }
         isLoadingOlder = true
         let throughSeq = journal.cursor
@@ -758,6 +775,7 @@ final class SessionViewModel: ObservableObject {
     /// `performOlderPageLoad` from a Task; unit tests drive the state machine
     /// deterministically through this wrapper.
     func loadOlderPageNowForTesting() async {
+        syncOlderState()
         guard canStartOlderPageLoad else { return }
         isLoadingOlder = true
         await performOlderPageLoad(throughSeq: journal.cursor, beforeSeq: journal.oldestSeq ?? 0)
@@ -765,8 +783,18 @@ final class SessionViewModel: ObservableObject {
 
     private var canStartOlderPageLoad: Bool {
         guard hasMoreOlder, !isLoadingOlder else { return false }
-        guard journal.cursor >= 0, journal.oldestSeq != nil else { return false }
+        // Never ask for a page in front of seq 0: reaching the first event is the
+        // terminal state (a `beforeSeq=0` request would only return an empty page).
+        guard journal.cursor >= 0, let oldest = journal.oldestSeq, oldest > 0 else { return false }
         return olderPageLoader != nil || (link?.phase.isConnected ?? false)
+    }
+
+    /// Publishes the paging front from the journal. `hasMoreOlder` can never be true
+    /// once the first event is loaded; every path that learns about older history
+    /// (cache restore, live snapshot, page merge, row rebuild) goes through here so
+    /// the view-facing flag cannot drift from the window it describes.
+    private func syncOlderState() {
+        hasMoreOlder = journal.hasMoreOlder
     }
 
     /// One `session/page` round trip + front merge.
@@ -803,7 +831,7 @@ final class SessionViewModel: ObservableObject {
                 appendCachedOlderFrames(addedFrames)
                 scheduleCacheSave()
             }
-            hasMoreOlder = journal.hasMoreOlder
+            syncOlderState()
             if olderPageErrorShown {
                 actionErrorText = nil
                 olderPageErrorShown = false
@@ -954,7 +982,7 @@ final class SessionViewModel: ObservableObject {
                 )
                 cachedSnapshotFrame = value
                 cachedEventFrames = []
-                hasMoreOlder = journal.hasMoreOlder
+                syncOlderState()
                 hasLiveSnapshot = true
                 isShowingCachedWindow = false
                 cachedWindowIsStale = false
@@ -1055,8 +1083,8 @@ final class SessionViewModel: ObservableObject {
 
     private func rebuildRows() {
         sections = SessionRowBuilder.build(events: journal.events)
-        dbg("rebuild: events=" + String(journal.events.count) + " sections=" + String(sections.count) + " hasMoreOlder=" + String(journal.hasMoreOlder))
-        hasMoreOlder = journal.hasMoreOlder
+        dbg("rebuild: events=" + String(journal.events.count) + " sections=" + String(sections.count) + " hasMoreOlder=" + String(journal.hasMoreOlder) + " oldest=" + String(journal.oldestSeq ?? -1) + " turns=" + sections.prefix(12).map { String($0.turn) + ($0.isRunning ? "*" : "") }.joined(separator: ","))
+        syncOlderState()
         title = journal.title
         permissionsValue = journal.permissionsValue
         todos = journal.todos
