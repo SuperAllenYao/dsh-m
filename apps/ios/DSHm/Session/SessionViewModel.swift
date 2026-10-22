@@ -330,13 +330,24 @@ final class SessionViewModel: ObservableObject {
  // v3: replay the loaded older range *before* the live tail, so the
  // restored window is [oldestLoadedSeq, cursor] instead of only the
  // newest message window (cold start must not regress to 40 messages).
+ //
+ // task-7: only a gap-free suffix that is adjacent to the snapshot window
+ // may be replayed. A cache written by an older build could carry a
+ // non-contiguous prefix; restoring it hides whole turns (turn 1 keeps
+ // "running", turns 2–7 vanish) and paging can never repair an interior
+ // hole, so the prefix is dropped and the entry is re-armed instead.
             let olderFrames = cached.payload.olderEvents ?? []
+            var restoredWindowWasRepaired = false
             if !olderFrames.isEmpty {
-                let olderEvents = olderFrames.compactMap { try? $0.decode(SessionEvent.self) }
-                journal.prepend(
-                    events: olderEvents,
-                    hasMoreOlder: cached.payload.hasMoreOlder ?? true
-                )
+                let decodedOlder = olderFrames.compactMap { try? $0.decode(SessionEvent.self) }
+                let snapshotOldest = snapshot.records.compactMap { $0.event?.seq }.min()
+                let usableOlder = Self.contiguousOlderSuffix(decodedOlder, snapshotOldest: snapshotOldest)
+                if !usableOlder.isEmpty {
+                    journal.prepend(events: usableOlder, hasMoreOlder: true)
+                }
+                if usableOlder.count != decodedOlder.count {
+                    restoredWindowWasRepaired = true
+                }
             }
             for eventValue in cached.payload.events {
                 let event = try eventValue.decode(SessionEvent.self)
@@ -346,6 +357,12 @@ final class SessionViewModel: ObservableObject {
                     journal = SessionJournal()
                     return
                 }
+            }
+ // Whole-window continuity gate (task-7): if anything still leaves a hole,
+ // keep only the gap-free suffix that ends at the newest event.
+            if !journal.isWindowContiguous {
+                let dropped = journal.trimToContiguousSuffix()
+                if dropped > 0 { restoredWindowWasRepaired = true }
             }
             if cached.payload.schemaVersion >= SessionWindowCacheStore.olderRangeSchemaVersion {
                 journal.setHasMoreOlder(cached.payload.hasMoreOlder ?? journal.hasMore)
@@ -362,9 +379,21 @@ final class SessionViewModel: ObservableObject {
                 cached.payload.hasReachedOldest
                     ?? (cached.payload.oldestSeq == 0 || journal.oldestSeq == 0)
             )
+            if restoredWindowWasRepaired {
+ // The discarded prefix must be pulled again: re-arm the entry for good
+ // (this also clears the sticky terminal state — the first event is no
+ // longer in the window).
+                journal.markOlderHistoryUnloaded()
+            }
             cachedSnapshotFrame = cached.payload.snapshot
             cachedEventFrames = cached.payload.events
-            cachedOlderEventFrames = olderFrames
+ // Cache only the raw older frames that actually landed in the repaired
+ // window (a dropped hole must not be written back on the next save).
+            let keptSeqs = Set(journal.events.lazy.map(\.seq))
+            cachedOlderEventFrames = Self.mergedEventFrames(olderFrames.filter { frame in
+                guard let seq = Self.eventFrameSeq(frame) else { return false }
+                return keptSeqs.contains(seq)
+            })
             rebuildCachedOlderFrameBytes()
             didRestoreWindowFromCache = true
             isShowingCachedWindow = true
@@ -867,6 +896,19 @@ final class SessionViewModel: ObservableObject {
             kept.append(frame)
         }
         cachedOlderEventFrames = Self.mergedEventFrames(kept)
+ // task-7: never persist a prefix that is not a gap-free run ending right
+ // below the snapshot window. A hole written into the cache comes back as a
+ // hole-y cold-start window (whole turns missing / a finished turn shows
+ // "running"), and paging can never fill an interior hole.
+        if let newSnapshotOldest {
+            let seqs = cachedOlderEventFrames.compactMap { Self.eventFrameSeq($0) }
+            let contiguous = zip(seqs, seqs.dropFirst()).allSatisfy { $0 + 1 == $1 }
+            let adjacent = seqs.last.map { $0 + 1 == newSnapshotOldest } ?? true
+            if !contiguous || !adjacent {
+                cachedOlderEventFrames = []
+                cachedOlderFramesTruncated = true
+            }
+        }
         rebuildCachedOlderFrameBytes()
     }
 
@@ -915,6 +957,20 @@ final class SessionViewModel: ObservableObject {
         }
         cachedOlderFrameBytes = sizes
         cachedOlderFramesBytes = total
+    }
+
+ /// Longest gap-free suffix of a decoded older range that is adjacent to the
+ /// snapshot window's first record. Anything else is unusable: restoring a
+ /// non-contiguous prefix would render a window with a hole (task-7).
+    static func contiguousOlderSuffix(_ events: [SessionEvent], snapshotOldest: Int?) -> [SessionEvent] {
+        guard let snapshotOldest else { return [] }
+        let older = events.filter { $0.seq < snapshotOldest }.sorted { $0.seq < $1.seq }
+        guard let last = older.last, last.seq + 1 == snapshotOldest else { return [] }
+        var start = older.count - 1
+        while start > 0, older[start].seq == older[start - 1].seq + 1 {
+            start -= 1
+        }
+        return Array(older[start...])
     }
 
  /// Sorted, seq-de-duplicated raw `event` objects.

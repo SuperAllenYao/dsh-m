@@ -129,10 +129,17 @@ final class SessionJournal {
  // from the snapshot is safer than rendering a window with a hidden gap.
         let previous = events
         var preserved: [SessionEvent] = []
+        var droppedPrefixWhilePreserving = false
         if let snapshotOldest = deduped.first?.seq {
             let older = previous.filter { $0.seq < snapshotOldest }
             if !older.isEmpty, let last = older.last, last.seq + 1 == snapshotOldest {
-                preserved = older
+ // A previous replay/cache could have left an internal hole in the
+ // loaded prefix. Keep only the gap-free suffix that is adjacent to the
+ // snapshot window: carrying the hole over hides whole turns (turn 1
+ // keeps "running", turns 2–7 vanish) and can never be repaired by
+ // paging, which only walks further back from the front.
+                preserved = Self.contiguousSuffix(of: older)
+                droppedPrefixWhilePreserving = preserved.count < older.count
             }
         }
         header = snapshot.header
@@ -151,6 +158,11 @@ final class SessionJournal {
  // `hasMore = true` must not re-arm the entry.
         if preserved.isEmpty {
             hasMoreOlderFlag = snapshot.hasMore ?? false
+        }
+        if droppedPrefixWhilePreserving {
+ // The discarded prefix must be pulled again (a hole can only be refilled
+ // from the outside in, never from the current front).
+            markOlderHistoryUnloaded()
         }
         markReachedOldestIfNeeded()
         snapshotCount += 1
@@ -245,29 +257,44 @@ final class SessionJournal {
     }
 
  /// Cache-restore / test seam for `prepend(page:)` without wire records.
+ ///
+ /// Task-7: a page is only merged when it is a **gap-free block adjacent to the
+ /// current front** (`candidates.last.seq + 1 == events.first.seq`). The Host
+ /// guarantees this for a request keyed on the current oldest seq, but a stale page
+ /// (arrived after a snapshot jump) or a corrupt reply must never punch a hole in
+ /// the window: a hole hides whole turns and can not be repaired by further paging
+ /// (which only walks further back). Rejected pages keep `hasMoreOlder = true` so
+ /// the next scroll refetches from the new front.
     @discardableResult
     func prepend(events incoming: [SessionEvent], hasMoreOlder: Bool) -> Update {
         let ascending = incoming.sorted { $0.seq < $1.seq }
         let currentOldest = events.first?.seq
-        var merged: [SessionEvent] = []
-        merged.reserveCapacity(events.count + ascending.count)
-        var inserted: [Int] = []
+        var candidates: [SessionEvent] = []
+        candidates.reserveCapacity(ascending.count)
         for event in ascending {
  // Defensive: the Host only returns events older than `beforeSeq`; keep
  // anything at/after the current front out of the prefix merge.
             if let currentOldest, event.seq >= currentOldest { continue }
-            if let last = merged.last, event.seq <= last.seq { continue }
-            merged.append(event)
-            inserted.append(event.seq)
+            if let last = candidates.last, event.seq <= last.seq { continue }
+            candidates.append(event)
         }
-        merged.append(contentsOf: events)
-        events = merged
-        if inserted.isEmpty {
+        guard !candidates.isEmpty else {
  // Nothing new: stop pagination instead of asking the same page forever.
             hasMoreOlderFlag = false
-        } else {
-            hasMoreOlderFlag = hasMoreOlder
+            markReachedOldestIfNeeded()
+            return .olderPrepended([])
         }
+        let blockContiguous = zip(candidates, candidates.dropFirst())
+            .allSatisfy { $0.seq + 1 == $1.seq }
+        let adjacentToFront = currentOldest.map { candidates[candidates.count - 1].seq + 1 == $0 } ?? false
+        guard blockContiguous, adjacentToFront else {
+ // Reject the page as a whole: keep the window (and the paging flag) intact
+ // so the caller can retry with a fresh `beforeSeq`.
+            hasMoreOlderFlag = true
+            return .olderPrepended([])
+        }
+        events = candidates + events
+        hasMoreOlderFlag = hasMoreOlder
  // `page.hasMore == false` is the Host telling us this page starts the log;
  // reaching seq 0 proves the same thing even if a (conservative/buggy) Host
  // still reports `hasMore = true` (task-6).
@@ -275,7 +302,7 @@ final class SessionJournal {
             hasReachedOldest = true
         }
         markReachedOldestIfNeeded()
-        return .olderPrepended(inserted)
+        return .olderPrepended(candidates.map(\.seq))
     }
 
  /// Restores the paging state from an on-disk window cache (see
@@ -305,6 +332,60 @@ final class SessionJournal {
         guard events.first?.seq == 0 else { return }
         hasReachedOldest = true
         hasMoreOlderFlag = false
+    }
+
+ // MARK: - Window continuity (task-7)
+
+ /// True when every neighbouring pair in the window is exactly +1 (no holes).
+ /// A hole is a hard rendering bug: turn grouping loses intermediate turns and a
+ /// turn whose `turn/end` fell into the hole looks "running" forever.
+    var isWindowContiguous: Bool {
+        guard events.count > 1 else { return true }
+        for index in 1..<events.count where events[index].seq != events[index - 1].seq + 1 {
+            return false
+        }
+        return true
+    }
+
+ /// Keeps only the maximal gap-free suffix of the window (front repair: a hole can
+ /// only be refilled from the outside in, never by paging from the current front).
+ /// Never touches `lastSeq`/`cursor`; returns the number of dropped oldest events.
+    @discardableResult
+    func trimToContiguousSuffix() -> Int {
+        guard events.count > 1 else { return 0 }
+        var start = events.count - 1
+        while start > 0, events[start].seq == events[start - 1].seq + 1 {
+            start -= 1
+        }
+        return dropOldestPrefix(start)
+    }
+
+ /// Drops the `count` oldest events (front repair). Never touches
+ /// `lastSeq`/`cursor`.
+    @discardableResult
+    func dropOldestPrefix(_ count: Int) -> Int {
+        let dropped = max(0, min(count, events.count))
+        guard dropped > 0 else { return 0 }
+        events.removeFirst(dropped)
+        return dropped
+    }
+
+ /// Repair hook: the loaded front is no longer usable (a hole was discarded), so
+ /// older history has to be pulled again. Clears the sticky terminal state — the
+ /// window no longer contains the first event.
+    func markOlderHistoryUnloaded() {
+        hasReachedOldest = false
+        hasMoreOlderFlag = true
+    }
+
+ /// Longest gap-free suffix of an ascending event list.
+    static func contiguousSuffix(of ascending: [SessionEvent]) -> [SessionEvent] {
+        guard !ascending.isEmpty else { return [] }
+        var start = ascending.count - 1
+        while start > 0, ascending[start].seq == ascending[start - 1].seq + 1 {
+            start -= 1
+        }
+        return Array(ascending[start...])
     }
 
  /// Applies an assistant-stream frame; enforces strictly monotonic revision.
