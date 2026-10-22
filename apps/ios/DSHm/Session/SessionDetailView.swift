@@ -1309,22 +1309,62 @@ private struct StickToBottomObserver: ViewModifier {
 /// interacting/decelerating，因此不会自我触发。
 /// 常量集中在 `Trigger`，真机微调手感只改这一处。
 /// iOS 17 由顶部加载行是否实体化兜底（TopRowTrigger）。
-private struct NearTopObserver: ViewModifier {
-    let onPullAtTop: () -> Void
-
-    /// 触发条件（集中调参处）。
-    private enum Trigger {
+/// 「下拉加载更早」的触发判定，抽成纯逻辑以便单测（真机手势仍需 UITest 覆盖）。
+///
+/// 关键口径：量的是 **contentOffset 的下降量**（内容被向上拉动的距离），不是手指位移。
+/// 已经贴顶时继续下拉会进入 rubber-band，offset 变负、松手又弹回 0 ——
+/// 所以必须在滚动过程中累计**峰值**，不能在手势结束时用起止 offset 相减
+/// （2026-10-22 真机回归：贴顶下拉永远算成 0，加载彻底失效）。
+struct NearTopPullTracker: Equatable {
+    /// 触发条件（集中调参处；真机调手感只改这一处）。
+    enum Trigger {
         /// 视口距顶部多少 pt 以内算"已到达顶部附近"。
         static let nearTopThreshold: CGFloat = 240
-        /// 本次手势实际向上拉动的距离下限（放大 2 倍后的触发距离）。
+        /// 本次手势实际向上拉动的距离下限（相对原 120 放大 2 倍）。
         static let minimumPullDistance: CGFloat = 240
     }
 
-    @State private var isNearTop = true
-    /// 最近一次 ScrollGeometry 提交的 contentOffset.y，用于计算手势位移。
-    @State private var offsetY: CGFloat = 0
-    /// 本次用户手势开始（进入 interacting）时的 contentOffset.y。
-    @State private var pullStartOffsetY: CGFloat?
+    /// 最近一次 ScrollGeometry 提交的 contentOffset.y。
+    private(set) var offsetY: CGFloat = 0
+    /// 当前视口是否在顶部附近（用于手势结束时的判定）。
+    private(set) var isNearTop = true
+    /// 本次用户手势开始时的 contentOffset.y（nil = 当前没有进行中的手势）。
+    private var startOffsetY: CGFloat?
+    /// 本次手势过程中累计的最大向上拉动距离（含 rubber-band 峰值）。
+    private(set) var maxPullDistance: CGFloat = 0
+
+    /// 每次 ScrollGeometry 变化都调用；手势进行中会累计拉动峰值。
+    mutating func updateOffset(_ y: CGFloat) {
+        if let start = startOffsetY {
+            maxPullDistance = max(maxPullDistance, start - y)
+        }
+        offsetY = y
+        isNearTop = y <= Trigger.nearTopThreshold
+    }
+
+    /// 用户手势开始（ScrollPhase 进入 .interacting）。
+    mutating func gestureBegan() {
+        startOffsetY = offsetY
+        maxPullDistance = 0
+    }
+
+    /// 用户手势结束（.interacting/.decelerating → .idle）：返回是否应加载一页，并清空手势状态。
+    mutating func gestureEnded() -> Bool {
+        let triggered = isNearTop && maxPullDistance >= Trigger.minimumPullDistance
+        resetGesture()
+        return triggered
+    }
+
+    /// 手势未以"用户驱动"方式结束（或需要显式清理）时调用，避免陈旧峰值串到下一次手势。
+    mutating func resetGesture() {
+        startOffsetY = nil
+        maxPullDistance = 0
+    }
+}
+
+private struct NearTopObserver: ViewModifier {
+    let onPullAtTop: () -> Void
+    @State private var tracker = NearTopPullTracker()
 
     func body(content: Content) -> some View {
         if #available(iOS 18.0, *) {
@@ -1332,22 +1372,19 @@ private struct NearTopObserver: ViewModifier {
                 .onScrollGeometryChange(for: CGFloat.self) { geometry in
                     geometry.contentOffset.y
                 } action: { _, y in
-                    offsetY = y
-                    isNearTop = y <= Trigger.nearTopThreshold
+                    tracker.updateOffset(y)
                 }
                 .onScrollPhaseChange { previousPhase, phase in
                     switch phase {
                     case .interacting:
-                        // 手势开始的那一帧记下起点，idle 时用"起点 - 当前"算真实拉动距离。
-                        if previousPhase != .interacting { pullStartOffsetY = offsetY }
+                        if previousPhase != .interacting { tracker.gestureBegan() }
                     case .idle:
                         let wasUserDriven = previousPhase == .interacting || previousPhase == .decelerating
-                        // 向上拉（内容向新的一端滚）= contentOffset.y 变小，故用起点减当前值。
-                        let pulled = (pullStartOffsetY ?? offsetY) - offsetY
-                        if wasUserDriven, isNearTop, pulled >= Trigger.minimumPullDistance {
-                            onPullAtTop()
+                        if wasUserDriven {
+                            if tracker.gestureEnded() { onPullAtTop() }
+                        } else {
+                            tracker.resetGesture()
                         }
-                        pullStartOffsetY = nil
                     default:
                         break
                     }

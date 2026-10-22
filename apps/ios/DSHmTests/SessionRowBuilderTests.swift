@@ -445,4 +445,101 @@ final class SessionRowBuilderTests: XCTestCase {
         XCTAssertEqual(store.count, 1, "a retried prompt must not leave two pending bubbles")
         XCTAssertEqual(store.echoes.first?.text, "新文本")
     }
+
+    // MARK: - Mid-turn window / turn-0 orphan (real-device regression 2026-10-22)
+
+    /// Window shape taken from the real session log (session-daa07b5a…): the
+    /// follow window starts at seq 3232 while `turn/start` for turn 8 is seq
+    /// 3225, i.e. outside the window. The first row-producing event is a
+    /// `user/message`, which carries no `data.turn`.
+    private func midTurnWindowEvents() -> [SessionEvent] {
+        [
+            TestJSON.event("user/message", seq: 3232, data: TestJSON.value("""
+            {"content":[{"type":"text","text":"跑一遍真机回归"}],"source":{"kind":"user"},"role":"user","id":"m1"}
+            """)),
+            TestJSON.event("assistant/message", seq: 3235, data: TestJSON.value("""
+            {"turn":8,"message":{"content":[{"type":"text","text":"收到，开始跑。"}]},"source":{"provider":"mock","model":"mock"}}
+            """)),
+            TestJSON.event("user/message", seq: 3236, data: TestJSON.value("""
+            {"content":[{"type":"text","text":"子代理结算摘要"}],"source":{"kind":"subagent-settled","summary":"子代理结算摘要"}}
+            """)),
+            TestJSON.event("turn/end", seq: 3240, data: .object(["turn": .int(8), "reason": TestJSON.reason("completed")])),
+            TestJSON.event("turn/start", seq: 3244, data: .object(["turn": .int(9)])),
+            TestJSON.event("assistant/message", seq: 3245, data: TestJSON.value("""
+            {"turn":9,"message":{"content":[{"type":"text","text":"下一轮输出。"}]}}
+            """)),
+            TestJSON.event("turn/end", seq: 3246, data: .object(["turn": .int(9), "reason": TestJSON.reason("completed")])),
+        ]
+    }
+
+    func testWindowStartingMidTurnPromotesOrphanToRealTurn() {
+        let sections = SessionRowBuilder.build(events: midTurnWindowEvents())
+        XCTAssertEqual(sections.count, 2, "no synthetic Turn 0 section for a window that starts mid-turn")
+        XCTAssertNil(sections.first(where: { $0.turn == 0 }), "the orphan must be promoted to its real turn")
+        let turn8 = sections[0]
+        XCTAssertEqual(turn8.turn, 8)
+        XCTAssertEqual(turn8.status, .completed)
+        XCTAssertEqual(userTexts(in: sections).first, "跑一遍真机回归", "the window's first rows belong to turn 8")
+        let noticeKinds = turn8.rows.compactMap { row -> String? in
+            if case .notice(let notice) = row.content { return notice.kind }
+            return nil
+        }
+        XCTAssertEqual(noticeKinds, ["subagent-settled"])
+        XCTAssertTrue(turn8.rows.contains { row in
+            if case .text(let text) = row.content { return text == "收到，开始跑。" }
+            return false
+        })
+        XCTAssertEqual(sections[1].turn, 9)
+        XCTAssertEqual(sections[1].status, .completed)
+    }
+
+    func testPureNoticeWindowNeverRendersRunningOrphan() {
+        let events = [
+            TestJSON.event("user/message", seq: 10, data: TestJSON.value("""
+            {"content":[{"type":"text","text":"子代理结算摘要"}],"source":{"kind":"subagent-settled","summary":"子代理结算摘要"}}
+            """)),
+            TestJSON.event("user/message", seq: 11, data: TestJSON.value("""
+            {"content":[{"type":"text","text":"后台任务"}],"source":{"kind":"tool-jobs","summary":"后台任务"}}
+            """)),
+            TestJSON.event("job/registered", seq: 12, data: TestJSON.value("""
+            {"jobId":"job-1","kind":"bash","label":"xcodebuild","startedAt":1}
+            """)),
+        ]
+        let sections = SessionRowBuilder.build(events: events)
+        XCTAssertEqual(sections.count, 1)
+        XCTAssertEqual(sections[0].turn, 0)
+        XCTAssertEqual(sections[0].status, .completed, "an orphan window has no live turn to run")
+        XCTAssertFalse(sections[0].isRunning)
+    }
+
+    func testMidTurnWindowOfALiveTurnStaysRunning() {
+        // Same window shape, but the turn has not ended: promotion must keep the
+        // real turn header running (the closing guard only touches turn 0).
+        let events = [
+            TestJSON.event("user/message", seq: 3232, data: TestJSON.value("""
+            {"content":[{"type":"text","text":"跑一遍真机回归"}],"source":{"kind":"user"},"role":"user","id":"m1"}
+            """)),
+            TestJSON.event("assistant/message", seq: 3235, data: TestJSON.value("""
+            {"turn":8,"message":{"content":[{"type":"text","text":"正在跑。"}]}}
+            """)),
+        ]
+        let sections = SessionRowBuilder.build(events: events)
+        XCTAssertEqual(sections.count, 1)
+        XCTAssertEqual(sections[0].turn, 8)
+        XCTAssertTrue(sections[0].isRunning, "a live mid-turn window must keep the running header")
+    }
+
+    func testTurnEndAlonePromotesOrphanToItsRealTurn() {
+        let events = [
+            TestJSON.event("user/message", seq: 3232, data: TestJSON.value("""
+            {"content":[{"type":"text","text":"收尾消息"}],"source":{"kind":"user"},"role":"user","id":"m1"}
+            """)),
+            TestJSON.event("turn/end", seq: 3240, data: .object(["turn": .int(8), "reason": TestJSON.reason("completed")])),
+        ]
+        let sections = SessionRowBuilder.build(events: events)
+        XCTAssertEqual(sections.count, 1)
+        XCTAssertEqual(sections[0].turn, 8, "turn/end closes the promoted window tail instead of leaving Turn 0")
+        XCTAssertEqual(sections[0].status, .completed)
+        XCTAssertEqual(userTexts(in: sections), ["收尾消息"])
+    }
 }

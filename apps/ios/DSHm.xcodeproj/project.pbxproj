@@ -90,6 +90,7 @@
 		7A59FD592EF4F7ABD76693FE /* FlowModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0A35903C417579AE068561FD /* FlowModels.swift */; };
 		7B5864859A0B775E102CD0F4 /* ModelSelectionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9F337403486AE4A7AD726AB0 /* ModelSelectionTests.swift */; };
 		7CA67467B1A8EBCF458E62D6 /* WorkspaceStatusColors.swift in Sources */ = {isa = PBXBuildFile; fileRef = FD6C861AEED47D79FCEB7AFA /* WorkspaceStatusColors.swift */; };
+		7D550AC8F08ADBF5D7339625 /* NearTopPullTrackerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E36681E8571641E727AEFA8E /* NearTopPullTrackerTests.swift */; };
 		7D729CBEBAFCFCC3A10C3F53 /* ComposerState.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0375CEF09EAD0B2865AFB1F /* ComposerState.swift */; };
 		7DBAC60E44106C65E203B94D /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5D7E6C81778FF8F328C15DE6 /* SettingsView.swift */; };
 		7DEA9CEF1C042E6C7346CA50 /* P1Protocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0B5CCC3426F54D4DFA6B7D88 /* P1Protocol.swift */; };
@@ -284,6 +285,7 @@
 		DDB0030311F5C166D8A5B796 /* SessionListLite.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionListLite.swift; sourceTree = "<group>"; };
 		E217AF796FABBF113ED61B9A /* L10n.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = L10n.swift; sourceTree = "<group>"; };
 		E2FEEBAE0BBAE45F8F6C8AD0 /* Base64URL.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Base64URL.swift; sourceTree = "<group>"; };
+		E36681E8571641E727AEFA8E /* NearTopPullTrackerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NearTopPullTrackerTests.swift; sourceTree = "<group>"; };
 		E566A0B0F30946B8B04DCA2B /* SessionWindowPrewarmer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionWindowPrewarmer.swift; sourceTree = "<group>"; };
 		E5A2E306DB8095DFF74E4A5A /* PairingModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PairingModels.swift; sourceTree = "<group>"; };
 		E5D091D6F4A078F10C51240B /* APNsTokenValidator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = APNsTokenValidator.swift; sourceTree = "<group>"; };
@@ -317,6 +319,7 @@
 				D6707F428A2D9F0EA8E9EF42 /* MarkdownDocumentTests.swift */,
 				96DAA82D80EC88F332C8D777 /* ModelSelectionLiveSyncTests.swift */,
 				9F337403486AE4A7AD726AB0 /* ModelSelectionTests.swift */,
+				E36681E8571641E727AEFA8E /* NearTopPullTrackerTests.swift */,
 				43F251DAF63AD98F8FF98C73 /* P1ProtocolTests.swift */,
 				276745941721B234C6DC352D /* P1ResumeTests.swift */,
 				D67D6E2E5A0A3909E64CAFD3 /* P1TransportTests.swift */,
@@ -668,6 +671,7 @@
 				08488C4B96EE2EDD5FE6D839 /* MarkdownDocumentTests.swift in Sources */,
 				32CA9D574E4995CB255F8CA7 /* ModelSelectionLiveSyncTests.swift in Sources */,
 				7B5864859A0B775E102CD0F4 /* ModelSelectionTests.swift in Sources */,
+				7D550AC8F08ADBF5D7339625 /* NearTopPullTrackerTests.swift in Sources */,
 				651ECFFE3085C76DB745DB8C /* P15LiteListTests.swift in Sources */,
 				77942DB6E6E4E9F6E79E6A51 /* P1ProtocolTests.swift in Sources */,
 				DAAC6EB6C85BAEBD7E7E2932 /* P1ResumeTests.swift in Sources */,

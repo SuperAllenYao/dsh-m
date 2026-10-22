@@ -204,8 +204,44 @@ enum SessionRowBuilder {
             return sections.count - 1
         }
 
+        /// Promote the turn-0 orphan in place once an event names its real turn.
+        ///
+        /// A follow window can start mid-turn (its `turn/start` is outside the
+        /// window), so the first row-producing events — `user/message` and other
+        /// notices carry no `data.turn` — open a section through
+        /// `activeIndex(for:)` with turn 0. Without promotion that section stays
+        /// "Turn 0 运行中" forever and the real `turn/end` can never close it
+        /// (real-device regression 2026-10-22, oldest=3232 / turn/start(8)=3225).
+        /// - Returns: the section index that now owns `turn`.
+        func promoteOrphan(at index: Int, to turn: Int) -> Int {
+            if let existing = sections.firstIndex(where: { $0.turn == turn }) {
+                // The orphan rows precede this section's rows in seq order, so
+                // merge them in front, then drop the orphan.
+                sections[existing].rows.insert(contentsOf: sections[index].rows, at: 0)
+                if sections[existing].startedAt == nil {
+                    sections[existing].startedAt = sections[index].startedAt
+                }
+                sections.remove(at: index)
+                return existing > index ? existing - 1 : existing
+            }
+            sections[index].turn = turn
+            return index
+        }
+
         func activeIndex(for event: SessionEvent) -> Int {
-            if let currentIndex { return currentIndex }
+            if let index = currentIndex {
+                // Mid-turn window: the orphan gets its real turn as soon as an
+                // event carries one (`assistant/message`/`tool/call` do,
+                // `user/message` does not). Rows and order are preserved.
+                if sections[index].turn == 0,
+                   let turn = event.data?["turn"]?.int,
+                   turn > 0 {
+                    let promoted = promoteOrphan(at: index, to: turn)
+                    currentIndex = promoted
+                    return promoted
+                }
+                return index
+            }
             let turn = event.data?["turn"]?.int ?? 0
             return ensureSection(turn: turn, time: event.time)
         }
@@ -237,6 +273,15 @@ enum SessionRowBuilder {
                 sections[index].status = .running
             case "turn/end":
                 let turn = data?["turn"]?.int ?? (sections.last?.turn ?? 0)
+                // Mid-turn window whose tail has no turn-bearing row event yet:
+                // this `turn/end` is the first event that names the turn, so
+                // close the promoted orphan as that turn instead of leaving
+                // "Turn 0" behind.
+                if turn > 0,
+                   !sections.contains(where: { $0.turn == turn }),
+                   let orphan = sections.firstIndex(where: { $0.turn == 0 }) {
+                    currentIndex = promoteOrphan(at: orphan, to: turn)
+                }
                 if let index = sections.firstIndex(where: { $0.turn == turn }) {
                     let reason = data?["reason"]
                     sections[index].status = status(from: reason)
@@ -323,6 +368,15 @@ enum SessionRowBuilder {
             default:
                 continue
             }
+        }
+
+        // Closing guard: a window that starts mid-turn may never see the
+        // `turn/start`/`turn/end` owning its first rows (pagination window,
+        // restored cache hole). Such a detached section must never render as
+        // "运行中" — an ended session showed a permanent "Turn 0 运行中" card.
+        sections.removeAll { $0.turn == 0 && $0.rows.isEmpty }
+        for index in sections.indices where sections[index].turn == 0 {
+            sections[index].status = .completed
         }
 
         // Optimistic echo: painted last, so a prompt the user just sent stays at
