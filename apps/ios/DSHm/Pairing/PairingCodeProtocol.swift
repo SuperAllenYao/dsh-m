@@ -347,7 +347,8 @@ enum PairingCodeProtocol {
             deviceName: deviceName,
             pairedAt: Int64(Date().timeIntervalSince1970 * 1000),
             keyId: response.keyId,
-            originCandidates: ordered
+            originCandidates: ordered,
+            hostId: response.hostId
         )
     }
 

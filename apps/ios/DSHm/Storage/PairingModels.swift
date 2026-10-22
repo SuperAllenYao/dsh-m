@@ -29,6 +29,9 @@ struct PairingCredentials: Codable, Equatable {
     /// P1: resume cursor for `hello{resume}` — epoch + last applied server sid.
     var p1Epoch: String?
     var p1Sid: Int?
+    /// Mac 的稳定 hostId（配对载荷 `host.id` / 配对码兑换响应的 hostId）。
+    /// 运行期 mDNS 自愈用它确认「广播的是同一台 Mac」；旧凭据为 nil。
+    var hostId: String? = nil
 
     var originURL: URL? { URL(string: origin) }
 }

@@ -154,6 +154,12 @@ final class LinkService: ObservableObject {
     /// the same few milliseconds; restarting a just-started round would cancel the
     /// candidate that is about to win.
     private var lastReconnectRequestAt: Date?
+    /// 运行时端点自愈（用户 2026-10-23）：最近一次连接成功后刷新
+    /// `/health.deviceEndpoints` 的时间，用于节流。
+    private var lastEndpointRefreshAt: Date?
+    /// 网络路径变化 / 整轮失败后置脏：下一轮必须重新发现端点 + 并行探测，
+    /// 不能沿用上一张网络的地址顺序。
+    private var endpointsDirty = true
     /// Observer for `HTTPConnection`'s reused-socket first-byte watchdog.
     private var firstByteTimeoutObserver: NSObjectProtocol?
 
@@ -385,7 +391,8 @@ final class LinkService: ObservableObject {
             supportsMuxRPC: p1Capable,
             connectTickets: seededTickets,
             p1Epoch: nil,
-            p1Sid: nil
+            p1Sid: nil,
+            hostId: payload.host?.id
         )
         adopt(credentials: credentials)
         // M2a: remember the relay server advertised by the Mac so public
@@ -474,6 +481,9 @@ final class LinkService: ObservableObject {
         p1SilentResume = false
         p1LostAt = nil
         p1Resume.discard()
+        // 新配对 = 全新端点语境：下一轮必须重新发现（mDNS + /health 探测）。
+        endpointsDirty = true
+        lastEndpointRefreshAt = nil
         phase = .connecting
         startConnecting()
         return credentials
@@ -713,6 +723,7 @@ final class LinkService: ObservableObject {
         case .connected:
             if networkPathChangedSinceConnect {
                 ReconnectMetrics.markInvalidate(reason: "pageEnter/pathChanged")
+                endpointsDirty = true
                 teardownTransport()
                 reconnectNow()
             } else {
@@ -733,6 +744,8 @@ final class LinkService: ObservableObject {
     /// timeout; invalidating it here is what turns a 10s+ wait into a <1s reconnect.
     func handleNetworkPathChanged() {
         ReconnectMetrics.markPathChange()
+        // 网络已变：旧端点顺序作废，下一轮必须重新发现（mDNS）+ 并行探测。
+        endpointsDirty = true
         guard credentials != nil, !manuallyDisconnected else { return }
         switch phase {
         case .connected:
@@ -883,17 +896,32 @@ final class LinkService: ObservableObject {
             local: localNetwork,
             pathChanged: pathChanged
         )
-        let hasSameSubnetLAN = orderedCandidates.contains {
+        // 跨网络自愈（用户 2026-10-23）：mDNS 拿 Mac **当前** 端点 + 对候选并行打
+        // /health，两项都带预算（≤1.5s）。网络刚变时这一步把"按旧顺序串行盲试"
+        // 变成一次并行收敛，第一拨就落在可达地址上。
+        let discovery = await discoverAndProbe(
+            candidates: orderedCandidates,
+            local: localNetwork,
+            credentials: credentials
+        )
+        let dialCandidates = Self.dialOrder(
+            discovered: discovery.origins,
+            observations: discovery.observations,
+            fallback: orderedCandidates,
+            local: localNetwork,
+            prefersRelay: prefersRelay
+        )
+        let hasSameSubnetLAN = dialCandidates.contains {
             Self.candidateRole(host: $0.host, local: localNetwork) == .lanSameSubnet
         }
-        let hasRelay = orderedCandidates.contains {
+        let hasRelay = dialCandidates.contains {
             Self.candidateRole(host: $0.host, local: localNetwork) == .relay
         }
         // Fixed total budget for the candidate walk: the round can never turn into
         // a 10s tail. Cross-network relay+LAN: 1.5s; same-LAN: 3s; a single
         // candidate keeps the generous dial budget (nothing to switch to).
         let roundBudget = Self.roundBudgetSeconds(
-            candidateCount: orderedCandidates.count,
+            candidateCount: dialCandidates.count,
             hasSameSubnetLAN: hasSameSubnetLAN,
             hasRelay: hasRelay
         )
@@ -901,7 +929,7 @@ final class LinkService: ObservableObject {
         var failures: [String] = []
         var failureClasses: [CandidateFailureClass] = []
         var roundBudgetExhausted = false
-        for (index, origin) in orderedCandidates.enumerated() {
+        for (index, origin) in dialCandidates.enumerated() {
             if Task.isCancelled {
                 isConnecting = false
                 return
@@ -910,7 +938,7 @@ final class LinkService: ObservableObject {
             guard let attemptTimeout = Self.attemptBudget(
                 baseTimeout: Self.candidateTimeoutSeconds(
                     index: index,
-                    count: orderedCandidates.count,
+                    count: dialCandidates.count,
                     pathChanged: pathChanged
                 ),
                 remainingRoundBudget: remaining
@@ -959,6 +987,9 @@ final class LinkService: ObservableObject {
                 // the freshly authenticated link is up, learn the public CA
                 // certificate so future leaf re-issues need no re-pair.
                 startCATrustMigrationIfNeeded()
+                // 连接成功即把 Mac 当前端点写回持久化候选（网络再变时手里是新地址）。
+                endpointsDirty = false
+                refreshEndpointsAfterConnect(origin: origin)
                 return
             case .credentialRejected(let reason):
                 ReconnectMetrics.markCandidateAttempt(
@@ -1009,6 +1040,8 @@ final class LinkService: ObservableObject {
         // Remember a different starting origin for the next round so a dead
         // address does not always head the list.
         lastRoundFailureClasses = failureClasses
+        // 整轮都失败：下一轮必须重新发现端点（很可能手里全是旧地址）。
+        endpointsDirty = true
         _ = rotateOriginIfPossible(reason: failures.last ?? L10n.t("连接失败"))
         scheduleReconnect()
     }
@@ -1575,6 +1608,187 @@ final class LinkService: ObservableObject {
             return resume.isEmpty ? nil : resume
         }
         return resume.isEmpty ? base : base + ";" + resume
+    }
+
+    // MARK: - 运行时端点自愈（用户 2026-10-23：任何网络都要连得上，且极致快）
+
+    /// 一轮连接前的并行发现：mDNS 拿 Mac **当前** 端点 + 对所有候选并行打 `/health`。
+    ///
+    /// 两项都带硬预算（≤1.5s）且并发执行：即便发现全部失败，也只让这一轮多等一次
+    /// 预算，随后回落到原有的串行拨号。
+    private func discoverAndProbe(
+        candidates: [URL],
+        local: LocalIPv4Network?,
+        credentials: PairingCredentials
+    ) async -> (origins: [String], observations: [EndpointHealing.ProbeObservation]) {
+        // 单候选且端点不脏：没有可切换目标、地址也不可能过时，直接拨（省掉预算）。
+        let shouldDiscover = endpointsDirty || candidates.count > 1
+        let shouldProbe = EndpointHealing.shouldProbe(candidateCount: candidates.count)
+        guard shouldDiscover || shouldProbe else { return ([], []) }
+        let hasLANCandidate = candidates.contains {
+            Self.candidateRole(host: $0.host, local: local) != .relay
+        }
+        let discoveryBudget = EndpointHealing.discoveryBudget(hasLANCandidate: hasLANCandidate)
+        let probeTimeout = EndpointHealing.probeTimeout(candidateCount: candidates.count)
+        async let discovered: LANEndpointDiscovery.Result = shouldDiscover
+            ? LANEndpointDiscovery.discover(
+                hostId: credentials.hostId,
+                leafPin: credentials.leafPin,
+                caCertBase64: credentials.caCertBase64,
+                budget: discoveryBudget
+            )
+            : LANEndpointDiscovery.Result()
+        async let probed: [EndpointHealing.ProbeObservation] = shouldProbe
+            ? probeCandidateHealth(candidates, timeout: probeTimeout)
+            : []
+        let (mdns, observations) = await (discovered, probed)
+        var origins = mdns.origins
+        if let relay = mdns.relayOrigin { origins.append(relay) }
+        linkDebug("heal mdns=\(mdns.origins.count) relay=\(mdns.relayOrigin ?? "-") probed=\(observations.count)")
+        return (origins, observations)
+    }
+
+    /// 只读 `/health` 的并行探测（不认证、不改凭据、不碰 mux），给选路提供
+    /// "此刻谁能连"的事实，替代按存储顺序盲试。
+    private func probeCandidateHealth(
+        _ candidates: [URL],
+        timeout: TimeInterval
+    ) async -> [EndpointHealing.ProbeObservation] {
+        let leafPin = credentials?.leafPin
+        let caCertBase64 = credentials?.caCertBase64
+        let normalized = candidates.map { PairingOriginSelector.normalizedOriginString($0) }
+        return await withTaskGroup(of: EndpointHealing.ProbeObservation.self) { group in
+            for (index, url) in candidates.enumerated() {
+                let origin = normalized[index]
+                group.addTask {
+                    let started = ProcessInfo.processInfo.systemUptime
+                    func elapsedMs() -> Int {
+                        Int(((ProcessInfo.processInfo.systemUptime - started) * 1000).rounded())
+                    }
+                    do {
+                        let response = try await HTTPSClient.json(
+                            origin: url,
+                            method: "GET",
+                            path: "/health",
+                            leafPin: leafPin,
+                            caCertBase64: caCertBase64,
+                            timeout: timeout
+                        )
+                        let healthy = response.status == 200 && response.json["ok"]?.boolValue == true
+                        return EndpointHealing.ProbeObservation(
+                            origin: origin,
+                            result: healthy ? .healthy : .rejected,
+                            latencyMs: elapsedMs()
+                        )
+                    } catch {
+                        return EndpointHealing.ProbeObservation(
+                            origin: origin,
+                            result: .unreachable,
+                            latencyMs: elapsedMs()
+                        )
+                    }
+                }
+            }
+            var observations: [EndpointHealing.ProbeObservation] = []
+            for await observation in group { observations.append(observation) }
+            return observations
+        }
+    }
+
+    /// 本轮拨号顺序：mDNS 当前端点（已被 `/health` 验证）→ 并行探测结论
+    /// （healthy 按延迟、rejected 次之）→ 其余存量候选兜底。
+    nonisolated static func dialOrder(
+        discovered: [String],
+        observations: [EndpointHealing.ProbeObservation],
+        fallback: [URL],
+        local: LocalIPv4Network?,
+        prefersRelay: Bool
+    ) -> [URL] {
+        var result: [URL] = []
+        var seen = Set<String>()
+        func append(_ url: URL) {
+            let key = PairingOriginSelector.normalizedOriginString(url).lowercased()
+            guard seen.insert(key).inserted else { return }
+            result.append(url)
+        }
+        let discoveredURLs = PairingOriginSelector.candidates(
+            from: discovered,
+            allowLoopback: !PairingOriginSelector.isPhysicalDevice
+        )
+        for url in discoveredURLs { append(url) }
+        for observation in EndpointHealing.rankProbes(observations) where observation.result != .unreachable {
+            guard let url = URL(string: observation.origin) else { continue }
+            append(url)
+        }
+        for url in fallback { append(url) }
+        // 组合完再按当前网络路径做一次稳定分组：同一 Wi-Fi 同网段 LAN 优先；
+        // 蜂窝/跨网段中继优先（LAN 只兜底）。组内保留 mDNS/探测得到的顺序。
+        guard result.count > 1 else { return result }
+        var relay: [URL] = []
+        var lanSame: [URL] = []
+        var lanOther: [URL] = []
+        for url in result {
+            switch candidateRole(host: url.host, local: local) {
+            case .relay: relay.append(url)
+            case .lanSameSubnet: lanSame.append(url)
+            case .lanOther: lanOther.append(url)
+            }
+        }
+        if !prefersRelay, !lanSame.isEmpty { return lanSame + relay + lanOther }
+        if prefersRelay || local != nil { return relay + lanOther + lanSame }
+        return result
+    }
+
+    /// 连接成功后把 Mac 当前的 `/health.deviceEndpoints` 合并回持久化候选：
+    /// 网络再变时手机手里是"现在的地址"，而不是配对那天的。
+    private func refreshEndpointsAfterConnect(origin: URL) {
+        guard let current = credentials else { return }
+        let pathChanged = endpointsDirty
+        guard EndpointHealing.shouldRefreshEndpoints(
+            lastRefreshAt: lastEndpointRefreshAt,
+            now: Date(),
+            networkPathChanged: pathChanged
+        ) else { return }
+        lastEndpointRefreshAt = Date()
+        Task { [weak self] in
+            guard let self else { return }
+            let response = try? await HTTPSClient.json(
+                origin: origin,
+                method: "GET",
+                path: "/health",
+                leafPin: current.leafPin,
+                caCertBase64: current.caCertBase64,
+                timeout: 4
+            )
+            guard let response, response.status == 200 else { return }
+            let advertised = Self.healthDeviceEndpoints(from: response.json)
+            guard !advertised.isEmpty else { return }
+            self.applyAdvertisedEndpoints(advertised, currentOrigin: origin)
+        }
+    }
+
+    /// 合并并持久化 Mac 广播的端点；有变化时同步更新内存凭据（下一轮立即用新顺序）。
+    @discardableResult
+    func applyAdvertisedEndpoints(_ advertised: [String], currentOrigin: URL) -> [String]? {
+        guard var latest = credentials else { return nil }
+        let merged = EndpointHealing.mergeAdvertised(
+            current: PairingOriginSelector.normalizedOriginString(currentOrigin),
+            stored: latest.originCandidates,
+            advertised: advertised
+        )
+        guard !merged.isEmpty, merged != latest.originCandidates else { return nil }
+        latest.originCandidates = merged
+        credentials = latest
+        try? store.save(latest)
+        linkDebug("endpoints healed: " + merged.joined(separator: ","))
+        return merged
+    }
+
+    /// DEBUG 一行诊断日志（真机连不上时用 `devicectl process launch --console` 看）。
+    private func linkDebug(_ message: String) {
+        #if DEBUG
+        NSLog("[LINKHEAL] %@", message)
+        #endif
     }
 }
 

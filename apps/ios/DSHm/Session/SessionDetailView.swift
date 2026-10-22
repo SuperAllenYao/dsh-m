@@ -1304,28 +1304,40 @@ struct FlowRowGroupView: View, Equatable {
             && lhs.isNewestGroupRunning == rhs.isNewestGroupRunning
     }
 
-    var body: some View {
+    private var axIdentifier: String {
         switch group {
-        case .single(let row):
-            FlowRowView(
-                row: row,
-                sessionId: sessionId,
-                attachments: attachments,
-                subagentLabels: subagentLabels,
-                onOpenTool: onOpenTool
-            )
-            .accessibilityIdentifier("flow-row")
-        case .process(let steps):
-            ProcessGroupView(
-                steps: steps,
-                isRunning: isNewestGroupRunning,
-                sessionId: sessionId,
-                attachments: attachments,
-                pendingApprovalCallIds: pendingApprovalCallIds,
-                onOpenTool: onOpenTool
-            )
-            .accessibilityIdentifier("process-group")
+        case .single: return "flow-row"
+        case .process: return "process-group"
         }
+    }
+
+    var body: some View {
+        Group {
+            switch group {
+            case .single(let row):
+                FlowRowView(
+                    row: row,
+                    sessionId: sessionId,
+                    attachments: attachments,
+                    subagentLabels: subagentLabels,
+                    onOpenTool: onOpenTool
+                )
+            case .process(let steps):
+                ProcessGroupView(
+                    steps: steps,
+                    isRunning: isNewestGroupRunning,
+                    sessionId: sessionId,
+                    attachments: attachments,
+                    pendingApprovalCallIds: pendingApprovalCallIds,
+                    onOpenTool: onOpenTool
+                )
+            }
+        }
+        // SwiftUI 只会把 identifier 挂到「可访问元素」上：单个 Text/Markdown/卡片内部的
+        // identifier 不会冒泡成元素，所以 XCUITest 数不到行。`children: .contain`
+        // 把每个渲染单元显式包成一个可访问容器（子元素仍逐个可达，供点击/断言）。
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier(axIdentifier)
     }
 }
 
