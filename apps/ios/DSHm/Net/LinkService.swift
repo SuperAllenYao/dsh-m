@@ -782,6 +782,12 @@ final class LinkService: ObservableObject {
         reconnectNow()
     }
 
+ /// E2E-only：模拟 OS 报告一次网络切换，走与真实切换完全相同的
+ /// `handleNetworkPathChanged` 即时重连路径。
+    func simulateNetworkPathChangeForE2E() {
+        NetworkPathMonitor.shared.simulateMeaningfulChangeForE2E()
+    }
+
  /// The reused mux delivered its first `workspace/follow` baseline inside the
  /// probe budget: the provisional "reuse" chain is confirmed and may complete.
     func noteReuseLivenessConfirmed() {
@@ -917,6 +923,7 @@ final class LinkService: ObservableObject {
         let hasRelay = dialCandidates.contains {
             Self.candidateRole(host: $0.host, local: localNetwork) == .relay
         }
+        linkDebug("round: dial=[" + dialCandidates.map { Self.originLabel($0) }.joined(separator: ",") + "]")
  // Fixed total budget for the candidate walk: the round can never turn into
  // a 10s tail. Cross-network relay+LAN: 1.5s; same-LAN: 3s; a single
  // candidate keeps the generous dial budget (nothing to switch to).
@@ -964,6 +971,7 @@ final class LinkService: ObservableObject {
             let candidateStartedAt = ReconnectMetrics.clock()
             switch await attemptConnection(origin: origin, leafPin: credentials.leafPin, timeout: attemptTimeout) {
             case .connected(let bumpGeneration):
+                linkDebug("round: connected " + Self.originLabel(origin))
                 ReconnectMetrics.markCandidateAttempt(
                     host: host,
                     milliseconds: (ReconnectMetrics.clock() - candidateStartedAt) * 1000,
@@ -1002,6 +1010,7 @@ final class LinkService: ObservableObject {
                 phase = .needsRepair(reason)
                 return
             case .fastRejected(let reason, let failureClass):
+                linkDebug("round: fastRejected " + Self.originLabel(origin) + " " + reason)
                 ReconnectMetrics.markCandidateAttempt(
                     host: host,
                     milliseconds: (ReconnectMetrics.clock() - candidateStartedAt) * 1000,
@@ -1016,6 +1025,7 @@ final class LinkService: ObservableObject {
                     ? L10n.t("桌面端插件未就绪（host/inactive），正在尝试其他地址…")
                     : L10n.t("该地址被服务端拒绝，正在尝试其他地址…")
             case .failed(let reason):
+                linkDebug("round: failed " + Self.originLabel(origin) + " " + reason)
                 let failureClass = Self.classifyFailureMessage(reason)
                 ReconnectMetrics.markCandidateAttempt(
                     host: host,
@@ -1037,6 +1047,7 @@ final class LinkService: ObservableObject {
  // One-line, actionable reason (cross-network req 4): the list banner shows
  // `statusDetail`, so it must never be empty or a generic 「重连中」.
         lastErrorText = Self.roundFailureSummary(classes: failureClasses, details: failures)
+        linkDebug("round: all candidates failed classes=[" + failureClasses.map(\.rawValue).joined(separator: ",") + "]")
  // Remember a different starting origin for the next round so a dead
  // address does not always head the list.
         lastRoundFailureClasses = failureClasses
@@ -1644,7 +1655,10 @@ final class LinkService: ObservableObject {
         let (mdns, observations) = await (discovered, probed)
         var origins = mdns.origins
         if let relay = mdns.relayOrigin { origins.append(relay) }
-        linkDebug("heal mdns=\(mdns.origins.count) relay=\(mdns.relayOrigin ?? "-") probed=\(observations.count)")
+        let probeSummary = EndpointHealing.rankProbes(observations)
+            .map { "\($0.origin)=\($0.result)\( $0.latencyMs)ms" }
+            .joined(separator: ",")
+        linkDebug("heal mdns=\(mdns.origins.count) relay=\(mdns.relayOrigin ?? "-") probes=[\(probeSummary)]")
         return (origins, observations)
     }
 
@@ -1693,6 +1707,12 @@ final class LinkService: ObservableObject {
             for await observation in group { observations.append(observation) }
             return observations
         }
+    }
+
+    nonisolated static func originLabel(_ url: URL) -> String {
+        let host = url.host ?? url.absoluteString
+        if let port = url.port { return "\(host):\(port)" }
+        return host
     }
 
  /// 本轮拨号顺序：mDNS 当前端点（已被 `/health` 验证）→ 并行探测结论

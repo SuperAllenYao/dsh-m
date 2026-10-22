@@ -258,8 +258,17 @@ final class AppModel: ObservableObject {
         if let tappedSession = ProcessInfo.processInfo.environment["DSHM_E2E_TAP_PUSH_SESSION"],
            !tappedSession.isEmpty {
             let delay = Int(ProcessInfo.processInfo.environment["DSHM_E2E_TAP_PUSH_AFTER_MS"] ?? "") ?? 1_500
-            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(max(0, delay))) {
-                NotificationCenter.default.post(name: .dshmPushNotificationTapped, object: tappedSession)
+ // `DSHM_E2E_TAP_PUSH_WAIT_READY=1`: 先等链路就绪再计延迟。首屏可能在
+ // 冷启动/清缓存/跨网恢复时超过固定延迟，旧写法会让"注入推送"早于
+ // 测试基线，导致跨会话重入断言假红。
+            let waitForReady = ProcessInfo.processInfo.environment["DSHM_E2E_TAP_PUSH_WAIT_READY"] == "1"
+            scheduleE2EPushTap(session: tappedSession, delayMs: delay, waitForReady: waitForReady)
+        }
+ // E2E: 在运行中模拟一次网络切换（Wi-Fi↔蜂窝/断网恢复），验证即时重连。
+        if let raw = ProcessInfo.processInfo.environment["DSHM_E2E_SIMULATE_PATH_CHANGE_AFTER_MS"],
+           let milliseconds = Int(raw), milliseconds >= 0 {
+            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(milliseconds)) { [weak self] in
+                self?.link.simulateNetworkPathChangeForE2E()
             }
         }
         #endif
@@ -812,4 +821,31 @@ final class AppModel: ObservableObject {
         subagentRoute = nil
         route = .pairing
     }
+
+    #if DEBUG
+ /// E2E 推送注入（生产不可达）。
+ ///
+ /// `waitForReady == false`：按 launch 起算的固定延迟（旧行为，用于验"启动即被
+ /// 推送打断"的场景）。`waitForReady == true`：等链路就绪后**再**计延迟，保证
+ /// 测试基线已经在目标会话里——冷启动/清缓存/跨网恢复时首屏可能超过固定延迟，
+ /// 旧写法会让注入早于基线，产生跨会话重入假红。
+    private func scheduleE2EPushTap(session: String, delayMs: Int, waitForReady: Bool) {
+        func post(afterDelay: Int) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(max(0, afterDelay))) {
+                NotificationCenter.default.post(name: .dshmPushNotificationTapped, object: session)
+            }
+        }
+        guard waitForReady else { return post(afterDelay: delayMs) }
+        var polls = 0
+        func poll() {
+            if link.phase.isConnected || polls >= 900 {
+ // 链路就绪后再给首屏渲染一点余量（最少 1.2s）。
+                return post(afterDelay: max(delayMs, 1_200))
+            }
+            polls += 1
+            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(100)) { poll() }
+        }
+        poll()
+    }
+    #endif
 }
