@@ -60,10 +60,14 @@ packages/dsh-m-link/test/run-m1.sh
 packages/dsh-m-link/test/lib/cdp.mjs
 packages/dsh-m-link/test/lib/mock-llm*.mjs
 
-# ── 非代码资产禁止入 git（2026-10-22 用户硬性规则）──────────────────────────
-# 文档一律不入库、不 push：README / AGENTS / 设计文档 / release notes / 交接文档 等。
-# 这些文件保存在本地磁盘即可（本地副本不会被删除）。
+# ── 白名单机制（2026-10-22）：默认禁止非代码资产，只有用户点名的文件可入库 ──────
+# 规则见 ~/.dsh/AGENTS.md；授权清单见 ~/.dsh/github-allowlist.txt（均为本地文件）。
+# 注意：白名单一律用「/」锚定到仓库根，避免误放开同名的其它文件。
 *.md
-docs/
-AGENTS.md
-README
+/docs/*
+/AGENTS.md
+/docs/release-notes/*
+# 用户已授权入库（2026-10-22）：
+!/README.md
+!/docs/release-notes/
+!/docs/release-notes/v0.2.2.md
