@@ -127,6 +127,9 @@ final class LinkService: ObservableObject {
     var eventsStream: RemoteStreamHandle?
     var connectTask: Task<Void, Never>?
     var retryTask: Task<Void, Never>?
+ /// 最近一轮每个候选的失败类别：用于区分"桌面端还在启动"（插件未就绪/地址不可达）
+ /// 与普通断网，从而在重启窗口内用短固定退避快速探测，不让退避滚到 10s。
+    private var lastRoundFailureClasses: [CandidateFailureClass] = []
     var readyContinuation: CheckedContinuation<Void, Error>?
     var readyTimeoutTask: Task<Void, Never>?
  /// Generation of the legacy `$events` ready handshake (v0.1.1 Bug 1). Stream
@@ -820,8 +823,13 @@ final class LinkService: ObservableObject {
  // Any scheduled round is visible: the silent resume window is over.
         p1SilentResume = false
         let attemptNumber = attempt
+ // 桌面端重启窗口：上一轮所有候选都是"服务端还没起来"（插件未就绪 / 网关 5xx /
+ // 地址不可达 / 超时）时，用短固定退避（400ms 起、+200ms、上限 1.5s）快速探测；
+ // 不要用指数退避滚到 10s（用户实测：重启桌面端后开 App 等了约 10 秒）。
+        let delayMs = Self.isBootWindow(classes: lastRoundFailureClasses)
+            ? Self.bootWindowDelayMs(attempt: attemptNumber)
  // Spec §3.8: base 500ms, factor 2, cap 10s, 50% jitter.
-        let delayMs = Self.reconnectDelayMs(attempt: attemptNumber, randomUnit: Double.random(in: 0...1))
+            : Self.reconnectDelayMs(attempt: attemptNumber, randomUnit: Double.random(in: 0...1))
         phase = .reconnecting(attempt: attemptNumber)
         retryTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: UInt64(delayMs * 1_000_000))
@@ -940,6 +948,7 @@ final class LinkService: ObservableObject {
                 lastConnectedAt = Date()
                 lastErrorText = nil
                 pathGenerationAtConnect = NetworkPathMonitor.shared.changeGeneration
+                lastRoundFailureClasses = []
                 p1SilentResume = false
                 phase = .connected
                 if bumpGeneration { generation += 1 }
@@ -999,6 +1008,7 @@ final class LinkService: ObservableObject {
         lastErrorText = Self.roundFailureSummary(classes: failureClasses, details: failures)
  // Remember a different starting origin for the next round so a dead
  // address does not always head the list.
+        lastRoundFailureClasses = failureClasses
         _ = rotateOriginIfPossible(reason: failures.last ?? L10n.t("连接失败"))
         scheduleReconnect()
     }
@@ -1577,6 +1587,21 @@ extension LinkService {
         let base = min(10_000.0, 500.0 * pow(2.0, Double(max(0, attempt - 1))))
         let unit = min(1, max(0, randomUnit))
         return base / 2 + unit * (base / 2)
+    }
+
+ /// "桌面端还在启动"：这一轮所有候选都是服务端未就绪类失败（插件未就绪 / 网关 5xx /
+ /// 地址不可达 / 超时），而不是凭据失效或被取消。重启桌面的窗口很短，值得密探。
+    nonisolated static func isBootWindow(classes: [CandidateFailureClass]) -> Bool {
+        guard !classes.isEmpty else { return false }
+        return classes.allSatisfy {
+            $0 == .pluginNotReady || $0 == .gatewayRejected || $0 == .unreachable || $0 == .timeout
+        }
+    }
+
+ /// 启动窗口内的短固定退避：400ms 起、每轮 +200ms、上限 1.5s。
+ /// 桌面端插件恢复通常在数秒内，指数退避（500ms→…→10s）会把等待放大到 ~10s。
+    nonisolated static func bootWindowDelayMs(attempt: Int) -> Double {
+        min(1_500.0, 400.0 + Double(max(0, attempt - 1)) * 200.0)
     }
 
  /// Per-candidate budget inside one round. The last candidate keeps a longer
