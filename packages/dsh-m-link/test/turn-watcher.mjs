@@ -325,12 +325,16 @@ await check('frame-path-fallback-when-device-has-no-watcher', async () => {
 
 await check('config-defaults-and-normalization', async () => {
   const defaults = resolveConfig({});
-  assert.equal(defaults.notifications.watchSessions, true);
+  // task-5b: the host session-event bus is the primary turn-end source, so the
+  // polling watcher is opt-in (fallback for hosts without the bus).
+  assert.equal(defaults.notifications.watchSessions, false, 'polling watcher is opt-in now');
   assert.equal(defaults.notifications.pollIntervalMs, 2000);
   assert.equal(defaults.notifications.requestTimeoutMs, 1500);
   assert.equal(DEFAULT_POLL_INTERVAL_MS, 2000);
   assert.equal(DEFAULT_REQUEST_TIMEOUT_MS, 1500);
 
+  const optIn = resolveConfig({ notifications: { watchSessions: true } });
+  assert.equal(optIn.notifications.watchSessions, true, 'explicit opt-in is honored');
   const off = resolveConfig({ notifications: { watchSessions: false, pollIntervalMs: 10 } });
   assert.equal(off.notifications.watchSessions, false, 'kill switch is honored');
   assert.equal(off.notifications.pollIntervalMs, 2000, 'invalid cadence falls back to default');

@@ -288,3 +288,57 @@ export class TurnWatcher {
     this.lastError = undefined;
   }
 }
+
+/**
+ * task-5b: kind of notification a durable session event should produce, or
+ * undefined when the event is not a finished turn. Only `completed` and
+ * `error` turns notify (aborted/interrupted turns are user-visible in the app).
+ *
+ * The host emits every durable event on `ctx.on('session/event', (session,
+ * event))`; this is the in-process, real-time source that works whether or not
+ * any phone is connected or following the session.
+ */
+export function hostTurnEndKind(event) {
+  if (event === null || typeof event !== 'object' || event.type !== 'turn/end') return undefined;
+  const kind = event.data?.reason?.kind ?? 'completed';
+  if (kind === 'completed') return 'turn-end';
+  if (kind === 'error') return 'failure';
+  return undefined;
+}
+
+/**
+ * Build the `session/event` subscriber used by LinkServer.
+ *
+ * @param {{
+ *   notifyTurnEnd: (sessionId: string) => void,
+ *   notifyFailure?: (sessionId: string) => void,
+ *   config?: { turnEnd?: boolean, failure?: boolean, enabled?: boolean },
+ *   isEnabled?: () => boolean,
+ * }} options
+ */
+export function createHostTurnEventHandler({
+  notifyTurnEnd = () => {},
+  notifyFailure = () => {},
+  config = {},
+  isEnabled = () => true,
+} = {}) {
+  return (session, event) => {
+    try {
+      if (isEnabled() !== true) return;
+      if (config.enabled === false) return;
+      const kind = hostTurnEndKind(event);
+      if (kind === undefined) return;
+      const sessionId = session?.id;
+      if (typeof sessionId !== 'string' || sessionId.length === 0) return;
+      if (kind === 'turn-end') {
+        if (config.turnEnd === false) return;
+        notifyTurnEnd(sessionId);
+        return;
+      }
+      if (config.failure === false) return;
+      notifyFailure(sessionId);
+    } catch {
+      /* the host event bus must never break the link */
+    }
+  };
+}

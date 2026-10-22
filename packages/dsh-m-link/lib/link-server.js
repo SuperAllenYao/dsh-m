@@ -51,7 +51,7 @@ import { DeviceStore, keyFingerprint256, normalizeDevicePublicKey } from './devi
 import { FrameAudit } from './frame-audit.js';
 import { ensureHostIdentity } from './host-identity.js';
 import { APPROVAL_CATEGORY, Notifier } from './notifier.js';
-import { TurnWatcher } from './session-watcher.js';
+import { createHostTurnEventHandler, TurnWatcher } from './session-watcher.js';
 import { buildEndpoints, PairCodeService, PairingService, selectDeviceEndpoints, trimDeviceName } from './pairing.js';
 import { BonjourResponder } from './bonjour.js';
 import { QrRenderer } from './qr.js';
@@ -125,9 +125,10 @@ const DEFAULTS = {
     silent: true,
     silentMinIntervalMs: 3000,
     // task-5: turn-end pushes must not depend on the phone following the session.
-    // While at least one push-token device exists the host polls session/list
-    // (running -> idle) and notifies every push-token device.
-    watchSessions: true,
+    // Primary source is the in-process host event bus (`ctx.on('session/event')`,
+    // real-time and free). The polling watcher below is a fallback for hosts that
+    // do not expose the bus — off by default because it costs a session/list poll.
+    watchSessions: false,
     pollIntervalMs: 2000,
     requestTimeoutMs: 1500,
   },
@@ -227,7 +228,7 @@ export function resolveConfig(raw) {
   merged.security = mergeConfig(DEFAULTS.security, merged.security);
   merged.tls = mergeConfig(DEFAULTS.tls, merged.tls);
   merged.notifications = mergeConfig(DEFAULTS.notifications, merged.notifications);
-  merged.notifications.watchSessions = merged.notifications.watchSessions !== false;
+  merged.notifications.watchSessions = merged.notifications.watchSessions === true;
   merged.notifications.pollIntervalMs =
     Number.isInteger(merged.notifications.pollIntervalMs) &&
     merged.notifications.pollIntervalMs >= 250 &&
@@ -461,6 +462,10 @@ export class LinkServer {
     this.notifier = undefined;
     /** task-5: host-side turn watcher (created in startInternal). */
     this.sessionWatcher = undefined;
+    /** task-5b: disposers for the in-process host event subscriptions. */
+    this.hostEventDisposers = [];
+    /** task-5b: true while the host session-event bus drives turn-end pushes. */
+    this.hostTurnEventsActive = false;
     this.qr = undefined;
     this.pairing = undefined;
     /** M2a 8-digit pairing-code service (pairing.js PairCodeService). */
@@ -626,6 +631,55 @@ export class LinkServer {
     return sent;
   }
 
+  /** Push a finished-with-error turn to every push-capable device (host event bus). */
+  notifyTurnFailureAllDevices(sessionId) {
+    if (this.disposed || typeof sessionId !== 'string' || sessionId.length === 0) return 0;
+    if (this.notifier === undefined || this.devices === undefined) return 0;
+    let sent = 0;
+    for (const device of this.devices.active()) {
+      if (typeof device.pushToken !== 'string' || device.pushToken.length === 0) continue;
+      this.notifier.notify(device, {
+        kind: 'failure',
+        title: 'DSH 回合失败',
+        body: '任务执行出错，打开 App 查看详情',
+        threadId: sessionId,
+        data: { type: 'failure', sessionId },
+      });
+      sent += 1;
+    }
+    return sent;
+  }
+
+  /**
+   * Subscribe to the host's in-process session event bus. This is the primary
+   * turn-end source: it fires for every session on this host, independent of
+   * device connections and of which session any phone happens to follow.
+   */
+  subscribeHostTurnEvents() {
+    if (this.hostEventDisposers.length > 0) return;
+    const ctx = this.ctx;
+    if (ctx === undefined || typeof ctx.on !== 'function') {
+      log('host event bus unavailable: turn-end notifications fall back to the frame watcher');
+      return;
+    }
+    const handler = createHostTurnEventHandler({
+      notifyTurnEnd: (sessionId) => this.notifyTurnEndAllDevices(sessionId),
+      notifyFailure: (sessionId) => this.notifyTurnFailureAllDevices(sessionId),
+      config: this.config.notifications,
+      isEnabled: () => this.disposed !== true,
+    });
+    try {
+      // `global: true` matches how the host's own packages listen: a scoped
+      // context only receives its own sessions' events otherwise.
+      const dispose = ctx.on('session/event', handler, { global: true });
+      if (typeof dispose === 'function') this.hostEventDisposers.push(dispose);
+      this.hostTurnEventsActive = true;
+      log('host session-event subscription active (turn-end notifications are event-driven)');
+    } catch (error) {
+      log('session/event subscribe failed: ' + String(error?.message ?? error));
+    }
+  }
+
   /**
    * One loopback `session/list` for the watcher: the same target the phone
    * unary proxy uses, authenticated with a device peer cookie. Only
@@ -786,7 +840,7 @@ export class LinkServer {
       log,
       // task-5: while the TurnWatcher owns turn-end delivery (a push-token
       // device exists), the frame path must not push a second time.
-      isTurnEndWatched: () => this.sessionWatcher?.active === true,
+      isTurnEndWatched: () => this.hostTurnEventsActive === true || this.sessionWatcher?.active === true,
     });
     // task-5 (user requirement): turn completion must be delivered even when the
     // App is not following the session / not running. The watcher polls
@@ -801,6 +855,11 @@ export class LinkServer {
       log,
     });
     this.sessionWatcher.sync();
+    // task-5b (user requirement): turn completion must be delivered even when the
+    // App is not following the session / not running / killed. The host emits every
+    // durable session event in-process — subscribe here instead of relying on the
+    // device frame bridge (which only sees sessions the phone follows).
+    this.subscribeHostTurnEvents();
     this.auth = new AuthService({ devices: this.devices, audit: this.audit, config: this.config.security, log });
     this.hostname = osHostname();
     this.lanIps = collectLanIps();
@@ -3285,6 +3344,15 @@ export class LinkServer {
         /* already stopped */
       }
       this.sessionWatcher = undefined;
+      for (const dispose of this.hostEventDisposers) {
+        try {
+          dispose();
+        } catch {
+          /* host bus already gone */
+        }
+      }
+      this.hostEventDisposers = [];
+      this.hostTurnEventsActive = false;
       try {
         this.notifier?.dispose?.();
       } catch {
