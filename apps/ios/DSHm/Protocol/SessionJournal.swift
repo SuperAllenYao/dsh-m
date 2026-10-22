@@ -279,9 +279,21 @@ final class SessionJournal {
             candidates.append(event)
         }
         guard !candidates.isEmpty else {
-            // Nothing new: stop pagination instead of asking the same page forever.
-            hasMoreOlderFlag = false
-            markReachedOldestIfNeeded()
+            // Nothing older to merge. Two different cases:
+            //   - the page carried no events at all: the Host claimed older history
+            //     but handed us nothing, so stop instead of asking the same page
+            //     forever;
+            //   - the page carried events, but every one of them is at/after the
+            //     current front (a stale page that was requested *before* a snapshot
+            //     jump): that is a non-adjacent page and must be rejected like one,
+            //     keeping hasMoreOlder = true so the paging entry survives and the
+            //     next request walks back from the new front (task-7).
+            if incoming.isEmpty {
+                hasMoreOlderFlag = false
+                markReachedOldestIfNeeded()
+            } else {
+                hasMoreOlderFlag = true
+            }
             return .olderPrepended([])
         }
         let blockContiguous = zip(candidates, candidates.dropFirst())

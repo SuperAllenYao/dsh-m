@@ -1810,5 +1810,179 @@ final class CacheTests: XCTestCase {
         let payload = try XCTUnwrap(store.load(sessionId: "s1")?.payload)
         XCTAssertNil(payload.olderEvents, "跳远后旧前缀必须从缓存清掉")
     }
+
+    // MARK: - task-7 (a 补强)：粘滞“已到最早”与不连续前缀丢弃的交互
+
+    /// 真实冷启动场景：用户上一次已经翻到过 turn 1（cache 粘滞位 hasReachedOldest=true），
+    /// 之后重连快照把窗口整体跳到 turn 8-9（seq 3005...）。恢复时老前缀与快照之间缺
+    /// seq 8...3004：必须丢弃前缀、保持窗口连续、turn 分组完整，并且不能把缓存的粘滞位
+    /// 当成“已到最早”沿用——窗口已不含 seq 0，hasMoreOlder 必须重新为 true（§4.1 的粘滞
+    /// 语义只在窗口真的到达最早事件时成立）。
+    @MainActor
+    func testCacheRestoreClearsStickyOldestWhenPrefixIsDropped() throws {
+        let store = windowStore()
+        // 老前缀：turn 1-2（seq 0...7，自身连续）。
+        let olderPrefix = [
+            eventJSON("turn/start", seq: 0, data: #"{"turn":1}"#),
+            eventJSON("user/message", seq: 1, data: #"{"content":[],"source":{"kind":"user"}}"#),
+            eventJSON("assistant/message", seq: 2, data: #"{"message":{"content":[]}}"#),
+            eventJSON("turn/end", seq: 3, data: #"{"turn":1}"#),
+            eventJSON("turn/start", seq: 4, data: #"{"turn":2}"#),
+            eventJSON("user/message", seq: 5, data: #"{"content":[],"source":{"kind":"user"}}"#),
+            eventJSON("assistant/message", seq: 6, data: #"{"message":{"content":[]}}"#),
+            eventJSON("turn/end", seq: 7, data: #"{"turn":2}"#),
+        ]
+        // 新快照窗口：turn 8-9（seq 3005...3010），与老前缀之间缺 8...3004。
+        let window = [
+            eventJSON("turn/start", seq: 3005, data: #"{"turn":8}"#),
+            eventJSON("user/message", seq: 3006, data: #"{"content":[],"source":{"kind":"user"}}"#),
+            eventJSON("assistant/message", seq: 3007, data: #"{"message":{"content":[]}}"#),
+            eventJSON("turn/end", seq: 3008, data: #"{"turn":8}"#),
+            eventJSON("turn/start", seq: 3009, data: #"{"turn":9}"#),
+            eventJSON("user/message", seq: 3010, data: #"{"content":[],"source":{"kind":"user"}}"#),
+        ]
+        XCTAssertTrue(store.save(
+            sessionId: "s1",
+            snapshot: snapshotJSON(cursor: 3010, hasMore: true, events: window),
+            events: [],
+            olderEvents: olderPrefix.map { TestJSON.value($0) },
+            oldestSeq: 0,
+            hasMoreOlder: false,
+            hasReachedOldest: true
+        ))
+        let viewModel = SessionViewModel(address: .session(sessionId: "s1"), windowCache: store)
+        XCTAssertTrue(viewModel.isShowingCachedWindow)
+        // 不连续老前缀必须整体丢弃：恢复后的窗口严格连续。
+        XCTAssertEqual(viewModel.eventSeqs, Array(3005...3010), "不连续老前缀必须丢弃")
+        // turn 分组完整：只有快照窗口里的 8、9，不会出现 turn 1 假运行中。
+        XCTAssertEqual(viewModel.sections.map(\.turn), [8, 9], "turn 分组完整、无假运行中")
+        XCTAssertFalse(viewModel.sections.first?.isRunning ?? true, "turn 8 已结束")
+        // 丢弃前缀 = 确实还有更早历史要重新拉：hasMoreOlder 必须为 true。
+        XCTAssertTrue(viewModel.hasMoreOlder, "丢弃前缀后放开分页")
+        // 粘滞位不得沿用：窗口已不含 seq 0。
+        XCTAssertFalse(viewModel.reachedFirstEvent, "粘滞 hasReachedOldest 必须被清掉")
+    }
+
+    /// task-7 (b 补强)：重连快照整体跳远 → 旧前缀不得写进缓存，且写出的缓存
+    /// 重新带 hasMoreOlder=true / oldestSeq=新快照最老；从这份缓存再冷启动一次，
+    /// 窗口仍连续、分页入口还在（不会因为一次跳远把缓存写成洞）。
+    @MainActor
+    func testSnapshotJumpDropsPrefixAndReArmsPaginationOnReopen() async throws {
+        let store = windowStore()
+        let viewModel = SessionViewModel(address: .session(sessionId: "s1"), windowCache: store)
+        viewModel.applyStreamValue(snapshotJSON(
+            cursor: 20,
+            hasMore: true,
+            events: (15...20).map { eventJSON("tool/call", seq: $0, data: "{}") }
+        ))
+        // 先分页拿到一页旧前缀（10...14），缓存里出现 olderEvents。
+        viewModel.olderPageLoader = { _ in
+            .object([
+                "records": .array((10...14).map { seq in
+                    .object([
+                        "type": .string("event"),
+                        "event": TestJSON.value(self.eventJSON("tool/call", seq: seq, data: "{}")),
+                    ])
+                }),
+                "hasMore": .bool(true),
+            ])
+        }
+        await viewModel.loadOlderPageNowForTesting()
+        XCTAssertEqual(viewModel.oldestLoadedSeq, 10)
+        XCTAssertTrue(viewModel.hasMoreOlder)
+        viewModel.saveWindowCacheNow()
+        XCTAssertNotNil(store.load(sessionId: "s1")?.payload.olderEvents, "前置历史已进缓存")
+
+        // 窗口整体跳远（seq 45... 与 10...20 不连续）：旧前缀必须丢弃，不写进缓存。
+        viewModel.applyStreamValue(snapshotJSON(
+            cursor: 46,
+            hasMore: true,
+            events: (45...46).map { eventJSON("tool/call", seq: $0, data: "{}") }
+        ))
+        XCTAssertEqual(viewModel.eventSeqs, [45, 46])
+        viewModel.saveWindowCacheNow()
+        let payload = try XCTUnwrap(store.load(sessionId: "s1")?.payload)
+        XCTAssertNil(payload.olderEvents, "跳远后旧前缀不得写进缓存")
+        XCTAssertEqual(payload.oldestSeq, 45, "缓存的 oldestSeq 必须对齐新快照")
+        XCTAssertEqual(payload.hasMoreOlder, true, "旧前缀被丢弃 → 需重新拉取，缓存要带 hasMoreOlder=true")
+
+        // 用这份缓存冷启动：窗口连续、分页仍可用（缓存没被写成洞）。
+        let reopened = SessionViewModel(address: .session(sessionId: "s1"), windowCache: store)
+        XCTAssertTrue(reopened.isShowingCachedWindow)
+        XCTAssertEqual(reopened.eventSeqs, [45, 46], "冷启动窗口严格连续")
+        XCTAssertTrue(reopened.hasMoreOlder, "重新打开后分页入口仍在")
+        XCTAssertFalse(reopened.reachedFirstEvent)
+    }
+
+    // MARK: - task-5：缓存里的“已无更早历史”与恢复窗口 front 不一致 → 重新武装分页
+
+    /// 真机取证（session-daa07b5a…）：cache payload 由旧构建写成 hasMoreOlder=false（+
+    /// hasReachedOldest=true），但恢复出的窗口最老 seq=3232 > 0，而该 session 实际从
+    /// seq 0 开始。若直接采纳缓存状态，“加载更早”入口会永久消失（用户回不到 turn 1-7）。
+    /// 收尾一致性 gate 必须在 oldestSeq>0 且 !hasMoreOlder 时重新武装分页。
+    @MainActor
+    func testCacheRestoreReArmsPaginationWhenCachedStateSaysTerminal() async throws {
+        let store = windowStore()
+        // 连续 olderEvents(3232...3234) + snapshot(3235...3240)：窗口无洞，修复路径不会触发，
+        // 只有一致性 gate 能救回分页入口。
+        let older = (3232...3234).map { TestJSON.value(eventJSON("tool/call", seq: $0, data: "{}")) }
+        let window = (3235...3240).map { eventJSON("tool/call", seq: $0, data: "{}") }
+        XCTAssertTrue(store.save(
+            sessionId: "s1",
+            snapshot: snapshotJSON(cursor: 3240, hasMore: true, events: window),
+            events: [],
+            olderEvents: older,
+            oldestSeq: 3232,
+            hasMoreOlder: false,
+            hasReachedOldest: true
+        ))
+        let viewModel = SessionViewModel(address: .session(sessionId: "s1"), windowCache: store)
+        XCTAssertTrue(viewModel.isShowingCachedWindow)
+        XCTAssertEqual(viewModel.eventSeqs, Array(3232...3240), "恢复后窗口保持连续")
+        XCTAssertEqual(viewModel.oldestLoadedSeq, 3232)
+        XCTAssertTrue(viewModel.hasMoreOlder, "oldest>0 时“已无更早历史”是假终态，必须重新武装")
+        XCTAssertFalse(viewModel.reachedFirstEvent, "粘滞终态必须被清掉（窗口不含 seq 0）")
+
+        // 重新武装后 loadOlderIfNeeded 必须真的发请求（入口不是摆设）。
+        var calls = 0
+        viewModel.olderPageLoader = { _ in
+            calls += 1
+            return .object([:])
+        }
+        viewModel.loadOlderIfNeeded()
+        await waitForRowRebuild()
+        XCTAssertEqual(calls, 1, "重新武装后分页请求必须发出")
+    }
+
+    /// 合法终态不被误伤：缓存窗口真的覆盖到 seq 0 时保持粘滞终止（本次 gate 不生效）。
+    @MainActor
+    func testCacheRestoreKeepsLegalTerminalStateAtFirstEvent() async throws {
+        let store = windowStore()
+        let older = (0...2).map { TestJSON.value(eventJSON("tool/call", seq: $0, data: "{}")) }
+        let window = (3...5).map { eventJSON("tool/call", seq: $0, data: "{}") }
+        XCTAssertTrue(store.save(
+            sessionId: "s2",
+            snapshot: snapshotJSON(cursor: 5, hasMore: false, events: window),
+            events: [],
+            olderEvents: older,
+            oldestSeq: 0,
+            hasMoreOlder: false,
+            hasReachedOldest: true
+        ))
+        let viewModel = SessionViewModel(address: .session(sessionId: "s2"), windowCache: store)
+        XCTAssertEqual(viewModel.eventSeqs, Array(0...5))
+        XCTAssertEqual(viewModel.oldestLoadedSeq, 0)
+        XCTAssertFalse(viewModel.hasMoreOlder, "真的到 seq 0 → 合法终态，不得重新武装")
+        XCTAssertTrue(viewModel.reachedFirstEvent)
+
+        var calls = 0
+        viewModel.olderPageLoader = { _ in
+            calls += 1
+            return .object([:])
+        }
+        viewModel.loadOlderIfNeeded()
+        await waitForRowRebuild()
+        XCTAssertEqual(calls, 0, "已到最早事件，不得再发分页请求")
+    }
 }
 

@@ -205,4 +205,244 @@ final class SessionRowBuilderTests: XCTestCase {
         XCTAssertEqual(sections.count, 1)
         XCTAssertTrue(sections[0].rows.isEmpty)
     }
+
+    // MARK: - Optimistic user echo (steer / send-then-wait, round2 §3)
+
+    /// Fixed wall clock for the echo tests: real time must not decide whether a
+    /// fixture's "发送中…" marker is still fresh.
+    private let echoNowMs: Int64 = 1_792_510_100_000
+
+    private func steerEcho(
+        requestId: String = "req-steer-1",
+        text: String = "插队：先别跑长命令"
+    ) -> SessionRowBuilder.PendingUserEcho {
+        SessionRowBuilder.PendingUserEcho(
+            requestId: requestId,
+            text: text,
+            sentAt: echoNowMs,
+            mode: "steer"
+        )
+    }
+
+    private func runningTurnWithoutSteerEvent() -> [SessionEvent] {
+        [
+            TestJSON.event("turn/start", seq: 1, data: .object(["turn": .int(1)])),
+            TestJSON.event("user/message", seq: 2, data: TestJSON.value("""
+            {"content":[{"type":"text","text":"跑一遍全量测试"}],"source":{"kind":"user"},"role":"user","id":"m1"}
+            """)),
+            TestJSON.event("tool/call", seq: 3, data: TestJSON.value("""
+            {"callId":"call_1","name":"bash","arguments":"{\\"command\\":\\"xcodebuild test\\"}","turn":1,"step":1}
+            """)),
+        ]
+    }
+
+    private func durableSteerEvent(seq: Int = 6, rpcId: String = "req-steer-1", text: String = "插队：先别跑长命令") -> SessionEvent {
+        let source: String
+        if rpcId.isEmpty {
+            source = #""source":{"kind":"user"}"#
+        } else {
+            source = "\"source\":{\"kind\":\"user\",\"rpcId\":\"\(rpcId)\"}"
+        }
+        return TestJSON.event("user/message", seq: seq, data: TestJSON.value("""
+        {"content":[{"type":"text","text":"\(text)"}],\(source),"role":"user","id":"m2"}
+        """))
+    }
+
+    private func userTexts(in sections: [TurnSection]) -> [String] {
+        sections.flatMap { $0.rows }.compactMap { row -> String? in
+            if case .user(let bubble) = row.content { return bubble.text }
+            return nil
+        }
+    }
+
+    private func sendingNotes(in sections: [TurnSection]) -> [String] {
+        sections.flatMap { $0.rows }.compactMap { row -> String? in
+            if case .systemNote(let text) = row.content { return text }
+            return nil
+        }
+    }
+
+    func testPendingUserEchoPaintsImmediatelyAtEndOfRunningTurn() {
+        let echo = steerEcho()
+        let sections = SessionRowBuilder.build(
+            events: runningTurnWithoutSteerEvent(),
+            pendingUserEchoes: [echo],
+            nowMs: echoNowMs
+        )
+        XCTAssertEqual(sections.count, 1, "the pending prompt must not invent a second turn section")
+        XCTAssertEqual(sections[0].status, .running)
+        XCTAssertEqual(userTexts(in: sections), ["跑一遍全量测试", "插队：先别跑长命令"])
+        XCTAssertEqual(sendingNotes(in: sections), ["发送中…"])
+        let rows = sections[0].rows
+        XCTAssertEqual(rows[rows.count - 2].id, "pending-\(echo.requestId)-user")
+        XCTAssertEqual(rows[rows.count - 1].id, "pending-\(echo.requestId)-status")
+        XCTAssertEqual(rows[rows.count - 2].seq, 4)
+        XCTAssertEqual(rows[rows.count - 1].seq, 5)
+    }
+
+    func testPendingUserEchoIsRetiredByDurableRpcId() {
+        var store = SessionRowBuilder.PendingUserEchoStore()
+        store.record(steerEcho())
+        let events = runningTurnWithoutSteerEvent() + [durableSteerEvent()]
+        store.reconcile(events: events)
+        XCTAssertTrue(store.isEmpty, "durable user/message carried source.rpcId === requestId")
+        let sections = SessionRowBuilder.build(events: events, pendingUserEchoes: store.echoes, nowMs: echoNowMs)
+        XCTAssertEqual(userTexts(in: sections), ["跑一遍全量测试", "插队：先别跑长命令"], "exactly one steer bubble, no duplicate")
+        XCTAssertTrue(sendingNotes(in: sections).isEmpty, "sending marker disappears when the echo retires")
+        XCTAssertEqual(SessionRowBuilder.userMessageRpcId(of: events[events.count - 1]), "req-steer-1")
+    }
+
+    func testRebuildKeepsPendingEchoWhenDurableEventNotYetArrived() {
+        var store = SessionRowBuilder.PendingUserEchoStore()
+        store.record(steerEcho())
+        for events in [
+            runningTurnWithoutSteerEvent(),
+            Array(runningTurnWithoutSteerEvent().prefix(1)),
+            [SessionEvent](),
+        ] {
+            store.reconcile(events: events)
+            let sections = SessionRowBuilder.build(events: events, pendingUserEchoes: store.echoes, nowMs: echoNowMs)
+            XCTAssertEqual(store.count, 1)
+            XCTAssertEqual(userTexts(in: sections).last, "插队：先别跑长命令", "pending bubble still painted after rebuild")
+            XCTAssertEqual(sendingNotes(in: sections), ["发送中…"])
+        }
+    }
+
+    func testSendFailureRemovesPendingEchoRow() {
+        var store = SessionRowBuilder.PendingUserEchoStore()
+        store.record(steerEcho())
+        store.remove(requestId: "req-steer-1")
+        XCTAssertTrue(store.isEmpty)
+        let sections = SessionRowBuilder.build(
+            events: runningTurnWithoutSteerEvent(),
+            pendingUserEchoes: store.echoes,
+            nowMs: echoNowMs
+        )
+        XCTAssertEqual(userTexts(in: sections), ["跑一遍全量测试"], "failed steer leaves no ghost bubble")
+        XCTAssertTrue(sendingNotes(in: sections).isEmpty)
+    }
+
+    func testDurableMessageWithoutRpcIdDoesNotRetireEcho() {
+        var store = SessionRowBuilder.PendingUserEchoStore()
+        store.record(steerEcho())
+        let events = runningTurnWithoutSteerEvent() + [
+            durableSteerEvent(seq: 6, rpcId: "", text: "桌面端发的消息"),
+        ]
+        store.reconcile(events: events)
+        XCTAssertEqual(store.count, 1, "only our own rpcId retires the echo (desktop messages have none)")
+    }
+
+    func testPendingEchoOnEmptyJournalStartsRunningPlaceholderSection() {
+        let sections = SessionRowBuilder.build(events: [], pendingUserEchoes: [steerEcho()], nowMs: echoNowMs)
+        XCTAssertEqual(sections.count, 1)
+        XCTAssertEqual(sections[0].turn, 1)
+        XCTAssertEqual(sections[0].status, .running)
+        XCTAssertEqual(userTexts(in: sections), ["插队：先别跑长命令"])
+        XCTAssertEqual(sendingNotes(in: sections), ["发送中…"])
+    }
+
+    func testUnknownUserMessageSourceKindRendersNoticeInsteadOfBeingDropped() {
+        let events = [
+            TestJSON.event("turn/start", seq: 1, data: .object(["turn": .int(1)])),
+            TestJSON.event("user/message", seq: 2, data: TestJSON.value("""
+            {"content":[{"type":"text","text":"来自未知来源"}],"source":{"kind":"steer"}}
+            """)),
+        ]
+        let sections = SessionRowBuilder.build(events: events)
+        let notices = sections[0].rows.compactMap { row -> NoticeCard? in
+            if case .notice(let card) = row.content { return card }
+            return nil
+        }
+        XCTAssertEqual(notices.count, 1)
+        XCTAssertEqual(notices.first?.kind, "steer")
+        XCTAssertEqual(notices.first?.text, "来自未知来源")
+    }
+
+    func testSendingIndicatorExpiresButPendingBubbleStays() {
+        let echo = steerEcho()
+        let timeout = SessionRowBuilder.PendingUserEchoStore.sendingIndicatorTimeoutMs
+        let fresh = SessionRowBuilder.build(
+            events: runningTurnWithoutSteerEvent(),
+            pendingUserEchoes: [echo],
+            nowMs: echoNowMs + timeout - 1
+        )
+        XCTAssertEqual(sendingNotes(in: fresh), ["发送中…"], "still inside the timeout")
+        let stale = SessionRowBuilder.build(
+            events: runningTurnWithoutSteerEvent(),
+            pendingUserEchoes: [echo],
+            nowMs: echoNowMs + timeout
+        )
+        XCTAssertTrue(sendingNotes(in: stale).isEmpty, "\"发送中…\" must never hang after the timeout")
+        XCTAssertEqual(
+            userTexts(in: stale).last,
+            "插队：先别跑长命令",
+            "the user's own bubble is kept until the durable event retires it"
+        )
+    }
+
+    func testStaleEchoStillRetiresWhenDurableEventArrivesEventually() {
+        var store = SessionRowBuilder.PendingUserEchoStore()
+        store.record(steerEcho())
+        let events = runningTurnWithoutSteerEvent() + [durableSteerEvent()]
+        store.reconcile(events: events)
+        XCTAssertTrue(store.isEmpty)
+        let sections = SessionRowBuilder.build(
+            events: events,
+            pendingUserEchoes: store.echoes,
+            nowMs: echoNowMs + SessionRowBuilder.PendingUserEchoStore.sendingIndicatorTimeoutMs * 10
+        )
+        XCTAssertEqual(userTexts(in: sections), ["跑一遍全量测试", "插队：先别跑长命令"])
+        XCTAssertTrue(sendingNotes(in: sections).isEmpty)
+    }
+
+    func testNextSendingIndicatorDeadlineIsEarliestEchoTimeout() {
+        var store = SessionRowBuilder.PendingUserEchoStore()
+        let timeout = SessionRowBuilder.PendingUserEchoStore.sendingIndicatorTimeoutMs
+        let first = SessionRowBuilder.PendingUserEcho(requestId: "req-a", text: "a", sentAt: echoNowMs, mode: "steer")
+        let second = SessionRowBuilder.PendingUserEcho(requestId: "req-b", text: "b", sentAt: echoNowMs + 5_000, mode: "queue")
+        store.record(second)
+        store.record(first)
+        XCTAssertEqual(
+            store.nextSendingIndicatorDeadline(nowMs: echoNowMs),
+            echoNowMs + timeout,
+            "the VM timer must wake for the oldest echo"
+        )
+        store.remove(requestId: "req-a")
+        XCTAssertEqual(
+            store.nextSendingIndicatorDeadline(nowMs: echoNowMs),
+            echoNowMs + 5_000 + timeout
+        )
+        // Expired indicators must yield nil: the stale-repaint task would
+        // otherwise reschedule itself in a busy loop.
+        XCTAssertNil(store.nextSendingIndicatorDeadline(nowMs: echoNowMs + 5_000 + timeout))
+        store.removeAll()
+        XCTAssertNil(store.nextSendingIndicatorDeadline(nowMs: echoNowMs))
+    }
+
+    func testRepaintPendingEchoesIsIdempotent() {
+        // The view model repaints the tail right after the RPC and again when the
+        // "发送中…" marker expires; the same requestId must never paint twice.
+        let echo = steerEcho()
+        var sections = SessionRowBuilder.build(events: runningTurnWithoutSteerEvent(), nowMs: echoNowMs)
+        for _ in 0..<3 {
+            sections = SessionRowBuilder.appendingPendingEchoes([echo], to: sections, nowMs: echoNowMs)
+        }
+        XCTAssertEqual(userTexts(in: sections), ["跑一遍全量测试", "插队：先别跑长命令"])
+        XCTAssertEqual(sendingNotes(in: sections), ["发送中…"])
+        let refreshed = SessionRowBuilder.appendingPendingEchoes(
+            [echo],
+            to: sections,
+            nowMs: echoNowMs + SessionRowBuilder.PendingUserEchoStore.sendingIndicatorTimeoutMs
+        )
+        XCTAssertEqual(userTexts(in: refreshed), ["跑一遍全量测试", "插队：先别跑长命令"])
+        XCTAssertTrue(sendingNotes(in: refreshed).isEmpty, "expiry repaint drops only the marker")
+    }
+
+    func testRecordIsIdempotentPerRequestId() {
+        var store = SessionRowBuilder.PendingUserEchoStore()
+        store.record(steerEcho(text: "旧文本"))
+        store.record(steerEcho(text: "新文本"))
+        XCTAssertEqual(store.count, 1, "a retried prompt must not leave two pending bubbles")
+        XCTAssertEqual(store.echoes.first?.text, "新文本")
+    }
 }

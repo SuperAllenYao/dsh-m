@@ -383,4 +383,21 @@ final class SessionJournalTests: XCTestCase {
         XCTAssertFalse(journal.hasReachedOldest, "前端修复后重新允许分页")
         XCTAssertTrue(journal.hasMoreOlder)
     }
+
+    /// task-7 (c)：快照跳远后才返回的旧分页请求（整页都比当前最老新）= 非相邻页，
+    /// 必须拒绝插入，且不得把它当成"空页"终止分页。
+    func testStalePageAfterSnapshotJumpKeepsPaginationArmed() {
+        let journal = SessionJournal()
+        journal.apply(snapshot: snapshot(cursor: 20, eventSeqs: 10...20, hasMore: true))
+        // 请求发出时 front=10；响应回来时窗口已换成 10...20，旧页覆盖 25...30。
+        XCTAssertEqual(
+            journal.prepend(page: page(records: Array(25...30), hasMore: true)),
+            .olderPrepended([])
+        )
+        XCTAssertEqual(journal.events.map(\.seq), Array(10...20), "过期页不得插入")
+        XCTAssertTrue(journal.hasMoreOlder, "拒绝过期页后保持可重试，不得终止分页")
+        // 按新 front 重新取回的一页仍能正常合并（分页没有被打死）。
+        XCTAssertEqual(journal.prepend(page: page(records: [8, 9], hasMore: true)), .olderPrepended([8, 9]))
+        XCTAssertEqual(journal.events.map(\.seq), Array(8...20))
+    }
 }

@@ -41,9 +41,134 @@ enum SessionRowBuilder {
         "permission/preset",
     ]
 
+    // MARK: - Optimistic user echo (send now, durable event arrives later)
+
+    /// One locally echoed user prompt whose durable `user/message` has not arrived yet.
+    ///
+    /// Why this exists: `session/prompt` with `mode:"steer"` only inserts the
+    /// message into the host agent's inbox (`agent/inbox/spliced`); the durable
+    /// `user/message` is appended when the running turn claims that inbox at its
+    /// **next step** (dsh-agent-loop `step()`), which can lag the RPC by a whole
+    /// tool call. The phone used to paint nothing until then, so "插队发送"
+    /// looked like the message was swallowed.
+    ///
+    /// `requestId` is the prompt RPC id: the host records it on the durable
+    /// message as `data.source.rpcId` (with `kind:"user"`), so
+    /// `PendingUserEchoStore.reconcile(events:)` can retire the echo exactly when
+    /// the real row shows up.
+    struct PendingUserEcho: Identifiable, Equatable {
+        var requestId: String
+        var text: String
+        var images: [ImageRef]
+        /// Milliseconds since epoch, aligned with `SessionEvent.time`.
+        var sentAt: Int64?
+        /// Delivery mode the prompt used: "queue" (followup) or "steer".
+        var mode: String
+
+        var id: String { requestId }
+
+        init(
+            requestId: String,
+            text: String,
+            images: [ImageRef] = [],
+            sentAt: Int64? = nil,
+            mode: String = "queue"
+        ) {
+            self.requestId = requestId
+            self.text = text
+            self.images = images
+            self.sentAt = sentAt
+            self.mode = mode
+        }
+    }
+
+    /// Insertion-ordered set of optimistic echoes, keyed by prompt `requestId`.
+    ///
+    /// Owned by `SessionViewModel` next to the journal; `build(events:pendingUserEchoes:)`
+    /// paints it and `reconcile(events:)` retires entries as the durable events
+    /// land. Keeping it outside the journal means a rebuild / pagination
+    /// recompute never drops the user's own message.
+    struct PendingUserEchoStore: Equatable {
+        /// How long the optimistic row may claim "发送中…". A steer prompt can
+        /// legitimately wait minutes for the running turn's next step, so the
+        /// bubble itself is kept until the durable event retires it; only the
+        /// progress marker expires (no permanent "发送中…").
+        static let sendingIndicatorTimeoutMs: Int64 = 120_000
+
+        private(set) var echoes: [PendingUserEcho] = []
+
+        var isEmpty: Bool { echoes.isEmpty }
+        var count: Int { echoes.count }
+
+        /// Earliest still-in-the-future moment some echo's "发送中…" marker stops
+        /// being truthful (nil when every indicator already expired — the VM's
+        /// stale-repaint task must not reschedule itself in a busy loop).
+        func nextSendingIndicatorDeadline(nowMs: Int64) -> Int64? {
+            echoes.compactMap { echo -> Int64? in
+                guard let sentAt = echo.sentAt else { return nil }
+                let deadline = sentAt + Self.sendingIndicatorTimeoutMs
+                return deadline > nowMs ? deadline : nil
+            }.min()
+        }
+
+        /// Whether the echo still deserves the "发送中…" marker at `nowMs`.
+        static func showsSendingIndicator(sentAt: Int64?, nowMs: Int64) -> Bool {
+            guard let sentAt else { return true }
+            return nowMs - sentAt < sendingIndicatorTimeoutMs
+        }
+
+        init(echoes: [PendingUserEcho] = []) {
+            self.echoes = echoes
+        }
+
+        /// Insert (or replace) the echo for its `requestId`; retries never duplicate rows.
+        mutating func record(_ echo: PendingUserEcho) {
+            if let index = echoes.firstIndex(where: { $0.requestId == echo.requestId }) {
+                echoes[index] = echo
+            } else {
+                echoes.append(echo)
+            }
+        }
+
+        /// Drop one echo: the send failed / the host rejected it (caller surfaces the error).
+        mutating func remove(requestId: String) {
+            echoes.removeAll { $0.requestId == requestId }
+        }
+
+        mutating func removeAll() {
+            echoes.removeAll()
+        }
+
+        /// Retire every echo whose durable `user/message` (`data.source.rpcId`)
+        /// reached the journal. Unmatched echoes are kept: a rebuild must never
+        /// make the user's own message disappear.
+        mutating func reconcile(events: [SessionEvent]) {
+            guard !echoes.isEmpty else { return }
+            var durable: Set<String> = []
+            for event in events where event.type == "user/message" {
+                if let rpcId = SessionRowBuilder.userMessageRpcId(of: event) {
+                    durable.insert(rpcId)
+                }
+            }
+            guard !durable.isEmpty else { return }
+            echoes.removeAll { durable.contains($0.requestId) }
+        }
+    }
+
+    /// `data.source.rpcId` of a durable user message (the prompt RPC id recorded
+    /// by the host); nil for messages that were not sent through `session/prompt`.
+    static func userMessageRpcId(of event: SessionEvent) -> String? {
+        guard event.type == "user/message" else { return nil }
+        return event.data?["source"]?["rpcId"]?.stringValue
+    }
+
     // MARK: - Build
 
-    static func build(events: [SessionEvent]) -> [TurnSection] {
+    static func build(
+        events: [SessionEvent],
+        pendingUserEchoes: [PendingUserEcho] = [],
+        nowMs: Int64 = Int64(Date().timeIntervalSince1970 * 1000)
+    ) -> [TurnSection] {
         let sorted = events.sorted { $0.seq < $1.seq }
         var callIdsWithEvents = Set<String>()
         for event in sorted {
@@ -200,6 +325,10 @@ enum SessionRowBuilder {
             }
         }
 
+        // Optimistic echo: painted last, so a prompt the user just sent stays at
+        // the end of the flow until its durable user/message retires it.
+        sections = appendingPendingEchoes(pendingUserEchoes, to: sections, nowMs: nowMs)
+
         // Aggregate file changes per turn from tool/result.meta.diffs
         // (workspace/changes carries only {turn}; baseline §3.5/§6).
         for index in sections.indices {
@@ -209,6 +338,74 @@ enum SessionRowBuilder {
             }
         }
         return sections
+    }
+
+    /// Repaint only the optimistic tail rows (idempotent): the view model calls
+    /// this right after `session/prompt` is accepted so the bubble shows in the
+    /// same frame, *without* re-running the full journal rebuild (turn status /
+    /// queue-flush side effects) before `turn/start` lands.
+    static func appendingPendingEchoes(
+        _ echoes: [PendingUserEcho],
+        to sections: [TurnSection],
+        nowMs: Int64 = Int64(Date().timeIntervalSince1970 * 1000)
+    ) -> [TurnSection] {
+        var result = sections
+        for index in result.indices {
+            result[index].rows.removeAll { $0.id.hasPrefix("pending-") }
+        }
+        appendPendingUserEchoes(echoes, to: &result, nowMs: nowMs)
+        return result
+    }
+
+    /// Append the optimistic echo rows to the newest section: the user bubble
+    /// itself plus a subtle "发送中…" system note. Two rows per echo with ids
+    /// derived from `requestId`; the next rebuild replaces the whole pair when
+    /// `reconcile(events:)` retires the echo (no duplicate bubble).
+    private static func appendPendingUserEchoes(
+        _ echoes: [PendingUserEcho],
+        to sections: inout [TurnSection],
+        nowMs: Int64
+    ) {
+        guard !echoes.isEmpty else { return }
+        if sections.isEmpty {
+            // No turn events yet (fresh session): paint a running placeholder so
+            // the just-sent prompt is visible before `turn/start` lands.
+            sections.append(TurnSection(
+                turn: 1,
+                status: .running,
+                summary: nil,
+                rows: [],
+                stepCount: 0,
+                startedAt: echoes.first?.sentAt,
+                endedAt: nil,
+                fileChanges: nil,
+                fileChangeSeq: nil
+            ))
+        }
+        var seq = sections.flatMap { $0.rows }.map(\.seq).max() ?? 0
+        let index = sections.count - 1
+        for echo in echoes {
+            seq += 1
+            sections[index].rows.append(FlowRow(
+                id: "pending-\(echo.requestId)-user",
+                seq: seq,
+                content: .user(UserBubble(
+                    text: echo.text,
+                    images: echo.images,
+                    time: echo.sentAt,
+                    messageId: nil
+                ))
+            ))
+            // The bubble stays until the durable event retires the echo; only
+            // the progress marker expires so "发送中…" can never hang forever.
+            guard PendingUserEchoStore.showsSendingIndicator(sentAt: echo.sentAt, nowMs: nowMs) else { continue }
+            seq += 1
+            sections[index].rows.append(FlowRow(
+                id: "pending-\(echo.requestId)-status",
+                seq: seq,
+                content: .systemNote("发送中…")
+            ))
+        }
     }
 
     // MARK: - Status / parsing helpers
