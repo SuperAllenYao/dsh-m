@@ -552,6 +552,7 @@ final class WorkspaceViewModel: ObservableObject {
             isLoading = false
             // task-2: the reused mux delivered its first byte within budget.
             cancelReuseLivenessProbe()
+            link?.noteReuseLivenessConfirmed()
         }
         errorText = nil
         rebuildGroups()

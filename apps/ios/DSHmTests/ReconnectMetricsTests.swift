@@ -68,11 +68,32 @@ final class ReconnectMetricsTests: XCTestCase {
         ReconnectMetrics.beginPageEnter(reason: "sceneActive")
         ReconnectMetrics.markReuseDecision()
         now += 0.120
+        ReconnectMetrics.markReuseConfirmed() // first baseline arrived in budget
         ReconnectMetrics.markListApplied()
         let value = ReconnectMetrics.valueString ?? ""
         XCTAssertTrue(value.contains("reuse=1"), value)
         XCTAssertTrue(value.contains("connectedMs=0"), value)
         XCTAssertTrue(value.contains("totalMs=120"), value)
+        XCTAssertTrue(value.contains("stage=complete"), value)
+    }
+
+    func testProvisionalReuseDemotedByFirstByteTimeout() {
+        ReconnectMetrics.beginPageEnter(reason: "sceneActive")
+        ReconnectMetrics.markReuseDecision()
+        now += 0.500
+        // The reused mux never delivered a baseline: this is a real reconnect.
+        ReconnectMetrics.markFirstByteTimeout(source: "workspaceBaseline")
+        XCTAssertTrue((ReconnectMetrics.valueString ?? "").contains("reuse=0"))
+        now += 0.300
+        ReconnectMetrics.markReconnectStart()
+        now += 0.250
+        ReconnectMetrics.markConnected()
+        now += 0.050
+        ReconnectMetrics.markListApplied()
+        let value = ReconnectMetrics.valueString ?? ""
+        XCTAssertTrue(value.contains("reuse=0"), value)
+        XCTAssertTrue(value.contains("connectedMs=1050"), value)
+        XCTAssertTrue(value.contains("totalMs=1100"), value)
         XCTAssertTrue(value.contains("stage=complete"), value)
     }
 

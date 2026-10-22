@@ -761,6 +761,12 @@ final class LinkService: ObservableObject {
         reconnectNow()
     }
 
+    /// The reused mux delivered its first `workspace/follow` baseline inside the
+    /// probe budget: the provisional "reuse" chain is confirmed and may complete.
+    func noteReuseLivenessConfirmed() {
+        ReconnectMetrics.markReuseConfirmed()
+    }
+
     /// A pooled unary request hit `HTTPConnection.firstByteTimeout`. Only a request
     /// against the *current* origin says anything about the live mux transport.
     private func handleFirstByteTimeout(endpoint: String, host: String?) {
