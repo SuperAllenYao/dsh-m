@@ -50,6 +50,11 @@ final class LinkService: ObservableObject {
     @Published private(set) var credentials: PairingCredentials?
     @Published private(set) var generation: Int = 0
     @Published var clientId: String?
+    /// 当前连接上是否收到过 **本连接** 的 `$events` ready 帧。
+    /// Host 只接受来自"拥有该事件流"的 Peer 的 `$events/result`；重连后沿用旧
+    /// clientId 会得到 `gateway/interactions-forbidden: Remote event result belongs
+    /// to another Peer`（用户 2026-10-22 报障：作答/审批提交失败）。
+    var eventsClientIdConfirmed = false
     @Published var pendingApprovals: [ApprovalWaterfall] = []
     /// Live user-question waterfalls from `$events` (task-2 / tech-design §14).
     /// `open` calls answer through `$events/result`; the pending list lets the
@@ -59,6 +64,10 @@ final class LinkService: ObservableObject {
     @Published private(set) var lastConnectedAt: Date?
     /// P0: E2E-gated `connect-metrics` summary of the last bring-up round.
     @Published private(set) var connectionMetricsValue: String?
+    /// task-2 (reconnect): E2E-gated one-line `[RECONNECT] ...` summary of the last
+    /// page-enter / foreground reconnect chain (see `ReconnectMetrics`). Surfaced
+    /// through the hidden `reconnect-metrics` element on the list page.
+    @Published private(set) var reconnectMetricsValue: String?
 
     /// P0-4 guard: an early `session/list` before `phase == .connected` is only
     /// worth issuing when the stored origin is dialable on this path. A stale LAN
@@ -69,6 +78,12 @@ final class LinkService: ObservableObject {
             return false
         }
         return true
+    }
+    /// task-2: true when the network path changed after this link became ready —
+    /// the live socket is then presumed stale even if `phase` still says
+    /// `.connected` (the OS does not report a migrated socket as dead).
+    var networkPathChangedSinceConnect: Bool {
+        pathGenerationAtConnect != NetworkPathMonitor.shared.changeGeneration
     }
     /// v0.1.1 C: true while the one-shot `/health` CA-migration fetch runs, so
     /// repeated reconnects do not stack migration requests.
@@ -125,6 +140,20 @@ final class LinkService: ObservableObject {
     var isConnecting = false
     var manuallyDisconnected = false
 
+    // MARK: - task-2 reconnect-chain state
+
+    /// `NetworkPathMonitor.changeGeneration` at the last successful connect and at
+    /// the start of the current round; together they tell "the socket died on a new
+    /// network" from "this round already dialed on the new network".
+    private var pathGenerationAtConnect = 0
+    private var pathGenerationAtRoundStart = 0
+    /// Dedupe: page enter + scenePhase + path change can all request a reconnect in
+    /// the same few milliseconds; restarting a just-started round would cancel the
+    /// candidate that is about to win.
+    private var lastReconnectRequestAt: Date?
+    /// Observer for `HTTPConnection`'s reused-socket first-byte watchdog.
+    private var firstByteTimeoutObserver: NSObjectProtocol?
+
     /// Short-lived api token (auto-refreshed on expiry/401).
     var apiToken: String?
     var apiTokenExpiresAt: Date?
@@ -136,6 +165,29 @@ final class LinkService: ObservableObject {
 
     init() {
         credentials = store.load()
+        // task-2 (reconnect < 1s): one listener per app process. A meaningful path
+        // change invalidates the live socket immediately instead of waiting for the
+        // system TCP timeout; the reconnect then runs on the new path.
+        NetworkPathMonitor.shared.onMeaningfulChange = { [weak self] in
+            self?.handleNetworkPathChanged()
+        }
+        ReconnectMetrics.onChange = { [weak self] value in
+            self?.reconnectMetricsValue = value
+        }
+        // A pooled unary request that produced no first byte within
+        // `HTTPConnection.firstByteTimeout` means the keep-alive socket is dead
+        // (network switch/Mac sleep). The mux almost always shares that fate.
+        firstByteTimeoutObserver = NotificationCenter.default.addObserver(
+            forName: .dshmHTTPFirstByteTimeout,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            let endpoint = notification.userInfo?["endpoint"] as? String ?? "-"
+            let host = notification.userInfo?["host"] as? String
+            Task { @MainActor [weak self] in
+                self?.handleFirstByteTimeout(endpoint: endpoint, host: host)
+            }
+        }
         if credentials != nil {
             phase = .connecting
             startConnecting()
@@ -594,6 +646,15 @@ final class LinkService: ObservableObject {
 
     func reconnectNow() {
         guard credentials != nil else { return }
+        // task-2: page enter + scenePhase + path change can all request a reconnect
+        // in the same few milliseconds; restarting a just-started round would cancel
+        // the candidate that is about to win. (An explicit user retry after a long
+        // wait is not throttled: the phase is not busy then.)
+        if phase.isBusy, let last = lastReconnectRequestAt,
+           Date().timeIntervalSince(last) < 0.3 {
+            return
+        }
+        lastReconnectRequestAt = Date()
         retryTask?.cancel()
         retryTask = nil
         attempt = 0
@@ -617,12 +678,107 @@ final class LinkService: ObservableObject {
     /// when `generation` changes.
     func handleForeground() {
         guard credentials != nil, !manuallyDisconnected else { return }
-        if phase.isConnected { return }
+        if phase.isConnected {
+            // task-2: ".connected" on a network the socket was not dialed on is a
+            // stale transport, not a reusable one. The path-change event usually
+            // invalidates it already; this is the scenePhase race window.
+            if networkPathChangedSinceConnect {
+                ReconnectMetrics.markInvalidate(reason: "foreground/pathChanged")
+                teardownTransport()
+                reconnectNow()
+            }
+            return
+        }
         // A `connectOnce` round is already in flight: restarting it would cancel
         // the candidate that is about to succeed (foreground resume must not turn
         // a 1s connect into a full retry).
         guard !isConnecting else { return }
         reconnectNow()
+    }
+
+    // MARK: - task-2 reconnect triggers
+
+    /// The session/workspace list page appeared: t0 of the reconnect chain.
+    ///
+    /// A healthy mux on the current network is reused with no traffic (P0-5 rule);
+    /// every other state reconnects **now**, cancelling a pending backoff wait so
+    /// the chain never pays the 0.5-10s `scheduleReconnect` delay.
+    func handlePageEnter() {
+        ReconnectMetrics.beginPageEnter(reason: "listPage")
+        guard credentials != nil, !manuallyDisconnected else { return }
+        switch phase {
+        case .connected:
+            if networkPathChangedSinceConnect {
+                ReconnectMetrics.markInvalidate(reason: "pageEnter/pathChanged")
+                teardownTransport()
+                reconnectNow()
+            } else {
+                ReconnectMetrics.markReuseDecision()
+            }
+        case .reconnecting, .disconnected:
+            // The backoff wait exists to space out unattended retries; an explicit
+            // page enter is a user-visible resume and must not wait for it.
+            reconnectNow()
+        case .connecting, .unpaired, .needsRepair:
+            break
+        }
+    }
+
+    /// A **meaningful** network-path change (interface type / satisfied flip).
+    ///
+    /// The OS keeps the old socket open across Wi-Fi -> cellular until the TCP
+    /// timeout; invalidating it here is what turns a 10s+ wait into a <1s reconnect.
+    func handleNetworkPathChanged() {
+        ReconnectMetrics.markPathChange()
+        guard credentials != nil, !manuallyDisconnected else { return }
+        switch phase {
+        case .connected:
+            ReconnectMetrics.markInvalidate(reason: "pathChange")
+            lastErrorText = L10n.t("网络已切换，正在重连…")
+            teardownTransport()
+            reconnectNow()
+        case .reconnecting, .disconnected:
+            ReconnectMetrics.markInvalidate(reason: "pathChange")
+            reconnectNow()
+        case .connecting:
+            // Only restart a round that was dialed before the change; a round that
+            // already started on the new path must be allowed to finish.
+            if Self.shouldRestartConnectingRound(
+                roundStartGeneration: pathGenerationAtRoundStart,
+                pathGeneration: NetworkPathMonitor.shared.changeGeneration
+            ) {
+                ReconnectMetrics.markInvalidate(reason: "pathChange/connecting")
+                reconnectNow()
+            }
+        case .unpaired, .needsRepair:
+            break
+        }
+    }
+
+    /// The live transport produced no first byte within its probe budget (callers:
+    /// the reused-mux `workspace/follow` baseline probe and the pooled-unary
+    /// watchdog). Treat the socket as lost and reconnect immediately.
+    func noteTransportUnresponsive(source: String) {
+        ReconnectMetrics.markFirstByteTimeout(source: source)
+        guard credentials != nil, !manuallyDisconnected, phase.isConnected else { return }
+        lastErrorText = L10n.t("连接无响应，正在重连…")
+        teardownTransport()
+        reconnectNow()
+    }
+
+    /// The reused mux delivered its first `workspace/follow` baseline inside the
+    /// probe budget: the provisional "reuse" chain is confirmed and may complete.
+    func noteReuseLivenessConfirmed() {
+        ReconnectMetrics.markReuseConfirmed()
+    }
+
+    /// A pooled unary request hit `HTTPConnection.firstByteTimeout`. Only a request
+    /// against the *current* origin says anything about the live mux transport.
+    private func handleFirstByteTimeout(endpoint: String, host: String?) {
+        guard let currentHost = credentials?.originURL?.host, let host, currentHost == host else {
+            return
+        }
+        noteTransportUnresponsive(source: "unary:" + endpoint)
     }
 
     func disconnect(clearCredentials: Bool) {
@@ -665,8 +821,7 @@ final class LinkService: ObservableObject {
         p1SilentResume = false
         let attemptNumber = attempt
         // Spec §3.8: base 500ms, factor 2, cap 10s, 50% jitter.
-        let base = min(10_000.0, 500.0 * pow(2.0, Double(max(0, attemptNumber - 1))))
-        let delayMs = base / 2 + Double.random(in: 0...base / 2)
+        let delayMs = Self.reconnectDelayMs(attempt: attemptNumber, randomUnit: Double.random(in: 0...1))
         phase = .reconnecting(attempt: attemptNumber)
         retryTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: UInt64(delayMs * 1_000_000))
@@ -693,6 +848,9 @@ final class LinkService: ObservableObject {
             phase = attempt > 0 ? .reconnecting(attempt: attempt) : .connecting
         }
         let prefersRelay = NetworkPathMonitor.shared.prefersRelay
+        let pathChanged = networkPathChangedSinceConnect
+        pathGenerationAtRoundStart = NetworkPathMonitor.shared.changeGeneration
+        ReconnectMetrics.markReconnectStart()
         ConnectionMetrics.begin(preferRelay: prefersRelay)
         P1ResumeMetrics.begin()
 
@@ -700,19 +858,57 @@ final class LinkService: ObservableObject {
             current: credentials.origin,
             stored: credentials.originCandidates
         )
-        // P0: on cellular/expensive paths the Mac's LAN origin is unreachable and
-        // every LAN probe burns a full timeout; dial only the relay origin there.
-        let dialCandidates = PairingOriginSelector.dialCandidates(candidates, prefersRelay: prefersRelay)
-        guard !dialCandidates.isEmpty else {
+        guard !candidates.isEmpty else {
             isConnecting = false
             phase = .needsRepair(L10n.t("配对凭据没有可用的服务器地址，请重新配对"))
             return
         }
+        // Cross-network requirement: order candidates by the phone's *current*
+        // network. Same subnet -> LAN first; cellular / a different network ->
+        // relay first with the stale LAN address only as a bounded fallback. This
+        // is what stops a cross-network reconnect from burning seconds on an
+        // unreachable LAN origin (the reported relay-503 -> LAN-timeout chain).
+        let localNetwork = NetworkPathMonitor.shared.currentLocalIPv4Network()
+        let orderedCandidates = Self.orderedCandidatesForPath(
+            candidates,
+            prefersRelay: prefersRelay,
+            local: localNetwork,
+            pathChanged: pathChanged
+        )
+        let hasSameSubnetLAN = orderedCandidates.contains {
+            Self.candidateRole(host: $0.host, local: localNetwork) == .lanSameSubnet
+        }
+        let hasRelay = orderedCandidates.contains {
+            Self.candidateRole(host: $0.host, local: localNetwork) == .relay
+        }
+        // Fixed total budget for the candidate walk: the round can never turn into
+        // a 10s tail. Cross-network relay+LAN: 1.5s; same-LAN: 3s; a single
+        // candidate keeps the generous dial budget (nothing to switch to).
+        let roundBudget = Self.roundBudgetSeconds(
+            candidateCount: orderedCandidates.count,
+            hasSameSubnetLAN: hasSameSubnetLAN,
+            hasRelay: hasRelay
+        )
+        let roundDeadline = Date().addingTimeInterval(roundBudget)
         var failures: [String] = []
-        for (index, origin) in dialCandidates.enumerated() {
+        var failureClasses: [CandidateFailureClass] = []
+        var roundBudgetExhausted = false
+        for (index, origin) in orderedCandidates.enumerated() {
             if Task.isCancelled {
                 isConnecting = false
                 return
+            }
+            let remaining = roundDeadline.timeIntervalSinceNow
+            guard let attemptTimeout = Self.attemptBudget(
+                baseTimeout: Self.candidateTimeoutSeconds(
+                    index: index,
+                    count: orderedCandidates.count,
+                    pathChanged: pathChanged
+                ),
+                remainingRoundBudget: remaining
+            ) else {
+                roundBudgetExhausted = true
+                break
             }
             // authenticateToken() reads `credentials.origin`, so point it at the
             // origin under test before every attempt.
@@ -727,20 +923,27 @@ final class LinkService: ObservableObject {
                 }
                 teardownTransport(keepP1Resume: p1SilentResume)
             }
-            ConnectionMetrics.markCandidate(origin.host ?? origin.absoluteString)
-            // P0: bound every candidate; the last one keeps a longer budget so a
-            // slow-but-working relay still connects.
-            let attemptTimeout: TimeInterval = index == dialCandidates.count - 1 ? 8 : 4
+            let host = origin.host ?? origin.absoluteString
+            ConnectionMetrics.markCandidate(host)
+            let candidateStartedAt = ReconnectMetrics.clock()
             switch await attemptConnection(origin: origin, leafPin: credentials.leafPin, timeout: attemptTimeout) {
             case .connected(let bumpGeneration):
+                ReconnectMetrics.markCandidateAttempt(
+                    host: host,
+                    milliseconds: (ReconnectMetrics.clock() - candidateStartedAt) * 1000,
+                    result: CandidateFailureClass.ok.rawValue
+                )
+                ReconnectMetrics.markPickedOrigin(host)
                 setCurrentOrigin(origin, persist: true)
                 isConnecting = false
                 attempt = 0
                 lastConnectedAt = Date()
                 lastErrorText = nil
+                pathGenerationAtConnect = NetworkPathMonitor.shared.changeGeneration
                 p1SilentResume = false
                 phase = .connected
                 if bumpGeneration { generation += 1 }
+                ReconnectMetrics.markConnected()
                 ConnectionMetrics.markConnected()
                 connectionMetricsValue = connectionMetricsSummary()
                 // v0.1.1 C: pre-C pairings still trust only the leaf pin; while
@@ -749,18 +952,51 @@ final class LinkService: ObservableObject {
                 startCATrustMigrationIfNeeded()
                 return
             case .credentialRejected(let reason):
+                ReconnectMetrics.markCandidateAttempt(
+                    host: host,
+                    milliseconds: (ReconnectMetrics.clock() - candidateStartedAt) * 1000,
+                    result: CandidateFailureClass.credentialRejected.rawValue
+                )
                 isConnecting = false
                 lastErrorText = reason
                 phase = .needsRepair(reason)
                 return
+            case .fastRejected(let reason, let failureClass):
+                ReconnectMetrics.markCandidateAttempt(
+                    host: host,
+                    milliseconds: (ReconnectMetrics.clock() - candidateStartedAt) * 1000,
+                    result: failureClass.rawValue
+                )
+                failureClasses.append(failureClass)
+                failures.append(host + ": " + reason)
+                // Fast reject: the server answered, so switch candidates with no
+                // timeout wait and no retry of this origin. Keep a clear interim
+                // message for the banner (cross-network req 4).
+                lastErrorText = failureClass == .pluginNotReady
+                    ? L10n.t("桌面端插件未就绪（host/inactive），正在尝试其他地址…")
+                    : L10n.t("该地址被服务端拒绝，正在尝试其他地址…")
             case .failed(let reason):
-                failures.append((origin.host ?? origin.absoluteString) + ": " + reason)
+                let failureClass = Self.classifyFailureMessage(reason)
+                ReconnectMetrics.markCandidateAttempt(
+                    host: host,
+                    milliseconds: (ReconnectMetrics.clock() - candidateStartedAt) * 1000,
+                    result: failureClass.rawValue
+                )
+                failureClasses.append(failureClass)
+                failures.append(host + ": " + reason)
                 lastErrorText = reason
             }
         }
         isConnecting = false
         guard !Task.isCancelled else { return }
-        lastErrorText = "无法连接 Mac（已尝试 \(dialCandidates.count) 个地址）：\n" + failures.joined(separator: "\n")
+        if roundBudgetExhausted {
+            ReconnectMetrics.markRoundBudgetExhausted()
+            failureClasses.append(.timeout)
+            failures.append(L10n.f("候选总预算已耗尽（%lld ms）", Int(roundBudget * 1000)))
+        }
+        // One-line, actionable reason (cross-network req 4): the list banner shows
+        // `statusDetail`, so it must never be empty or a generic 「重连中」.
+        lastErrorText = Self.roundFailureSummary(classes: failureClasses, details: failures)
         // Remember a different starting origin for the next round so a dead
         // address does not always head the list.
         _ = rotateOriginIfPossible(reason: failures.last ?? L10n.t("连接失败"))
@@ -771,6 +1007,10 @@ final class LinkService: ObservableObject {
         /// `bumpGeneration` is false only for a silent replay (streams retained).
         case connected(bumpGeneration: Bool)
         case credentialRejected(String)
+        /// The origin answered "cannot serve right now" (503 host/inactive, 5xx
+        /// gateway): the round must switch to the next candidate immediately, with
+        /// no timeout wait and no retry of this candidate.
+        case fastRejected(String, CandidateFailureClass)
         case failed(String)
     }
 
@@ -850,6 +1090,11 @@ final class LinkService: ObservableObject {
         } catch {
             let reason = NetworkErrorInterpreter.message(for: error)
             if isCredentialRejection(error) { return .credentialRejected(reason) }
+            // Cross-network: `503 {error:"host/inactive"}` means this origin's
+            // plugin instance is not serving; switching candidates costs one
+            // round-trip instead of a full timeout.
+            let failureClass = Self.failureClass(for: error)
+            if failureClass.isFastReject { return .fastRejected(reason, failureClass) }
             return .failed(reason)
         }
         ConnectionMetrics.markAuth()
@@ -881,6 +1126,10 @@ final class LinkService: ObservableObject {
             self.ws = nil
             let reason = NetworkErrorInterpreter.message(for: error)
             if isCredentialRejection(error) { return .credentialRejected(reason) }
+            // A 5xx upgrade refusal is a fast reject (plugin/gateway state), not a
+            // transient timeout: do not sit on this candidate.
+            let failureClass = Self.failureClass(for: error)
+            if failureClass.isFastReject { return .fastRejected(reason, failureClass) }
             return .failed(reason)
         }
         ConnectionMetrics.markWS()
@@ -902,6 +1151,8 @@ final class LinkService: ObservableObject {
             self.mux = nil
             self.ws = nil
             if isCredentialRejection(error) { return .credentialRejected(reason) }
+            let failureClass = Self.failureClass(for: error)
+            if failureClass.isFastReject { return .fastRejected(reason, failureClass) }
             return .failed(reason)
         }
         ConnectionMetrics.markReady()
@@ -1126,6 +1377,27 @@ final class LinkService: ObservableObject {
         readyTimeoutTask = nil
     }
 
+    /// 当前连接上真正生效的 `$events` clientId（必须来自本连接的 ready 帧）。
+    ///
+    /// 重连/冷启动后 Host 侧仍可能残留上一次连接的事件流 client；直接拿 `clientId`
+    /// 发 `$events/result` 会被判成"另一个 Peer 的结果"。这里等 ready 落地
+    /// （通常 <300ms），超时抛未连接错误，由调用方呈现可重试提示。
+    func confirmedEventsClientId(timeoutMs: Int = 3000) async throws -> String {
+        let deadline = Date().addingTimeInterval(Double(max(0, timeoutMs)) / 1000)
+        while true {
+            if eventsClientIdConfirmed, let clientId { return clientId }
+            if Date() >= deadline { break }
+            try? await Task.sleep(nanoseconds: 30_000_000)
+        }
+        throw LinkError.notConnected
+    }
+
+    /// 单测 seam：直接设定"已确认的 `$events` clientId"，不经过真实流。
+    func setConfirmedEventsClientIdForTesting(_ id: String?) {
+        clientId = id
+        eventsClientIdConfirmed = id != nil
+    }
+
     /// Persists the live channel's resume cursor into the Keychain credential.
     func persistP1Resume() {
         guard let p1Channel, var credentials, let resume = p1Channel.resumeState else { return }
@@ -1265,6 +1537,7 @@ final class LinkService: ObservableObject {
             eventsStream?.cancel()
             eventsStream = nil
             clientId = nil
+            eventsClientIdConfirmed = false
             // v0.1.1 (Bug 2): pending approval/question waterfalls are **not**
             // dropped here. `teardownTransport` also runs at the start of every
             // reconnect attempt; clearing here is what made the answer card
@@ -1292,6 +1565,222 @@ final class LinkService: ObservableObject {
             return resume.isEmpty ? nil : resume
         }
         return resume.isEmpty ? base : base + ";" + resume
+    }
+}
+
+// MARK: - task-2 reconnect policy (pure, unit-tested)
+
+extension LinkService {
+    /// Spec §3.8 backoff: base 500ms, factor 2, cap 10s, 50% jitter. Extracted from
+    /// `scheduleReconnect()` so the bounds are unit-tested instead of only observed.
+    nonisolated static func reconnectDelayMs(attempt: Int, randomUnit: Double) -> Double {
+        let base = min(10_000.0, 500.0 * pow(2.0, Double(max(0, attempt - 1))))
+        let unit = min(1, max(0, randomUnit))
+        return base / 2 + unit * (base / 2)
+    }
+
+    /// Per-candidate budget inside one round. The last candidate keeps a longer
+    /// budget so a slow-but-working relay still connects; the others are bounded at
+    /// 2s (1.5s after a path change) because a reachable origin completes
+    /// TCP+TLS+auth well under 1s, and a stale LAN address must not burn 4s before
+    /// the relay is dialed.
+    nonisolated static func candidateTimeoutSeconds(
+        index: Int,
+        count: Int,
+        pathChanged: Bool
+    ) -> TimeInterval {
+        if index >= count - 1 { return 8 }
+        return pathChanged ? 1.5 : 2
+    }
+
+    // MARK: Candidate role + path-aware order (cross-network requirement)
+
+    /// Role of one stored origin relative to the phone's current network.
+    enum CandidateRole: String {
+        /// Public relay bridge (reachable from any network).
+        case relay = "relay"
+        /// LAN origin inside the phone's current subnet (fastest path).
+        case lanSameSubnet = "lan-same"
+        /// LAN origin from another network / different subnet (fallback only).
+        case lanOther = "lan-other"
+    }
+
+    nonisolated static func candidateRole(host: String?, local: LocalIPv4Network?) -> CandidateRole {
+        guard PairingOriginSelector.isLANHost(host) else { return .relay }
+        guard let local, local.contains(host: host) else { return .lanOther }
+        return .lanSameSubnet
+    }
+
+    /// Path-aware candidate order for one reconnect round:
+    /// - **same LAN** (Wi-Fi/wired and the LAN candidate is inside the phone's
+    ///   subnet): LAN first, relay as fallback — the Mac's LAN origin is the fastest;
+    /// - **cellular / cross-network** (no LAN candidate on this subnet): relay first,
+    ///   LAN addresses last as a best-effort fallback — the old serial "try the
+    ///   stale LAN first and burn seconds" order is exactly the reported failure;
+    /// - **unknown local network**: legacy order (current origin, then stored list).
+    ///
+    /// Happy Eyeballs (parallel first dial) is deliberately **not** used:
+    /// `authInFlightByPurpose` is purpose-scoped and two concurrent attempts would
+    /// fight over `self.ws`/`self.mux` and multiply `/auth/challenge` requests
+    /// (plugin rate limit). The serial walk is bounded by `roundBudgetSeconds`.
+    nonisolated static func orderedCandidatesForPath(
+        _ candidates: [URL],
+        prefersRelay: Bool,
+        local: LocalIPv4Network?,
+        pathChanged: Bool
+    ) -> [URL] {
+        guard candidates.count > 1 else { return candidates }
+        var relay: [URL] = []
+        var lanSame: [URL] = []
+        var lanOther: [URL] = []
+        for candidate in candidates {
+            switch candidateRole(host: candidate.host, local: local) {
+            case .relay: relay.append(candidate)
+            case .lanSameSubnet: lanSame.append(candidate)
+            case .lanOther: lanOther.append(candidate)
+            }
+        }
+        let sameLANPath = !prefersRelay && !lanSame.isEmpty
+        if sameLANPath { return lanSame + relay + lanOther }
+        if prefersRelay || pathChanged || local != nil { return relay + lanOther + lanSame }
+        return candidates
+    }
+
+    /// Fixed total budget for walking the candidates of one round. This removes the
+    /// old 10s+ tail where every serial candidate burned its own timeout.
+    /// - single candidate: nothing to switch to, but still capped at 6s (8s dial +
+    ///   backoff used to be the worst-case tail);
+    /// - same-LAN multi-candidate: LAN should answer fast, relay fallback usable -> 3s;
+    /// - cross-network multi-candidate (relay first + LAN fallback): 1.5s total.
+    nonisolated static func roundBudgetSeconds(
+        candidateCount: Int,
+        hasSameSubnetLAN: Bool,
+        hasRelay: Bool
+    ) -> TimeInterval {
+        guard candidateCount > 1 else { return 6 }
+        if hasSameSubnetLAN { return 3 }
+        guard hasRelay else { return 3 }
+        return 1.5
+    }
+
+    /// Clamped per-candidate timeout, or nil when the round budget is exhausted
+    /// (the caller then reports a clear retryable failure instead of waiting).
+    nonisolated static func attemptBudget(
+        baseTimeout: TimeInterval,
+        remainingRoundBudget: TimeInterval
+    ) -> TimeInterval? {
+        guard remainingRoundBudget > 0.05 else { return nil }
+        return min(baseTimeout, remainingRoundBudget)
+    }
+
+    // MARK: Failure classification (fast reject + retryable distinction)
+
+    /// Why one candidate failed. Drives fast candidate switching, the per-candidate
+    /// `[RECONNECT]` metrics and the one-line user-facing error (handoff reqs 2/4/5).
+    enum CandidateFailureClass: String {
+        case ok = "ok"
+        /// The plugin instance is gone/booting: `HTTP 503 {error:host/inactive}`.
+        case pluginNotReady = "plugin-not-ready"
+        /// Gateway/upgrade refusal (5xx) that is not a plugin-state error.
+        case gatewayRejected = "gateway-5xx"
+        case timeout = "timeout"
+        case unreachable = "unreachable"
+        /// Credential rejected: only re-pairing can help (not retryable).
+        case credentialRejected = "credential-rejected"
+        case cancelled = "cancelled"
+        case other = "other"
+
+        /// The server told us this origin cannot serve the request right now: do
+        /// not wait for a timeout and do not retry the same candidate — switch to
+        /// the next one immediately.
+        var isFastReject: Bool {
+            self == .pluginNotReady || self == .gatewayRejected
+        }
+
+        /// Worth another round after the standard backoff.
+        var isRetryable: Bool { self != .credentialRejected }
+    }
+
+    /// Maps a connect-path error to a failure class. `HTTP 5xx` with a plugin-state
+    /// code is a fast reject; 401/403 is a credential rejection; everything else is
+    /// classified from the localized transport text.
+    nonisolated static func failureClass(for error: Error) -> CandidateFailureClass {
+        if let linkError = error as? LinkError {
+            switch linkError {
+            case .httpStatus(let status, let body):
+                let text = body.lowercased()
+                if (500...599).contains(status) {
+                    if text.contains("host/inactive")
+                        || text.contains("host/starting")
+                        || text.contains("host/incompatible") {
+                        return .pluginNotReady
+                    }
+                    return .gatewayRejected
+                }
+                if status == 401 || status == 403 { return .credentialRejected }
+                return .other
+            case .timeout:
+                return .timeout
+            case .cancelled:
+                return .cancelled
+            case .transport(let message):
+                return classifyFailureMessage(message)
+            default:
+                return .other
+            }
+        }
+        return classifyFailureMessage(NetworkErrorInterpreter.message(for: error))
+    }
+
+    nonisolated static func classifyFailureMessage(_ message: String) -> CandidateFailureClass {
+        let lower = message.lowercased()
+        if lower.contains("host/inactive") || lower.contains("host/starting") {
+            return .pluginNotReady
+        }
+        if lower.contains("超时") || lower.contains("timeout") || lower.contains("timed out")
+            || lower.contains("code: 60") {
+            return .timeout
+        }
+        if lower.contains("已取消") || lower.contains("cancelled") {
+            return .cancelled
+        }
+        if lower.contains("http 5") || lower.contains("网关") {
+            return .gatewayRejected
+        }
+        return .unreachable
+    }
+
+    /// One-line user-facing reason after a failed round — the UI must never show
+    /// only 「重连中」 (handoff cross-network req 4).
+    nonisolated static func roundFailureSummary(
+        classes: [CandidateFailureClass],
+        details: [String]
+    ) -> String {
+        if classes.contains(.pluginNotReady) {
+            return L10n.t("桌面端插件未就绪（host/inactive），请在 Mac 上重启 DSH-m 插件后重试")
+        }
+        if classes.contains(.gatewayRejected) {
+            return L10n.t("连接被服务端网关拒绝（HTTP 5xx），请检查桌面端插件状态")
+        }
+        if classes.contains(.credentialRejected) {
+            return L10n.t("设备凭据已失效，请重新配对")
+        }
+        if classes.contains(.timeout) {
+            return L10n.t("连接 Mac 超时：当前网络不可达，请检查网络与桌面端")
+        }
+        if let last = details.last, !last.isEmpty {
+            return last
+        }
+        return L10n.t("无法连接 Mac，请检查网络与桌面端是否在线")
+    }
+
+    /// A round already dialed on the post-change path must be allowed to finish;
+    /// only a round that predates the change is restarted.
+    nonisolated static func shouldRestartConnectingRound(
+        roundStartGeneration: Int,
+        pathGeneration: Int
+    ) -> Bool {
+        roundStartGeneration < pathGeneration
     }
 }
 

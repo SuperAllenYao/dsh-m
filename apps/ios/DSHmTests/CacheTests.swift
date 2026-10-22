@@ -51,7 +51,7 @@ final class CacheTests: XCTestCase {
     }
 
     private func windowPayload(
-        schemaVersion: Int = CacheSchema.version,
+        schemaVersion: Int = SessionWindowCacheStore.schemaVersion,
         savedAt: Date = Date(),
         identity: String = CacheTests.pairingIdentity,
         sessionId: String = "s1",
@@ -60,7 +60,10 @@ final class CacheTests: XCTestCase {
         windowMessages: Int? = nil,
         hasMore: Bool? = nil,
         p1Epoch: String? = nil,
-        p1Sid: Int64? = nil
+        p1Sid: Int64? = nil,
+        olderEvents: [JSONValue]? = nil,
+        oldestSeq: Int? = nil,
+        hasMoreOlder: Bool? = nil
     ) -> SessionWindowCachePayload {
         SessionWindowCachePayload(
             schemaVersion: schemaVersion,
@@ -72,7 +75,10 @@ final class CacheTests: XCTestCase {
             windowMessages: windowMessages,
             hasMore: hasMore,
             p1Epoch: p1Epoch,
-            p1Sid: p1Sid
+            p1Sid: p1Sid,
+            olderEvents: olderEvents,
+            oldestSeq: oldestSeq,
+            hasMoreOlder: hasMoreOlder
         )
     }
 
@@ -260,9 +266,10 @@ final class CacheTests: XCTestCase {
         XCTAssertNil(store.load(sessionId: "s1"), "损坏文件 -> nil，不崩溃")
         XCTAssertFalse(FileManager.default.fileExists(atPath: store.fileURL(for: "s1").path))
 
-        // 会话 id 一致但 schema 不同：同样丢弃。
+        // 会话 id 一致但 schema 不同：同样丢弃（v2/v3 之外的版本才丢弃；v2 是
+        // 兼容读取的旧 40 条窗口，见 testSessionWindowCacheReadsLegacyV2Payload）。
         let payload = windowPayload(
-            schemaVersion: CacheSchema.version + 1,
+            schemaVersion: SessionWindowCacheStore.schemaVersion + 1,
             snapshot: snapshotJSON(cursor: 3, events: windowEvents())
         )
         XCTAssertTrue(CacheIO.writeAtomically(payload, to: store.fileURL(for: "s1")))
@@ -482,7 +489,9 @@ final class CacheTests: XCTestCase {
         ]
         viewModel.applyStreamValue(snapshotJSON(cursor: 5, title: "Live session", events: liveEvents))
         XCTAssertFalse(viewModel.isShowingCachedWindow)
-        XCTAssertEqual(viewModel.eventSeqs, [2, 3, 4, 5], "snapshot 替换 + 按 seq 排序、去重")
+        // snapshot 替换所有重叠 seq 的记录；缓存里 seq 1 比 live 窗口最老记录(2)更老，
+        // 按 task session-history 语义保留（重连/替换不得丢掉已加载的更早历史）。
+        XCTAssertEqual(viewModel.eventSeqs, [1, 2, 3, 4, 5], "snapshot 替换 + 按 seq 排序、去重、保留更老前缀")
         await waitForRowRebuild()
         XCTAssertEqual(viewModel.title, "Live session")
 
@@ -492,7 +501,7 @@ final class CacheTests: XCTestCase {
             seq: 6,
             data: "{\"content\":[{\"type\":\"text\",\"text\":\"again\"}],\"source\":{\"kind\":\"user\"}}"
         )))
-        XCTAssertEqual(viewModel.eventSeqs, [2, 3, 4, 5, 6])
+        XCTAssertEqual(viewModel.eventSeqs, [1, 2, 3, 4, 5, 6])
         XCTAssertEqual(Set(viewModel.eventSeqs).count, viewModel.eventSeqs.count)
     }
 
@@ -1439,15 +1448,227 @@ final class CacheTests: XCTestCase {
         XCTAssertEqual(loaded.payload.p1Epoch, "epoch-1")
         XCTAssertEqual(loaded.payload.p1Sid, 7)
 
-        // Legacy payload (new optional fields absent) still loads: old caches keep
-        // working after the app update.
-        let legacy = windowPayload(snapshot: snapshotJSON(cursor: 3, events: windowEvents()))
+        // Legacy v2 payload (new optional fields absent) still loads: old caches
+        // keep working after the app update (restore interprets it as the legacy
+        // 40-message window: oldestSeq = earliest record, hasMoreOlder = hasMore).
+        let legacy = windowPayload(
+            schemaVersion: 2,
+            snapshot: snapshotJSON(cursor: 3, events: windowEvents())
+        )
         let data = try XCTUnwrap(CacheIO.encode(legacy))
         XCTAssertTrue(CacheIO.writeDataAtomically(data, to: store.fileURL(for: "s1")))
         let restored = try XCTUnwrap(store.load(sessionId: "s1"))
+        XCTAssertEqual(restored.payload.schemaVersion, 2)
         XCTAssertNil(restored.payload.windowMessages)
         XCTAssertNil(restored.payload.hasMore)
         XCTAssertNil(restored.payload.p1Epoch)
         XCTAssertNil(restored.payload.p1Sid)
+        XCTAssertNil(restored.payload.olderEvents)
+        XCTAssertNil(restored.payload.oldestSeq)
+        XCTAssertNil(restored.payload.hasMoreOlder)
+    }
+
+    // MARK: - task session-history: 已加载区间缓存（v3）/ v2 兼容 / 超限裁剪
+
+    /// Raw "event" object (the "event" field of a session/page record).
+    private func rawEvent(_ type: String, seq: Int) -> JSONValue {
+        TestJSON.value(eventJSON(type, seq: seq, data: "{}"))
+    }
+
+    func testSessionWindowCacheRoundTripsLoadedOlderRange() throws {
+        let store = windowStore()
+        let older = (0...7).map { rawEvent("tool/call", seq: $0) }
+        XCTAssertTrue(store.save(
+            sessionId: "s1",
+            snapshot: snapshotJSON(cursor: 10, events: windowEvents()),
+            events: [],
+            windowMessages: 20,
+            hasMore: true,
+            olderEvents: older,
+            oldestSeq: 0,
+            hasMoreOlder: true
+        ))
+        let loaded = try XCTUnwrap(store.load(sessionId: "s1"))
+        XCTAssertEqual(loaded.payload.schemaVersion, SessionWindowCacheStore.schemaVersion)
+        XCTAssertEqual(loaded.payload.olderEvents, older)
+        XCTAssertEqual(loaded.payload.oldestSeq, 0)
+        XCTAssertEqual(loaded.payload.hasMoreOlder, true)
+    }
+
+    func testSessionWindowCacheReadsLegacyV2Payload() throws {
+        let store = windowStore()
+        let legacy = windowPayload(
+            schemaVersion: 2,
+            snapshot: snapshotJSON(cursor: 3, events: windowEvents())
+        )
+        XCTAssertTrue(CacheIO.writeAtomically(legacy, to: store.fileURL(for: "s1")))
+        let loaded = try XCTUnwrap(store.load(sessionId: "s1"), "v2 缓存必须可读，升级不得直接丢弃")
+        XCTAssertEqual(loaded.payload.schemaVersion, 2)
+        XCTAssertNil(loaded.payload.olderEvents)
+        XCTAssertNil(loaded.payload.oldestSeq)
+        XCTAssertNil(loaded.payload.hasMoreOlder)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: store.fileURL(for: "s1").path))
+    }
+
+    func testSessionWindowCacheTrimsOlderRangeInsteadOfFailing() throws {
+        let store = windowStore()
+        let body = String(repeating: "x", count: 12_000)
+        let older = (0..<400).map { seq in
+            TestJSON.value("{\"type\":\"tool/result\",\"seq\":\(seq),\"data\":{\"text\":\(TestJSON.quoted(body))}}")
+        }
+        XCTAssertTrue(store.save(
+            sessionId: "s1",
+            snapshot: snapshotJSON(cursor: 3, events: windowEvents()),
+            events: [],
+            olderEvents: older,
+            oldestSeq: 0,
+            hasMoreOlder: false
+        ), "超过 4MB 预算时裁剪最老历史，而不是整份缓存写入失败")
+        let loaded = try XCTUnwrap(store.load(sessionId: "s1"))
+        let kept = try XCTUnwrap(loaded.payload.olderEvents)
+        XCTAssertLessThan(kept.count, older.count, "必须裁剪")
+        XCTAssertEqual(kept.last, older.last, "保留最新的一段已加载历史")
+        XCTAssertEqual(loaded.payload.hasMoreOlder, true, "被裁剪 -> 必须允许重新向上分页")
+        XCTAssertNil(loaded.payload.oldestSeq, "被裁剪后 oldestSeq 由恢复时的记录推导")
+    }
+
+    @MainActor
+    func testSessionViewModelRestoresPagedOlderRangeFromCache() throws {
+        let store = windowStore()
+        let older = (0...7).map { rawEvent("tool/call", seq: $0) }
+        let window = [
+            eventJSON("turn/start", seq: 8, data: "{\"turn\":1}"),
+            eventJSON("user/message", seq: 9, data: "{\"content\":[],\"source\":{\"kind\":\"user\"}}"),
+            eventJSON("assistant/message", seq: 10, data: "{\"message\":{\"content\":[]}}"),
+        ]
+        XCTAssertTrue(store.save(
+            sessionId: "s1",
+            snapshot: snapshotJSON(cursor: 10, events: window),
+            events: [],
+            windowMessages: 20,
+            hasMore: true,
+            olderEvents: older,
+            oldestSeq: 0,
+            hasMoreOlder: false
+        ))
+        let viewModel = SessionViewModel(address: .session(sessionId: "s1"), windowCache: store)
+        XCTAssertTrue(viewModel.isShowingCachedWindow)
+        XCTAssertEqual(viewModel.eventSeqs, Array(0...10), "冷启动恢复 [oldestSeq, cursor] 整段，不退回 40 条窗口")
+        XCTAssertEqual(viewModel.oldestLoadedSeq, 0)
+        XCTAssertFalse(viewModel.hasMoreOlder)
+    }
+
+    @MainActor
+    func testSessionViewModelLegacyV2CacheIsInterpretedAsFortyMessageWindow() throws {
+        let store = windowStore()
+        let legacy = windowPayload(
+            schemaVersion: 2,
+            snapshot: snapshotJSON(cursor: 3, hasMore: true, events: windowEvents())
+        )
+        XCTAssertTrue(CacheIO.writeAtomically(legacy, to: store.fileURL(for: "s1")))
+        let viewModel = SessionViewModel(address: .session(sessionId: "s1"), windowCache: store)
+        XCTAssertTrue(viewModel.isShowingCachedWindow)
+        XCTAssertEqual(viewModel.eventSeqs, [1, 2, 3], "v2 = 旧 40 条窗口：只有快照窗口内的记录")
+        XCTAssertEqual(viewModel.oldestLoadedSeq, 1, "v2: oldestSeq = 最早记录")
+        XCTAssertTrue(viewModel.hasMoreOlder, "v2: hasMoreOlder = 旧 hasMore（true）")
+    }
+
+    @MainActor
+    func testSessionViewModelReconnectKeepsLoadedPagedHistory() throws {
+        let store = windowStore()
+        let older = (0...8).map { rawEvent("tool/call", seq: $0) }
+        let window = [
+            eventJSON("turn/start", seq: 9, data: "{\"turn\":1}"),
+            eventJSON("user/message", seq: 10, data: "{\"content\":[],\"source\":{\"kind\":\"user\"}}"),
+        ]
+        XCTAssertTrue(store.save(
+            sessionId: "s1",
+            snapshot: snapshotJSON(cursor: 10, events: window),
+            events: [],
+            olderEvents: older,
+            oldestSeq: 0,
+            hasMoreOlder: true
+        ))
+        let viewModel = SessionViewModel(address: .session(sessionId: "s1"), windowCache: store)
+        XCTAssertEqual(viewModel.eventSeqs, Array(0...10))
+
+        // 重连：新 snapshot 窗口 9...12 与已加载区间重叠，0...8 必须保留。
+        viewModel.applyStreamValue(snapshotJSON(
+            cursor: 12,
+            title: "Live",
+            hasMore: true,
+            events: [
+                eventJSON("user/message", seq: 9, data: "{\"content\":[],\"source\":{\"kind\":\"user\"}}"),
+                eventJSON("assistant/message", seq: 10, data: "{\"message\":{\"content\":[]}}"),
+                eventJSON("turn/end", seq: 11, data: "{\"turn\":1}"),
+                eventJSON("turn/start", seq: 12, data: "{\"turn\":2}"),
+            ]
+        ))
+        XCTAssertEqual(viewModel.eventSeqs, Array(0...12), "重连不得丢掉已加载的更早历史")
+        XCTAssertEqual(viewModel.oldestLoadedSeq, 0)
+        XCTAssertFalse(viewModel.hasMoreOlder, "已加载到 seq 0：重连后不得重新显示加载更早")
+    }
+
+    func testSessionWindowPoliciesCarryTurnWindowWithinHostBounds() {
+        for messages in [12, 16, 20] {
+            let window = SessionWindowPolicy.firstWindowTurnWindow(messages: messages)
+            XCTAssertLessThanOrEqual(window.minMessages, messages, "Host 校验：minMessages <= maxMessages")
+            XCTAssertGreaterThanOrEqual(window.minTurns, 6, "覆盖若干完整 turn")
+            XCTAssertEqual(window.minTurns, SessionWindowPolicy.turnWindowMinTurns)
+        }
+        let fill = SessionWindowPolicy.fillWindowTurnWindow(messages: 40)
+        XCTAssertLessThanOrEqual(fill.minMessages, 40)
+        let page = SessionWindowPolicy.pageTurnWindow
+        XCTAssertLessThanOrEqual(page.minMessages, SessionWindowPolicy.pageWindowMessages)
+        XCTAssertTrue((40...60).contains(SessionWindowPolicy.pageWindowMessages), "分页步长 40–60 条消息")
+
+        // Wire keys must match the Host schema exactly.
+        let json = page.jsonValue
+        XCTAssertEqual(Set((json.objectValue ?? [:]).keys), Set(["minMessages", "minTurns"]))
+        XCTAssertEqual(json["minMessages"]?.intValue, Int64(page.minMessages))
+        XCTAssertEqual(json["minTurns"]?.intValue, Int64(page.minTurns))
+    }
+
+    /// 证据测试：已加载 2000 条事件（~2MB）的窗口缓存冷启动恢复耗时（报告用；
+    /// 宽松上限防止大缓存把首帧拖到秒级）。
+    @MainActor
+    func testSessionViewModelPagedHistoryColdRestoreCost() throws {
+        let store = windowStore()
+        let body = String(repeating: "工具输出内容 ", count: 40)
+        // 真实会话的事件形状（turn/start -> user -> tool/call -> tool/result ->
+        // assistant -> turn/end）。这里的 tool/result 是"孤儿结果"（没有匹配的
+        // tool/call 行）：它曾触发 SessionRowBuilder 的 inout/闭包 exclusivity 崩溃，
+        // 现在同时作为该 bug 的回归用例（分页历史事件里同样会出现孤儿工具结果）。
+        let types = ["turn/start", "user/message", "tool/call", "tool/result", "assistant/message", "turn/end"]
+        var older: [JSONValue] = []
+        for seq in 0..<2000 {
+            let type = types[seq % types.count]
+            older.append(TestJSON.value(
+                "{\"type\":\"\(type)\",\"seq\":\(seq),\"data\":{\"text\":\(TestJSON.quoted(body))}}"
+            ))
+        }
+        let window = [
+            eventJSON("turn/start", seq: 2000, data: "{\"turn\":1}"),
+            eventJSON("user/message", seq: 2001, data: "{\"content\":[],\"source\":{\"kind\":\"user\"}}"),
+        ]
+        XCTAssertTrue(store.save(
+            sessionId: "s1",
+            snapshot: snapshotJSON(cursor: 2001, events: window),
+            events: [],
+            olderEvents: older,
+            oldestSeq: 0,
+            hasMoreOlder: false
+        ))
+        let size = fileSize(store.fileURL(for: "s1"))
+        var samples: [Double] = []
+        for _ in 0..<5 {
+            let viewModel = SessionViewModel(address: .session(sessionId: "s1"), windowCache: store)
+            XCTAssertEqual(viewModel.eventSeqs.count, 2002)
+            samples.append(viewModel.cacheLoadMilliseconds)
+        }
+        let average = samples.reduce(0, +) / Double(samples.count)
+        print("[session-history] paged-history cache restore: bytes=\(size) events=2002 avg=\(String(format: "%.2f", average))ms samples=\(samples.map { String(format: "%.2f", $0) })")
+        XCTAssertLessThan(average, 500, "大历史缓存恢复不得慢到秒级（实测 \(String(format: "%.2f", average))ms）")
     }
 }
+

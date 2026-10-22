@@ -2054,6 +2054,8 @@ export class LinkServer {
     const frameAudit = this.frameAudit;
     const onDownstreamMessage = (data, isBinary) => {
       if (frameAudit !== undefined) frameAudit.fromDevice(device.deviceId, data, isBinary);
+      // task-2: learn the stream -> session map so turn-end pushes carry a deep link.
+      this.notifier?.observeDevice?.(device, data, isBinary);
       if (bridged) {
         if (upstream.readyState === 1) {
           if (frameAudit !== undefined) frameAudit.toUpstream(device.deviceId, data, isBinary);
@@ -2459,6 +2461,8 @@ export class LinkServer {
             // Bug1: the frame actually handed to the local DSH mux (a phone
             // frame forwarded verbatim, or a plugin-generated `cancel`).
             if (this.frameAudit !== undefined) this.frameAudit.toUpstream(device.deviceId, text, false);
+            // task-2: learn the stream -> session map so turn-end pushes carry a deep link.
+            this.notifier?.observeDevice?.(device, text, false);
             if (upstream.readyState === 1) upstream.send(text);
           },
         });

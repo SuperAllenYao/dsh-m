@@ -3,7 +3,12 @@ import XCTest
 
 final class SessionJournalTests: XCTestCase {
 
-    private func snapshot(cursor: Int, eventSeqs: ClosedRange<Int>, revision: Int = 0) -> SessionSnapshot {
+    private func snapshot(
+        cursor: Int,
+        eventSeqs: ClosedRange<Int>,
+        revision: Int = 0,
+        hasMore: Bool = false
+    ) -> SessionSnapshot {
         let records = eventSeqs.map { seq in
             """
             {"type":"event","event":{"type":"step/start","seq":\(seq),"time":\(1_000 + seq),"data":{"turn":1,"step":\(seq)}}}
@@ -11,7 +16,7 @@ final class SessionJournalTests: XCTestCase {
         }.joined(separator: ",")
         let json = """
         {"type":"snapshot","header":{"version":4,"id":"session-test","cwd":"/tmp/ws"},"cursor":\(cursor),
-         "records":[\(records)],"hasMore":false,
+         "records":[\(records)],"hasMore":\(hasMore),
          "projections":{"asOfSeq":\(cursor),"values":{"title":"hello"}},
          "assistantStream":{"revision":\(revision)}}
         """
@@ -43,14 +48,17 @@ final class SessionJournalTests: XCTestCase {
         )
         XCTAssertEqual(journal.events.count, 6, "gap event must not be applied")
 
-        // re-snapshot after reconnect: old window is discarded, new cursor wins
+        // re-snapshot after reconnect: the newest window is replaced, but the prefix
+        // the user already loaded is preserved (task session-history: a reconnect
+        // must not throw the loaded history away). Local 0...5 + new window 6...9 =
+        // contiguous, so all of it stays.
         XCTAssertEqual(journal.apply(snapshot: snapshot(cursor: 9, eventSeqs: 6...9)), .snapshotReplaced)
         XCTAssertEqual(journal.lastSeq, 9)
-        XCTAssertEqual(journal.events.count, 4)
-        XCTAssertEqual(journal.events.first?.seq, 6)
+        XCTAssertEqual(journal.events.map(\.seq), Array(0...9), "更老的前缀必须保留")
+        XCTAssertEqual(journal.oldestSeq, 0)
         XCTAssertEqual(journal.events.last?.seq, 9)
 
-        // events older than the new snapshot are duplicates
+        // events older than the new snapshot's cursor are duplicates
         XCTAssertEqual(journal.apply(event: TestJSON.event("step/end", seq: 8)), .duplicate(8))
     }
 
@@ -133,5 +141,149 @@ final class SessionJournalTests: XCTestCase {
         XCTAssertEqual(journal.title, "新标题")
         XCTAssertEqual(journal.permissionsValue, "read-only")
         XCTAssertEqual(journal.todos?.count, 1)
+    }
+
+    // MARK: - 更早历史前置合并（task session-history: unary session/page）
+    //
+    // Host semantics (verified against the installed session-controller):
+    // beforeSeq exclusive, records hold *all* events of the seq range, hasMore =
+    // the range's oldest offset > 0. These tests pin the client side of that
+    // contract: sorted/de-duplicated front merge, newest position untouched, and a
+    // paging state that stops exactly at the first event.
+
+    private func page(records seqs: [Int], hasMore: Bool) -> SessionPage {
+        let records = seqs
+            .map { "{\"type\":\"event\",\"event\":{\"type\":\"user/message\",\"seq\":\($0)}}" }
+            .joined(separator: ",")
+        let json = "{\"records\":[\(records)],\"hasMore\":\(hasMore)}"
+        return try! JSONDecoder().decode(SessionPage.self, from: Data(json.utf8))
+    }
+
+    func testFirstSnapshotHasMoreOlderComesFromSnapshot() {
+        let journal = SessionJournal()
+        XCTAssertFalse(journal.hasMoreOlder, "没有快照 -> 未知，整型默认 false")
+        journal.apply(snapshot: snapshot(cursor: 6, eventSeqs: 4...6, hasMore: true))
+        XCTAssertTrue(journal.hasMoreOlder, "长会话首帧 hasMore=true，视图才能触发\"加载更早\"")
+        XCTAssertEqual(journal.oldestSeq, 4)
+    }
+
+    func testPrependSortsDedupesAndKeepsNewestPosition() {
+        let journal = SessionJournal()
+        journal.apply(snapshot: snapshot(cursor: 20, eventSeqs: 9...20))
+        XCTAssertEqual(journal.oldestSeq, 9)
+
+        // Out of order + duplicated seqs: the Host is exclusive per page, the merge
+        // is defensive about both.
+        let update = journal.prepend(page: page(records: [6, 8, 7, 6, 5], hasMore: true))
+        XCTAssertEqual(update, .olderPrepended([5, 6, 7, 8]))
+        XCTAssertEqual(journal.events.map(\.seq), Array(5...20))
+        XCTAssertEqual(journal.oldestSeq, 5)
+        XCTAssertEqual(journal.lastSeq, 20, "前置合并不改最新位置")
+        XCTAssertEqual(journal.cursor, 20, "cursor 仍是 follow 快照的 cursor")
+        XCTAssertTrue(journal.hasMoreOlder)
+    }
+
+    func testPrependReachesFirstEventAndClearsHasMoreOlder() {
+        let journal = SessionJournal()
+        journal.apply(snapshot: snapshot(cursor: 3, eventSeqs: 3...3, hasMore: true))
+        XCTAssertEqual(journal.prepend(page: page(records: [1, 2], hasMore: true)), .olderPrepended([1, 2]))
+        XCTAssertTrue(journal.hasMoreOlder)
+        // The last page reaches seq 0: the Host reports hasMore=false.
+        XCTAssertEqual(journal.prepend(page: page(records: [0], hasMore: false)), .olderPrepended([0]))
+        XCTAssertEqual(journal.events.map(\.seq), Array(0...3))
+        XCTAssertEqual(journal.oldestSeq, 0)
+        XCTAssertFalse(journal.hasMoreOlder, "到达第一条事件后停止分页")
+    }
+
+    func testEmptyPageStopsPaginationInsteadOfLooping() {
+        let journal = SessionJournal()
+        journal.apply(snapshot: snapshot(cursor: 3, eventSeqs: 2...3, hasMore: true))
+        // The Host claimed more history but the page adds nothing: stop instead of
+        // asking the same page forever.
+        XCTAssertEqual(journal.prepend(page: page(records: [], hasMore: true)), .olderPrepended([]))
+        XCTAssertFalse(journal.hasMoreOlder)
+        XCTAssertEqual(journal.events.map(\.seq), [2, 3])
+    }
+
+    func testPrependIgnoresRecordsAtOrAfterCurrentFront() {
+        let journal = SessionJournal()
+        journal.apply(snapshot: snapshot(cursor: 5, eventSeqs: 3...5, hasMore: true))
+        // Overlapping (non-exclusive) page: only the truly older seq is merged.
+        XCTAssertEqual(journal.prepend(page: page(records: [4, 5, 2], hasMore: true)), .olderPrepended([2]))
+        XCTAssertEqual(journal.events.map(\.seq), Array(2...5))
+        XCTAssertTrue(journal.hasMoreOlder)
+    }
+
+    func testPrependIgnoresNonEventRecords() {
+        let json = """
+        {"records":[{"type":"projection","seq":9},
+                    {"type":"event","event":{"type":"tool/call","seq":2}}],"hasMore":false}
+        """
+        let page = try! JSONDecoder().decode(SessionPage.self, from: Data(json.utf8))
+        let journal = SessionJournal()
+        journal.apply(snapshot: snapshot(cursor: 4, eventSeqs: 3...4, hasMore: true))
+        XCTAssertEqual(journal.prepend(page: page), .olderPrepended([2]))
+        XCTAssertEqual(journal.events.map(\.seq), [2, 3, 4])
+        XCTAssertFalse(journal.hasMoreOlder)
+    }
+
+    func testPrependCoexistsWithLiveEventAppend() {
+        let journal = SessionJournal()
+        journal.apply(snapshot: snapshot(cursor: 5, eventSeqs: 3...5, hasMore: true))
+        journal.prepend(page: page(records: [0, 1, 2], hasMore: false))
+        XCTAssertEqual(journal.lastSeq, 5)
+        // The live tail keeps appending from the snapshot cursor, unaffected by the
+        // front merge (and its gap detection still works).
+        XCTAssertEqual(journal.apply(event: TestJSON.event("step/end", seq: 6)), .eventsApplied([6]))
+        XCTAssertEqual(journal.apply(event: TestJSON.event("step/end", seq: 8)), .gap(expected: 7, received: 8))
+        XCTAssertEqual(journal.lastSeq, 6)
+        XCTAssertEqual(journal.oldestSeq, 0)
+        XCTAssertEqual(journal.events.count, 7)
+    }
+
+    func testReconnectSnapshotPreservesPagedHistory() {
+        let journal = SessionJournal()
+        journal.apply(snapshot: snapshot(cursor: 5, eventSeqs: 3...5, hasMore: true))
+        journal.prepend(page: page(records: [0, 1, 2], hasMore: false))
+        XCTAssertEqual(journal.oldestSeq, 0)
+        // Reconnect: new snapshot window [4...7] is contiguous with the preserved
+        // 0...3, so the whole loaded range survives and paging state stays "done".
+        XCTAssertEqual(
+            journal.apply(snapshot: snapshot(cursor: 7, eventSeqs: 4...7, hasMore: true)),
+            .snapshotReplaced
+        )
+        XCTAssertEqual(journal.events.map(\.seq), Array(0...7))
+        XCTAssertEqual(journal.lastSeq, 7)
+        XCTAssertEqual(journal.cursor, 7)
+        XCTAssertFalse(journal.hasMoreOlder, "已加载到 seq 0，重连不得重置回 snapshot.hasMore")
+    }
+
+    func testReconnectSnapshotDropsStalePrefixWhenDiscontinuous() {
+        let journal = SessionJournal()
+        journal.apply(snapshot: snapshot(cursor: 5, eventSeqs: 0...5, hasMore: false))
+        // The Host's window moved past the loaded events (a long gap): keeping the
+        // stale prefix would render a hole, so it is dropped and pagination restarts
+        // from the new snapshot instead.
+        XCTAssertEqual(
+            journal.apply(snapshot: snapshot(cursor: 20, eventSeqs: 18...20, hasMore: true)),
+            .snapshotReplaced
+        )
+        XCTAssertEqual(journal.events.map(\.seq), Array(18...20))
+        XCTAssertEqual(journal.oldestSeq, 18)
+        XCTAssertTrue(journal.hasMoreOlder)
+    }
+
+    func testSnapshotReplacementWithoutPrefixAdoptsSnapshotHasMore() {
+        let journal = SessionJournal()
+        journal.apply(snapshot: snapshot(cursor: 2, eventSeqs: 1...2, hasMore: false))
+        XCTAssertFalse(journal.hasMoreOlder)
+        journal.apply(snapshot: snapshot(cursor: 4, eventSeqs: 2...4, hasMore: true))
+        XCTAssertEqual(journal.oldestSeq, 1, "第一段 1 被保留，与快照 2...4 连续")
+        XCTAssertFalse(journal.hasMoreOlder, "已有已加载前缀时沿用分页状态（此前为 false）")
+
+        let fresh = SessionJournal()
+        fresh.apply(snapshot: snapshot(cursor: 4, eventSeqs: 2...4, hasMore: true))
+        XCTAssertTrue(fresh.hasMoreOlder, "空 journal 的首个快照直接采用 hasMore")
+        XCTAssertEqual(fresh.oldestSeq, 2)
     }
 }
