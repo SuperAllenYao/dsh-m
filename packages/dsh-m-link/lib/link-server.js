@@ -64,6 +64,16 @@ import { detectListLiteRequest, LIST_LITE_HEADER, trimSessionListResponse } from
 const PLUGIN_NAME = 'dsh-m-link';
 const PLUGIN_VERSION = '0.2.2';
 const MUX_PATH = '/api/remote.mux';
+
+/**
+ * 同一设备只允许一条 mux（协议不变量）。旧连接**静默**超过这个窗口即视为死连接：
+ * 网络切换（Wi-Fi→蜂窝/换网段）后服务端 socket 往往仍是 ESTABLISHED，但不会再
+ * 有任何帧；此时新连接必须能**接管**旧 socket，而不是用 409 让手机白等到心跳
+ * 超时（用户 要求：任何网络都要连得上，且极致快）。
+ * 活跃连接（窗口内有帧）仍按 409 拒绝，防止两个客户端抢流。
+ */
+export const MUX_TAKEOVER_STALE_MS = 1500;
+
 const ENDPOINT_RE = /^\/api\/[A-Za-z0-9_$.-]+\/[A-Za-z0-9_$.-]+$/;
 const MAX_BODY_BYTES = 32 * 1024 * 1024;
 const SMALL_BODY_BYTES = 64 * 1024;
@@ -526,6 +536,7 @@ export class LinkServer {
       listLiteBytes: 0,
       muxOpened: 0,
       muxRejected409: 0,
+      muxTakeovers: 0,
       muxRejected401: 0,
       revokedDevices: 0,
       notifications: 0,
@@ -683,9 +694,8 @@ export class LinkServer {
  /**
  * One loopback `session/list` for the watcher: the same target the phone
  * unary proxy uses, authenticated with a device peer cookie. Only
- * `sessionId` + `running` + the subagent markers (`origin`, `parentSessionId`)
- * are kept, so the transient full projection object (up to ~1.5 MB) is dropped
- * immediately and the watcher never holds list data.
+ * `sessionId` + `running` are kept, so the transient full projection object
+ * (up to ~1.5 MB) is dropped immediately and the watcher never holds list data.
  */
   async fetchSessionListForWatcher(device) {
     const peer = this.ensurePeer(device);
@@ -730,18 +740,11 @@ export class LinkServer {
       throw new Error('session/list envelope is not ok');
     }
     return value.items
-      .map((item) => {
-        if (item === null || typeof item !== 'object') return null;
- // Keep the two subagent markers next to the running flag so the watcher
- // can enforce "top-level sessions only"
- // without ever retaining the heavy projections.
-        const kept = { sessionId: item.sessionId, running: item.running === true };
-        if (item.origin === 'subagent') kept.origin = 'subagent';
-        if (typeof item.parentSessionId === 'string' && item.parentSessionId.length > 0) {
-          kept.parentSessionId = item.parentSessionId;
-        }
-        return kept;
-      })
+      .map((item) =>
+        item !== null && typeof item === 'object'
+          ? { sessionId: item.sessionId, running: item.running === true }
+          : null
+      )
       .filter((item) => item !== null && typeof item.sessionId === 'string');
   }
 
@@ -2162,6 +2165,34 @@ export class LinkServer {
     return undefined;
   }
 
+ /**
+ * 同一设备的 mux 冲突处理。
+ *
+ * 旧连接**静默**超过 `MUX_TAKEOVER_STALE_MS`（网络切换后 socket 仍显示
+ * ESTABLISHED，但手机已经放弃它）→ 由新连接接管：清掉 device.downstream、
+ * 用 4409 关掉旧 socket，让新 upgrade 继续。活跃连接 → 仍 409 拒绝。
+ *
+ * @returns {boolean} true = 已接管/无冲突，可以继续升级；false = 应 409 拒绝
+ */
+  tryTakeOverStaleDownstream(device) {
+    const existing = device.downstream;
+    if (existing === undefined) return true;
+    const lastActivity = Number(device.lastDownstreamActivityAt) || 0;
+    const silentMs = Date.now() - lastActivity;
+    if (silentMs < MUX_TAKEOVER_STALE_MS) return false;
+    this.counters.muxTakeovers += 1;
+    device.downstream = undefined;
+    device.lastDownstreamActivityAt = 0;
+    log('device ' + device.deviceId + ': stale downstream mux taken over (silent ' + String(silentMs) + 'ms)');
+    this.audit.record('conn.takeover', { deviceId: device.deviceId, silentMs });
+    try {
+      existing.close(4409, 'session takeover');
+    } catch {
+ /* already gone */
+    }
+    return true;
+  }
+
   handleUpgrade(request, socket, head) {
     let url;
     try {
@@ -2189,7 +2220,7 @@ export class LinkServer {
       return rejectUpgrade(socket, 401, 'Unauthorized', { 'x-dshm-error': consumed.error });
     }
     const device = consumed.device;
-    if (device.downstream !== undefined) {
+    if (!this.tryTakeOverStaleDownstream(device)) {
       this.counters.muxRejected409 += 1;
       log('device ' + device.deviceId + ': second downstream mux rejected with 409 (one socket per device)');
       return rejectUpgrade(socket, 409, 'Conflict', { 'x-dshm-error': 'conn/conflict' });
@@ -2222,7 +2253,7 @@ export class LinkServer {
       return rejectUpgrade(socket, 401, 'Unauthorized', { 'x-dshm-error': consumed.error });
     }
     const device = consumed.device;
-    if (device.downstream !== undefined) {
+    if (!this.tryTakeOverStaleDownstream(device)) {
       this.counters.muxRejected409 += 1;
       this.counters.p1Rejected += 1;
       log('device ' + device.deviceId + ': second downstream mux rejected with 409 (one socket per device)');
@@ -2244,6 +2275,8 @@ export class LinkServer {
   attachDownstream(device, downstream) {
     clearTimeout(device.idleTimer);
     device.idleTimer = undefined;
+ // 静默判定基线（takeover 依赖它）：从 attach 起算，之后每条来自手机的帧刷新。
+    device.lastDownstreamActivityAt = Date.now();
     let peer;
     try {
       peer = this.ensurePeer(device);
@@ -2265,6 +2298,7 @@ export class LinkServer {
  // Bug1: debug-gated frame observation for the legacy (M1) byte bridge.
     const frameAudit = this.frameAudit;
     const onDownstreamMessage = (data, isBinary) => {
+      device.lastDownstreamActivityAt = Date.now();
       if (frameAudit !== undefined) frameAudit.fromDevice(device.deviceId, data, isBinary);
  // task-2: learn the stream -> session map so turn-end pushes carry a deep link.
       this.notifier?.observeDevice?.(device, data, isBinary);
@@ -2294,7 +2328,10 @@ export class LinkServer {
     downstream.on('error', () => {});
     downstream.once('close', () => {
       downstream.off('message', onDownstreamMessage);
-      if (device.downstream === downstream) device.downstream = undefined;
+      if (device.downstream === downstream) {
+        device.downstream = undefined;
+        device.lastDownstreamActivityAt = 0;
+      }
       if (upstream !== undefined) {
         upstream.off('message', onUpstreamMessage);
         upstream.off('close', onUpstreamClose);
@@ -2405,6 +2442,9 @@ export class LinkServer {
     const onMessage = (data, isBinary) => {
  // Bug1: every frame the phone sends lands here exactly once (the first
  // `hello` included; the device is still unknown at that point).
+      if (device !== undefined && device.downstream === downstream) {
+        device.lastDownstreamActivityAt = Date.now();
+      }
       if (frameAudit !== undefined) frameAudit.fromDevice(device?.deviceId, data, isBinary);
       if (isBinary === true) {
         this.counters.p1ProtocolErrors += 1;
@@ -2449,10 +2489,12 @@ export class LinkServer {
           settlePending();
         }
         if (device.downstream !== undefined) {
-          this.counters.p1Rejected += 1;
-          this.audit.record('p1.rejected', { deviceId: device.deviceId, reason: 'conn/conflict' });
-          close(4409, 'conn/conflict');
-          return;
+          if (!this.tryTakeOverStaleDownstream(device)) {
+            this.counters.p1Rejected += 1;
+            this.audit.record('p1.rejected', { deviceId: device.deviceId, reason: 'conn/conflict' });
+            close(4409, 'conn/conflict');
+            return;
+          }
         }
         try {
           channel = this.openP1Channel(device, downstream, send, close);
@@ -2493,7 +2535,10 @@ export class LinkServer {
       downstream.off('message', onMessage);
       settlePending();
       if (channel !== undefined) channel.detachTransport();
-      if (device !== undefined && device.downstream === downstream) device.downstream = undefined;
+      if (device !== undefined && device.downstream === downstream) {
+        device.downstream = undefined;
+        device.lastDownstreamActivityAt = 0;
+      }
       if (channel !== undefined) this.scheduleP1Disposal(device, channel);
  // task-11: the close code/reason is what tells an E2E drop (4000) apart
  // from a transport failure; metadata only (no frame payloads).
@@ -2616,6 +2661,7 @@ export class LinkServer {
       existing.disposeTimer = undefined;
       existing.attachTransport({ send, close });
       device.downstream = downstream;
+      device.lastDownstreamActivityAt = Date.now();
       device.p1Channel = existing;
       this.audit.record('p1.channel-reattached', { deviceId: device.deviceId, epoch: existing.epoch });
       log('device ' + device.deviceId + ': P1 channel reattached (epoch ' + existing.epoch.slice(0, 8) + '…)');
@@ -2643,6 +2689,7 @@ export class LinkServer {
     });
     this.p1Channels.set(device.deviceId, channel);
     device.downstream = downstream;
+    device.lastDownstreamActivityAt = Date.now();
     device.p1Channel = channel;
     channel.attachTransport({ send, close });
     this.counters.p1Channels += 1;
