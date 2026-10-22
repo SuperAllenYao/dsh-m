@@ -9,6 +9,8 @@ import Foundation
 /// depending on the pasteboard or the QR scanner.
 /// - `DSHM_E2E_PAIR_CODE`: optional pairing-code prefill (the primary E2E case
 /// still types the code through the number pad).
+/// - `DSHM_E2E_RESET_CACHE=1` + `DSHM_E2E_OPEN_SESSION`: clear that session's
+/// cold-start window cache before it is opened (repeatable paging E2E).
 enum E2EScaffolding {
     static var isEnabled: Bool {
         ProcessInfo.processInfo.environment["DSHM_E2E"] == "1"
@@ -20,6 +22,16 @@ enum E2EScaffolding {
             RelayConfigStore.save(nil, defaults: defaults)
         }
         guard isEnabled else { return }
+ // task-7 E2E: drop the cold-start window cache for the session we are about
+ // to open. A restored cache already holds previously paged-in older events,
+ // so `hasMoreOlder` is false on the next launch and the pull-to-load gesture
+ // test would silently assert against a no-op. DEBUG + explicit env only;
+ // product launch paths never read this key.
+        if env["DSHM_E2E_RESET_CACHE"] == "1",
+           let openSession = env["DSHM_E2E_OPEN_SESSION"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !openSession.isEmpty {
+            SessionWindowCacheStore().clear(sessionId: openSession)
+        }
         guard let relayText = env["DSHM_E2E_RELAY_CONFIG"]?.trimmingCharacters(in: .whitespacesAndNewlines),
               !relayText.isEmpty,
               let result = RelayServerConfig.parse(relayText),
