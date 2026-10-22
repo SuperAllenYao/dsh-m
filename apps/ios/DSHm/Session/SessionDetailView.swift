@@ -681,11 +681,14 @@ struct SessionDetailView: View {
                     if let actionError = viewModel.actionErrorText {
                         InlineErrorView(message: actionError)
                     }
-
-                    bottomSentinel
                 }
                 .padding(.horizontal, Theme.Spacing.pageInset)
                 .padding(.vertical, Theme.Spacing.s)
+                // 问题三关键修复：锚点必须放在 LazyVStack 外面。
+                // 放里面时 LazyVStack 尚未实体化该行，scrollTo(bottom) 会按估算布局滚到
+                // 非法位置；等内容上屏后视图停在 content 之外 → 整屏空白
+                // （冷启动 / 通知深链进入时必现，从列表进入则不一定）。
+                bottomSentinel
             }
             // 问题三 H1：首帧锚底。iOS 17+ 原生能力；初始内容即缓存窗口时这是唯一生效点。
             .defaultScrollAnchor(.bottom)
