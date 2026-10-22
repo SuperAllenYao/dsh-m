@@ -683,8 +683,9 @@ export class LinkServer {
  /**
  * One loopback `session/list` for the watcher: the same target the phone
  * unary proxy uses, authenticated with a device peer cookie. Only
- * `sessionId` + `running` are kept, so the transient full projection object
- * (up to ~1.5 MB) is dropped immediately and the watcher never holds list data.
+ * `sessionId` + `running` + the subagent markers (`origin`, `parentSessionId`)
+ * are kept, so the transient full projection object (up to ~1.5 MB) is dropped
+ * immediately and the watcher never holds list data.
  */
   async fetchSessionListForWatcher(device) {
     const peer = this.ensurePeer(device);
@@ -729,11 +730,18 @@ export class LinkServer {
       throw new Error('session/list envelope is not ok');
     }
     return value.items
-      .map((item) =>
-        item !== null && typeof item === 'object'
-          ? { sessionId: item.sessionId, running: item.running === true }
-          : null
-      )
+      .map((item) => {
+        if (item === null || typeof item !== 'object') return null;
+ // Keep the two subagent markers next to the running flag so the watcher
+ // can enforce "top-level sessions only"
+ // without ever retaining the heavy projections.
+        const kept = { sessionId: item.sessionId, running: item.running === true };
+        if (item.origin === 'subagent') kept.origin = 'subagent';
+        if (typeof item.parentSessionId === 'string' && item.parentSessionId.length > 0) {
+          kept.parentSessionId = item.parentSessionId;
+        }
+        return kept;
+      })
       .filter((item) => item !== null && typeof item.sessionId === 'string');
   }
 

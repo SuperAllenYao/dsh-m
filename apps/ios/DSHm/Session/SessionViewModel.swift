@@ -108,6 +108,12 @@ final class SessionViewModel: ObservableObject {
  /// One `session/page` round trip is in flight. Repeated scroll callbacks are
  /// no-ops while this is true (concurrent requests are deduplicated).
     @Published private(set) var isLoadingOlder: Bool = false
+ /// E2E/DEBUG paging diagnostics: the last `session/page` request/response/merge
+ /// (task-10 bug2b — "pull shows a spinner but nothing loads" was a silent
+ /// no-op). Only written when `DSHM_E2E`/`DSHM_DEBUG_STREAM` is set; the
+ /// product path keeps it empty. Read by SessionDetailView's hidden
+ /// `e2e-lastpage` accessibility element.
+    @Published private(set) var e2eLastPageDebug: String = ""
  /// Oldest event seq currently loaded (front of the window), read-only view
  /// contract: the detail can anchor/verify the scroll position against it.
     var oldestLoadedSeq: Int? { journal.oldestSeq }
@@ -167,6 +173,16 @@ final class SessionViewModel: ObservableObject {
  /// True while `actionErrorText` is the paging failure; a later success clears it
  /// once (other action errors are left alone).
     private var olderPageErrorShown = false
+ /// A pull was dropped because the link was reconnecting (task-10 bug2b); it is
+ /// replayed once the link reports connected again.
+    private var olderPageAwaitingReconnect = false
+ /// Pages merged by this VM instance — marks the "first page after a push
+ /// deep-link reentry" in the E2E diagnostics (a reentry builds a fresh VM).
+    private var olderPageMergedCount = 0
+ /// Set when an older page just merged, consumed by `rebuildRows()` to expand
+ /// the newly loaded oldest turn (A5: within-turn prepend landed inside a
+ /// collapsed completed turn, so the pull looked like it did nothing).
+    private var olderPageJustMerged = false
  /// M2b-2c: in-app detail timing (`firstFrameMs=..;cacheHit=1;networkMs=..`),
  /// E2E-gated; surfaced through the hidden `detail-metrics` element.
     @Published private(set) var detailMetricsValue: String?
@@ -316,6 +332,15 @@ final class SessionViewModel: ObservableObject {
 
     private static let debugStreamLogging =
         ProcessInfo.processInfo.environment["DSHM_DEBUG_STREAM"] == "1"
+
+ /// E2E paging diagnostics (`e2e-lastpage`) are written only in E2E/debug runs;
+ /// the product path leaves `e2eLastPageDebug` empty.
+    private static let e2ePageDiagnosticsEnabled =
+        ProcessInfo.processInfo.environment["DSHM_E2E"] == "1"
+        || debugStreamLogging
+ /// Unit-test seam: the simulator test runner has no E2E env, so paging tests
+ /// flip this on to assert the `e2e-lastpage` diagnostics.
+    static var e2ePageDiagnosticsTestOverride = false
 
     private func dbg(_ message: @autoclosure () -> String) {
         guard Self.debugStreamLogging else { return }
@@ -546,6 +571,9 @@ final class SessionViewModel: ObservableObject {
             .sink { [weak self] phase in
                 guard let self, phase.isConnected else { return }
                 self.maybeFlushQueued()
+ // task-10 bug2b: a pull during a reconnect used to be dropped
+ // silently; replay it as soon as the link is back.
+                self.retryOlderPageAfterReconnect()
             }
     }
 
@@ -564,6 +592,8 @@ final class SessionViewModel: ObservableObject {
         subagentDebounceTask?.cancel()
         olderPageTask?.cancel()
         olderPageTask = nil
+        olderPageAwaitingReconnect = false
+        olderPageJustMerged = false
         isLoadingOlder = false
         fillTask?.cancel()
         fillTask = nil
@@ -808,13 +838,17 @@ final class SessionViewModel: ObservableObject {
 
  /// View contract: called whenever the scroll approaches the top (may be called
  /// repeatedly and at high frequency). No-op when there is no older history, a
- /// request is already in flight, no snapshot/cursor exists yet, or the link is
- /// offline — the next scroll callback simply retries.
+ /// request is already in flight, or no snapshot/cursor exists yet. A pull while
+ /// the link is reconnecting is **not** a silent no-op (task-10 bug2b): it
+ /// surfaces a visible error and is replayed as soon as the link is back.
     func loadOlderIfNeeded() {
  // task-6: settle the terminal state before deciding anything, so a stale
  // cache/restore flag can never resurrect the entry after seq 0 is loaded.
         syncOlderState()
-        guard canStartOlderPageLoad else { return }
+        if let block = olderPageBlock {
+            noteOlderPageBlocked(block)
+            return
+        }
         isLoadingOlder = true
         let throughSeq = journal.cursor
         let beforeSeq = journal.oldestSeq ?? 0
@@ -828,17 +862,73 @@ final class SessionViewModel: ObservableObject {
  /// deterministically through this wrapper.
     func loadOlderPageNowForTesting() async {
         syncOlderState()
-        guard canStartOlderPageLoad else { return }
+        if let block = olderPageBlock {
+            noteOlderPageBlocked(block)
+            return
+        }
         isLoadingOlder = true
         await performOlderPageLoad(throughSeq: journal.cursor, beforeSeq: journal.oldestSeq ?? 0)
     }
 
-    private var canStartOlderPageLoad: Bool {
-        guard hasMoreOlder, !isLoadingOlder else { return false }
+ /// Why a pull cannot start a page load (nil = it can). Classified instead of a
+ /// bare `canStart` bool so the silent-no-op guard (task-10 bug2b) can surface
+ /// a visible reason — and E2E can tell "the gesture never reached us" from
+ /// "the load was blocked/rejected".
+    private enum OlderPageBlock: String {
+        case noOlderHistory = "no-more-history"
+        case alreadyLoading = "already-loading"
+        case windowNotReady = "window-not-ready"
+        case notConnected = "not-connected"
+    }
+
+    private var olderPageBlock: OlderPageBlock? {
+        guard hasMoreOlder else { return .noOlderHistory }
+        guard !isLoadingOlder else { return .alreadyLoading }
  // Never ask for a page in front of seq 0: reaching the first event is the
  // terminal state (a `beforeSeq=0` request would only return an empty page).
-        guard journal.cursor >= 0, let oldest = journal.oldestSeq, oldest > 0 else { return false }
-        return olderPageLoader != nil || (link?.phase.isConnected ?? false)
+        guard journal.cursor >= 0, let oldest = journal.oldestSeq, oldest > 0 else { return .windowNotReady }
+        guard olderPageLoader != nil || (link?.phase.isConnected ?? false) else { return .notConnected }
+        return nil
+    }
+
+ /// task-10 bug2b: a user pull that cannot start must not be a silent no-op.
+ /// Only the reconnect case is a *failure* worth surfacing (it is replayed
+ /// automatically); the other blocks are legitimate no-ops (already loading /
+ /// nothing older / window not painted yet), but they still leave an E2E trace.
+    private func noteOlderPageBlocked(_ block: OlderPageBlock) {
+        switch block {
+        case .notConnected:
+            olderPageAwaitingReconnect = true
+            if !olderPageErrorShown {
+                actionErrorText = L10n.f("加载更早历史失败：%@", "网络连接中断，恢复后会自动重试")
+                olderPageErrorShown = true
+            }
+            publishOlderPageDebug("blocked(not-connected);" + olderPageContext())
+            dbg("older page blocked: not-connected")
+        case .windowNotReady:
+            publishOlderPageDebug("blocked(window-not-ready);" + olderPageContext())
+            dbg("older page blocked: window-not-ready")
+        case .noOlderHistory:
+            publishOlderPageDebug("blocked(no-more-history);" + olderPageContext())
+        case .alreadyLoading:
+            break
+        }
+    }
+
+ /// E2E context tying a page attempt to its lifecycle: a push deep-link reentry
+ /// opens a **fresh VM** (firstPage=1) that may paint from the on-disk cache
+ /// (cacheRestore=1) before the live snapshot (hasLive) lands.
+    private func olderPageContext() -> String {
+        "ctx(firstPage=\(olderPageMergedCount == 0 ? 1 : 0),cacheRestore=\(didRestoreWindowFromCache ? 1 : 0),hasLive=\(hasLiveSnapshot ? 1 : 0),pagesLoaded=\(olderPageMergedCount))"
+    }
+
+ /// Replays the pull that was dropped while the link was reconnecting.
+    private func retryOlderPageAfterReconnect() {
+        guard olderPageAwaitingReconnect else { return }
+        olderPageAwaitingReconnect = false
+        guard hasMoreOlder, !isLoadingOlder else { return }
+        dbg("older page: replay pull after reconnect (oldest=" + String(journal.oldestSeq ?? -1) + ")")
+        loadOlderIfNeeded()
     }
 
  /// Publishes the paging front from the journal. `hasMoreOlder` can never be true
@@ -851,49 +941,172 @@ final class SessionViewModel: ObservableObject {
 
  /// One `session/page` round trip + front merge.
  ///
- /// Failure policy: the current window is left untouched and `hasMoreOlder`
- /// stays true (retry allowed); the message goes through the existing
- /// `actionErrorText` surface — no alert, no window reset.
+ /// Failure policy (task-10 bug2b): the current window is left untouched and
+ /// `hasMoreOlder` stays true, but a page that cannot be merged is **never a
+ /// silent no-op** — the user pulled, saw the spinner and must either see older
+ /// rows or a visible, retryable error:
+ /// - the page is stale/non-adjacent (the window front moved while the request
+ /// was in flight: reconnect snapshot, concurrent prepend) → retry once
+ /// against the *fresh* front;
+ /// - the retry is rejected too → surface `actionErrorText`;
+ /// - an empty page (or Host `hasMore == false`) terminates pagination; the
+ /// entry row disappearing is the visible state change.
     private func performOlderPageLoad(throughSeq: Int, beforeSeq: Int) async {
         defer { isLoadingOlder = false }
-        let args = Self.olderPageRequestArgs(
-            address: address,
-            throughSeq: throughSeq,
-            beforeSeq: beforeSeq
-        )
-        do {
-            let value: JSONValue
-            if let olderPageLoader {
-                value = try await olderPageLoader(args)
-            } else if let link {
-                value = try await link.unary("session/page", args: args)
-            } else {
-                throw LinkError.notPaired
-            }
-            let page = try value.decode(SessionPage.self)
-            let rawFrames = value["records"]?.arrayValue?.compactMap { $0["event"] } ?? []
-            let update = journal.prepend(page: page)
-            applyJournalUpdate(update)
-            if case .olderPrepended(let inserted) = update, !inserted.isEmpty {
-                let insertedSet = Set(inserted)
-                let addedFrames = rawFrames.filter { frame in
-                    guard let seq = Self.eventFrameSeq(frame) else { return false }
-                    return insertedSet.contains(seq)
-                }
-                appendCachedOlderFrames(addedFrames)
-                scheduleCacheSave()
-            }
-            syncOlderState()
-            if olderPageErrorShown {
-                actionErrorText = nil
-                olderPageErrorShown = false
-            }
-        } catch {
-            actionErrorText = L10n.f(
-                "加载更早历史失败：%@",
-                NetworkErrorInterpreter.message(for: error)
+        let startedAt = Date()
+        var attempt = 0
+        while true {
+            attempt += 1
+            let retrying = attempt > 1
+ // The retry re-reads the front: the first request was keyed on the
+ // window front at *trigger* time, which may already be stale.
+            let requestThrough = retrying ? journal.cursor : throughSeq
+            let requestBefore = retrying ? (journal.oldestSeq ?? 0) : beforeSeq
+            let oldestBefore = journal.oldestSeq
+            let args = Self.olderPageRequestArgs(
+                address: address,
+                throughSeq: requestThrough,
+                beforeSeq: requestBefore
             )
-            olderPageErrorShown = true
+            do {
+                let value: JSONValue
+                if let olderPageLoader {
+                    value = try await olderPageLoader(args)
+                } else if let link {
+                    value = try await link.unary("session/page", args: args)
+                } else {
+                    throw LinkError.notPaired
+                }
+                let page = try value.decode(SessionPage.self)
+                let rawFrames = value["records"]?.arrayValue?.compactMap { $0["event"] } ?? []
+                let update = journal.prepend(page: page)
+                applyJournalUpdate(update)
+                let oldestAfter = journal.oldestSeq
+                let merged: Bool = {
+                    guard let before = oldestBefore, let after = oldestAfter else { return false }
+                    return after < before
+                }()
+                if merged, case .olderPrepended(let inserted) = update, !inserted.isEmpty {
+                    let insertedSet = Set(inserted)
+                    let addedFrames = rawFrames.filter { frame in
+                        guard let seq = Self.eventFrameSeq(frame) else { return false }
+                        return insertedSet.contains(seq)
+                    }
+                    appendCachedOlderFrames(addedFrames)
+                    scheduleCacheSave()
+                }
+                syncOlderState()
+                let usedMs = Int(Date().timeIntervalSince(startedAt) * 1000)
+                let debugContext = olderPageContext()
+                let debugLine = Self.olderPageDebugLine(
+                    requestBefore: requestBefore,
+                    requestThrough: requestThrough,
+                    records: page.records.count,
+                    hasMore: page.hasMore,
+                    update: update,
+                    merged: merged,
+                    oldestBefore: oldestBefore,
+                    oldestAfter: oldestAfter,
+                    retried: retrying,
+                    usedMs: usedMs,
+                    context: debugContext
+                )
+                if merged { olderPageMergedCount += 1 }
+                if merged {
+                    olderPageAwaitingReconnect = false
+                    olderPageJustMerged = true
+                    if olderPageErrorShown {
+                        actionErrorText = nil
+                        olderPageErrorShown = false
+                    }
+                    publishOlderPageDebug(debugLine)
+                    dbg("older page: " + debugLine)
+                    return
+                }
+                if page.records.isEmpty || !journal.hasMoreOlder {
+ // Terminal by design: the page carried nothing older (or the
+ // Host reached the log start); the entry row goes away.
+                    olderPageAwaitingReconnect = false
+                    publishOlderPageDebug(debugLine)
+                    dbg("older page terminal: " + debugLine)
+                    return
+                }
+                if !retrying {
+ // Stale/non-adjacent page: the front moved under us. Retry
+ // once with the fresh front instead of dropping the gesture.
+                    dbg("older page rejected, retrying with fresh front: " + debugLine)
+                    continue
+                }
+                let reason = "分页窗口已变化，请重试"
+                actionErrorText = L10n.f("加载更早历史失败：%@", reason)
+                olderPageErrorShown = true
+                publishOlderPageDebug(debugLine + ";error=" + reason)
+                dbg("older page rejected after retry: " + debugLine)
+                return
+            } catch {
+                let message = NetworkErrorInterpreter.message(for: error)
+                actionErrorText = L10n.f("加载更早历史失败：%@", message)
+                olderPageErrorShown = true
+                publishOlderPageDebug(
+                    "req(before=\(requestBefore),through=\(requestThrough));error=" + message + ";" + olderPageContext()
+                )
+                dbg("older page failed: " + message)
+                return
+            }
+        }
+    }
+
+ /// E2E/DEBUG only: publishes the last paging attempt for the hidden
+ /// `e2e-lastpage` element. The product path never writes it.
+    private func publishOlderPageDebug(_ value: String) {
+        guard Self.e2ePageDiagnosticsEnabled || Self.e2ePageDiagnosticsTestOverride else { return }
+        e2eLastPageDebug = value
+    }
+
+ /// `req(before=3232,through=4179);resp(records=263,hasMore=1);prepend(olderPrepended(inserted=2880-3231,count=352),merged=1);oldest=3232->2880;usedMs=812;retry=0`
+    nonisolated private static func olderPageDebugLine(
+        requestBefore: Int,
+        requestThrough: Int,
+        records: Int,
+        hasMore: Bool,
+        update: SessionJournal.Update,
+        merged: Bool,
+        oldestBefore: Int?,
+        oldestAfter: Int?,
+        retried: Bool,
+        usedMs: Int,
+        context: String
+    ) -> String {
+        let before = oldestBefore.map(String.init) ?? "-"
+        let after = oldestAfter.map(String.init) ?? "-"
+        return "req(before=\(requestBefore),through=\(requestThrough))"
+            + ";resp(records=\(records),hasMore=\(hasMore ? 1 : 0))"
+            + ";prepend(\(describeOlderPageUpdate(update)),merged=\(merged ? 1 : 0))"
+            + ";oldest=\(before)->\(after)"
+            + ";usedMs=\(usedMs)"
+            + ";retry=\(retried ? 1 : 0)"
+            + ";" + context
+    }
+
+    nonisolated private static func describeOlderPageUpdate(_ update: SessionJournal.Update) -> String {
+        switch update {
+        case .olderPrepended(let seqs):
+            guard let first = seqs.first, let last = seqs.last else { return "olderPrepended(empty)" }
+            return "olderPrepended(inserted=\(first)-\(last),count=\(seqs.count))"
+        case .snapshotReplaced:
+            return "snapshotReplaced"
+        case .eventsApplied(let seqs):
+            return "eventsApplied(count=\(seqs.count))"
+        case .duplicate(let seq):
+            return "duplicate(\(seq))"
+        case .gap(let expected, let received):
+            return "gap(expected=\(expected),received=\(received))"
+        case .assistantRevisionGap(let expected, let received):
+            return "assistantRevisionGap(expected=\(expected),received=\(received))"
+        case .assistantStreamProgress(let revision):
+            return "assistantStreamProgress(\(revision))"
+        case .ignored:
+            return "ignored"
         }
     }
 
@@ -1215,6 +1428,7 @@ final class SessionViewModel: ObservableObject {
             }
         }
         ensureExpandedCurrentTurn()
+        expandNewlyLoadedOlderTurnIfNeeded()
         requestFileChangeSummariesIfNeeded()
  // v5.4 queue: a finished turn automatically releases the oldest queued
  // prompt with mode=queue; the rest keep waiting for the next turn/end.
@@ -1230,6 +1444,16 @@ final class SessionViewModel: ObservableObject {
             DetailMetrics.markFullWindowApplied()
             detailMetricsValue = DetailMetrics.valueString
         }
+    }
+
+ /// 真机 A5：更早页合并进一个**已存在的、已完成的 turn** 时，那条 turn
+ /// 的 section 默认是折叠的 —— 用户下拉后只看到原来的 header，看起来「没刷出更早
+ /// 消息」。合并成功后展开最老的 section，让刚加载的行立刻上屏。
+    private func expandNewlyLoadedOlderTurnIfNeeded() {
+        guard olderPageJustMerged else { return }
+        olderPageJustMerged = false
+        guard let first = sections.first else { return }
+        expandedTurnIDs.insert(first.id)
     }
 
     private func ensureExpandedCurrentTurn() {
