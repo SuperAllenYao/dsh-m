@@ -45,9 +45,18 @@ export class Notifier {
  * },
  * log?: (message: string) => void,
  * now?: => number,
+ * isTurnEndWatched?: (device) => boolean,
  * }} options
  */
-  constructor({ devices, apns, audit, config = {}, log = () => {}, now = () => Date.now() }) {
+  constructor({
+    devices,
+    apns,
+    audit,
+    config = {},
+    log = () => {},
+    now = () => Date.now(),
+    isTurnEndWatched = () => false,
+  }) {
     this.devices = devices;
     this.apns = apns;
     this.audit = audit;
@@ -63,6 +72,12 @@ export class Notifier {
     };
     this.log = log;
     this.now = now;
+ /**
+ * task-5: true while the host-side TurnWatcher owns turn-end delivery for the
+ * device (a push-token device is being polled), so the frame path must stay
+ * quiet and not double-push. Approval/question frames are unaffected.
+ */
+    this.isTurnEndWatched = typeof isTurnEndWatched === 'function' ? isTurnEndWatched : () => false;
     this.seen = new Set();
  /** deviceId -> last silent-push timestamp (M4 coalescing window). */
     this.lastSilentAt = new Map();
@@ -163,6 +178,11 @@ export class Notifier {
         typeof event.data?.sessionId === 'string' && event.data.sessionId.length > 0
           ? event.data.sessionId
           : (streamId === undefined ? undefined : this.streamSessions.get(device.deviceId + '|' + streamId));
+ // task-5 (user requirement): turn-end delivery must not depend on the phone
+ // following the session. When the host-side TurnWatcher is polling (a
+ // push-token device exists), it owns turn-end notifications and this frame
+ // path stays quiet so the device is not pushed twice.
+      if (reasonKind === 'completed' && this.isTurnEndWatched(device)) return;
       const key = 'turn|' + String(sessionId ?? '') + '|' + String(event.seq);
       if (!this.dedupe(key)) return;
       if (reasonKind === 'completed') {
