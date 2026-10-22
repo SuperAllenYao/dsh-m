@@ -16,6 +16,23 @@ const DEDUPE_LIMIT = 512;
 /** iOS UNNotificationCategory identifier registered by the app for approvals. */
 export const APPROVAL_CATEGORY = 'dshm-approval';
 
+/**
+ * Session id carried by a session-follow open frame
+ * (`{type:'open', streamId, endpoint, payload:{args:{request:{address}}}}').
+ * Orders of preference: normal session address, subagent child address, then
+ * the flat legacy shapes some clients still send.
+ */
+function sessionIdFromOpenFrame(frame) {
+  if (typeof frame.endpoint === 'string' && !frame.endpoint.includes('session')) return undefined;
+  const args = frame.payload?.args;
+  const address = args?.request?.address ?? args?.address;
+  const candidates = [address?.sessionId, address?.childSessionId, args?.request?.sessionId, args?.sessionId];
+  for (const candidate of candidates) {
+    if (typeof candidate === 'string' && candidate.length > 0) return candidate;
+  }
+  return undefined;
+}
+
 export class Notifier {
   /**
    * @param {{
@@ -49,6 +66,11 @@ export class Notifier {
     this.seen = new Set();
     /** deviceId -> last silent-push timestamp (M4 coalescing window). */
     this.lastSilentAt = new Map();
+    /**
+     * deviceId|streamId -> sessionId（来自手机侧的 open 帧）。
+     * turn/end 事件本身不带 sessionId，通知要深链到会话就必须从 follow 流映射出来。
+     */
+    this.streamSessions = new Map();
     this.queue = Promise.resolve();
   }
 
@@ -57,6 +79,35 @@ export class Notifier {
     this.seen.add(key);
     if (this.seen.size > DEDUPE_LIMIT) this.seen.delete(this.seen.values().next().value);
     return true;
+  }
+
+  /**
+   * Inspect one **device → Host** frame (text only, never modified) to learn the
+   * session behind each stream. `turn/end` events carry no sessionId, so a
+   * turn-end notification would otherwise deep-link nowhere (user report
+   * 2026-10-22: tapping it opened the workspace list instead of the session).
+   */
+  observeDevice(device, data, isBinary) {
+    if (!this.config.enabled || isBinary) return;
+    let frame;
+    try {
+      frame = JSON.parse(typeof data === 'string' ? data : data.toString('utf8'));
+    } catch {
+      return;
+    }
+    if (frame === null || typeof frame !== 'object') return;
+    const streamId = typeof frame.streamId === 'string' ? frame.streamId : undefined;
+    if (streamId === undefined) return;
+    const key = device.deviceId + '|' + streamId;
+    if (frame.type === 'open') {
+      const sessionId = sessionIdFromOpenFrame(frame);
+      if (sessionId === undefined) this.streamSessions.delete(key);
+      else this.streamSessions.set(key, sessionId);
+      return;
+    }
+    if (frame.type === 'end' || frame.type === 'cancel' || frame.type === 'error') {
+      this.streamSessions.delete(key);
+    }
   }
 
   /** Inspect one upstream mux frame (text only) without modifying it. */
@@ -107,7 +158,12 @@ export class Notifier {
     if (value.type === 'event' && value.event?.type === 'turn/end') {
       const event = value.event;
       const reasonKind = event.data?.reason?.kind ?? 'completed';
-      const key = 'turn|' + String(event.data?.sessionId ?? '') + '|' + String(event.seq);
+      const streamId = typeof frame.streamId === 'string' ? frame.streamId : undefined;
+      const sessionId =
+        typeof event.data?.sessionId === 'string' && event.data.sessionId.length > 0
+          ? event.data.sessionId
+          : (streamId === undefined ? undefined : this.streamSessions.get(device.deviceId + '|' + streamId));
+      const key = 'turn|' + String(sessionId ?? '') + '|' + String(event.seq);
       if (!this.dedupe(key)) return;
       if (reasonKind === 'completed') {
         if (!this.config.turnEnd) return;
@@ -115,7 +171,8 @@ export class Notifier {
           kind: 'turn-end',
           title: 'DSH 回合完成',
           body: '任务已在 Mac 上完成',
-          data: { type: 'turn-end', sessionId: event.data?.sessionId },
+          threadId: sessionId,
+          data: { type: 'turn-end', sessionId },
         });
         return;
       }
@@ -125,7 +182,8 @@ export class Notifier {
           kind: 'failure',
           title: 'DSH 回合失败',
           body: '任务执行出错，打开 App 查看详情',
-          data: { type: 'failure', sessionId: event.data?.sessionId },
+          threadId: sessionId,
+          data: { type: 'failure', sessionId },
         });
       }
       return;
