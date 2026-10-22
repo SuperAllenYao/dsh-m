@@ -789,6 +789,38 @@ final class HoldableHTTPServer {
     }
 }
 
+/// 桌面端重启窗口：重连退避不能滚到 10s（用户实测重启桌面端后开 App 等了约 10 秒）。
+final class ReconnectBootWindowTests: XCTestCase {
+    func testAllCandidatesUnreadyIsBootWindow() {
+        XCTAssertTrue(LinkService.isBootWindow(classes: [.pluginNotReady]))
+        XCTAssertTrue(LinkService.isBootWindow(classes: [.pluginNotReady, .unreachable, .timeout]))
+        XCTAssertTrue(LinkService.isBootWindow(classes: [.gatewayRejected, .timeout]))
+    }
+
+    func testCredentialOrCancelledFailuresAreNotBootWindow() {
+        XCTAssertFalse(LinkService.isBootWindow(classes: [.credentialRejected]))
+        XCTAssertFalse(LinkService.isBootWindow(classes: [.pluginNotReady, .credentialRejected]))
+        XCTAssertFalse(LinkService.isBootWindow(classes: [.cancelled]))
+        XCTAssertFalse(LinkService.isBootWindow(classes: [.ok]))
+    }
+
+    func testEmptyFailureSetIsNotBootWindow() {
+        XCTAssertFalse(LinkService.isBootWindow(classes: []))
+    }
+
+    func testBootWindowDelayStartsShortAndCapsAt1500ms() {
+        XCTAssertEqual(LinkService.bootWindowDelayMs(attempt: 1), 400, accuracy: 0.001)
+        XCTAssertEqual(LinkService.bootWindowDelayMs(attempt: 2), 600, accuracy: 0.001)
+        XCTAssertEqual(LinkService.bootWindowDelayMs(attempt: 3), 800, accuracy: 0.001)
+        XCTAssertEqual(LinkService.bootWindowDelayMs(attempt: 6), 1_400, accuracy: 0.001)
+        // 上限 1.5s：第 7 轮之后不再增长，保证桌面端一就绪就能在 ≤1.5s 内连上。
+        XCTAssertEqual(LinkService.bootWindowDelayMs(attempt: 7), 1_500, accuracy: 0.001)
+        XCTAssertEqual(LinkService.bootWindowDelayMs(attempt: 30), 1_500, accuracy: 0.001)
+        // 对比：指数退避在第 6 轮已经要等 8–10s。
+        XCTAssertGreaterThan(LinkService.reconnectDelayMs(attempt: 6, randomUnit: 1), 6_000)
+    }
+}
+
 /// Resumes a continuation exactly once (listener state updates can fire repeatedly).
 final class FirstByteResumeOnce {
     private let lock = NSLock()

@@ -51,6 +51,7 @@ import { DeviceStore, keyFingerprint256, normalizeDevicePublicKey } from './devi
 import { FrameAudit } from './frame-audit.js';
 import { ensureHostIdentity } from './host-identity.js';
 import { APPROVAL_CATEGORY, Notifier } from './notifier.js';
+import { TurnWatcher } from './session-watcher.js';
 import { buildEndpoints, PairCodeService, PairingService, selectDeviceEndpoints, trimDeviceName } from './pairing.js';
 import { BonjourResponder } from './bonjour.js';
 import { QrRenderer } from './qr.js';
@@ -123,6 +124,12 @@ const DEFAULTS = {
     questions: true,
     silent: true,
     silentMinIntervalMs: 3000,
+    // task-5: turn-end pushes must not depend on the phone following the session.
+    // While at least one push-token device exists the host polls session/list
+    // (running -> idle) and notifies every push-token device.
+    watchSessions: true,
+    pollIntervalMs: 2000,
+    requestTimeoutMs: 1500,
   },
   apns: {},
   fetchRoutes: {
@@ -200,7 +207,7 @@ function mergeConfig(base, override) {
   return merged;
 }
 
-function resolveConfig(raw) {
+export function resolveConfig(raw) {
   const merged = mergeConfig(DEFAULTS, raw ?? {});
   merged.port = Number.isInteger(merged.port) ? merged.port : DEFAULTS.port;
   merged.pairTtlMs = Number.isInteger(merged.pairTtlMs) && merged.pairTtlMs >= 5000 ? merged.pairTtlMs : DEFAULTS.pairTtlMs;
@@ -220,6 +227,19 @@ function resolveConfig(raw) {
   merged.security = mergeConfig(DEFAULTS.security, merged.security);
   merged.tls = mergeConfig(DEFAULTS.tls, merged.tls);
   merged.notifications = mergeConfig(DEFAULTS.notifications, merged.notifications);
+  merged.notifications.watchSessions = merged.notifications.watchSessions !== false;
+  merged.notifications.pollIntervalMs =
+    Number.isInteger(merged.notifications.pollIntervalMs) &&
+    merged.notifications.pollIntervalMs >= 250 &&
+    merged.notifications.pollIntervalMs <= 600_000
+      ? merged.notifications.pollIntervalMs
+      : DEFAULTS.notifications.pollIntervalMs;
+  merged.notifications.requestTimeoutMs =
+    Number.isInteger(merged.notifications.requestTimeoutMs) &&
+    merged.notifications.requestTimeoutMs >= 100 &&
+    merged.notifications.requestTimeoutMs <= 60_000
+      ? merged.notifications.requestTimeoutMs
+      : DEFAULTS.notifications.requestTimeoutMs;
   merged.contract = mergeConfig(DEFAULTS.contract, merged.contract);
   merged.fetchRoutes = mergeConfig(DEFAULTS.fetchRoutes, merged.fetchRoutes);
   if (!Array.isArray(merged.fetchRoutes.allow)) merged.fetchRoutes.allow = DEFAULTS.fetchRoutes.allow;
@@ -439,6 +459,8 @@ export class LinkServer {
     this.frameAudit = undefined;
     this.apns = undefined;
     this.notifier = undefined;
+    /** task-5: host-side turn watcher (created in startInternal). */
+    this.sessionWatcher = undefined;
     this.qr = undefined;
     this.pairing = undefined;
     /** M2a 8-digit pairing-code service (pairing.js PairCodeService). */
@@ -562,6 +584,105 @@ export class LinkServer {
     return device.peer;
   }
 
+  // ------------------------------------------------- task-5 turn watcher ---
+
+  /** Active devices that can receive an APNs push (the watcher's coverage set). */
+  watchableDevices() {
+    if (this.devices === undefined) return [];
+    return this.devices
+      .active()
+      .filter((device) => typeof device.pushToken === 'string' && device.pushToken.length > 0);
+  }
+
+  /** Start/stop the turn watcher after a device or push-token change. */
+  syncSessionWatcher() {
+    try {
+      this.sessionWatcher?.sync?.();
+    } catch (error) {
+      log('turn watcher sync failed: ' + String(error?.message ?? error));
+    }
+  }
+
+  /**
+   * Fan one completed turn out to every push-token device. While the watcher is
+   * active this is the only turn-end source (the frame path is suppressed), so
+   * the push is delivered even if the phone never followed the session.
+   */
+  notifyTurnEndAllDevices(sessionId) {
+    if (this.disposed || typeof sessionId !== 'string' || sessionId.length === 0) return 0;
+    if (this.notifier === undefined || this.devices === undefined) return 0;
+    let sent = 0;
+    for (const device of this.devices.active()) {
+      if (typeof device.pushToken !== 'string' || device.pushToken.length === 0) continue;
+      this.notifier.notify(device, {
+        kind: 'turn-end',
+        title: 'DSH 回合完成',
+        body: '任务已在 Mac 上完成',
+        threadId: sessionId,
+        data: { type: 'turn-end', sessionId },
+      });
+      sent += 1;
+    }
+    return sent;
+  }
+
+  /**
+   * One loopback `session/list` for the watcher: the same target the phone
+   * unary proxy uses, authenticated with a device peer cookie. Only
+   * `sessionId` + `running` are kept, so the transient full projection object
+   * (up to ~1.5 MB) is dropped immediately and the watcher never holds list data.
+   */
+  async fetchSessionListForWatcher(device) {
+    const peer = this.ensurePeer(device);
+    if (peer.cookie === undefined) await peer.connect('answer');
+    const envelope = {
+      type: 'client-request',
+      rpcId: 'turn-watch-' + randomUUID(),
+      method: 'session/list',
+      payload: { args: {} },
+    };
+    const timeoutMs = this.config.notifications.requestTimeoutMs;
+    const response = await fetch(this.loopbackOrigin + '/api/session/list', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        // Ask for the lite projection the App uses; the link layer may serve it
+        // trimmed (an older host ignores the hint — harmless).
+        [LIST_LITE_HEADER]: '1',
+        cookie: peer.cookie.name + '=' + peer.cookie.value,
+      },
+      body: JSON.stringify(envelope),
+      redirect: 'manual',
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (response.status === 401 || response.status === 403) {
+      // The cookie was minted for a peer the host has since disposed (device
+      // reconnected, host restarted): drop it so the next poll re-connects
+      // instead of retrying a dead credential forever.
+      peer.cookie = undefined;
+      throw new Error('session/list HTTP ' + response.status);
+    }
+    if (!response.ok) throw new Error('session/list HTTP ' + response.status);
+    const bytes = Buffer.from(await response.arrayBuffer());
+    let parsed;
+    try {
+      parsed = JSON.parse(bytes.toString('utf8'));
+    } catch {
+      throw new Error('session/list response is not JSON');
+    }
+    const value = parsed?.result?.ok === true ? parsed.result.value : undefined;
+    if (value === undefined || !Array.isArray(value.items)) {
+      throw new Error('session/list envelope is not ok');
+    }
+    return value.items
+      .map((item) =>
+        item !== null && typeof item === 'object'
+          ? { sessionId: item.sessionId, running: item.running === true }
+          : null
+      )
+      .filter((item) => item !== null && typeof item.sessionId === 'string');
+  }
+
   /**
    * True when the plugin can serve phones: not disposed, listener started, no
    * startup error, Cordis context still active and the contract probe passed.
@@ -657,7 +778,29 @@ export class LinkServer {
     this.devices = new DeviceStore({ dir: this.dataDir, hostId: this.hostIdentity.hostId, log }).load();
     this.qr = new QrRenderer({ log });
     this.apns = new ApnsProvider({ config: this.config.apns, log }).init();
-    this.notifier = new Notifier({ devices: this.devices, apns: this.apns, audit: this.audit, config: this.config.notifications, log });
+    this.notifier = new Notifier({
+      devices: this.devices,
+      apns: this.apns,
+      audit: this.audit,
+      config: this.config.notifications,
+      log,
+      // task-5: while the TurnWatcher owns turn-end delivery (a push-token
+      // device exists), the frame path must not push a second time.
+      isTurnEndWatched: () => this.sessionWatcher?.active === true,
+    });
+    // task-5 (user requirement): turn completion must be delivered even when the
+    // App is not following the session / not running. The watcher polls
+    // session/list over the loopback channel and owns turn-end pushes; the frame
+    // path only covers the no-watcher case.
+    this.sessionWatcher = new TurnWatcher({
+      listDevices: () => this.watchableDevices(),
+      fetchSessionList: (device) => this.fetchSessionListForWatcher(device),
+      notifyTurnEnd: (sessionId) => this.notifyTurnEndAllDevices(sessionId),
+      isAvailable: () => this.disposed !== true && this.contract?.ok === true,
+      config: this.config.notifications,
+      log,
+    });
+    this.sessionWatcher.sync();
     this.auth = new AuthService({ devices: this.devices, audit: this.audit, config: this.config.security, log });
     this.hostname = osHostname();
     this.lanIps = collectLanIps();
@@ -1742,6 +1885,8 @@ export class LinkServer {
       }
     }
     this.devices.setPushToken(device.deviceId, token, environment);
+    // task-5: a newly push-capable device starts the host-side turn watcher.
+    this.syncSessionWatcher();
     const fingerprint = tokenFingerprint(token);
     this.audit.record('device.push-token', {
       deviceId: device.deviceId,
@@ -2679,6 +2824,8 @@ export class LinkServer {
     device.peer = undefined;
     this.audit.record('device.revoked', { deviceId: device.deviceId, keyId: device.keyId, reason });
     log('device ' + device.deviceId + ' revoked (' + reason + ')');
+    // task-5: the watcher coverage set shrank; stop it when no push device is left.
+    this.syncSessionWatcher();
     return { device: this.devices.publicList().find((entry) => entry.deviceId === device.deviceId) };
   }
 
@@ -2699,6 +2846,7 @@ export class LinkServer {
       device.peer = undefined;
     }
     this.audit.record('device.revoked-all', { count: revoked.length, reason });
+    this.syncSessionWatcher();
     return { revoked: revoked.length };
   }
 
@@ -3131,6 +3279,12 @@ export class LinkServer {
         /* already closed */
       }
       this.tunnel = undefined;
+      try {
+        this.sessionWatcher?.dispose?.();
+      } catch {
+        /* already stopped */
+      }
+      this.sessionWatcher = undefined;
       try {
         this.notifier?.dispose?.();
       } catch {
