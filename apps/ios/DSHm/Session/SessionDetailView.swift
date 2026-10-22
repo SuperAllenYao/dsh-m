@@ -162,6 +162,7 @@ struct SessionDetailView: View {
                 sendMetricsElement
                 e2ePagingDebugElement
                 e2eLastPageDebugElement
+                e2eLinkDebugElement
             }
         }
         .onChange(of: app.link.generation) { generation in
@@ -568,6 +569,28 @@ struct SessionDetailView: View {
                 .opacity(0.02)
                 .allowsHitTesting(false)
                 .accessibilityIdentifier("e2e-lastpage")
+                .accessibilityLabel(value)
+                .accessibilityValue(value)
+        }
+    }
+
+    // MARK: - E2E link state (跨网络用例的可观测判据, 2026-10-23)
+
+    /// 隐藏元素：链路相位 + 连接代号。网络切换用例用它区分「已经重连成功」和
+    /// 「只是旧内容还留在屏上」，并给出可测的重连耗时（轮询到 connected=1）。
+    /// 格式：`connected=0|1;phase=<文案>;generation=<n>`。
+    @ViewBuilder
+    private var e2eLinkDebugElement: some View {
+        if app.isE2EMode {
+            let value = "connected=" + (app.link.phase.isConnected ? "1" : "0")
+                + ";phase=" + app.link.phase.label
+                + ";generation=" + String(app.link.generation)
+            Text("e2e-link")
+                .font(.system(size: 1))
+                .frame(width: 2, height: 2)
+                .opacity(0.02)
+                .allowsHitTesting(false)
+                .accessibilityIdentifier("e2e-link")
                 .accessibilityLabel(value)
                 .accessibilityValue(value)
         }

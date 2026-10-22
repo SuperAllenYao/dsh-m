@@ -153,7 +153,33 @@ final class NetworkPathMonitor {
     /// should be preferred: a satisfied cellular/expensive/constrained path that is
     /// neither Wi-Fi nor wired Ethernet. An unknown/unsatisfied path keeps the
     /// legacy candidate order so offline retries still work.
-    var prefersRelay: Bool { snapshot?.prefersRelay ?? true }
+    ///
+    /// E2E scaffolding（仅 DEBUG，用户无感）：`DSHM_E2E_FORCE_RELAY=1` 强制按
+    /// 「蜂窝/跨网段」排序、`DSHM_E2E_FORCE_LAN=1` 强制按「同一 Wi-Fi」排序，
+    /// 让真机 E2E 可以可重复地分别验证两条链路。
+    var prefersRelay: Bool {
+        if let forced = Self.e2eForcedPrefersRelay { return forced }
+        return snapshot?.prefersRelay ?? true
+    }
+
+    /// E2E-only override, nil in production.
+    static var e2eForcedPrefersRelay: Bool? {
+        #if DEBUG
+        let environment = ProcessInfo.processInfo.environment
+        if environment["DSHM_E2E_FORCE_RELAY"] == "1" { return true }
+        if environment["DSHM_E2E_FORCE_LAN"] == "1" { return false }
+        #endif
+        return nil
+    }
+
+    /// E2E-only：模拟 OS 报告一次「有意义」的网络切换（Wi-Fi→蜂窝 / 断网→恢复），
+    /// 走与真实切换完全相同的 `onMeaningfulChange` → `LinkService` 即时重连路径。
+    @discardableResult
+    func simulateMeaningfulChangeForE2E() -> Int {
+        changeGeneration += 1
+        onMeaningfulChange?()
+        return changeGeneration
+    }
 
     var isSatisfied: Bool { snapshot?.isSatisfied ?? false }
     var usesWiFi: Bool { snapshot?.interface == .wifi }
