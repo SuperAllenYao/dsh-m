@@ -59,6 +59,10 @@ final class LinkService: ObservableObject {
     @Published private(set) var lastConnectedAt: Date?
  /// P0: E2E-gated `connect-metrics` summary of the last bring-up round.
     @Published private(set) var connectionMetricsValue: String?
+ /// task-2 (reconnect): E2E-gated one-line `[RECONNECT]...` summary of the last
+ /// page-enter / foreground reconnect chain (see `ReconnectMetrics`). Surfaced
+ /// through the hidden `reconnect-metrics` element on the list page.
+    @Published private(set) var reconnectMetricsValue: String?
 
  /// P0-4 guard: an early `session/list` before `phase ==.connected` is only
  /// worth issuing when the stored origin is dialable on this path. A stale LAN
@@ -69,6 +73,12 @@ final class LinkService: ObservableObject {
             return false
         }
         return true
+    }
+ /// task-2: true when the network path changed after this link became ready —
+ /// the live socket is then presumed stale even if `phase` still says
+ /// `.connected` (the OS does not report a migrated socket as dead).
+    var networkPathChangedSinceConnect: Bool {
+        pathGenerationAtConnect != NetworkPathMonitor.shared.changeGeneration
     }
  /// v0.1.1 C: true while the one-shot `/health` CA-migration fetch runs, so
  /// repeated reconnects do not stack migration requests.
@@ -125,6 +135,20 @@ final class LinkService: ObservableObject {
     var isConnecting = false
     var manuallyDisconnected = false
 
+ // MARK: - task-2 reconnect-chain state
+
+ /// `NetworkPathMonitor.changeGeneration` at the last successful connect and at
+ /// the start of the current round; together they tell "the socket died on a new
+ /// network" from "this round already dialed on the new network".
+    private var pathGenerationAtConnect = 0
+    private var pathGenerationAtRoundStart = 0
+ /// Dedupe: page enter + scenePhase + path change can all request a reconnect in
+ /// the same few milliseconds; restarting a just-started round would cancel the
+ /// candidate that is about to win.
+    private var lastReconnectRequestAt: Date?
+ /// Observer for `HTTPConnection`'s reused-socket first-byte watchdog.
+    private var firstByteTimeoutObserver: NSObjectProtocol?
+
  /// Short-lived api token (auto-refreshed on expiry/401).
     var apiToken: String?
     var apiTokenExpiresAt: Date?
@@ -136,6 +160,29 @@ final class LinkService: ObservableObject {
 
     init() {
         credentials = store.load()
+ // task-2 (reconnect < 1s): one listener per app process. A meaningful path
+ // change invalidates the live socket immediately instead of waiting for the
+ // system TCP timeout; the reconnect then runs on the new path.
+        NetworkPathMonitor.shared.onMeaningfulChange = { [weak self] in
+            self?.handleNetworkPathChanged()
+        }
+        ReconnectMetrics.onChange = { [weak self] value in
+            self?.reconnectMetricsValue = value
+        }
+ // A pooled unary request that produced no first byte within
+ // `HTTPConnection.firstByteTimeout` means the keep-alive socket is dead
+ // (network switch/Mac sleep). The mux almost always shares that fate.
+        firstByteTimeoutObserver = NotificationCenter.default.addObserver(
+            forName: .dshmHTTPFirstByteTimeout,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            let endpoint = notification.userInfo?["endpoint"] as? String ?? "-"
+            let host = notification.userInfo?["host"] as? String
+            Task { @MainActor [weak self] in
+                self?.handleFirstByteTimeout(endpoint: endpoint, host: host)
+            }
+        }
         if credentials != nil {
             phase = .connecting
             startConnecting()
@@ -594,6 +641,15 @@ final class LinkService: ObservableObject {
 
     func reconnectNow() {
         guard credentials != nil else { return }
+ // task-2: page enter + scenePhase + path change can all request a reconnect
+ // in the same few milliseconds; restarting a just-started round would cancel
+ // the candidate that is about to win. (An explicit user retry after a long
+ // wait is not throttled: the phase is not busy then.)
+        if phase.isBusy, let last = lastReconnectRequestAt,
+           Date().timeIntervalSince(last) < 0.3 {
+            return
+        }
+        lastReconnectRequestAt = Date()
         retryTask?.cancel()
         retryTask = nil
         attempt = 0
@@ -617,12 +673,101 @@ final class LinkService: ObservableObject {
  /// when `generation` changes.
     func handleForeground() {
         guard credentials != nil, !manuallyDisconnected else { return }
-        if phase.isConnected { return }
+        if phase.isConnected {
+ // task-2: ".connected" on a network the socket was not dialed on is a
+ // stale transport, not a reusable one. The path-change event usually
+ // invalidates it already; this is the scenePhase race window.
+            if networkPathChangedSinceConnect {
+                ReconnectMetrics.markInvalidate(reason: "foreground/pathChanged")
+                teardownTransport()
+                reconnectNow()
+            }
+            return
+        }
  // A `connectOnce` round is already in flight: restarting it would cancel
  // the candidate that is about to succeed (foreground resume must not turn
  // a 1s connect into a full retry).
         guard !isConnecting else { return }
         reconnectNow()
+    }
+
+ // MARK: - task-2 reconnect triggers
+
+ /// The session/workspace list page appeared: t0 of the reconnect chain.
+ ///
+ /// A healthy mux on the current network is reused with no traffic (P0-5 rule);
+ /// every other state reconnects **now**, cancelling a pending backoff wait so
+ /// the chain never pays the 0.5-10s `scheduleReconnect` delay.
+    func handlePageEnter() {
+        ReconnectMetrics.beginPageEnter(reason: "listPage")
+        guard credentials != nil, !manuallyDisconnected else { return }
+        switch phase {
+        case .connected:
+            if networkPathChangedSinceConnect {
+                ReconnectMetrics.markInvalidate(reason: "pageEnter/pathChanged")
+                teardownTransport()
+                reconnectNow()
+            } else {
+                ReconnectMetrics.markReuseDecision()
+            }
+        case .reconnecting, .disconnected:
+ // The backoff wait exists to space out unattended retries; an explicit
+ // page enter is a user-visible resume and must not wait for it.
+            reconnectNow()
+        case .connecting, .unpaired, .needsRepair:
+            break
+        }
+    }
+
+ /// A **meaningful** network-path change (interface type / satisfied flip).
+ ///
+ /// The OS keeps the old socket open across Wi-Fi -> cellular until the TCP
+ /// timeout; invalidating it here is what turns a 10s+ wait into a <1s reconnect.
+    func handleNetworkPathChanged() {
+        ReconnectMetrics.markPathChange()
+        guard credentials != nil, !manuallyDisconnected else { return }
+        switch phase {
+        case .connected:
+            ReconnectMetrics.markInvalidate(reason: "pathChange")
+            lastErrorText = L10n.t("网络已切换，正在重连…")
+            teardownTransport()
+            reconnectNow()
+        case .reconnecting, .disconnected:
+            ReconnectMetrics.markInvalidate(reason: "pathChange")
+            reconnectNow()
+        case .connecting:
+ // Only restart a round that was dialed before the change; a round that
+ // already started on the new path must be allowed to finish.
+            if Self.shouldRestartConnectingRound(
+                roundStartGeneration: pathGenerationAtRoundStart,
+                pathGeneration: NetworkPathMonitor.shared.changeGeneration
+            ) {
+                ReconnectMetrics.markInvalidate(reason: "pathChange/connecting")
+                reconnectNow()
+            }
+        case .unpaired, .needsRepair:
+            break
+        }
+    }
+
+ /// The live transport produced no first byte within its probe budget (callers:
+ /// the reused-mux `workspace/follow` baseline probe and the pooled-unary
+ /// watchdog). Treat the socket as lost and reconnect immediately.
+    func noteTransportUnresponsive(source: String) {
+        ReconnectMetrics.markFirstByteTimeout(source: source)
+        guard credentials != nil, !manuallyDisconnected, phase.isConnected else { return }
+        lastErrorText = L10n.t("连接无响应，正在重连…")
+        teardownTransport()
+        reconnectNow()
+    }
+
+ /// A pooled unary request hit `HTTPConnection.firstByteTimeout`. Only a request
+ /// against the *current* origin says anything about the live mux transport.
+    private func handleFirstByteTimeout(endpoint: String, host: String?) {
+        guard let currentHost = credentials?.originURL?.host, let host, currentHost == host else {
+            return
+        }
+        noteTransportUnresponsive(source: "unary:" + endpoint)
     }
 
     func disconnect(clearCredentials: Bool) {
@@ -665,8 +810,7 @@ final class LinkService: ObservableObject {
         p1SilentResume = false
         let attemptNumber = attempt
  // Spec §3.8: base 500ms, factor 2, cap 10s, 50% jitter.
-        let base = min(10_000.0, 500.0 * pow(2.0, Double(max(0, attemptNumber - 1))))
-        let delayMs = base / 2 + Double.random(in: 0...base / 2)
+        let delayMs = Self.reconnectDelayMs(attempt: attemptNumber, randomUnit: Double.random(in: 0...1))
         phase = .reconnecting(attempt: attemptNumber)
         retryTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: UInt64(delayMs * 1_000_000))
@@ -693,6 +837,9 @@ final class LinkService: ObservableObject {
             phase = attempt > 0 ? .reconnecting(attempt: attempt) : .connecting
         }
         let prefersRelay = NetworkPathMonitor.shared.prefersRelay
+        let pathChanged = networkPathChangedSinceConnect
+        pathGenerationAtRoundStart = NetworkPathMonitor.shared.changeGeneration
+        ReconnectMetrics.markReconnectStart()
         ConnectionMetrics.begin(preferRelay: prefersRelay)
         P1ResumeMetrics.begin()
 
@@ -708,8 +855,12 @@ final class LinkService: ObservableObject {
             phase = .needsRepair(L10n.t("配对凭据没有可用的服务器地址，请重新配对"))
             return
         }
+ // task-2: after a network switch the stored origin was dialed on the old
+ // network; probe the public relay before a (probably stale) LAN address,
+ // keeping the LAN candidates as fallback instead of dropping them.
+        let orderedCandidates = Self.pathChangedDialCandidates(dialCandidates, pathChanged: pathChanged)
         var failures: [String] = []
-        for (index, origin) in dialCandidates.enumerated() {
+        for (index, origin) in orderedCandidates.enumerated() {
             if Task.isCancelled {
                 isConnecting = false
                 return
@@ -728,9 +879,15 @@ final class LinkService: ObservableObject {
                 teardownTransport(keepP1Resume: p1SilentResume)
             }
             ConnectionMetrics.markCandidate(origin.host ?? origin.absoluteString)
- // P0: bound every candidate; the last one keeps a longer budget so a
- // slow-but-working relay still connects.
-            let attemptTimeout: TimeInterval = index == dialCandidates.count - 1 ? 8 : 4
+ // task-2: bound every candidate. The last one keeps a longer budget so a
+ // slow-but-working relay still connects; a stale non-last candidate must
+ // not burn 4s before the relay is dialed (4s -> 2s, 1.5s after a path
+ // change). Reachable origins complete TCP+TLS+auth well under 1s.
+            let attemptTimeout = Self.candidateTimeoutSeconds(
+                index: index,
+                count: orderedCandidates.count,
+                pathChanged: pathChanged
+            )
             switch await attemptConnection(origin: origin, leafPin: credentials.leafPin, timeout: attemptTimeout) {
             case .connected(let bumpGeneration):
                 setCurrentOrigin(origin, persist: true)
@@ -738,9 +895,11 @@ final class LinkService: ObservableObject {
                 attempt = 0
                 lastConnectedAt = Date()
                 lastErrorText = nil
+                pathGenerationAtConnect = NetworkPathMonitor.shared.changeGeneration
                 p1SilentResume = false
                 phase = .connected
                 if bumpGeneration { generation += 1 }
+                ReconnectMetrics.markConnected()
                 ConnectionMetrics.markConnected()
                 connectionMetricsValue = connectionMetricsSummary()
  // v0.1.1 C: pre-C pairings still trust only the leaf pin; while
@@ -760,7 +919,7 @@ final class LinkService: ObservableObject {
         }
         isConnecting = false
         guard !Task.isCancelled else { return }
-        lastErrorText = "无法连接 Mac（已尝试 \(dialCandidates.count) 个地址）：\n" + failures.joined(separator: "\n")
+        lastErrorText = "无法连接 Mac（已尝试 \(orderedCandidates.count) 个地址）：\n" + failures.joined(separator: "\n")
  // Remember a different starting origin for the next round so a dead
  // address does not always head the list.
         _ = rotateOriginIfPossible(reason: failures.last ?? L10n.t("连接失败"))
@@ -1292,6 +1451,56 @@ final class LinkService: ObservableObject {
             return resume.isEmpty ? nil : resume
         }
         return resume.isEmpty ? base : base + ";" + resume
+    }
+}
+
+// MARK: - task-2 reconnect policy (pure, unit-tested)
+
+extension LinkService {
+ /// Spec §3.8 backoff: base 500ms, factor 2, cap 10s, 50% jitter. Extracted from
+ /// `scheduleReconnect()` so the bounds are unit-tested instead of only observed.
+    nonisolated static func reconnectDelayMs(attempt: Int, randomUnit: Double) -> Double {
+        let base = min(10_000.0, 500.0 * pow(2.0, Double(max(0, attempt - 1))))
+        let unit = min(1, max(0, randomUnit))
+        return base / 2 + unit * (base / 2)
+    }
+
+ /// Per-candidate budget inside one round. The last candidate keeps a longer
+ /// budget so a slow-but-working relay still connects; the others are bounded at
+ /// 2s (1.5s after a path change) because a reachable origin completes
+ /// TCP+TLS+auth well under 1s, and a stale LAN address must not burn 4s before
+ /// the relay is dialed.
+    nonisolated static func candidateTimeoutSeconds(
+        index: Int,
+        count: Int,
+        pathChanged: Bool
+    ) -> TimeInterval {
+        if index >= count - 1 { return 8 }
+        return pathChanged ? 1.5 : 2
+    }
+
+ /// After a path change the stored origin was dialed on the *previous* network,
+ /// so a LAN address is the least likely to answer. Probe non-LAN candidates
+ /// first and keep the LAN ones as fallback (never dropped).
+ ///
+ /// Happy Eyeballs (parallel first dial) is deliberately **not** used:
+ /// `authInFlightByPurpose` is purpose-scoped and two concurrent attempts would
+ /// fight over `self.ws`/`self.mux` and multiply `/auth/challenge` requests
+ /// (plugin rate limit).
+    nonisolated static func pathChangedDialCandidates(_ candidates: [URL], pathChanged: Bool) -> [URL] {
+        guard pathChanged, candidates.count > 1 else { return candidates }
+        let nonLAN = candidates.filter { !PairingOriginSelector.isLANHost($0.host) }
+        let lan = candidates.filter { PairingOriginSelector.isLANHost($0.host) }
+        return nonLAN + lan
+    }
+
+ /// A round already dialed on the post-change path must be allowed to finish;
+ /// only a round that predates the change is restarted.
+    nonisolated static func shouldRestartConnectingRound(
+        roundStartGeneration: Int,
+        pathGeneration: Int
+    ) -> Bool {
+        roundStartGeneration < pathGeneration
     }
 }
 

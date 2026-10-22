@@ -338,21 +338,31 @@ final class AppModel: ObservableObject {
  /// P0-5: decide how to resume the remote connection when the scene becomes
  /// active. The default is to **reuse** the existing TLS/mux: a full
  /// `connectOnce` is only justified when the transport is already down.
+ ///
+ /// task-2: a **meaningful network-path change** since the last successful
+ /// connect makes `.connected` meaningless — the socket was dialed on the old
+ /// network and the OS has not reported it dead — so the resume must reconnect
+ /// instead of reusing a stale mux.
     nonisolated static func foregroundAction(
         phase: LinkService.Phase,
-        backgroundedSeconds: TimeInterval?
+        backgroundedSeconds: TimeInterval?,
+        networkPathChanged: Bool = false
     ) -> ForegroundAction {
         guard let backgroundedSeconds else { return .none }
         switch phase {
         case .connected:
+ // A stale transport is never reusable, regardless of the interruption
+ // length: the mux was dialed on the network we already left.
+            if networkPathChanged { return .reconnect }
  // A very short interruption (control center, permission alert…) does
  // not justify any extra traffic or a stream reopen; a real resume
  // reuses the existing TLS/mux.
             return backgroundedSeconds >= 1 ? .reuseMux : .none
         case .connecting:
  // A bring-up attempt is already running. Restarting it would cancel
- // the in-flight TLS/WSS work and lengthen the reconnect (P0-5).
-            return .none
+ // the in-flight TLS/WSS work (P0-5) — unless the round predates a
+ // network switch, in which case it is dialing the wrong path.
+            return networkPathChanged ? .reconnect : .none
         case .disconnected, .reconnecting:
  // `.reconnecting` may be waiting out the 0.5–10s backoff; the resumed
  // app should retry immediately instead of waiting for it.
@@ -374,14 +384,28 @@ final class AppModel: ObservableObject {
     func handleAppBecameActive() {
         let backgroundedSeconds = enteredBackgroundAt.map { Date().timeIntervalSince($0) }
         enteredBackgroundAt = nil
-        switch Self.foregroundAction(phase: link.phase, backgroundedSeconds: backgroundedSeconds) {
+        let networkPathChanged = link.networkPathChangedSinceConnect
+        switch Self.foregroundAction(
+            phase: link.phase,
+            backgroundedSeconds: backgroundedSeconds,
+            networkPathChanged: networkPathChanged
+        ) {
         case .none:
             return
         case .reconnect:
+ // t0 of the reconnect chain: `scenePhase ==.active` (handoff §2.0).
+            ReconnectMetrics.beginPageEnter(reason: "sceneActive")
+            if networkPathChanged {
+                ReconnectMetrics.markInvalidate(reason: "sceneActive/pathChanged")
+            }
             let ms = (backgroundedSeconds ?? 0) * 1000
             recordForegroundMetrics(action: "reconnect", backgroundedMs: ms, reused: false)
             link.handleForeground()
         case .reuseMux:
+ // A healthy mux on the current network: the chain only measures the
+ // list refresh latency (connected is t0 itself).
+            ReconnectMetrics.beginPageEnter(reason: "sceneActive")
+            ReconnectMetrics.markReuseDecision()
             let seconds = backgroundedSeconds ?? 0
             foregroundReuseCount += 1
             recordForegroundMetrics(action: "reuseMux", backgroundedMs: seconds * 1000, reused: true)

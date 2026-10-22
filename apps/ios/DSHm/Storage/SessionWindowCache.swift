@@ -19,6 +19,57 @@ enum SessionWindowPolicy {
  /// Background fill target: keeps the legacy 40-message history window.
     static let fillWindowMessages = 40
 
+ // MARK: - turnWindow (task session-history)
+
+ /// Turn minima shared by every window: cover ~8 complete turns *when the
+ /// session's turns are short*, never at the cost of a bigger window.
+ ///
+ /// Host semantics (verified in the installed session-controller
+ /// `paginate`): the Host walks backwards from the window end, counts
+ /// append-origin user/assistant messages, and stops at a `turn/start` once
+ /// `count >= minMessages && turns >= minTurns` — **unless `maxMessages` or
+ /// history exhaustion wins first**. `minMessages` must be ≤ `maxMessages`
+ /// (Host-side validation). Consequence: adding a turnWindow never enlarges a
+ /// window; it only stops *earlier* at a turn boundary.
+    static let turnWindowMinTurns = 8
+
+    struct TurnWindow: Equatable {
+        var minMessages: Int
+        var minTurns: Int
+
+        var jsonValue: JSONValue {
+            .object([
+                "minMessages": .int(Int64(minMessages)),
+                "minTurns": .int(Int64(minTurns)),
+            ])
+        }
+    }
+
+ /// First window (12–20 messages): keep it phone-sized for the first paint; the
+ /// turn stop only matters for short-turn conversations (in tool-heavy sessions
+ /// `maxMessages` binds first — measured on real logs, see the session-history
+ /// report).
+    nonisolated static func firstWindowTurnWindow(messages: Int) -> TurnWindow {
+        TurnWindow(minMessages: max(1, min(8, messages)), minTurns: turnWindowMinTurns)
+    }
+
+ /// Background fill window (40 messages): stop at a turn start once 32 messages
+ /// and 8 turns are covered, otherwise the 40-message cap wins.
+    nonisolated static func fillWindowTurnWindow(messages: Int) -> TurnWindow {
+        TurnWindow(minMessages: max(1, min(messages - 8, messages)), minTurns: turnWindowMinTurns)
+    }
+
+ /// Older-history page step: 40 user/assistant messages (schema allows 40–60; a
+ /// page is *all* events in the seq range, so 40 messages ≈ 350–400 events /
+ /// 0.8–1.2MB on the measured long sessions — the same order as the legacy
+ /// 40-message fill, just fetched on demand while scrolling up).
+    static let pageWindowMessages = 40
+
+ /// Page turn stop: ≥32 messages + ≥8 turns, otherwise `maxMessages` wins.
+    nonisolated static var pageTurnWindow: TurnWindow {
+        TurnWindow(minMessages: 32, minTurns: turnWindowMinTurns)
+    }
+
  /// Screen-height adaptive first window: small phones 12, standard 16,
  /// large (Pro Max class) 20.
     nonisolated static func firstWindowMessages(screenHeight: CGFloat) -> Int {
@@ -91,6 +142,22 @@ struct SessionWindowCachePayload: Codable, Equatable {
  /// the legacy path (which keeps its old behaviour).
     var p1Epoch: String?
     var p1Sid: Int64?
+
+ // MARK: - v3 (task session-history): loaded older range
+
+ /// Raw `event` objects **older than** `snapshot`'s first record, ascending by
+ /// seq (the front of the loaded window, filled by `session/page`). A cold open
+ /// replays them so the user's loaded history is still there instead of
+ /// regressing to the newest message window.
+    var olderEvents: [JSONValue]?
+ /// Oldest event seq this payload can restore (= `olderEvents.first` seq, or the
+ /// snapshot's first record when no older range is persisted). Evidence field:
+ /// restoring derives the same value from the replayed records.
+    var oldestSeq: Int?
+ /// `session/page` `hasMore` at save time: true = the Host still has events
+ /// before `oldestSeq` (the user can keep scrolling up). Nil on v2 payloads,
+ /// which are interpreted from the legacy `hasMore` field instead.
+    var hasMoreOlder: Bool?
 }
 
 /// One file per session (`window-<stable-hash>.json`) inside the cache directory.
@@ -98,6 +165,17 @@ final class SessionWindowCacheStore {
  /// Very long tool outputs can make a wide snapshot multi-MB; caching that
  /// would slow the next open instead of speeding it up.
     static let maxPayloadBytes = 4 * 1024 * 1024
+
+ /// Window payload schema. **v3** (task session-history) adds the loaded older
+ /// range (`olderEvents` / `oldestSeq` / `hasMoreOlder`). v2 payloads stay
+ /// readable: they mean "the legacy 40-message window", i.e.
+ /// `oldestSeq = earliest record` and `hasMoreOlder = legacy hasMore`
+ /// (interpreted by `SessionViewModel.restoreCachedWindow`). The shared
+ /// `CacheSchema.version` is deliberately untouched: the session-list payloads
+ /// have their own schema and must not be invalidated by this change.
+    static let schemaVersion = 3
+ /// Versions `load` accepts (v2 = legacy 40-message window, upgraded in memory).
+    static let readableSchemaVersions: Set<Int> = [2, 3]
 
     struct Loaded {
         var payload: SessionWindowCachePayload
@@ -145,7 +223,8 @@ final class SessionWindowCacheStore {
             CacheIO.remove(url, fileManager: fileManager)
             return nil
         }
-        guard payload.schemaVersion == CacheSchema.version, payload.sessionId == sessionId else {
+        guard Self.readableSchemaVersions.contains(payload.schemaVersion),
+              payload.sessionId == sessionId else {
             CacheIO.remove(url, fileManager: fileManager)
             return nil
         }
@@ -165,11 +244,14 @@ final class SessionWindowCacheStore {
         windowMessages: Int? = nil,
         hasMore: Bool? = nil,
         p1Epoch: String? = nil,
-        p1Sid: Int64? = nil
+        p1Sid: Int64? = nil,
+        olderEvents: [JSONValue] = [],
+        oldestSeq: Int? = nil,
+        hasMoreOlder: Bool? = nil
     ) -> Bool {
         guard let identity = identity() else { return false }
-        let payload = SessionWindowCachePayload(
-            schemaVersion: CacheSchema.version,
+        var payload = SessionWindowCachePayload(
+            schemaVersion: Self.schemaVersion,
             savedAt: now(),
             identity: identity,
             sessionId: sessionId,
@@ -178,9 +260,27 @@ final class SessionWindowCacheStore {
             windowMessages: windowMessages,
             hasMore: hasMore,
             p1Epoch: p1Epoch,
-            p1Sid: p1Sid
+            p1Sid: p1Sid,
+            olderEvents: olderEvents.isEmpty ? nil : olderEvents,
+            oldestSeq: oldestSeq,
+            hasMoreOlder: hasMoreOlder
         )
-        guard let data = CacheIO.encode(payload), data.count <= Self.maxPayloadBytes else { return false }
+        guard var data = CacheIO.encode(payload) else { return false }
+ // A long session can accumulate more loaded older history than the cold-start
+ // budget. Persisting *some* of it beats failing the whole write (a cold start
+ // without any window cache is a much worse regression): drop the oldest older
+ // events until the payload fits, and report `hasMoreOlder = true` so
+ // scrolling up refetches the dropped prefix from the Host.
+        while data.count > Self.maxPayloadBytes,
+              let older = payload.olderEvents, !older.isEmpty {
+            let keep = older.count / 2
+            payload.olderEvents = keep > 0 ? Array(older.suffix(keep)) : nil
+            payload.oldestSeq = nil
+            payload.hasMoreOlder = true
+            guard let encoded = CacheIO.encode(payload) else { return false }
+            data = encoded
+        }
+        guard data.count <= Self.maxPayloadBytes else { return false }
         let url = fileURL(for: sessionId)
         guard CacheIO.writeDataAtomically(data, to: url, fileManager: fileManager) else { return false }
         pruneExpiredFiles(keeping: url)

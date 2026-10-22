@@ -91,6 +91,20 @@ final class SessionViewModel: ObservableObject {
     @Published private(set) var isShowingCachedWindow = false
  /// M2b-2: the restored window is older than the 24h display TTL (still shown).
     @Published private(set) var cachedWindowIsStale = false
+
+ // MARK: - Older history pagination (task session-history: view contract)
+
+ /// The Host still has events older than `oldestLoadedSeq`: the follow snapshot's
+ /// `hasMore` on open (a long session starts at `true`), then the last
+ /// `session/page` `hasMore`. The view calls `loadOlderIfNeeded()` when the
+ /// scroll approaches the top; `false` means the first event is loaded.
+    @Published private(set) var hasMoreOlder: Bool = false
+ /// One `session/page` round trip is in flight. Repeated scroll callbacks are
+ /// no-ops while this is true (concurrent requests are deduplicated).
+    @Published private(set) var isLoadingOlder: Bool = false
+ /// Oldest event seq currently loaded (front of the window), read-only view
+ /// contract: the detail can anchor/verify the scroll position against it.
+    var oldestLoadedSeq: Int? { journal.oldestSeq }
  /// M2b-2: cache read + journal replay + first row rebuild inside `init`, in ms.
         private(set) var cacheLoadMilliseconds: Double = 0
     private let windowCache: SessionWindowCacheStore
@@ -116,6 +130,31 @@ final class SessionViewModel: ObservableObject {
  /// Bound the persisted tail; when full, later events are no longer appended —
  /// the cached window stays contiguous (and therefore replayable), just older.
     private static let maxCachedEvents = 200
+
+ // MARK: - Older history pagination state (task session-history)
+
+ /// Raw `event` objects of the loaded older range (front of the snapshot window,
+ /// filled by `session/page`), ascending by seq. Persisted so a cold open replays
+ /// the loaded history instead of regressing to the phone-sized window.
+    private var cachedOlderEventFrames: [JSONValue] = []
+ /// Serialized size per seq of `cachedOlderEventFrames` (kept incrementally so
+ /// the budget check never re-encodes the whole history).
+    private var cachedOlderFrameBytes: [Int: Int] = [:]
+    private var cachedOlderFramesBytes: Int = 0
+ /// Older frames were dropped to stay within the cache budget: the persisted
+ /// window then reports `hasMoreOlder = true` so the prefix can be refetched.
+    private var cachedOlderFramesTruncated = false
+ /// Budget for the raw older range inside the window cache (~1.5MB keeps the
+ /// cold-start payload/parse cost near the existing 4MB design cap while still
+ /// restoring hundreds of events, not 40 messages).
+    private static let maxCachedOlderBytes = 1_500_000
+ /// Unary `session/page` seam (unit tests have no socket). Production leaves nil
+ /// and the loader rides `LinkService.unary("session/page", args:)`.
+    var olderPageLoader: (([String: JSONValue]) async throws -> JSONValue)?
+    private var olderPageTask: Task<Void, Never>?
+ /// True while `actionErrorText` is the paging failure; a later success clears it
+ /// once (other action errors are left alone).
+    private var olderPageErrorShown = false
  /// M2b-2c: in-app detail timing (`firstFrameMs=..;cacheHit=1;networkMs=..`),
  /// E2E-gated; surfaced through the hidden `detail-metrics` element.
     @Published private(set) var detailMetricsValue: String?
@@ -267,6 +306,17 @@ final class SessionViewModel: ObservableObject {
             let frame = try SessionStreamFrame.decode(cached.payload.snapshot)
             guard case .snapshot(let snapshot) = frame else { return }
             journal.apply(snapshot: snapshot)
+ // v3: replay the loaded older range *before* the live tail, so the
+ // restored window is [oldestLoadedSeq, cursor] instead of only the
+ // newest message window (cold start must not regress to 40 messages).
+            let olderFrames = cached.payload.olderEvents ?? []
+            if !olderFrames.isEmpty {
+                let olderEvents = olderFrames.compactMap { try? $0.decode(SessionEvent.self) }
+                journal.prepend(
+                    events: olderEvents,
+                    hasMoreOlder: cached.payload.hasMoreOlder ?? true
+                )
+            }
             for eventValue in cached.payload.events {
                 let event = try eventValue.decode(SessionEvent.self)
                 if case .gap = journal.apply(event: event) {
@@ -276,16 +326,31 @@ final class SessionViewModel: ObservableObject {
                     return
                 }
             }
+            if cached.payload.schemaVersion >= SessionWindowCacheStore.schemaVersion {
+                journal.setHasMoreOlder(cached.payload.hasMoreOlder ?? journal.hasMore)
+            } else {
+ // Legacy v2 payload = the old 40-message window: no older range was
+ // persisted, so `oldestSeq` is the earliest cached record and
+ // `hasMoreOlder` is the old `hasMore` (snapshot hasMore fallback).
+                journal.setHasMoreOlder(cached.payload.hasMore ?? journal.hasMore)
+            }
             cachedSnapshotFrame = cached.payload.snapshot
             cachedEventFrames = cached.payload.events
+            cachedOlderEventFrames = olderFrames
+            rebuildCachedOlderFrameBytes()
             didRestoreWindowFromCache = true
             isShowingCachedWindow = true
             cachedWindowIsStale = cached.isStale
             isLoading = false
+            hasMoreOlder = journal.hasMoreOlder
             rebuildRows()
             contextPressure = journal.contextPressure
         } catch {
             journal = SessionJournal()
+            cachedOlderEventFrames = []
+            cachedOlderFrameBytes = [:]
+            cachedOlderFramesBytes = 0
+            cachedOlderFramesTruncated = false
         }
     }
 
@@ -330,6 +395,12 @@ final class SessionViewModel: ObservableObject {
  // on the legacy path). Reserved for the Net/ stream-resume change; recording
  // it now keeps the cache evidence complete without changing behaviour.
         let channel = link?.p1Channel
+ // v3: persist the loaded older range too. The recovered oldest seq is
+ // `olderEvents.first` (or the snapshot window's first record when the user
+ // has not scrolled up yet); if the raw range had to be trimmed the payload
+ // keeps `hasMoreOlder = true` so scrolling up refetches the dropped prefix.
+        let restoredOldest = cachedOlderEventFrames.first.flatMap(Self.eventFrameSeq)
+            ?? Self.snapshotOldestSeq(in: snapshot)
         windowCache.save(
             sessionId: sessionId,
             snapshot: snapshot,
@@ -337,7 +408,10 @@ final class SessionViewModel: ObservableObject {
             windowMessages: hasFullWindow ? fillWindowMessages : firstWindowMessages,
             hasMore: journal.hasMore,
             p1Epoch: channel?.epoch,
-            p1Sid: channel?.lastAppliedSid
+            p1Sid: channel?.lastAppliedSid,
+            olderEvents: cachedOlderEventFrames,
+            oldestSeq: restoredOldest,
+            hasMoreOlder: journal.hasMoreOlder || cachedOlderFramesTruncated
         )
     }
 
@@ -405,6 +479,9 @@ final class SessionViewModel: ObservableObject {
         restartTask?.cancel()
         rebuildTask?.cancel()
         subagentDebounceTask?.cancel()
+        olderPageTask?.cancel()
+        olderPageTask = nil
+        isLoadingOlder = false
         fillTask?.cancel()
         fillTask = nil
         fillStream?.cancel()
@@ -485,6 +562,9 @@ final class SessionViewModel: ObservableObject {
         }
         isLoading = sections.isEmpty
         do {
+            let turnWindow = messages >= fillWindowMessages
+                ? SessionWindowPolicy.fillWindowTurnWindow(messages: messages)
+                : SessionWindowPolicy.firstWindowTurnWindow(messages: messages)
             let args: [String: JSONValue] = [
                 "request": .object([
                     "address": address.jsonValue,
@@ -492,6 +572,11 @@ final class SessionViewModel: ObservableObject {
  // P1.5-B: phone-sized window on a cold open; older history is
  // filled in the background (see scheduleBackgroundFillIfNeeded).
                     "maxMessages": .int(Int64(messages)),
+ // Task session-history: stop the window at a complete-turn
+ // boundary when the message budget allows it (the Host never
+ // returns more messages than `maxMessages`, so the first paint
+ // cost is unchanged).
+                    "turnWindow": turnWindow.jsonValue,
                 ]),
             ]
             stream = try link.openStream(
@@ -555,6 +640,12 @@ final class SessionViewModel: ObservableObject {
                         "address": address.jsonValue,
                         "assistantStream": .bool(true),
                         "maxMessages": .int(Int64(fillWindowMessages)),
+ // Same turn-stop contract as the first window: the fill is
+ // the legacy 40-message window, aligned to a turn start when
+ // 32 messages + 8 turns are already covered.
+                        "turnWindow": SessionWindowPolicy.fillWindowTurnWindow(
+                            messages: fillWindowMessages
+                        ).jsonValue,
                     ])
                 ],
                 onItem: { [weak self] value in
@@ -598,6 +689,221 @@ final class SessionViewModel: ObservableObject {
         rebuildRows()
     }
 
+ // MARK: - Older history pagination (unary session/page)
+
+ /// `session/page` wire request. Key names and shape are the Host schema exactly
+ /// (`spikes/protocol/samples/endpoints.json` → `session/page`, verified
+ /// ): `{request:{address, throughSeq, beforeSeq, maxMessages,
+ /// turnWindow}}`.
+ ///
+ /// `throughSeq` is the inclusive log cut taken from the corresponding
+ /// `session/follow` opening frame (`snapshot.cursor`); `beforeSeq` is
+ /// **exclusive** (Host: `end = min(throughSeq + 1, beforeSeq?? throughSeq + 1)`),
+ /// so the next request passes the current oldest loaded seq and walks strictly
+ /// backwards. `maxMessages` counts only append-origin user/assistant messages —
+ /// a page still contains *all* events of its seq range (tool calls, turn
+ /// starts,...), which is what the journal front-merge consumes.
+    nonisolated static func olderPageRequestArgs(
+        address: SessionFollowAddress,
+        throughSeq: Int,
+        beforeSeq: Int
+    ) -> [String: JSONValue] {
+        [
+            "request": .object([
+                "address": address.jsonValue,
+                "throughSeq": .int(Int64(throughSeq)),
+                "beforeSeq": .int(Int64(beforeSeq)),
+                "maxMessages": .int(Int64(SessionWindowPolicy.pageWindowMessages)),
+                "turnWindow": SessionWindowPolicy.pageTurnWindow.jsonValue,
+            ]),
+        ]
+    }
+
+ /// View contract: called whenever the scroll approaches the top (may be called
+ /// repeatedly and at high frequency). No-op when there is no older history, a
+ /// request is already in flight, no snapshot/cursor exists yet, or the link is
+ /// offline — the next scroll callback simply retries.
+    func loadOlderIfNeeded() {
+        guard canStartOlderPageLoad else { return }
+        isLoadingOlder = true
+        let throughSeq = journal.cursor
+        let beforeSeq = journal.oldestSeq ?? 0
+        olderPageTask = Task { [weak self] in
+            await self?.performOlderPageLoad(throughSeq: throughSeq, beforeSeq: beforeSeq)
+        }
+    }
+
+ /// Test seam: runs one page load and awaits it. The view path runs the same
+ /// `performOlderPageLoad` from a Task; unit tests drive the state machine
+ /// deterministically through this wrapper.
+    func loadOlderPageNowForTesting() async {
+        guard canStartOlderPageLoad else { return }
+        isLoadingOlder = true
+        await performOlderPageLoad(throughSeq: journal.cursor, beforeSeq: journal.oldestSeq ?? 0)
+    }
+
+    private var canStartOlderPageLoad: Bool {
+        guard hasMoreOlder, !isLoadingOlder else { return false }
+        guard journal.cursor >= 0, journal.oldestSeq != nil else { return false }
+        return olderPageLoader != nil || (link?.phase.isConnected ?? false)
+    }
+
+ /// One `session/page` round trip + front merge.
+ ///
+ /// Failure policy: the current window is left untouched and `hasMoreOlder`
+ /// stays true (retry allowed); the message goes through the existing
+ /// `actionErrorText` surface — no alert, no window reset.
+    private func performOlderPageLoad(throughSeq: Int, beforeSeq: Int) async {
+        defer { isLoadingOlder = false }
+        let args = Self.olderPageRequestArgs(
+            address: address,
+            throughSeq: throughSeq,
+            beforeSeq: beforeSeq
+        )
+        do {
+            let value: JSONValue
+            if let olderPageLoader {
+                value = try await olderPageLoader(args)
+            } else if let link {
+                value = try await link.unary("session/page", args: args)
+            } else {
+                throw LinkError.notPaired
+            }
+            let page = try value.decode(SessionPage.self)
+            let rawFrames = value["records"]?.arrayValue?.compactMap { $0["event"] } ?? []
+            let update = journal.prepend(page: page)
+            applyJournalUpdate(update)
+            if case .olderPrepended(let inserted) = update, !inserted.isEmpty {
+                let insertedSet = Set(inserted)
+                let addedFrames = rawFrames.filter { frame in
+                    guard let seq = Self.eventFrameSeq(frame) else { return false }
+                    return insertedSet.contains(seq)
+                }
+                appendCachedOlderFrames(addedFrames)
+                scheduleCacheSave()
+            }
+            hasMoreOlder = journal.hasMoreOlder
+            if olderPageErrorShown {
+                actionErrorText = nil
+                olderPageErrorShown = false
+            }
+        } catch {
+            actionErrorText = L10n.f(
+                "加载更早历史失败：%@",
+                NetworkErrorInterpreter.message(for: error)
+            )
+            olderPageErrorShown = true
+        }
+    }
+
+ // MARK: - Raw older-range tracking (window cache)
+
+ /// Mirrors the journal's snapshot merge for the raw frames kept for the cache:
+ /// after `apply(snapshot:)` the loaded older prefix is exactly those previous
+ /// raw frames whose seq is still in the journal *and* older than the new
+ /// snapshot window.
+    private func refreshCachedOlderFrames(
+        previousSnapshotFrame: JSONValue?,
+        newSnapshotOldest: Int?
+    ) {
+        let previousSnapshotEvents = previousSnapshotFrame?["records"]?.arrayValue?
+            .compactMap { $0["event"] } ?? []
+        let candidates = cachedOlderEventFrames + previousSnapshotEvents + cachedEventFrames
+        let preserved = Set(journal.events.lazy.map(\.seq))
+        var kept: [JSONValue] = []
+        for frame in candidates {
+            guard let seq = Self.eventFrameSeq(frame) else { continue }
+            if let newSnapshotOldest, seq >= newSnapshotOldest { continue }
+            guard preserved.contains(seq) else { continue }
+            kept.append(frame)
+        }
+        cachedOlderEventFrames = Self.mergedEventFrames(kept)
+        rebuildCachedOlderFrameBytes()
+    }
+
+ /// Adds newly paged raw frames to the front of the cache range, keeping the
+ /// serialized budget. Dropped frames are refetched by scrolling up because the
+ /// saved payload then reports `hasMoreOlder = true`.
+    private func appendCachedOlderFrames(_ frames: [JSONValue]) {
+        guard !frames.isEmpty else { return }
+        cachedOlderEventFrames = Self.mergedEventFrames(cachedOlderEventFrames + frames)
+        for frame in frames {
+            guard let seq = Self.eventFrameSeq(frame),
+                  cachedOlderFrameBytes[seq] == nil else { continue }
+            let bytes = Self.serializedBytes(frame)
+            cachedOlderFrameBytes[seq] = bytes
+            cachedOlderFramesBytes += bytes
+        }
+ // Re-align the size table with the merged (de-duplicated) frame list.
+        if cachedOlderFrameBytes.count != cachedOlderEventFrames.count {
+            let kept = Set(cachedOlderEventFrames.compactMap { Self.eventFrameSeq($0) })
+            cachedOlderFrameBytes = cachedOlderFrameBytes.filter { kept.contains($0.key) }
+            cachedOlderFramesBytes = cachedOlderFrameBytes.values.reduce(0, +)
+        }
+        var dropped = 0
+        while cachedOlderFramesBytes > Self.maxCachedOlderBytes,
+              let oldest = cachedOlderEventFrames.first,
+              let seq = Self.eventFrameSeq(oldest) {
+            cachedOlderEventFrames.removeFirst()
+            if let bytes = cachedOlderFrameBytes.removeValue(forKey: seq) {
+                cachedOlderFramesBytes -= bytes
+            }
+            dropped += 1
+        }
+        if dropped > 0 {
+            cachedOlderFramesTruncated = true
+        }
+    }
+
+    private func rebuildCachedOlderFrameBytes() {
+        var sizes: [Int: Int] = [:]
+        var total = 0
+        for frame in cachedOlderEventFrames {
+            guard let seq = Self.eventFrameSeq(frame) else { continue }
+            let bytes = Self.serializedBytes(frame)
+            sizes[seq] = bytes
+            total += bytes
+        }
+        cachedOlderFrameBytes = sizes
+        cachedOlderFramesBytes = total
+    }
+
+ /// Sorted, seq-de-duplicated raw `event` objects.
+    private static func mergedEventFrames(_ frames: [JSONValue]) -> [JSONValue] {
+        var bySeq: [Int: JSONValue] = [:]
+        for frame in frames {
+            guard let seq = eventFrameSeq(frame), bySeq[seq] == nil else { continue }
+            bySeq[seq] = frame
+        }
+        return bySeq.keys.sorted().compactMap { bySeq[$0] }
+    }
+
+ /// `seq` of a raw `event` object (the `event` field of an `{"type":"event"}`
+ /// frame / `session/page` record).
+    private static func eventFrameSeq(_ frame: JSONValue) -> Int? {
+        guard let raw = frame["seq"]?.intValue else { return nil }
+        let seq = Int(raw)
+        return seq >= 0 ? seq : nil
+    }
+
+ /// Oldest record seq of a raw `{"type":"snapshot",...}` frame.
+    private static func snapshotOldestSeq(in snapshot: JSONValue) -> Int? {
+        guard let records = snapshot["records"]?.arrayValue else { return nil }
+        var oldest: Int?
+        for record in records {
+            guard let eventValue = record["event"],
+                  let seq = eventFrameSeq(eventValue) else { continue }
+            if oldest == nil || seq < oldest! {
+                oldest = seq
+            }
+        }
+        return oldest
+    }
+
+    private static func serializedBytes(_ value: JSONValue) -> Int {
+        (try? JSONEncoder().encode(value))?.count ?? 0
+    }
+
  // MARK: - Frame handling
 
     private func handleItem(_ value: JSONValue?, isFill: Bool = false) {
@@ -607,6 +913,8 @@ final class SessionViewModel: ObservableObject {
             let frame = try SessionStreamFrame.decode(value)
             switch frame {
             case .snapshot(let snapshot):
+                let previousSnapshotFrame = cachedSnapshotFrame
+                let newSnapshotOldest = Self.snapshotOldestSeq(in: value)
                 let update = journal.apply(snapshot: snapshot)
                 applyJournalUpdate(update)
  // v5.5 §14.5 first frame: seed the context window from the
@@ -614,10 +922,17 @@ final class SessionViewModel: ObservableObject {
                 contextPressure = journal.contextPressure
                 isLoading = false
                 streamErrorText = nil
- // M2b-2: the live snapshot supersedes the cached window; keep the
- // raw frame and reset the event tail for the next cache write.
+ // Task session-history: the snapshot replaces only the newest part
+ // of the window; the journal keeps the loaded older prefix. Mirror
+ // that in the raw frames kept for the cache write, then adopt the
+ // new snapshot frame / reset the live tail (M2b-2).
+                refreshCachedOlderFrames(
+                    previousSnapshotFrame: previousSnapshotFrame,
+                    newSnapshotOldest: newSnapshotOldest
+                )
                 cachedSnapshotFrame = value
                 cachedEventFrames = []
+                hasMoreOlder = journal.hasMoreOlder
                 hasLiveSnapshot = true
                 isShowingCachedWindow = false
                 cachedWindowIsStale = false
@@ -683,6 +998,15 @@ final class SessionViewModel: ObservableObject {
         case .eventsApplied:
             pendingRebuild = true
             scheduleRebuild()
+        case .olderPrepended(let seqs):
+ // Front merge: the rows above the current position changed, the newest
+ // end did not. An empty result (defensive) has nothing to re-render.
+            if seqs.isEmpty {
+                liveAssistantText = journal.liveAssistantText
+            } else {
+                pendingRebuild = true
+                scheduleRebuild()
+            }
         case .duplicate, .ignored, .assistantStreamProgress:
             liveAssistantText = journal.liveAssistantText
         case .gap, .assistantRevisionGap:
@@ -707,6 +1031,7 @@ final class SessionViewModel: ObservableObject {
 
     private func rebuildRows() {
         sections = SessionRowBuilder.build(events: journal.events)
+        hasMoreOlder = journal.hasMoreOlder
         title = journal.title
         permissionsValue = journal.permissionsValue
         todos = journal.todos

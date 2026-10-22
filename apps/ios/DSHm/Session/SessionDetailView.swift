@@ -30,6 +30,16 @@ struct SessionDetailView: View {
     @State private var questionErrorCallId: String?
     @State private var answeredQuestionCallId: String?
     @State private var answeredQuestionNote: String?
+ /// 问题三（滚动定位）：粘底语义——只有用户停在底部附近时才自动跟随新内容，
+ /// 上滑阅读历史时绝不被强制拉回底部（交接文档 §7.4 第 2 条）。
+    @State private var isNearBottom = true
+ /// 问题三：首屏锚底只做一次。本页初始内容是 loading 占位，消息是异步上来的，
+ /// 而 `.defaultScrollAnchor(.bottom)` 只作用于初始内容，所以第一批 sections
+ /// 落地后必须补一次无动画锚底（交接文档 §7.3 H1）。
+    @State private var didAnchorInitialScreen = false
+ /// 问题三 + 问题一：向上加载更早历史时的视觉锚点（旧的首条 section id）。
+ /// 前置插入会让可见内容整体下移，加载完成后用它把旧视口重新钉回顶部。
+    @State private var pendingPrependAnchorID: String?
 
     init(address: SessionFollowAddress, subagentContext: SubagentSessionContext? = nil) {
         self.address = address
@@ -618,6 +628,9 @@ struct SessionDetailView: View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: Theme.Spacing.s) {
+                    if viewModel.hasMoreOlder || viewModel.isLoadingOlder {
+                        loadOlderRow
+                    }
                     if viewModel.isLoading {
                         HStack(spacing: Theme.Spacing.xs) {
                             ProgressView().tint(Theme.Palette.accent)
@@ -668,24 +681,140 @@ struct SessionDetailView: View {
                         InlineErrorView(message: actionError)
                     }
 
-                    Color.clear
-                        .frame(height: 1)
-                        .id("bottom")
+                    bottomSentinel
                 }
                 .padding(.horizontal, Theme.Spacing.pageInset)
                 .padding(.vertical, Theme.Spacing.s)
+            }
+ // 问题三 H1：首帧锚底。iOS 17+ 原生能力；初始内容即缓存窗口时这是唯一生效点。
+            .defaultScrollAnchor(.bottom)
+ // 问题三 H1：内容已在首帧前就绪（缓存窗口/历史窗口）时，
+ // `.defaultScrollAnchor(.bottom)` 之外的这次补锚是唯一机会——onChange 不会触发。
+            .onAppear {
+                guard !viewModel.sections.isEmpty else { return }
+                didAnchorInitialScreen = true
+                isNearBottom = true
+                scrollToBottom(proxy: proxy)
+            }
+ // 粘底判定：iOS 18+ 用 ScrollGeometry 精确算距离；iOS 17 退化看底部锚点可见性。
+            .modifier(StickToBottomObserver(isNearBottom: $isNearBottom))
+ // 问题一对接：滑到接近顶部自动加载更早历史（问题一的分页状态机由 SessionViewModel 提供）。
+            .modifier(NearTopObserver(onNearTop: triggerLoadOlder))
+            .onChange(of: viewModel.isLoadingOlder) { _, loading in
+                if !loading { restorePrependAnchor(proxy: proxy) }
             }
             .onChange(of: viewModel.sections) { _ in
  // Keep the newest activity visible; LazyVStack off-screen rows are
  // not in the accessibility tree, so this also keeps the live tool
  // row reachable for UI automation.
-                withAnimation(Theme.Motion.quick) {
-                    proxy.scrollTo("bottom", anchor: .bottom)
-                }
+ // 问题三 H2/H3：只在贴底时跟随，且等布局提交后再滚、不加动画
+ // （动画会把 turn 结束时的高度突变放大成"跳飞"）。
+                applySectionChange(proxy: proxy)
             }
             .onChange(of: viewModel.liveAssistantText) { _ in
-                proxy.scrollTo("bottom", anchor: .bottom)
+                followLiveText(proxy: proxy)
             }
+ // 问题三：ScrollView 的兄弟视图会改变视口高度（缓存横幅插在列表上方、
+ // 底部问答提示插在列表下方），高度一变底部就会被裁掉，所以贴底时重锚一次。
+            .onChange(of: viewModel.isShowingCachedWindow) { _ in
+                rescrollIfNeeded(proxy: proxy)
+            }
+            .onChange(of: answeredQuestionCallId) { _ in
+                rescrollIfNeeded(proxy: proxy)
+            }
+        }
+    }
+
+ // MARK: - 问题三：滚动锚定（首帧锚底 / 粘底 / 布局突变重锚）
+
+    private static let bottomAnchorID = "bottom"
+
+ /// 底部锚点：滚动目标 + iOS 17 上"是否接近底部"的退化探测点。
+    private var bottomSentinel: some View {
+        Color.clear
+            .frame(height: 1)
+            .id(Self.bottomAnchorID)
+            .modifier(BottomSentinelFallback(isNearBottom: $isNearBottom))
+    }
+
+ /// 首次拿到非空消息：无条件锚到底（需求"打开即停在最后一条消息底部"）。
+ /// 之后只在用户贴底时跟随。
+    private func applySectionChange(proxy: ScrollViewProxy) {
+        guard !viewModel.sections.isEmpty else { return }
+        if !didAnchorInitialScreen {
+            didAnchorInitialScreen = true
+            isNearBottom = true
+            scrollToBottom(proxy: proxy)
+            return
+        }
+        guard isNearBottom else { return }
+        scrollToBottom(proxy: proxy)
+    }
+
+ /// 流式增量文本：只在贴底时跟随，用户上滑阅读时保持原位。
+    private func followLiveText(proxy: ScrollViewProxy) {
+        guard didAnchorInitialScreen, isNearBottom else { return }
+        scrollToBottom(proxy: proxy)
+    }
+
+ /// 视口高度因兄弟视图插入/移除而变化时，贴底状态下重新锚底。
+    private func rescrollIfNeeded(proxy: ScrollViewProxy) {
+        guard didAnchorInitialScreen, isNearBottom else { return }
+        scrollToBottom(proxy: proxy)
+    }
+
+ /// H5：等布局提交后再滚，避免目标在 LazyVStack 里尚未实体化时 `scrollTo` 静默失效；
+ /// 自动跟随一律不加动画（H2：动画会把高度突变放大成跳变）。
+    private func scrollToBottom(proxy: ScrollViewProxy) {
+        Task { @MainActor in
+            await Task.yield()
+            proxy.scrollTo(Self.bottomAnchorID, anchor: .bottom)
+        }
+    }
+
+ /// 顶部"加载更早"兜底入口：自动触发失败时可手动重试；加载中显示菊花。
+    private var loadOlderRow: some View {
+        HStack(spacing: Theme.Spacing.xs) {
+            Spacer(minLength: 0)
+            if viewModel.isLoadingOlder {
+                ProgressView().tint(Theme.Palette.accent)
+                Text("正在加载更早的消息…")
+                    .font(Theme.Typography.caption)
+                    .foregroundStyle(Theme.Palette.textTertiary)
+            } else {
+                Button {
+                    viewModel.loadOlderIfNeeded()
+                } label: {
+                    Text("加载更早的消息")
+                        .font(Theme.Typography.caption)
+                        .foregroundStyle(Theme.Palette.textSecondary)
+                }
+                .buttonStyle(.plain)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.vertical, Theme.Spacing.xs)
+        .accessibilityIdentifier("session-load-older")
+ // iOS 17 退化触发点：这一行被实体化说明用户已滑到顶部附近。
+        .modifier(TopRowTrigger(onAppear: triggerLoadOlder))
+    }
+
+ /// 滑近顶部自动加载更早历史；到底/并发由 ViewModel 的 loadOlderIfNeeded 去重。
+    private func triggerLoadOlder() {
+        guard viewModel.hasMoreOlder, !viewModel.isLoadingOlder else { return }
+        if pendingPrependAnchorID == nil {
+            pendingPrependAnchorID = viewModel.sections.first?.id
+        }
+        viewModel.loadOlderIfNeeded()
+    }
+
+ /// 前置插入完成后，把旧的视口首条重新钉回顶部，避免用户"读着读着被推下去"。
+    private func restorePrependAnchor(proxy: ScrollViewProxy) {
+        guard let anchor = pendingPrependAnchorID else { return }
+        pendingPrependAnchorID = nil
+        Task { @MainActor in
+            await Task.yield()
+            proxy.scrollTo(anchor, anchor: .top)
         }
     }
 
@@ -1076,6 +1205,78 @@ enum SessionDetailSheet: Identifiable {
         case .permission: return "permission"
         case .subagentList: return "subagent-list"
         case .modelSelection: return "model-selection"
+        }
+    }
+}
+
+/// 问题三：粘底判定。iOS 18+ 用 ScrollGeometry 精确计算"距底距离"，
+/// 用户在底部附近（阈值内）才恢复自动跟随；上滑阅读时保持不动。
+private struct StickToBottomObserver: ViewModifier {
+    @Binding var isNearBottom: Bool
+ /// 距底阈值：约一屏的 1/5，覆盖"用户只是轻轻上推一下"仍在底部的语义。
+    private static let threshold: CGFloat = 140
+
+    func body(content: Content) -> some View {
+        if #available(iOS 18.0, *) {
+            content.onScrollGeometryChange(for: Bool.self) { geometry in
+                let distance = geometry.contentSize.height
+                    - geometry.contentOffset.y
+                    - geometry.containerSize.height
+                return distance <= Self.threshold
+            } action: { _, near in
+                isNearBottom = near
+            }
+        } else {
+            content
+        }
+    }
+}
+
+/// 问题一/问题三：滑近顶部时触发"加载更早"。iOS 18+ 用 ScrollGeometry 精确判定，
+/// iOS 17 由顶部加载行是否实体化兜底（TopRowTrigger）。
+private struct NearTopObserver: ViewModifier {
+    let onNearTop: () -> Void
+ /// 触发阈值：贴顶 80pt 内就预取，用户几乎感觉不到等待。
+    private static let threshold: CGFloat = 80
+
+    func body(content: Content) -> some View {
+        if #available(iOS 18.0, *) {
+            content.onScrollGeometryChange(for: Bool.self) { geometry in
+                geometry.contentOffset.y <= Self.threshold
+            } action: { wasNearTop, nearTop in
+                if nearTop, !wasNearTop { onNearTop() }
+            }
+        } else {
+            content
+        }
+    }
+}
+
+/// iOS 17 退化：顶部加载行进入视图树即视为"用户已接近顶部"。
+private struct TopRowTrigger: ViewModifier {
+    let onAppear: () -> Void
+
+    func body(content: Content) -> some View {
+        if #available(iOS 18.0, *) {
+            content
+        } else {
+            content.onAppear(perform: onAppear)
+        }
+    }
+}
+
+/// iOS 17 退化路径：LazyVStack 只有接近视口才实体化底部锚点，
+/// 因此"锚点在视图树上"≈"用户离底部不超过约一屏"。
+private struct BottomSentinelFallback: ViewModifier {
+    @Binding var isNearBottom: Bool
+
+    func body(content: Content) -> some View {
+        if #available(iOS 18.0, *) {
+            content
+        } else {
+            content
+                .onAppear { isNearBottom = true }
+                .onDisappear { isNearBottom = false }
         }
     }
 }
