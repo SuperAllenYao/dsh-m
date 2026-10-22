@@ -117,7 +117,9 @@ final class SessionViewModel: ObservableObject {
     private var cachedSnapshotFrame: JSONValue?
     private var cachedEventFrames: [JSONValue] = []
     private var cacheSaveTask: Task<Void, Never>?
-    private var hasLiveSnapshot = false
+    /// 打开阶段的锚底信号：缓存窗口先上屏、live 快照后到；视图在它为 true 之前
+    /// 必须无条件贴底（冷启动/通知深链进入时"停在旧消息"的根因）。
+    @Published private(set) var hasLiveSnapshot = false
     /// P1.5-B background fill: the delayed task + the second `session/follow`
     /// stream that requeststhe legacy 40-message window. When its snapshot lands it
     /// replaces the small window and becomes the live stream.
@@ -188,6 +190,10 @@ final class SessionViewModel: ObservableObject {
     private var pendingRebuild = false
     /// Last `isRunning` value used for the v5.4 queue flush (turn/end transition).
     private var lastKnownRunning = false
+    /// 问题三 H3：turn 结束后保持展开的 turn id（对齐桌面端 ui-chat.collapseTiming:
+    /// next-input）——turn 一结束就折叠成一行摘要会让视口上方高度骤减，内容"向上跳飞"。
+    /// 只记住自动展开的那一轮：用户手动折叠后不再自动展开。
+    private var stickyExpandedTurnID: String?
     /// v5.4 task-13: debounced `session/list` refresh after relay/turn activity.
     private var subagentDebounceTask: Task<Void, Never>?
     private var lastSubagentCatalogIds: [String] = []
@@ -1039,6 +1045,15 @@ final class SessionViewModel: ObservableObject {
         let wasRunning = lastKnownRunning
         isRunning = sections.last?.isRunning ?? false
         lastKnownRunning = isRunning
+        // 问题三 H3：running → completed 的这一次刷新，把刚结束的 turn 留在展开态，
+        // 直到用户下一次发送输入（sendPrompt）或新 turn 开始才折叠回摘要。
+        if wasRunning, !isRunning, let last = sections.last {
+            if let previous = stickyExpandedTurnID, previous != last.id {
+                expandedTurnIDs.remove(previous)
+            }
+            stickyExpandedTurnID = last.id
+            expandedTurnIDs.insert(last.id)
+        }
         liveAssistantText = journal.liveAssistantText
         approvalPolicy = journal.events.last(where: { $0.type == "approval/policy" })?.data?["policy"]?.stringValue
         sandboxMode = journal.events.last(where: { $0.type == "sandbox/mode" })?.data?["mode"]?.stringValue
@@ -1081,7 +1096,11 @@ final class SessionViewModel: ObservableObject {
     }
 
     private func ensureExpandedCurrentTurn() {
-        if let last = sections.last, expandedTurnIDs.isEmpty {
+        guard let last = sections.last else { return }
+        // 运行中的 turn 必须展开（哪怕用户展开了别的历史 turn）。
+        // 已结束的 turn 不在这里反复插入：turn/end 那一次由 stickyExpandedTurnID 插入一次，
+        // 用户手动折叠后不应该被下一次刷新再展开回来（交接文档 §7.4 第 3 条）。
+        if last.isRunning || expandedTurnIDs.isEmpty {
             expandedTurnIDs.insert(last.id)
         }
     }
@@ -1264,6 +1283,11 @@ final class SessionViewModel: ObservableObject {
                         "clientTimeZone": .string(TimeZone.current.identifier),
                     ]),
                 ])
+            }
+            // 问题三 H3：用户发出下一条输入时才折叠上一轮（桌面端 next-input 语义）。
+            if let sticky = stickyExpandedTurnID {
+                expandedTurnIDs.remove(sticky)
+                stickyExpandedTurnID = nil
             }
             isRunning = true
             lastKnownRunning = true

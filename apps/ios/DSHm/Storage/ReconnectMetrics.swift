@@ -38,6 +38,14 @@ enum ReconnectMetrics {
         return env["DSHM_E2E"] == "1" || env["DSHM_STARTUP_METRICS"] == "1"
     }
 
+    /// One candidate-origin attempt inside the reconnect round, for the bench:
+    /// which address was dialed, how long it took and why it failed.
+    struct CandidateAttempt: Equatable {
+        var host: String
+        var milliseconds: Double
+        var result: String
+    }
+
     struct Chain: Equatable {
         var pageEnterAt: TimeInterval
         var beginEpochMs: Int64
@@ -54,6 +62,9 @@ enum ReconnectMetrics {
         var pathChanges = 0
         var firstByteTimeouts = 0
         var invalidatedBy: String?
+        var candidates: [CandidateAttempt] = []
+        var pickedOrigin: String?
+        var budgetExhausted = false
         var completed = false
         var lastStage = "-"
     }
@@ -178,9 +189,35 @@ enum ReconnectMetrics {
         publish(stage: "invalidate")
     }
 
+    /// One candidate origin finished its attempt (success or classified failure).
+    static func markCandidateAttempt(host: String, milliseconds: Double, result: String) {
+        guard var current = activeChain() else { return }
+        current.candidates.append(
+            CandidateAttempt(host: host, milliseconds: max(0, milliseconds), result: result)
+        )
+        chain = current
+        publish(stage: "candidate")
+    }
+
+    /// The origin that finally produced `phase == .connected`.
+    static func markPickedOrigin(_ host: String) {
+        guard var current = activeChain() else { return }
+        current.pickedOrigin = host
+        chain = current
+    }
+
+    /// The fixed round budget ran out before every candidate was dialed (the
+    /// explicit "no 10s tail" failure state; retryable via the normal backoff).
+    static func markRoundBudgetExhausted() {
+        guard var current = activeChain() else { return }
+        current.budgetExhausted = true
+        chain = current
+        publish(stage: "budgetExhausted")
+    }
+
     // MARK: - Summary
 
-    /// `totalMs=..;pageEnterMs=0;reconnectStartMs=..;connectedMs=..;listAppliedMs=..;reuse=0|1;pathChanges=..;firstByteTimeouts=..;reason=..;invalidatedBy=..;stage=..;beginEpochMs=..`
+    /// `totalMs=..;pageEnterMs=0;reconnectStartMs=..;connectedMs=..;listAppliedMs=..;reuse=0|1;pathChanges=..;firstByteTimeouts=..;candidates=host:ms:result|..;picked=host;budgetExhausted=0|1;reason=..;invalidatedBy=..;stage=..;beginEpochMs=..`
     /// (`-1` = not seen yet; nil when disabled or no chain is active.)
     static var valueString: String? {
         guard isEnabled, let chain else { return nil }
@@ -194,7 +231,12 @@ enum ReconnectMetrics {
             listAppliedAt: chain.listAppliedAt
         )
         let totalText = total.map { String(format: "%.0f", $0) } ?? "-1"
-        return "totalMs=\(totalText);pageEnterMs=0;reconnectStartMs=\(milliseconds(chain.reconnectStartAt));connectedMs=\(milliseconds(chain.connectedAt));listAppliedMs=\(milliseconds(chain.listAppliedAt));reuse=\(chain.reusedMux ? 1 : 0);pathChanges=\(chain.pathChanges);firstByteTimeouts=\(chain.firstByteTimeouts);reason=\(chain.reason);invalidatedBy=\(chain.invalidatedBy ?? "-");stage=\(chain.lastStage);beginEpochMs=\(chain.beginEpochMs)"
+        let candidatesText = chain.candidates.isEmpty
+            ? "-"
+            : chain.candidates.map {
+                "\($0.host):\(String(format: "%.0f", $0.milliseconds)):\($0.result)"
+            }.joined(separator: "|")
+        return "totalMs=\(totalText);pageEnterMs=0;reconnectStartMs=\(milliseconds(chain.reconnectStartAt));connectedMs=\(milliseconds(chain.connectedAt));listAppliedMs=\(milliseconds(chain.listAppliedAt));reuse=\(chain.reusedMux ? 1 : 0);pathChanges=\(chain.pathChanges);firstByteTimeouts=\(chain.firstByteTimeouts);candidates=\(candidatesText);picked=\(chain.pickedOrigin ?? "-");budgetExhausted=\(chain.budgetExhausted ? 1 : 0);reason=\(chain.reason);invalidatedBy=\(chain.invalidatedBy ?? "-");stage=\(chain.lastStage);beginEpochMs=\(chain.beginEpochMs)"
     }
 
     /// t1 - t0: the chain only completes when **both** halves of t1 are in, so the

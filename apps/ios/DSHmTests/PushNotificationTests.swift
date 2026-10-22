@@ -444,4 +444,42 @@ final class PushNotificationTests: XCTestCase {
         XCTAssertEqual(alertResult, .noData)
         XCTAssertEqual(posted.count, 1)
     }
+
+    // MARK: - Cold-launch deep link（用户报障：点通知只进工作区列表）
+
+    /// 默认点击必须被识别成"打开这个会话"的 deep link，而不是 ignored。
+    func testDefaultTapRoutesToSessionDeepLink() {
+        let route = PushActionRouter.route(
+            userInfo: ["type": "turn-end", "sessionId": "session-tap"],
+            actionIdentifier: UNNotificationDefaultActionIdentifier
+        )
+        XCTAssertEqual(route, .deepLink(sessionId: "session-tap"))
+    }
+
+    /// 冷启动：UIKit 在 AppModel 创建前投递 tap，delegate 必须先把 sessionId 停进收件箱，
+    /// 否则这次点击会随丢失的 NotificationCenter 通知一起消失（只落到工作区列表）。
+    func testDeepLinkInboxParksTapBeforeModelIsLive() {
+        PushDeepLinkInbox.shared.resetForTesting()
+        PushDeepLinkInbox.shared.store("session-cold")
+        XCTAssertEqual(PushDeepLinkInbox.shared.drain(), "session-cold")
+        XCTAssertNil(PushDeepLinkInbox.shared.drain())
+        PushDeepLinkInbox.shared.resetForTesting()
+    }
+
+    /// AppModel 已存在时走实时通知路径；收件箱不得残留，否则下次冷启动会回放过期会话。
+    func testDeepLinkInboxIgnoresTapsAfterModelIsLive() {
+        PushDeepLinkInbox.shared.resetForTesting()
+        PushDeepLinkInbox.shared.markLive()
+        PushDeepLinkInbox.shared.store("session-warm")
+        XCTAssertNil(PushDeepLinkInbox.shared.drain())
+        PushDeepLinkInbox.shared.resetForTesting()
+    }
+
+    func testDeepLinkInboxIgnoresEmptySessionIds() {
+        PushDeepLinkInbox.shared.resetForTesting()
+        PushDeepLinkInbox.shared.store(nil)
+        PushDeepLinkInbox.shared.store("")
+        XCTAssertNil(PushDeepLinkInbox.shared.drain())
+        PushDeepLinkInbox.shared.resetForTesting()
+    }
 }

@@ -33,10 +33,11 @@ struct SessionDetailView: View {
     /// 问题三（滚动定位）：粘底语义——只有用户停在底部附近时才自动跟随新内容，
     /// 上滑阅读历史时绝不被强制拉回底部（交接文档 §7.4 第 2 条）。
     @State private var isNearBottom = true
-    /// 问题三：首屏锚底只做一次。本页初始内容是 loading 占位，消息是异步上来的，
-    /// 而 `.defaultScrollAnchor(.bottom)` 只作用于初始内容，所以第一批 sections
-    /// 落地后必须补一次无动画锚底（交接文档 §7.3 H1）。
-    @State private var didAnchorInitialScreen = false
+    /// 问题三：打开阶段锚底。本页初始内容是 loading 占位、消息异步上来，且缓存的
+    /// 会话窗口会先于 live 快照上屏；在 live 快照落地（`hasLiveSnapshot`）之前，
+    /// 每一次窗口替换都必须无条件贴底，否则粘底判定会被中间态打偏，出现
+    /// "冷启动/通知深链进入后停在旧消息"（用户 2026-10-22 报障）。
+    @State private var didAnchorLiveWindow = false
     /// 问题三 + 问题一：向上加载更早历史时的视觉锚点（旧的首条 section id）。
     /// 前置插入会让可见内容整体下移，加载完成后用它把旧视口重新钉回顶部。
     @State private var pendingPrependAnchorID: String?
@@ -692,7 +693,14 @@ struct SessionDetailView: View {
             // `.defaultScrollAnchor(.bottom)` 之外的这次补锚是唯一机会——onChange 不会触发。
             .onAppear {
                 guard !viewModel.sections.isEmpty else { return }
-                didAnchorInitialScreen = true
+                didAnchorLiveWindow = viewModel.hasLiveSnapshot
+                isNearBottom = true
+                scrollToBottom(proxy: proxy)
+            }
+            // 打开阶段：live 快照落地后结束"无条件锚底"，之后才交给粘底语义。
+            .onChange(of: viewModel.hasLiveSnapshot) { _, live in
+                guard live, !didAnchorLiveWindow else { return }
+                didAnchorLiveWindow = true
                 isNearBottom = true
                 scrollToBottom(proxy: proxy)
             }
@@ -737,12 +745,12 @@ struct SessionDetailView: View {
             .modifier(BottomSentinelFallback(isNearBottom: $isNearBottom))
     }
 
-    /// 首次拿到非空消息：无条件锚到底（用户要求"打开即停在最后一条消息底部"）。
-    /// 之后只在用户贴底时跟随。
+    /// 打开阶段（live 快照尚未落地）：缓存窗口/live 窗口的每次替换都无条件锚到底，
+    /// 满足"打开即停在最后一条消息底部"。live 快照落地后才交给粘底语义。
     private func applySectionChange(proxy: ScrollViewProxy) {
         guard !viewModel.sections.isEmpty else { return }
-        if !didAnchorInitialScreen {
-            didAnchorInitialScreen = true
+        if !didAnchorLiveWindow {
+            if viewModel.hasLiveSnapshot { didAnchorLiveWindow = true }
             isNearBottom = true
             scrollToBottom(proxy: proxy)
             return
@@ -753,13 +761,13 @@ struct SessionDetailView: View {
 
     /// 流式增量文本：只在贴底时跟随，用户上滑阅读时保持原位。
     private func followLiveText(proxy: ScrollViewProxy) {
-        guard didAnchorInitialScreen, isNearBottom else { return }
+        guard didAnchorLiveWindow, isNearBottom else { return }
         scrollToBottom(proxy: proxy)
     }
 
     /// 视口高度因兄弟视图插入/移除而变化时，贴底状态下重新锚底。
     private func rescrollIfNeeded(proxy: ScrollViewProxy) {
-        guard didAnchorInitialScreen, isNearBottom else { return }
+        guard didAnchorLiveWindow, isNearBottom else { return }
         scrollToBottom(proxy: proxy)
     }
 

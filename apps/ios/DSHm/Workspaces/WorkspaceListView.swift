@@ -370,12 +370,27 @@ struct WorkspaceListView: View {
         return 0
     }
 
+    /// One-line connection state; the specific failure reason wins.
+    private var connectionBannerText: String {
+        if !app.link.statusDetail.isEmpty, !app.link.phase.isConnected {
+            return app.link.statusDetail
+        }
+        return app.link.phase.isBusy ? L10n.t("正在连接 Mac…") : L10n.t("连接已断开")
+    }
+
     private var connectionBanner: some View {
         HStack(spacing: Theme.Spacing.xs) {
             StatusDot(color: app.link.phase.isBusy ? Theme.Palette.warning : Theme.Palette.danger, size: 6, pulsing: app.link.phase.isBusy)
-            Text(app.link.phase.isBusy ? L10n.t("正在连接 Mac…") : L10n.t("连接已断开"))
+            // Cross-network requirement (handoff §2.3): never only 「重连中」. The
+            // last failed round's classified one-line reason (desktop plugin not
+            // ready / network unreachable / gateway rejected) wins over the generic
+            // busy label.
+            Text(connectionBannerText)
                 .font(Theme.Typography.caption)
                 .foregroundStyle(Theme.Palette.textSecondary)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .accessibilityIdentifier("workspace-connection-reason")
             Spacer()
             if app.link.phase.isBusy {
                 ProgressView().tint(Theme.Palette.accent).scaleEffect(0.7)

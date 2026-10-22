@@ -162,6 +162,35 @@ final class ReconnectMetricsTests: XCTestCase {
         XCTAssertTrue(observed.last?.contains("stage=complete") ?? false)
     }
 
+    func testCandidateAttemptsPickedOriginAndBudgetFlagAreRecorded() throws {
+        ReconnectMetrics.beginPageEnter(reason: "listPage")
+        ReconnectMetrics.markReconnectStart()
+        ReconnectMetrics.markCandidateAttempt(
+            host: "relay.example.com", milliseconds: 123, result: "plugin-not-ready"
+        )
+        ReconnectMetrics.markCandidateAttempt(host: "192.168.1.9", milliseconds: 42, result: "ok")
+        ReconnectMetrics.markPickedOrigin("192.168.1.9")
+        ReconnectMetrics.markConnected()
+        ReconnectMetrics.markListApplied()
+        let value = try XCTUnwrap(ReconnectMetrics.valueString)
+        XCTAssertTrue(
+            value.contains("candidates=relay.example.com:123:plugin-not-ready|192.168.1.9:42:ok"),
+            value
+        )
+        XCTAssertTrue(value.contains("picked=192.168.1.9"), value)
+        XCTAssertTrue(value.contains("budgetExhausted=0"), value)
+        XCTAssertTrue(value.contains("stage=complete"), value)
+    }
+
+    func testRoundBudgetExhaustionIsRecorded() throws {
+        ReconnectMetrics.beginPageEnter(reason: "listPage")
+        ReconnectMetrics.markReconnectStart()
+        ReconnectMetrics.markRoundBudgetExhausted()
+        let value = try XCTUnwrap(ReconnectMetrics.valueString)
+        XCTAssertTrue(value.contains("budgetExhausted=1"), value)
+        XCTAssertTrue(value.contains("stage=budgetExhausted"), value)
+    }
+
     func testTotalMillisecondsPureFunction() throws {
         XCTAssertNil(ReconnectMetrics.totalMilliseconds(pageEnterAt: 100, connectedAt: nil, listAppliedAt: nil))
         XCTAssertEqual(
@@ -277,26 +306,39 @@ final class ReconnectPolicyTests: XCTestCase {
         XCTAssertEqual(LinkService.candidateTimeoutSeconds(index: 0, count: 1, pathChanged: true), 8)
     }
 
-    func testPathChangedDialOrderProbesRelayFirstButKeepsLANFallback() {
-        let lan = URL(string: "https://192.168.1.9:8443")!
-        let relay = URL(string: "https://relay.example.com")!
+    func testRoundBudgetPerPath() {
+        // Single candidate: nothing to switch to, but still capped below the old
+        // 8s-dial + backoff tail.
         XCTAssertEqual(
-            LinkService.pathChangedDialCandidates([lan, relay], pathChanged: true),
-            [relay, lan]
+            LinkService.roundBudgetSeconds(candidateCount: 1, hasSameSubnetLAN: false, hasRelay: true),
+            6
         )
+        // Same LAN: LAN should answer fast, relay fallback still usable.
         XCTAssertEqual(
-            LinkService.pathChangedDialCandidates([lan, relay], pathChanged: false),
-            [lan, relay],
-            "no path change: unchanged legacy order"
+            LinkService.roundBudgetSeconds(candidateCount: 2, hasSameSubnetLAN: true, hasRelay: true),
+            3
         )
+        // Cross-network: relay + stale LAN fallback must finish inside 1.5s.
         XCTAssertEqual(
-            LinkService.pathChangedDialCandidates([lan], pathChanged: true),
-            [lan],
-            "single candidate is never dropped"
+            LinkService.roundBudgetSeconds(candidateCount: 2, hasSameSubnetLAN: false, hasRelay: true),
+            1.5
         )
-        // LAN candidates stay in the list as fallback (no Happy Eyeballs).
-        let ordered = LinkService.pathChangedDialCandidates([lan, relay], pathChanged: true)
-        XCTAssertEqual(ordered.count, 2)
+        // LAN-only fallback keeps a usable budget.
+        XCTAssertEqual(
+            LinkService.roundBudgetSeconds(candidateCount: 2, hasSameSubnetLAN: false, hasRelay: false),
+            3
+        )
+    }
+
+    func testAttemptBudgetNeverExceedsTheRoundBudget() {
+        XCTAssertNil(LinkService.attemptBudget(baseTimeout: 8, remainingRoundBudget: 0))
+        XCTAssertNil(
+            LinkService.attemptBudget(baseTimeout: 8, remainingRoundBudget: 0.05),
+            "no point dialing with 50ms of the round budget left"
+        )
+        XCTAssertEqual(LinkService.attemptBudget(baseTimeout: 8, remainingRoundBudget: 0.4), 0.4)
+        XCTAssertEqual(LinkService.attemptBudget(baseTimeout: 2, remainingRoundBudget: 1.4), 1.4)
+        XCTAssertEqual(LinkService.attemptBudget(baseTimeout: 1.5, remainingRoundBudget: 3), 1.5)
     }
 
     func testConnectingRoundRestartRule() {
@@ -308,6 +350,177 @@ final class ReconnectPolicyTests: XCTestCase {
             LinkService.shouldRestartConnectingRound(roundStartGeneration: 2, pathGeneration: 3),
             "a round dialed before the path change is on the wrong network"
         )
+    }
+}
+
+// MARK: - Cross-network candidate routing
+
+/// task-2 cross-network: candidate roles + path-aware ordering, including the
+/// subnet judgement that decides LAN-first vs relay-first.
+final class CandidateRoutingTests: XCTestCase {
+    /// Phone: 192.168.1.5/24 (home Wi-Fi).
+    private let local = LocalIPv4Network(address: 0xC0A8_0105, prefixLength: 24)
+    private let sameLAN = URL(string: "https://192.168.1.9:8443")!
+    private let otherLAN = URL(string: "https://172.20.10.2:3466")!
+    private let relay = URL(string: "https://121.41.112.232:30000")!
+
+    func testLocalIPv4ParsingAndSubnetMatching() {
+        XCTAssertEqual(LocalIPv4Network.parseIPv4("192.168.1.9"), 0xC0A8_0109)
+        XCTAssertNil(LocalIPv4Network.parseIPv4("192.168.1"))
+        XCTAssertNil(LocalIPv4Network.parseIPv4("not-an-ip"))
+        XCTAssertEqual(LocalIPv4Network.prefixLength(mask: 0xFFFF_FF00), 24)
+        XCTAssertEqual(LocalIPv4Network.prefixLength(mask: 0xFFFF_0000), 16)
+        XCTAssertEqual(LocalIPv4Network.prefixLength(mask: 0xFFFF_FFFF), 32)
+        XCTAssertTrue(local.contains(host: "192.168.1.9"))
+        XCTAssertFalse(local.contains(host: "192.168.2.9"), "different /24")
+        XCTAssertFalse(local.contains(host: "172.20.10.2"))
+        XCTAssertFalse(local.contains(host: "not-an-ip"))
+        // /16 compares 16 bits.
+        let wide = LocalIPv4Network(address: 0xAC14_0005, prefixLength: 16) // 172.20.0.5/16
+        XCTAssertTrue(wide.contains(host: "172.20.10.2"))
+        XCTAssertFalse(wide.contains(host: "172.21.10.2"))
+    }
+
+    func testCandidateRoleUsesSubnetNotJustPrivateAddressRange() {
+        XCTAssertEqual(LinkService.candidateRole(host: "121.41.112.232", local: local), .relay)
+        XCTAssertEqual(LinkService.candidateRole(host: "192.168.1.9", local: local), .lanSameSubnet)
+        XCTAssertEqual(LinkService.candidateRole(host: "172.20.10.2", local: local), .lanOther)
+        XCTAssertEqual(LinkService.candidateRole(host: "172.20.10.2", local: nil), .lanOther)
+    }
+
+    func testSameLANPathPutsLANFirst() {
+        let ordered = LinkService.orderedCandidatesForPath(
+            [relay, otherLAN, sameLAN],
+            prefersRelay: false,
+            local: local,
+            pathChanged: false
+        )
+        XCTAssertEqual(ordered, [sameLAN, relay, otherLAN])
+    }
+
+    func testCrossNetworkPathPutsRelayFirstAndKeepsLANFallback() {
+        // Phone left the Mac's network (e.g. 172.20.10.x hotspot): the stale LAN
+        // origin must not be dialed first, but it is still kept as a fallback.
+        let ordered = LinkService.orderedCandidatesForPath(
+            [otherLAN, relay],
+            prefersRelay: false,
+            local: local,
+            pathChanged: false
+        )
+        XCTAssertEqual(ordered, [relay, otherLAN])
+        XCTAssertEqual(ordered.count, 2, "the stale LAN origin is never dropped")
+    }
+
+    func testCellularPutsRelayFirst() {
+        let ordered = LinkService.orderedCandidatesForPath(
+            [sameLAN, relay],
+            prefersRelay: true,
+            local: nil,
+            pathChanged: false
+        )
+        XCTAssertEqual(ordered, [relay, sameLAN])
+    }
+
+    func testUnknownLocalNetworkKeepsLegacyOrder() {
+        let candidates = [otherLAN, relay]
+        XCTAssertEqual(
+            LinkService.orderedCandidatesForPath(
+                candidates,
+                prefersRelay: false,
+                local: nil,
+                pathChanged: false
+            ),
+            candidates
+        )
+    }
+
+    func testSingleCandidateIsNeverReordered() {
+        XCTAssertEqual(
+            LinkService.orderedCandidatesForPath(
+                [otherLAN],
+                prefersRelay: true,
+                local: nil,
+                pathChanged: true
+            ),
+            [otherLAN]
+        )
+    }
+
+    func testSameSubnetLANStaysFirstEvenAfterPathChange() {
+        let ordered = LinkService.orderedCandidatesForPath(
+            [sameLAN, relay],
+            prefersRelay: false,
+            local: local,
+            pathChanged: true
+        )
+        XCTAssertEqual(ordered, [sameLAN, relay], "same-subnet LAN remains the fastest path")
+    }
+}
+
+// MARK: - Fast reject / failure classification
+
+/// task-2 cross-network: `HTTP 503 {error:"host/inactive"}` must be a **fast
+/// reject** (switch candidate immediately, no timeout wait, no retry of the same
+/// origin); 5xx/401/timeout classes drive retryability + the one-line banner text.
+final class CandidateFailureTests: XCTestCase {
+    func testPluginState503IsAFastRejectAndRetryable() {
+        let failure = LinkService.failureClass(for: LinkError.httpStatus(503, "host/inactive"))
+        XCTAssertEqual(failure, .pluginNotReady)
+        XCTAssertTrue(failure.isFastReject, "switch candidate immediately, do not wait for a timeout")
+        XCTAssertTrue(failure.isRetryable, "a restarted desktop plugin recovers on a later backoff round")
+        XCTAssertEqual(
+            LinkService.failureClass(for: LinkError.httpStatus(503, "{error:host/starting}")),
+            .pluginNotReady
+        )
+        XCTAssertEqual(
+            LinkService.failureClass(for: LinkError.httpStatus(503, "host/incompatible")),
+            .pluginNotReady
+        )
+    }
+
+    func testOther5xxIsGatewayRejectFastReject() {
+        for status in [500, 502, 504] {
+            let failure = LinkService.failureClass(for: LinkError.httpStatus(status, "bad gateway"))
+            XCTAssertEqual(failure, .gatewayRejected, "HTTP \(status)")
+            XCTAssertTrue(failure.isFastReject)
+            XCTAssertTrue(failure.isRetryable)
+        }
+    }
+
+    func test401IsCredentialRejectionAndNotRetryable() {
+        let failure = LinkService.failureClass(for: LinkError.httpStatus(401, "auth/token-expired"))
+        XCTAssertEqual(failure, .credentialRejected)
+        XCTAssertFalse(failure.isRetryable, "only re-pairing can recover")
+        XCTAssertFalse(failure.isFastReject, "handled by the needsRepair path, not the candidate walk")
+    }
+
+    func testTimeoutAndUnreachableClassification() {
+        XCTAssertEqual(LinkService.failureClass(for: LinkError.timeout("auth")), .timeout)
+        XCTAssertEqual(LinkService.classifyFailureMessage("连接 Mac 超时（code: 60）"), .timeout)
+        XCTAssertEqual(
+            LinkService.classifyFailureMessage("无法连接 Mac（连接被拒绝：地址或端口不可达）"),
+            .unreachable
+        )
+        XCTAssertEqual(LinkService.classifyFailureMessage("首字节超时（复用连接 800ms 无响应）"), .timeout)
+        XCTAssertEqual(
+            LinkService.classifyFailureMessage("HTTP 503: host/inactive"),
+            .pluginNotReady
+        )
+    }
+
+    func testRoundFailureSummaryPutsTheActionableReasonFirst() {
+        let plugin = LinkService.roundFailureSummary(
+            classes: [.pluginNotReady, .timeout],
+            details: ["relay: HTTP 503: host/inactive"]
+        )
+        XCTAssertTrue(plugin.contains("桌面端插件未就绪"), plugin)
+        XCTAssertTrue(plugin.contains("重启"), plugin)
+        let gateway = LinkService.roundFailureSummary(classes: [.gatewayRejected], details: [])
+        XCTAssertTrue(gateway.contains("网关"), gateway)
+        let timeout = LinkService.roundFailureSummary(classes: [.timeout], details: [])
+        XCTAssertTrue(timeout.contains("超时"), timeout)
+        let generic = LinkService.roundFailureSummary(classes: [.unreachable], details: ["h: 不可达"])
+        XCTAssertEqual(generic, "h: 不可达")
     }
 }
 

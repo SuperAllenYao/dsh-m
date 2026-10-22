@@ -50,6 +50,11 @@ final class LinkService: ObservableObject {
     @Published private(set) var credentials: PairingCredentials?
     @Published private(set) var generation: Int = 0
     @Published var clientId: String?
+    /// 当前连接上是否收到过 **本连接** 的 `$events` ready 帧。
+    /// Host 只接受来自"拥有该事件流"的 Peer 的 `$events/result`；重连后沿用旧
+    /// clientId 会得到 `gateway/interactions-forbidden: Remote event result belongs
+    /// to another Peer`（用户 2026-10-22 报障：作答/审批提交失败）。
+    var eventsClientIdConfirmed = false
     @Published var pendingApprovals: [ApprovalWaterfall] = []
     /// Live user-question waterfalls from `$events` (task-2 / tech-design §14).
     /// `open` calls answer through `$events/result`; the pending list lets the
@@ -853,23 +858,57 @@ final class LinkService: ObservableObject {
             current: credentials.origin,
             stored: credentials.originCandidates
         )
-        // P0: on cellular/expensive paths the Mac's LAN origin is unreachable and
-        // every LAN probe burns a full timeout; dial only the relay origin there.
-        let dialCandidates = PairingOriginSelector.dialCandidates(candidates, prefersRelay: prefersRelay)
-        guard !dialCandidates.isEmpty else {
+        guard !candidates.isEmpty else {
             isConnecting = false
             phase = .needsRepair(L10n.t("配对凭据没有可用的服务器地址，请重新配对"))
             return
         }
-        // task-2: after a network switch the stored origin was dialed on the old
-        // network; probe the public relay before a (probably stale) LAN address,
-        // keeping the LAN candidates as fallback instead of dropping them.
-        let orderedCandidates = Self.pathChangedDialCandidates(dialCandidates, pathChanged: pathChanged)
+        // Cross-network requirement: order candidates by the phone's *current*
+        // network. Same subnet -> LAN first; cellular / a different network ->
+        // relay first with the stale LAN address only as a bounded fallback. This
+        // is what stops a cross-network reconnect from burning seconds on an
+        // unreachable LAN origin (the reported relay-503 -> LAN-timeout chain).
+        let localNetwork = NetworkPathMonitor.shared.currentLocalIPv4Network()
+        let orderedCandidates = Self.orderedCandidatesForPath(
+            candidates,
+            prefersRelay: prefersRelay,
+            local: localNetwork,
+            pathChanged: pathChanged
+        )
+        let hasSameSubnetLAN = orderedCandidates.contains {
+            Self.candidateRole(host: $0.host, local: localNetwork) == .lanSameSubnet
+        }
+        let hasRelay = orderedCandidates.contains {
+            Self.candidateRole(host: $0.host, local: localNetwork) == .relay
+        }
+        // Fixed total budget for the candidate walk: the round can never turn into
+        // a 10s tail. Cross-network relay+LAN: 1.5s; same-LAN: 3s; a single
+        // candidate keeps the generous dial budget (nothing to switch to).
+        let roundBudget = Self.roundBudgetSeconds(
+            candidateCount: orderedCandidates.count,
+            hasSameSubnetLAN: hasSameSubnetLAN,
+            hasRelay: hasRelay
+        )
+        let roundDeadline = Date().addingTimeInterval(roundBudget)
         var failures: [String] = []
+        var failureClasses: [CandidateFailureClass] = []
+        var roundBudgetExhausted = false
         for (index, origin) in orderedCandidates.enumerated() {
             if Task.isCancelled {
                 isConnecting = false
                 return
+            }
+            let remaining = roundDeadline.timeIntervalSinceNow
+            guard let attemptTimeout = Self.attemptBudget(
+                baseTimeout: Self.candidateTimeoutSeconds(
+                    index: index,
+                    count: orderedCandidates.count,
+                    pathChanged: pathChanged
+                ),
+                remainingRoundBudget: remaining
+            ) else {
+                roundBudgetExhausted = true
+                break
             }
             // authenticateToken() reads `credentials.origin`, so point it at the
             // origin under test before every attempt.
@@ -884,18 +923,17 @@ final class LinkService: ObservableObject {
                 }
                 teardownTransport(keepP1Resume: p1SilentResume)
             }
-            ConnectionMetrics.markCandidate(origin.host ?? origin.absoluteString)
-            // task-2: bound every candidate. The last one keeps a longer budget so a
-            // slow-but-working relay still connects; a stale non-last candidate must
-            // not burn 4s before the relay is dialed (4s -> 2s, 1.5s after a path
-            // change). Reachable origins complete TCP+TLS+auth well under 1s.
-            let attemptTimeout = Self.candidateTimeoutSeconds(
-                index: index,
-                count: orderedCandidates.count,
-                pathChanged: pathChanged
-            )
+            let host = origin.host ?? origin.absoluteString
+            ConnectionMetrics.markCandidate(host)
+            let candidateStartedAt = ReconnectMetrics.clock()
             switch await attemptConnection(origin: origin, leafPin: credentials.leafPin, timeout: attemptTimeout) {
             case .connected(let bumpGeneration):
+                ReconnectMetrics.markCandidateAttempt(
+                    host: host,
+                    milliseconds: (ReconnectMetrics.clock() - candidateStartedAt) * 1000,
+                    result: CandidateFailureClass.ok.rawValue
+                )
+                ReconnectMetrics.markPickedOrigin(host)
                 setCurrentOrigin(origin, persist: true)
                 isConnecting = false
                 attempt = 0
@@ -914,18 +952,51 @@ final class LinkService: ObservableObject {
                 startCATrustMigrationIfNeeded()
                 return
             case .credentialRejected(let reason):
+                ReconnectMetrics.markCandidateAttempt(
+                    host: host,
+                    milliseconds: (ReconnectMetrics.clock() - candidateStartedAt) * 1000,
+                    result: CandidateFailureClass.credentialRejected.rawValue
+                )
                 isConnecting = false
                 lastErrorText = reason
                 phase = .needsRepair(reason)
                 return
+            case .fastRejected(let reason, let failureClass):
+                ReconnectMetrics.markCandidateAttempt(
+                    host: host,
+                    milliseconds: (ReconnectMetrics.clock() - candidateStartedAt) * 1000,
+                    result: failureClass.rawValue
+                )
+                failureClasses.append(failureClass)
+                failures.append(host + ": " + reason)
+                // Fast reject: the server answered, so switch candidates with no
+                // timeout wait and no retry of this origin. Keep a clear interim
+                // message for the banner (cross-network req 4).
+                lastErrorText = failureClass == .pluginNotReady
+                    ? L10n.t("桌面端插件未就绪（host/inactive），正在尝试其他地址…")
+                    : L10n.t("该地址被服务端拒绝，正在尝试其他地址…")
             case .failed(let reason):
-                failures.append((origin.host ?? origin.absoluteString) + ": " + reason)
+                let failureClass = Self.classifyFailureMessage(reason)
+                ReconnectMetrics.markCandidateAttempt(
+                    host: host,
+                    milliseconds: (ReconnectMetrics.clock() - candidateStartedAt) * 1000,
+                    result: failureClass.rawValue
+                )
+                failureClasses.append(failureClass)
+                failures.append(host + ": " + reason)
                 lastErrorText = reason
             }
         }
         isConnecting = false
         guard !Task.isCancelled else { return }
-        lastErrorText = "无法连接 Mac（已尝试 \(orderedCandidates.count) 个地址）：\n" + failures.joined(separator: "\n")
+        if roundBudgetExhausted {
+            ReconnectMetrics.markRoundBudgetExhausted()
+            failureClasses.append(.timeout)
+            failures.append(L10n.f("候选总预算已耗尽（%lld ms）", Int(roundBudget * 1000)))
+        }
+        // One-line, actionable reason (cross-network req 4): the list banner shows
+        // `statusDetail`, so it must never be empty or a generic 「重连中」.
+        lastErrorText = Self.roundFailureSummary(classes: failureClasses, details: failures)
         // Remember a different starting origin for the next round so a dead
         // address does not always head the list.
         _ = rotateOriginIfPossible(reason: failures.last ?? L10n.t("连接失败"))
@@ -936,6 +1007,10 @@ final class LinkService: ObservableObject {
         /// `bumpGeneration` is false only for a silent replay (streams retained).
         case connected(bumpGeneration: Bool)
         case credentialRejected(String)
+        /// The origin answered "cannot serve right now" (503 host/inactive, 5xx
+        /// gateway): the round must switch to the next candidate immediately, with
+        /// no timeout wait and no retry of this candidate.
+        case fastRejected(String, CandidateFailureClass)
         case failed(String)
     }
 
@@ -1015,6 +1090,11 @@ final class LinkService: ObservableObject {
         } catch {
             let reason = NetworkErrorInterpreter.message(for: error)
             if isCredentialRejection(error) { return .credentialRejected(reason) }
+            // Cross-network: `503 {error:"host/inactive"}` means this origin's
+            // plugin instance is not serving; switching candidates costs one
+            // round-trip instead of a full timeout.
+            let failureClass = Self.failureClass(for: error)
+            if failureClass.isFastReject { return .fastRejected(reason, failureClass) }
             return .failed(reason)
         }
         ConnectionMetrics.markAuth()
@@ -1046,6 +1126,10 @@ final class LinkService: ObservableObject {
             self.ws = nil
             let reason = NetworkErrorInterpreter.message(for: error)
             if isCredentialRejection(error) { return .credentialRejected(reason) }
+            // A 5xx upgrade refusal is a fast reject (plugin/gateway state), not a
+            // transient timeout: do not sit on this candidate.
+            let failureClass = Self.failureClass(for: error)
+            if failureClass.isFastReject { return .fastRejected(reason, failureClass) }
             return .failed(reason)
         }
         ConnectionMetrics.markWS()
@@ -1067,6 +1151,8 @@ final class LinkService: ObservableObject {
             self.mux = nil
             self.ws = nil
             if isCredentialRejection(error) { return .credentialRejected(reason) }
+            let failureClass = Self.failureClass(for: error)
+            if failureClass.isFastReject { return .fastRejected(reason, failureClass) }
             return .failed(reason)
         }
         ConnectionMetrics.markReady()
@@ -1291,6 +1377,27 @@ final class LinkService: ObservableObject {
         readyTimeoutTask = nil
     }
 
+    /// 当前连接上真正生效的 `$events` clientId（必须来自本连接的 ready 帧）。
+    ///
+    /// 重连/冷启动后 Host 侧仍可能残留上一次连接的事件流 client；直接拿 `clientId`
+    /// 发 `$events/result` 会被判成"另一个 Peer 的结果"。这里等 ready 落地
+    /// （通常 <300ms），超时抛未连接错误，由调用方呈现可重试提示。
+    func confirmedEventsClientId(timeoutMs: Int = 3000) async throws -> String {
+        let deadline = Date().addingTimeInterval(Double(max(0, timeoutMs)) / 1000)
+        while true {
+            if eventsClientIdConfirmed, let clientId { return clientId }
+            if Date() >= deadline { break }
+            try? await Task.sleep(nanoseconds: 30_000_000)
+        }
+        throw LinkError.notConnected
+    }
+
+    /// 单测 seam：直接设定"已确认的 `$events` clientId"，不经过真实流。
+    func setConfirmedEventsClientIdForTesting(_ id: String?) {
+        clientId = id
+        eventsClientIdConfirmed = id != nil
+    }
+
     /// Persists the live channel's resume cursor into the Keychain credential.
     func persistP1Resume() {
         guard let p1Channel, var credentials, let resume = p1Channel.resumeState else { return }
@@ -1430,6 +1537,7 @@ final class LinkService: ObservableObject {
             eventsStream?.cancel()
             eventsStream = nil
             clientId = nil
+            eventsClientIdConfirmed = false
             // v0.1.1 (Bug 2): pending approval/question waterfalls are **not**
             // dropped here. `teardownTransport` also runs at the start of every
             // reconnect attempt; clearing here is what made the answer card
@@ -1485,19 +1593,185 @@ extension LinkService {
         return pathChanged ? 1.5 : 2
     }
 
-    /// After a path change the stored origin was dialed on the *previous* network,
-    /// so a LAN address is the least likely to answer. Probe non-LAN candidates
-    /// first and keep the LAN ones as fallback (never dropped).
+    // MARK: Candidate role + path-aware order (cross-network requirement)
+
+    /// Role of one stored origin relative to the phone's current network.
+    enum CandidateRole: String {
+        /// Public relay bridge (reachable from any network).
+        case relay = "relay"
+        /// LAN origin inside the phone's current subnet (fastest path).
+        case lanSameSubnet = "lan-same"
+        /// LAN origin from another network / different subnet (fallback only).
+        case lanOther = "lan-other"
+    }
+
+    nonisolated static func candidateRole(host: String?, local: LocalIPv4Network?) -> CandidateRole {
+        guard PairingOriginSelector.isLANHost(host) else { return .relay }
+        guard let local, local.contains(host: host) else { return .lanOther }
+        return .lanSameSubnet
+    }
+
+    /// Path-aware candidate order for one reconnect round:
+    /// - **same LAN** (Wi-Fi/wired and the LAN candidate is inside the phone's
+    ///   subnet): LAN first, relay as fallback — the Mac's LAN origin is the fastest;
+    /// - **cellular / cross-network** (no LAN candidate on this subnet): relay first,
+    ///   LAN addresses last as a best-effort fallback — the old serial "try the
+    ///   stale LAN first and burn seconds" order is exactly the reported failure;
+    /// - **unknown local network**: legacy order (current origin, then stored list).
     ///
     /// Happy Eyeballs (parallel first dial) is deliberately **not** used:
     /// `authInFlightByPurpose` is purpose-scoped and two concurrent attempts would
     /// fight over `self.ws`/`self.mux` and multiply `/auth/challenge` requests
-    /// (plugin rate limit).
-    nonisolated static func pathChangedDialCandidates(_ candidates: [URL], pathChanged: Bool) -> [URL] {
-        guard pathChanged, candidates.count > 1 else { return candidates }
-        let nonLAN = candidates.filter { !PairingOriginSelector.isLANHost($0.host) }
-        let lan = candidates.filter { PairingOriginSelector.isLANHost($0.host) }
-        return nonLAN + lan
+    /// (plugin rate limit). The serial walk is bounded by `roundBudgetSeconds`.
+    nonisolated static func orderedCandidatesForPath(
+        _ candidates: [URL],
+        prefersRelay: Bool,
+        local: LocalIPv4Network?,
+        pathChanged: Bool
+    ) -> [URL] {
+        guard candidates.count > 1 else { return candidates }
+        var relay: [URL] = []
+        var lanSame: [URL] = []
+        var lanOther: [URL] = []
+        for candidate in candidates {
+            switch candidateRole(host: candidate.host, local: local) {
+            case .relay: relay.append(candidate)
+            case .lanSameSubnet: lanSame.append(candidate)
+            case .lanOther: lanOther.append(candidate)
+            }
+        }
+        let sameLANPath = !prefersRelay && !lanSame.isEmpty
+        if sameLANPath { return lanSame + relay + lanOther }
+        if prefersRelay || pathChanged || local != nil { return relay + lanOther + lanSame }
+        return candidates
+    }
+
+    /// Fixed total budget for walking the candidates of one round. This removes the
+    /// old 10s+ tail where every serial candidate burned its own timeout.
+    /// - single candidate: nothing to switch to, but still capped at 6s (8s dial +
+    ///   backoff used to be the worst-case tail);
+    /// - same-LAN multi-candidate: LAN should answer fast, relay fallback usable -> 3s;
+    /// - cross-network multi-candidate (relay first + LAN fallback): 1.5s total.
+    nonisolated static func roundBudgetSeconds(
+        candidateCount: Int,
+        hasSameSubnetLAN: Bool,
+        hasRelay: Bool
+    ) -> TimeInterval {
+        guard candidateCount > 1 else { return 6 }
+        if hasSameSubnetLAN { return 3 }
+        guard hasRelay else { return 3 }
+        return 1.5
+    }
+
+    /// Clamped per-candidate timeout, or nil when the round budget is exhausted
+    /// (the caller then reports a clear retryable failure instead of waiting).
+    nonisolated static func attemptBudget(
+        baseTimeout: TimeInterval,
+        remainingRoundBudget: TimeInterval
+    ) -> TimeInterval? {
+        guard remainingRoundBudget > 0.05 else { return nil }
+        return min(baseTimeout, remainingRoundBudget)
+    }
+
+    // MARK: Failure classification (fast reject + retryable distinction)
+
+    /// Why one candidate failed. Drives fast candidate switching, the per-candidate
+    /// `[RECONNECT]` metrics and the one-line user-facing error (handoff reqs 2/4/5).
+    enum CandidateFailureClass: String {
+        case ok = "ok"
+        /// The plugin instance is gone/booting: `HTTP 503 {error:host/inactive}`.
+        case pluginNotReady = "plugin-not-ready"
+        /// Gateway/upgrade refusal (5xx) that is not a plugin-state error.
+        case gatewayRejected = "gateway-5xx"
+        case timeout = "timeout"
+        case unreachable = "unreachable"
+        /// Credential rejected: only re-pairing can help (not retryable).
+        case credentialRejected = "credential-rejected"
+        case cancelled = "cancelled"
+        case other = "other"
+
+        /// The server told us this origin cannot serve the request right now: do
+        /// not wait for a timeout and do not retry the same candidate — switch to
+        /// the next one immediately.
+        var isFastReject: Bool {
+            self == .pluginNotReady || self == .gatewayRejected
+        }
+
+        /// Worth another round after the standard backoff.
+        var isRetryable: Bool { self != .credentialRejected }
+    }
+
+    /// Maps a connect-path error to a failure class. `HTTP 5xx` with a plugin-state
+    /// code is a fast reject; 401/403 is a credential rejection; everything else is
+    /// classified from the localized transport text.
+    nonisolated static func failureClass(for error: Error) -> CandidateFailureClass {
+        if let linkError = error as? LinkError {
+            switch linkError {
+            case .httpStatus(let status, let body):
+                let text = body.lowercased()
+                if (500...599).contains(status) {
+                    if text.contains("host/inactive")
+                        || text.contains("host/starting")
+                        || text.contains("host/incompatible") {
+                        return .pluginNotReady
+                    }
+                    return .gatewayRejected
+                }
+                if status == 401 || status == 403 { return .credentialRejected }
+                return .other
+            case .timeout:
+                return .timeout
+            case .cancelled:
+                return .cancelled
+            case .transport(let message):
+                return classifyFailureMessage(message)
+            default:
+                return .other
+            }
+        }
+        return classifyFailureMessage(NetworkErrorInterpreter.message(for: error))
+    }
+
+    nonisolated static func classifyFailureMessage(_ message: String) -> CandidateFailureClass {
+        let lower = message.lowercased()
+        if lower.contains("host/inactive") || lower.contains("host/starting") {
+            return .pluginNotReady
+        }
+        if lower.contains("超时") || lower.contains("timeout") || lower.contains("timed out")
+            || lower.contains("code: 60") {
+            return .timeout
+        }
+        if lower.contains("已取消") || lower.contains("cancelled") {
+            return .cancelled
+        }
+        if lower.contains("http 5") || lower.contains("网关") {
+            return .gatewayRejected
+        }
+        return .unreachable
+    }
+
+    /// One-line user-facing reason after a failed round — the UI must never show
+    /// only 「重连中」 (handoff cross-network req 4).
+    nonisolated static func roundFailureSummary(
+        classes: [CandidateFailureClass],
+        details: [String]
+    ) -> String {
+        if classes.contains(.pluginNotReady) {
+            return L10n.t("桌面端插件未就绪（host/inactive），请在 Mac 上重启 DSH-m 插件后重试")
+        }
+        if classes.contains(.gatewayRejected) {
+            return L10n.t("连接被服务端网关拒绝（HTTP 5xx），请检查桌面端插件状态")
+        }
+        if classes.contains(.credentialRejected) {
+            return L10n.t("设备凭据已失效，请重新配对")
+        }
+        if classes.contains(.timeout) {
+            return L10n.t("连接 Mac 超时：当前网络不可达，请检查网络与桌面端")
+        }
+        if let last = details.last, !last.isEmpty {
+            return last
+        }
+        return L10n.t("无法连接 Mac，请检查网络与桌面端是否在线")
     }
 
     /// A round already dialed on the post-change path must be allowed to finish;
