@@ -64,6 +64,12 @@ final class SessionViewModel: ObservableObject {
     @Published private(set) var contextPressure: ContextPressureValue?
  /// v5.4: client-side prompt queue while a turn runs (see `PromptQueue`).
     @Published private(set) var queuedPrompts = PromptQueue()
+ /// Round2 §3 (task-2): optimistic echoes for prompts the host accepted but has
+ /// not materialized as durable `user/message` events yet. The important case
+ /// is `mode:"steer"`: the host only inserts it into the running agent's inbox
+ /// and appends the durable message when the turn reaches its next step, which
+ /// can lag by a whole tool call — the App used to paint nothing until then.
+    @Published private(set) var pendingUserEchoes = SessionRowBuilder.PendingUserEchoStore()
  /// task-2 / tech-design §14: pending user-question calls of this session
  /// (projection `userQuestions.active`; refreshed by snapshot and after answers).
     @Published private(set) var activeUserQuestions: [UserQuestionCall] = []
@@ -190,6 +196,9 @@ final class SessionViewModel: ObservableObject {
     private var stream: RemoteStreamHandle?
     private var restartTask: Task<Void, Never>?
     private var rebuildTask: Task<Void, Never>?
+ /// One-shot wakeup that rebuilds the rows when a pending echo's "发送中…"
+ /// marker expires (see `schedulePendingEchoStaleRefresh`).
+    private var pendingEchoStaleTask: Task<Void, Never>?
     private var observedGeneration = -1
     private var pendingRebuild = false
  /// Last `isRunning` value used for the v5.4 queue flush (turn/end transition).
@@ -383,6 +392,20 @@ final class SessionViewModel: ObservableObject {
  // The discarded prefix must be pulled again: re-arm the entry for good
  // (this also clears the sticky terminal state — the first event is no
  // longer in the window).
+                journal.markOlderHistoryUnloaded()
+            }
+ // task-5: the persisted paging state can be internally inconsistent — a
+ // cache written by an older build (stale/empty page path) can carry
+ // `hasMoreOlder = false` and even `hasReachedOldest = true` while the
+ // restored front is not the session's first event (`oldestSeq > 0`).
+ // Taking that at face value hides the "load earlier" entry forever: the
+ // user can never scroll back to the missing older turns (real device:
+ // oldest=3232 yet hasMoreOlder=false while the session starts at seq 0).
+ // A terminal state is only valid when seq 0 is actually loaded, so
+ // re-arm pagination whenever the flags disagree with the window.
+            if (journal.oldestSeq ?? 0) > 0, !journal.hasMoreOlder {
+                dbg("cache restore: re-arm paging (cached state said terminal but oldest="
+                    + String(journal.oldestSeq ?? -1) + ")")
                 journal.markOlderHistoryUnloaded()
             }
             cachedSnapshotFrame = cached.payload.snapshot
@@ -1138,8 +1161,19 @@ final class SessionViewModel: ObservableObject {
     }
 
     private func rebuildRows() {
-        sections = SessionRowBuilder.build(events: journal.events)
-        dbg("rebuild: events=" + String(journal.events.count) + " sections=" + String(sections.count) + " hasMoreOlder=" + String(journal.hasMoreOlder) + " oldest=" + String(journal.oldestSeq ?? -1) + " turns=" + sections.prefix(12).map { String($0.turn) + ($0.isRunning ? "*" : "") }.joined(separator: ","))
+ // Optimistic echoes (round2 §3): retire the ones whose durable
+ // `user/message` arrived (matched by `data.source.rpcId`), then paint
+ // the rest at the tail of the flow. Sitting outside the journal means a
+ // rebuild / pagination recompute never drops the user's own message.
+        let echoCountBefore = pendingUserEchoes.count
+        pendingUserEchoes.reconcile(events: journal.events)
+        let retiredEchoes = echoCountBefore - pendingUserEchoes.count
+        sections = SessionRowBuilder.build(
+            events: journal.events,
+            pendingUserEchoes: pendingUserEchoes.echoes,
+            nowMs: Self.epochMilliseconds()
+        )
+        dbg("rebuild: events=" + String(journal.events.count) + " sections=" + String(sections.count) + " hasMoreOlder=" + String(journal.hasMoreOlder) + " oldest=" + String(journal.oldestSeq ?? -1) + " pendingEchoes=" + String(pendingUserEchoes.count) + (retiredEchoes > 0 ? " retired=" + String(retiredEchoes) : "") + " turns=" + sections.prefix(12).map { String($0.turn) + ($0.isRunning ? "*" : "") }.joined(separator: ","))
         syncOlderState()
         title = journal.title
         permissionsValue = journal.permissionsValue
@@ -1357,6 +1391,9 @@ final class SessionViewModel: ObservableObject {
     @discardableResult
     private func sendPrompt(text: String, mode: String) async -> Bool {
         guard let link else { return false }
+ // The prompt RPC id doubles as the optimistic-echo key: the host records
+ // it on the durable message as `data.source.rpcId` (kind "user").
+        let requestId = UUID().uuidString.lowercased()
         sending = true
         actionErrorText = nil
         defer { sending = false }
@@ -1377,7 +1414,7 @@ final class SessionViewModel: ObservableObject {
             } else {
                 _ = try await link.unary("session/prompt", args: [
                     "request": .object([
-                        "requestId": .string(UUID().uuidString.lowercased()),
+                        "requestId": .string(requestId),
                         "sessionId": .string(sessionId),
                         "mode": .string(mode),
                         "content": .array([
@@ -1394,6 +1431,12 @@ final class SessionViewModel: ObservableObject {
             }
             isRunning = true
             lastKnownRunning = true
+ // Round2 §3: the host accepted the prompt, but `user/message` is only
+ // durable once the running turn claims its inbox (steer: next step).
+ // Paint the bubble now; `rebuildRows` retires it by rpcId later.
+            if subagentContext == nil {
+                recordPendingUserEcho(requestId: requestId, text: text, mode: mode)
+            }
             SendMetrics.markAccepted()
             sendMetricsValue = SendMetrics.valueString
             return true
@@ -1403,6 +1446,68 @@ final class SessionViewModel: ObservableObject {
             actionErrorText = NetworkErrorInterpreter.message(for: error)
             return false
         }
+    }
+
+ // MARK: - Optimistic user echo (round2 §3, task-2)
+
+ /// Paints a prompt immediately instead of waiting for the host's durable
+ /// `user/message`. Failure paths never record (the caller keeps the existing
+ /// error toast / queue restore), so a failed send leaves no ghost bubble.
+    private func recordPendingUserEcho(requestId: String, text: String, mode: String) {
+        let now = Self.epochMilliseconds()
+        pendingUserEchoes.record(SessionRowBuilder.PendingUserEcho(
+            requestId: requestId,
+            text: text,
+            images: [],
+            sentAt: now,
+            mode: mode
+        ))
+        dbg("pending echo recorded: " + requestId + " mode=" + mode)
+ // Race guard: a fast idle followup can materialize the durable event before
+ // this response is processed — retire the echo before it is ever painted.
+        pendingUserEchoes.reconcile(events: journal.events)
+        repaintPendingUserEchoes()
+        schedulePendingEchoStaleRefresh()
+    }
+
+ /// Repaint the optimistic tail rows in place. Deliberately NOT a full
+ /// `rebuildRows()`: that would recompute `isRunning` from the journal and
+ /// could briefly report idle between `session/prompt` and `turn/start`
+ /// (queue-flush side effects). A pending row only ever needs appending.
+    private func repaintPendingUserEchoes() {
+        sections = SessionRowBuilder.appendingPendingEchoes(
+            pendingUserEchoes.echoes,
+            to: sections,
+            nowMs: Self.epochMilliseconds()
+        )
+    }
+
+ /// `mode:"steer"` can legitimately wait minutes for the running turn's next
+ /// step. The bubble is kept until the durable event retires it, but the
+ /// "发送中…" marker must not hang forever: this one-shot wakeup repaints the
+ /// rows when the oldest echo's indicator expires (works with no event traffic).
+    private func schedulePendingEchoStaleRefresh() {
+        pendingEchoStaleTask?.cancel()
+        let now = Self.epochMilliseconds()
+        guard let deadline = pendingUserEchoes.nextSendingIndicatorDeadline(nowMs: now) else {
+            pendingEchoStaleTask = nil
+            return
+        }
+        let delayMs = max(0, deadline - now)
+        pendingEchoStaleTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(delayMs) * 1_000_000)
+            guard !Task.isCancelled, let self else { return }
+            self.pendingEchoStaleTask = nil
+            guard !self.pendingUserEchoes.isEmpty else { return }
+            self.dbg("pending echo indicator expired; repaint")
+            self.repaintPendingUserEchoes()
+ // Later echoes may still be inside their own window.
+            self.schedulePendingEchoStaleRefresh()
+        }
+    }
+
+    private static func epochMilliseconds() -> Int64 {
+        Int64(Date().timeIntervalSince1970 * 1000)
     }
 
     func abort() async {

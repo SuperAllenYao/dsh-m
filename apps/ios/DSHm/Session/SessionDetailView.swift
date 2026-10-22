@@ -1297,31 +1297,59 @@ private struct StickToBottomObserver: ViewModifier {
 ///
 /// 旧实现只在"是否贴顶"这个 Bool 翻转时触发。但前置加载完成后锚点恢复会把视口
 /// 留在顶部附近，Bool 一直是 true、不再翻转，于是后面几次下拉完全不触发，
-/// 用户只能去点按钮。现在改为：
+/// 用户只能去点按钮。修正后改为：
 /// - 用 ScrollGeometry 持续跟踪"是否在顶部附近"；
 /// - 用户每一次滚动手势结束（interacting/decelerating → idle）时，只要还在顶部附近
 /// 就触发一次加载 —— 天然做到"一次下拉加载一页"，不会无节制连发。
+///
+/// 二次反馈："加载更早的消息"出现后稍微一滑就自动加载，极易误触。
+/// 因此把触发所需的滑动距离整体放大 2 倍（120 → 240），并额外要求**本次手势
+/// 实际向上拉动的距离**也 ≥ 240pt：只认"用户真的把内容拉上去一屏"，
+/// 贴顶状态下的小幅抖动不再触发。程序化跟随是瞬时无动画滚动，不产生
+/// interacting/decelerating，因此不会自我触发。
+/// 常量集中在 `Trigger`，真机微调手感只改这一处。
 /// iOS 17 由顶部加载行是否实体化兜底（TopRowTrigger）。
 private struct NearTopObserver: ViewModifier {
     let onPullAtTop: () -> Void
- /// 触发阈值：贴顶 120pt 内都算"在顶部"，滑到顶后自然松手就会命中。
-    private static let threshold: CGFloat = 120
+
+ /// 触发条件（集中调参处）。
+    private enum Trigger {
+ /// 视口距顶部多少 pt 以内算"已到达顶部附近"。
+        static let nearTopThreshold: CGFloat = 240
+ /// 本次手势实际向上拉动的距离下限（放大 2 倍后的触发距离）。
+        static let minimumPullDistance: CGFloat = 240
+    }
+
     @State private var isNearTop = true
+ /// 最近一次 ScrollGeometry 提交的 contentOffset.y，用于计算手势位移。
+    @State private var offsetY: CGFloat = 0
+ /// 本次用户手势开始（进入 interacting）时的 contentOffset.y。
+    @State private var pullStartOffsetY: CGFloat?
 
     func body(content: Content) -> some View {
         if #available(iOS 18.0, *) {
             content
-                .onScrollGeometryChange(for: Bool.self) { geometry in
-                    geometry.contentOffset.y <= Self.threshold
-                } action: { _, nearTop in
-                    isNearTop = nearTop
+                .onScrollGeometryChange(for: CGFloat.self) { geometry in
+                    geometry.contentOffset.y
+                } action: { _, y in
+                    offsetY = y
+                    isNearTop = y <= Trigger.nearTopThreshold
                 }
                 .onScrollPhaseChange { previousPhase, phase in
- // 只认"用户手势结束"的那一刻；程序化跟随是瞬时无动画滚动，
- // 不产生 interacting/decelerating，因此不会自我触发。
-                    let wasUserDriven = previousPhase == .interacting || previousPhase == .decelerating
-                    if phase == .idle, wasUserDriven, isNearTop {
-                        onPullAtTop()
+                    switch phase {
+                    case .interacting:
+ // 手势开始的那一帧记下起点，idle 时用"起点 - 当前"算真实拉动距离。
+                        if previousPhase != .interacting { pullStartOffsetY = offsetY }
+                    case .idle:
+                        let wasUserDriven = previousPhase == .interacting || previousPhase == .decelerating
+ // 向上拉（内容向新的一端滚）= contentOffset.y 变小，故用起点减当前值。
+                        let pulled = (pullStartOffsetY ?? offsetY) - offsetY
+                        if wasUserDriven, isNearTop, pulled >= Trigger.minimumPullDistance {
+                            onPullAtTop()
+                        }
+                        pullStartOffsetY = nil
+                    default:
+                        break
                     }
                 }
         } else {
