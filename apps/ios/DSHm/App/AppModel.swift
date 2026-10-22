@@ -135,6 +135,8 @@ final class AppModel: ObservableObject {
     let push = PushManager()
  /// Deep-link session lookup table, refreshed from every `session/list` load.
     private var deepLinkResolver = SessionDeepLinkResolver()
+ /// 通知 tap 的 deep link 在未配对时就到达（冷启动/配对前）：先记住，配对完成再跳。
+    private var pendingDeepLinkSessionId: String?
     private var cancellables = Set<AnyCancellable>()
 
  // MARK: - P0-4/P0-5 first screen + foreground resume
@@ -316,6 +318,17 @@ final class AppModel: ObservableObject {
         for route in PushActionInbox.shared.drain() {
             handlePushApprovalRoute(route)
         }
+ // 通知 tap 冷启动：UIKit 可能在 AppModel 创建前就投递了 deep link，上面那次
+ // NotificationCenter post 会丢失，默认 `.workspaces` 路由就会覆盖掉它
+ // （用户报障：点通知只进工作区列表）。这里领取 delegate 停放的 sessionId。
+        PushDeepLinkInbox.shared.markLive()
+        if let parkedSessionId = PushDeepLinkInbox.shared.drain() {
+            if link.credentials == nil {
+                pendingDeepLinkSessionId = parkedSessionId
+            } else {
+                openSession(parkedSessionId)
+            }
+        }
     }
 
  /// Called from RootView on appear: notification permission + APNs registration
@@ -338,21 +351,31 @@ final class AppModel: ObservableObject {
  /// P0-5: decide how to resume the remote connection when the scene becomes
  /// active. The default is to **reuse** the existing TLS/mux: a full
  /// `connectOnce` is only justified when the transport is already down.
+ ///
+ /// task-2: a **meaningful network-path change** since the last successful
+ /// connect makes `.connected` meaningless — the socket was dialed on the old
+ /// network and the OS has not reported it dead — so the resume must reconnect
+ /// instead of reusing a stale mux.
     nonisolated static func foregroundAction(
         phase: LinkService.Phase,
-        backgroundedSeconds: TimeInterval?
+        backgroundedSeconds: TimeInterval?,
+        networkPathChanged: Bool = false
     ) -> ForegroundAction {
         guard let backgroundedSeconds else { return .none }
         switch phase {
         case .connected:
+ // A stale transport is never reusable, regardless of the interruption
+ // length: the mux was dialed on the network we already left.
+            if networkPathChanged { return .reconnect }
  // A very short interruption (control center, permission alert…) does
  // not justify any extra traffic or a stream reopen; a real resume
  // reuses the existing TLS/mux.
             return backgroundedSeconds >= 1 ? .reuseMux : .none
         case .connecting:
  // A bring-up attempt is already running. Restarting it would cancel
- // the in-flight TLS/WSS work and lengthen the reconnect (P0-5).
-            return .none
+ // the in-flight TLS/WSS work (P0-5) — unless the round predates a
+ // network switch, in which case it is dialing the wrong path.
+            return networkPathChanged ? .reconnect : .none
         case .disconnected, .reconnecting:
  // `.reconnecting` may be waiting out the 0.5–10s backoff; the resumed
  // app should retry immediately instead of waiting for it.
@@ -374,14 +397,28 @@ final class AppModel: ObservableObject {
     func handleAppBecameActive() {
         let backgroundedSeconds = enteredBackgroundAt.map { Date().timeIntervalSince($0) }
         enteredBackgroundAt = nil
-        switch Self.foregroundAction(phase: link.phase, backgroundedSeconds: backgroundedSeconds) {
+        let networkPathChanged = link.networkPathChangedSinceConnect
+        switch Self.foregroundAction(
+            phase: link.phase,
+            backgroundedSeconds: backgroundedSeconds,
+            networkPathChanged: networkPathChanged
+        ) {
         case .none:
             return
         case .reconnect:
+ // t0 of the reconnect chain: `scenePhase ==.active` (handoff §2.0).
+            ReconnectMetrics.beginPageEnter(reason: "sceneActive")
+            if networkPathChanged {
+                ReconnectMetrics.markInvalidate(reason: "sceneActive/pathChanged")
+            }
             let ms = (backgroundedSeconds ?? 0) * 1000
             recordForegroundMetrics(action: "reconnect", backgroundedMs: ms, reused: false)
             link.handleForeground()
         case .reuseMux:
+ // A healthy mux on the current network: the chain only measures the
+ // list refresh latency (connected is t0 itself).
+            ReconnectMetrics.beginPageEnter(reason: "sceneActive")
+            ReconnectMetrics.markReuseDecision()
             let seconds = backgroundedSeconds ?? 0
             foregroundReuseCount += 1
             recordForegroundMetrics(action: "reuseMux", backgroundedMs: seconds * 1000, reused: true)
@@ -531,13 +568,26 @@ final class AppModel: ObservableObject {
 
     func didPair() {
         subagentRoute = nil
-        route = .workspaces
+ // 配对前点过通知：配对完成后再补跳会话详情，而不是丢掉这次意图。
+        if let pending = pendingDeepLinkSessionId {
+            pendingDeepLinkSessionId = nil
+            openSession(pending)
+        } else {
+            route = .workspaces
+        }
         push.bootstrap()
     }
 
  /// Opens a session by id (list taps and notification deep links).
     func openSession(_ sessionId: String) {
         subagentRoute = nil
+ // 未配对时没有会话可看：先停在这里，配对成功（didPair）后再跳，避免
+ // 落到一个打不开的详情页或丢掉这次 deep link。
+        guard link.credentials != nil else {
+            pendingDeepLinkSessionId = sessionId
+            route = .pairing
+            return
+        }
         route = .session(sessionAddress(forDeepLink: sessionId))
     }
 

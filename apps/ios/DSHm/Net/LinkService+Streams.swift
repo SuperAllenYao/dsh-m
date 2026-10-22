@@ -115,6 +115,9 @@ extension LinkService {
  /// approvals/questions) and seeds `clientId`. No 15s wait, no continuation.
     func openEventsAndWaitReadyP1(channel: P1Channel) throws {
         guard let welcome = channel.welcome else { throw LinkError.notConnected }
+ // 新连接的 `$events` 还没 ready：在收到本连接的 ready 帧之前，不能用
+ // `welcome.deviceId` 这个种子值去回答 waterfall（会被判成另一个 Peer）。
+        eventsClientIdConfirmed = false
         clientId = welcome.deviceId
         readyTimeoutTask?.cancel()
         readyTimeoutTask = nil
@@ -147,6 +150,8 @@ extension LinkService {
         if case .ready(let ready) = event {
             if let readyGeneration, readyGeneration != readyHandshakeGeneration { return }
             clientId = ready.clientId
+ /// 本连接的事件流就绪：从现在起 `$events/result` 才会被 Host 接受。
+            eventsClientIdConfirmed = true
             readyTimeoutTask?.cancel()
             readyTimeoutTask = nil
             if let continuation = readyContinuation {
@@ -167,10 +172,11 @@ extension LinkService {
  /// Answers a pending approval waterfall via the unary `$events/result` method.
  /// Only `allowed-once` permits the tool; `rejected` fails closed.
     func respondApproval(_ approval: ApprovalWaterfall, outcome: ApprovalOutcome) async throws {
-        guard let clientId else { throw LinkError.notConnected }
+ // 必须等本连接的 $events ready：旧 clientId 会被 Host 判成另一个 Peer。
+        let confirmedClientId = try await confirmedEventsClientId()
         _ = try await unary(
             "$events/result",
-            args: EventsResultArgs.outcome(clientId: clientId, eventId: approval.eventId, value: outcome)
+            args: EventsResultArgs.outcome(clientId: confirmedClientId, eventId: approval.eventId, value: outcome)
         )
         pendingApprovals.removeAll { $0.eventId == approval.eventId }
     }
@@ -199,17 +205,19 @@ extension LinkService {
  /// Answers an `open` user-question call through the live forwarded-events
  /// waterfall (`$events/result`). Requires the `$events` ready `clientId`.
     func answerUserQuestionsLive(eventId: String, answers: [UserQuestionAnswer]) async throws {
-        guard let clientId else { throw LinkError.notConnected }
  // The Host may have cancelled/settled this waterfall while the user was
  // composing an answer (turn aborted, answered elsewhere); never send a
  // stale $events/result.
         guard pendingUserQuestions.contains(where: { $0.eventId == eventId }) else {
             throw UserQuestionSubmitError.noLiveRequest
         }
+ // 必须等本连接的 $events ready：重连窗口内用旧 clientId 会得到
+ // gateway/interactions-forbidden（Remote event result belongs to another Peer）。
+        let confirmedClientId = try await confirmedEventsClientId()
         _ = try await unary(
             "$events/result",
             args: EventsResultArgs.userQuestionOutcome(
-                clientId: clientId,
+                clientId: confirmedClientId,
                 eventId: eventId,
                 answers: answers
             )

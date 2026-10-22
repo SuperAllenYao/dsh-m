@@ -34,6 +34,11 @@ struct WorkspaceListView: View {
             SettingsView().environmentObject(app)
         }
         .task {
+ // task-2 (reconnect < 1s): t0 = page enter. Cancels a pending backoff
+ // wait and invalidates a stale (network-changed) mux before the view
+ // model asks for the snapshot, so the list request overlaps the mux
+ // handshake instead of queueing behind it.
+            app.link.handlePageEnter()
             viewModel.attach(link: app.link)
             viewModel.start()
         }
@@ -71,6 +76,7 @@ struct WorkspaceListView: View {
                 startupMetricsElement
                 prewarmMetricsElement
                 connectMetricsElement
+                reconnectMetricsElement
             }
         }
     }
@@ -118,6 +124,22 @@ struct WorkspaceListView: View {
                 .opacity(0.02)
                 .allowsHitTesting(false)
                 .accessibilityIdentifier("connect-metrics")
+                .accessibilityLabel(metrics)
+                .accessibilityValue(metrics)
+        }
+    }
+
+ /// task-2 E2E-gated reconnect-chain summary (`totalMs=..;pageEnterMs=..;...`,
+ /// handoff §2.3(6)). Hidden leaf element, same pattern as `connect-metrics`.
+    @ViewBuilder
+    private var reconnectMetricsElement: some View {
+        if let metrics = app.link.reconnectMetricsValue {
+            Text("reconnect-metrics")
+                .font(.system(size: 1))
+                .frame(width: 2, height: 2)
+                .opacity(0.02)
+                .allowsHitTesting(false)
+                .accessibilityIdentifier("reconnect-metrics")
                 .accessibilityLabel(metrics)
                 .accessibilityValue(metrics)
         }
@@ -348,12 +370,27 @@ struct WorkspaceListView: View {
         return 0
     }
 
+ /// One-line connection state; the specific failure reason wins.
+    private var connectionBannerText: String {
+        if !app.link.statusDetail.isEmpty, !app.link.phase.isConnected {
+            return app.link.statusDetail
+        }
+        return app.link.phase.isBusy ? L10n.t("正在连接 Mac…") : L10n.t("连接已断开")
+    }
+
     private var connectionBanner: some View {
         HStack(spacing: Theme.Spacing.xs) {
             StatusDot(color: app.link.phase.isBusy ? Theme.Palette.warning : Theme.Palette.danger, size: 6, pulsing: app.link.phase.isBusy)
-            Text(app.link.phase.isBusy ? L10n.t("正在连接 Mac…") : L10n.t("连接已断开"))
+ // Cross-network requirement (handoff §2.3): never only 「重连中」. The
+ // last failed round's classified one-line reason (desktop plugin not
+ // ready / network unreachable / gateway rejected) wins over the generic
+ // busy label.
+            Text(connectionBannerText)
                 .font(Theme.Typography.caption)
                 .foregroundStyle(Theme.Palette.textSecondary)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .accessibilityIdentifier("workspace-connection-reason")
             Spacer()
             if app.link.phase.isBusy {
                 ProgressView().tint(Theme.Palette.accent).scaleEffect(0.7)

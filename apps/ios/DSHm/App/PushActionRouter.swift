@@ -178,6 +178,57 @@ final class PushActionInbox {
     }
 }
 
+/// In-process parking slot for a notification **tap** deep link.
+///
+/// UIKit delivers `didReceive response` during launch, before SwiftUI builds
+/// `AppModel` (`@StateObject` is created with the first scene). The posted
+/// `.dshmPushNotificationTapped` would therefore be lost, and the app would keep
+/// its default `.workspaces` route — the "tap lands on the workspace list"
+/// regression. The delegate stores the session id here before posting;
+/// `AppModel.init` drains it once the model exists and routes to the session.
+final class PushDeepLinkInbox {
+    static let shared = PushDeepLinkInbox()
+
+    private let lock = NSLock()
+    private var pending: String?
+ /// Once AppModel is alive the live NotificationCenter path is authoritative;
+ /// storing late taps would replay a stale session on the next cold launch.
+    private var appModelIsLive = false
+
+    func markLive() {
+        lock.lock()
+        defer { lock.unlock() }
+        appModelIsLive = true
+    }
+
+ /// Stores a tap that arrives before AppModel exists; later taps are ignored
+ /// here because the live publisher handles them.
+    func store(_ sessionId: String?) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !appModelIsLive else { return }
+        guard let sessionId, !sessionId.isEmpty else { return }
+        pending = sessionId
+    }
+
+ /// Returns the parked session id (if any) and clears the slot.
+    func drain() -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+        let value = pending
+        pending = nil
+        return value
+    }
+
+ /// Unit-test seam: a process-wide singleton must not leak state between cases.
+    func resetForTesting() {
+        lock.lock()
+        defer { lock.unlock() }
+        pending = nil
+        appModelIsLive = false
+    }
+}
+
 /// ≥2s throttle for background (silent) push refreshes. `session/list` returns
 /// every session's projections (hundreds of KB) and the plugin
 /// already coalesces silent pushes per device for 3s; the app still guards on its
