@@ -776,7 +776,8 @@ final class SessionPaginationTests: XCTestCase {
         return try! JSONValue.jsonObject(from: data)
     }
 
-    /// task-7 (c)：非相邻/带洞的页必须被拒绝，窗口不变、入口保持可重试。
+    /// task-7 (c) + task-10：非相邻/带洞的页不得插入窗口；自动用最新 front
+    /// 重试一次，仍失败则必须给出可见错误（不能静默 no-op），入口保持可重试。
     @MainActor
     func testNonAdjacentPageIsRejectedWithoutPunchingHole() async throws {
         let host = FixtureSessionHost(events: fixtureEvents())
@@ -793,9 +794,10 @@ final class SessionPaginationTests: XCTestCase {
             return .object(["records": .array(records), "hasMore": .bool(true)])
         }
         await viewModel.loadOlderPageNowForTesting()
-        XCTAssertEqual(calls, 1)
+        XCTAssertEqual(calls, 2, "一次自动重试后仍被拒")
         XCTAssertEqual(viewModel.eventSeqs, before, "带洞的页不得插入")
         XCTAssertEqual(viewModel.oldestLoadedSeq, oldestBefore)
+        XCTAssertNotNil(viewModel.actionErrorText, "静默失败不允许：被拒必须可见")
         XCTAssertTrue(viewModel.hasMoreOlder, "拒绝后保持可重试")
         XCTAssertFalse(viewModel.isLoadingOlder)
 
@@ -805,5 +807,141 @@ final class SessionPaginationTests: XCTestCase {
         let newOldest = try XCTUnwrap(viewModel.oldestLoadedSeq)
         XCTAssertLessThan(newOldest, oldestBefore)
         XCTAssertEqual(viewModel.eventSeqs, Array(newOldest...host.cursor))
+    }
+
+    // MARK: - 9. Silent-failure guard (task-10 bug2b, real-device 2026-10-22)
+
+    /// A stale/non-adjacent page (the window front moved while the request was in
+    /// flight) must be retried once against the fresh front, not silently dropped:
+    /// the user saw the spinner but no older rows ever appeared.
+    @MainActor
+    func testStaleNonAdjacentPageRetriesWithFreshFrontThenMerges() async throws {
+        let host = FixtureSessionHost(events: fixtureEvents())
+        let viewModel = makeViewModel(host: host, store: makeStore(), firstWindow: 16)
+        let oldestBefore = try XCTUnwrap(viewModel.oldestLoadedSeq)
+        let newestBefore = try XCTUnwrap(viewModel.eventSeqs.last)
+        var calls = 0
+        let normalLoader = hostLoader(host: host)
+        viewModel.olderPageLoader = { args in
+            calls += 1
+            if calls == 1 {
+                // Stale page: front moved on, so this page is not adjacent to the
+                // current window front (journal rejects the whole block).
+                let records: [JSONValue] = (0..<6).map { seq in
+                    .object(["type": .string("event"), "event": self.wireEvent(host.events[seq])])
+                }
+                return .object(["records": .array(records), "hasMore": .bool(true)])
+            }
+            return try await normalLoader(args)
+        }
+        await viewModel.loadOlderPageNowForTesting()
+        XCTAssertEqual(calls, 2, "a stale page must be retried once against the fresh front")
+        let oldestAfter = try XCTUnwrap(viewModel.oldestLoadedSeq)
+        XCTAssertLessThan(oldestAfter, oldestBefore, "the retry must really prepend (oldest strictly decreases)")
+        XCTAssertEqual(viewModel.eventSeqs.last, newestBefore, "the retry must not touch the window tail")
+        XCTAssertNil(viewModel.actionErrorText, "a successful retry must not surface an error")
+        XCTAssertEqual(viewModel.eventSeqs.count, newestBefore - oldestAfter + 1, "the merged window must stay contiguous")
+    }
+
+    /// Retry rejected too: the user-visible failure must be surfaced (retryable),
+    /// never a silent no-op.
+    @MainActor
+    func testPersistentlyRejectedPageSurfacesVisibleErrorAndStaysRetryable() async throws {
+        let host = FixtureSessionHost(events: fixtureEvents())
+        let viewModel = makeViewModel(host: host, store: makeStore(), firstWindow: 16)
+        let before = viewModel.eventSeqs
+        let oldestBefore = try XCTUnwrap(viewModel.oldestLoadedSeq)
+        var calls = 0
+        viewModel.olderPageLoader = { _ in
+            calls += 1
+            let records: [JSONValue] = (0..<6).map { seq in
+                .object(["type": .string("event"), "event": self.wireEvent(host.events[seq])])
+            }
+            return .object(["records": .array(records), "hasMore": .bool(true)])
+        }
+        await viewModel.loadOlderPageNowForTesting()
+        XCTAssertEqual(calls, 2, "one automatic retry, then stop")
+        XCTAssertNotNil(viewModel.actionErrorText, "no silent no-op: a rejected page must surface an error")
+        XCTAssertEqual(viewModel.eventSeqs, before, "the window must not be damaged")
+        XCTAssertEqual(viewModel.oldestLoadedSeq, oldestBefore)
+        XCTAssertTrue(viewModel.hasMoreOlder, "the paging entry must stay retryable")
+        XCTAssertFalse(viewModel.isLoadingOlder)
+
+        viewModel.olderPageLoader = hostLoader(host: host)
+        await viewModel.loadOlderPageNowForTesting()
+        XCTAssertNil(viewModel.actionErrorText, "a later success clears the paging error")
+        XCTAssertLessThan(try XCTUnwrap(viewModel.oldestLoadedSeq), oldestBefore)
+    }
+
+    /// E2E diagnostics: request/response/merge are recorded on `e2eLastPageDebug`
+    /// (read by the hidden `e2e-lastpage` element), and failures carry `error=`.
+    @MainActor
+    func testE2ELastPageDebugRecordsMergeAndFailure() async throws {
+        SessionViewModel.e2ePageDiagnosticsTestOverride = true
+        defer { SessionViewModel.e2ePageDiagnosticsTestOverride = false }
+        let host = FixtureSessionHost(events: fixtureEvents())
+        let viewModel = makeViewModel(host: host, store: makeStore(), firstWindow: 16)
+        viewModel.olderPageLoader = hostLoader(host: host)
+        await viewModel.loadOlderPageNowForTesting()
+        let success = viewModel.e2eLastPageDebug
+        XCTAssertTrue(success.contains("req(before="), success)
+        XCTAssertTrue(success.contains("through="), success)
+        XCTAssertTrue(success.contains("resp(records="), success)
+        XCTAssertTrue(success.contains("prepend(olderPrepended(inserted="), success)
+        XCTAssertTrue(success.contains("merged=1"), success)
+        XCTAssertTrue(success.contains("oldest="), success)
+        XCTAssertTrue(success.contains("ctx(firstPage=1"), success)
+        XCTAssertTrue(success.contains("pagesLoaded="), success)
+        XCTAssertFalse(success.contains("error="), success)
+
+        viewModel.olderPageLoader = { _ in
+            throw FixtureHostError(code: "gateway/internal", message: "boom")
+        }
+        await viewModel.loadOlderPageNowForTesting()
+        let failure = viewModel.e2eLastPageDebug
+        XCTAssertTrue(failure.contains("error="), "失败路径也要有诊断，不能静默: \(failure)")
+    }
+
+    /// task-10 bug2b / E2E pull #5: a pull that lands while the link is reconnecting
+    /// used to be a silent no-op (no request, no spinner, no error). It must be
+    /// visible and must load (or replay) afterwards.
+    @MainActor
+    func testPullWhileReconnectingSurfacesVisibleErrorAndRetries() async throws {
+        SessionViewModel.e2ePageDiagnosticsTestOverride = true
+        defer { SessionViewModel.e2ePageDiagnosticsTestOverride = false }
+        let host = FixtureSessionHost(events: fixtureEvents())
+        let viewModel = makeViewModel(host: host, store: makeStore(), firstWindow: 16)
+        let oldestBefore = try XCTUnwrap(viewModel.oldestLoadedSeq)
+        // No page loader and no attached link => "not connected".
+        await viewModel.loadOlderPageNowForTesting()
+        XCTAssertNotNil(viewModel.actionErrorText, "a pull during a reconnect must not be silent")
+        XCTAssertTrue(viewModel.e2eLastPageDebug.contains("blocked(not-connected)"), viewModel.e2eLastPageDebug)
+        XCTAssertTrue(viewModel.hasMoreOlder, "the entry stays retryable")
+        XCTAssertEqual(viewModel.oldestLoadedSeq, oldestBefore)
+
+        // Link is back (here: the loader seam): the retried pull loads and clears it.
+        viewModel.olderPageLoader = hostLoader(host: host)
+        await viewModel.loadOlderPageNowForTesting()
+        XCTAssertNil(viewModel.actionErrorText, "a successful load clears the reconnect error")
+        XCTAssertLessThan(try XCTUnwrap(viewModel.oldestLoadedSeq), oldestBefore)
+    }
+
+    /// 2026-10-22 真机 A5：页可能合并进一个**已存在的、已完成的 turn**（同 turn 内继续
+    /// 往前翻）。那种 turn 的 section 默认折叠，用户下拉后只看到原来的 header，看起来
+    /// 「没刷出更早消息」。合并成功后最老 section 必须自动展开，让新行立刻上屏。
+    @MainActor
+    func testOlderPageMergeExpandsNewlyLoadedOldestTurn() async throws {
+        let host = FixtureSessionHost(events: fixtureEvents())
+        let viewModel = makeViewModel(host: host, store: makeStore(), firstWindow: 16)
+        let firstBefore = viewModel.sections.first?.id
+        viewModel.olderPageLoader = hostLoader(host: host)
+        await viewModel.loadOlderPageNowForTesting()
+        // rows rebuild is debounced (~40ms) — the view-driven path lands it async.
+        await waitUntil { viewModel.sections.first?.id != firstBefore }
+        let oldestSection = try XCTUnwrap(viewModel.sections.first)
+        XCTAssertTrue(
+            viewModel.expandedTurnIDs.contains(oldestSection.id),
+            "the newly loaded oldest turn must be expanded so the pulled-in rows are visible on screen"
+        )
     }
 }

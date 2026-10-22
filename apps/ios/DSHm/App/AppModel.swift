@@ -107,6 +107,21 @@ enum FirstScreenMetrics {
     }
 }
 
+/// task-9: navigation a push deep link must use for one session id.
+///
+/// A subagent (Agent Teams teammate) session must be opened through its durable
+/// parent address **and** carry the parent context: a plain `kind:"session"`
+/// address for such a session is rejected by the Host (`session/agent-busy`),
+/// which used to leave an empty detail + error banner after tapping a turn-end
+/// notification (real device, 2026-10-22 23:0x).
+struct PushDeepLinkNavigation: Equatable {
+    var address: SessionFollowAddress
+    /// Non-nil when `address` is a subagent address: where "back" goes.
+    var parentAddress: SessionFollowAddress?
+    /// Non-nil when `address` is a subagent address: parent/child/mode context.
+    var context: SubagentSessionContext?
+}
+
 /// App-level navigation + environment wiring.
 @MainActor
 final class AppModel: ObservableObject {
@@ -137,6 +152,16 @@ final class AppModel: ObservableObject {
     private var deepLinkResolver = SessionDeepLinkResolver()
     /// 通知 tap 的 deep link 在未配对时就到达（冷启动/配对前）：先记住，配对完成再跳。
     private var pendingDeepLinkSessionId: String?
+    /// task-9: in-flight `session/list` lookup for a notification deep link whose
+    /// id is not in the cached table (see `resolveDeepLinkSession`).
+    private var deepLinkResolveTask: Task<Void, Never>?
+    private var deepLinkResolveToken: UUID?
+    /// Ids from the last `session/list`: a known session navigates immediately, an
+    /// unknown one must be resolved first (it may be a subagent child).
+    private var knownSessionIds = Set<String>()
+    /// Test seam: overrides the live `session/list` lookup used by
+    /// `resolveDeepLinkSession`. Nil in production.
+    var deepLinkSessionLookup: ((String) async -> [SessionListItem]?)?
     private var cancellables = Set<AnyCancellable>()
 
     // MARK: - P0-4/P0-5 first screen + foreground resume
@@ -225,6 +250,17 @@ final class AppModel: ObservableObject {
         // measures list/detail latency and drives the composer on a real device).
         if let deepLink = ProcessInfo.processInfo.environment["DSHM_E2E_OPEN_SESSION"], !deepLink.isEmpty {
             openSession(deepLink)
+        }
+        // E2E: simulate a notification tap N ms after launch. Posts the exact
+        // NotificationCenter signal AppDelegate sends for a real push response, so
+        // UI tests exercise the real "already in a session -> tap turn-end push"
+        // path (AppModel.handlePushApprovalRoute -> openSession). Debug-only.
+        if let tappedSession = ProcessInfo.processInfo.environment["DSHM_E2E_TAP_PUSH_SESSION"],
+           !tappedSession.isEmpty {
+            let delay = Int(ProcessInfo.processInfo.environment["DSHM_E2E_TAP_PUSH_AFTER_MS"] ?? "") ?? 1_500
+            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(max(0, delay))) {
+                NotificationCenter.default.post(name: .dshmPushNotificationTapped, object: tappedSession)
+            }
         }
         #endif
         // Republish link state so views observing AppModel also refresh on link changes.
@@ -579,16 +615,143 @@ final class AppModel: ObservableObject {
     }
 
     /// Opens a session by id (list taps and notification deep links).
+    ///
+    /// task-9: a notification can point at a **subagent** session. That session
+    /// must be opened through its durable parent address *and* with the parent
+    /// context (`subagentRoute`), otherwise the app either (a) sends a plain
+    /// `kind:"session"` address, which the Host rejects with
+    /// `session/agent-busy` (blank detail + error banner) — or (b) opens the child
+    /// as a normal session (wrong back navigation / composer).
     func openSession(_ sessionId: String) {
-        subagentRoute = nil
         // 未配对时没有会话可看：先停在这里，配对成功（didPair）后再跳，避免
         // 落到一个打不开的详情页或丢掉这次 deep link。
         guard link.credentials != nil else {
+            subagentRoute = nil
             pendingDeepLinkSessionId = sessionId
             route = .pairing
             return
         }
-        route = .session(sessionAddress(forDeepLink: sessionId))
+        openDeepLinkSession(sessionId)
+    }
+
+    /// Opens one notification deep link. A resolved subagent address (or a known
+    /// top-level session) navigates immediately; an **unknown** id is resolved
+    /// against a fresh `session/list` *before* the detail is created — the detail
+    /// identity is the session id, so replacing the route afterwards would keep the
+    /// existing (plain-address) view model and its Host rejection alive.
+    private func openDeepLinkSession(_ sessionId: String) {
+        // Every deep link supersedes a pending lookup: rapid notification taps must
+        // end on the newest target, and a slow lookup of an older tap must not
+        // override it.
+        let navigationToken = UUID()
+        deepLinkResolveToken = navigationToken
+        let navigation = Self.deepLinkNavigation(sessionId: sessionId, resolver: deepLinkResolver)
+        if navigation.context != nil || knownSessionIds.contains(sessionId) {
+            deepLinkResolveTask?.cancel()
+            deepLinkResolveTask = nil
+            applyDeepLinkNavigation(navigation)
+            return
+        }
+        resolveDeepLinkSession(sessionId, token: navigationToken)
+    }
+
+    private func applyDeepLinkNavigation(_ navigation: PushDeepLinkNavigation) {
+        if let context = navigation.context, let parentAddress = navigation.parentAddress {
+            subagentRoute = SubagentRoute(context: context, parentAddress: parentAddress)
+        } else {
+            subagentRoute = nil
+        }
+        route = .session(navigation.address)
+    }
+
+    /// Pure decision seam (unit-tested): route + subagent context for one id.
+    nonisolated static func deepLinkNavigation(
+        sessionId: String,
+        resolver: SessionDeepLinkResolver
+    ) -> PushDeepLinkNavigation {
+        let address = resolver.address(for: sessionId)
+        guard case .subagent(let parentSessionId, let childSessionId, let mode) = address else {
+            return PushDeepLinkNavigation(address: address, parentAddress: nil, context: nil)
+        }
+        // A subagent parent is a top-level session; if a (stale) row resolves the
+        // parent to another subagent address, fall back to the plain parent id
+        // instead of nesting subagent addresses.
+        let resolvedParent = resolver.address(for: parentSessionId)
+        let parentAddress: SessionFollowAddress = resolvedParent.isSubagent
+            ? .session(sessionId: parentSessionId)
+            : resolvedParent
+        let context = SubagentSessionContext(
+            parentSessionId: parentSessionId,
+            childSessionId: childSessionId,
+            modeRaw: mode
+        )
+        return PushDeepLinkNavigation(
+            address: address,
+            parentAddress: parentAddress,
+            context: context
+        )
+    }
+
+    /// Resolves an unknown deep-linked id against a fresh `session/list`, then
+    /// opens it (a cold-launch tap arrives before the transport is up, and the
+    /// table is only refreshed when the workspace list renders). A failed lookup
+    /// falls back to the plain address after a bounded wait so an offline tap still
+    /// navigates somewhere — the Host error then surfaces instead of a silent no-op.
+    private func resolveDeepLinkSession(_ sessionId: String, token resolveToken: UUID) {
+        deepLinkResolveTask?.cancel()
+        deepLinkResolveTask = Task { [weak self] in
+            guard let self else { return }
+            defer {
+                if self.deepLinkResolveToken == resolveToken {
+                    self.deepLinkResolveTask = nil
+                    self.deepLinkResolveToken = nil
+                }
+            }
+            var items: [SessionListItem]?
+            if let lookup = self.deepLinkSessionLookup {
+                items = await lookup(sessionId)
+            } else {
+                for _ in 0..<24 {
+                    if Task.isCancelled { return }
+                    if self.link.phase.isConnected { break }
+                    try? await Task.sleep(nanoseconds: 250_000_000)
+                }
+                if !Task.isCancelled, self.link.phase.isConnected,
+                   let value = try? await self.link.unary(
+                       "session/list",
+                       args: SessionListLite.requestArgs(),
+                       timeout: 20
+                   ),
+                   let list = try? value.decode(SessionListValue.self) {
+                    items = list.items
+                }
+            }
+            guard !Task.isCancelled else { return }
+            if let items { self.updateKnownSessions(items) }
+            let navigation = Self.deepLinkNavigation(
+                sessionId: sessionId,
+                resolver: self.deepLinkResolver
+            )
+            Self.pushDbg(
+                "deep link resolve session=" + sessionId
+                    + " listed=" + String(items != nil)
+                    + " subagent=" + String(navigation.context != nil)
+            )
+            // Ordering: a newer deep link (or a newer resolved navigation) supersedes
+            // this lookup. `.pairing` / `.workspaces` are fine — nothing is open yet
+            // (cold launch / pairing hand-off), so the deep link still completes.
+            guard self.deepLinkResolveToken == resolveToken else { return }
+            self.applyDeepLinkNavigation(navigation)
+        }
+    }
+
+    /// DSHM_DEBUG_STREAM-gated diagnostic (notification deep-link navigation).
+    private static let pushDebugEnabled =
+        ProcessInfo.processInfo.environment["DSHM_DEBUG_STREAM"] == "1"
+
+    private static func pushDbg(_ message: @autoclosure () -> String) {
+        guard pushDebugEnabled else { return }
+        NSLog("[PUSHDBG] %@", message())
     }
 
     func openSession(_ address: SessionFollowAddress) {
@@ -636,6 +799,7 @@ final class AppModel: ObservableObject {
     /// Keeps the deep-link lookup table in sync with the list the user sees.
     func updateKnownSessions(_ sessions: [SessionListItem]) {
         deepLinkResolver.update(sessions: sessions)
+        knownSessionIds = Set(sessions.map(\.sessionId))
     }
 
     func backToWorkspaces() {

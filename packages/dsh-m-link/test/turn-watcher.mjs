@@ -321,6 +321,49 @@ await check('frame-path-fallback-when-device-has-no-watcher', async () => {
   assert.equal(sent[0].threadId, 'session-def');
 });
 
+// -------------------------------- top-level only (user decision 2026-10-22)
+
+await check('subagent-list-rows-never-produce-turn-end', async () => {
+  const before = [
+    { sessionId: 'parent-1', running: true },
+    { sessionId: 'child-1', running: true, parentSessionId: 'parent-1' },
+    { sessionId: 'child-2', running: true, origin: 'subagent' },
+  ];
+  const after = [
+    { sessionId: 'parent-1', running: false },
+    { sessionId: 'child-1', running: false, parentSessionId: 'parent-1' },
+    { sessionId: 'child-2', running: false, origin: 'subagent' },
+  ];
+  assert.deepEqual(
+    [...sessionRunningState(before)],
+    ['parent-1'],
+    'only top-level sessions enter the running baseline'
+  );
+  const diff = diffRunningSessions(sessionRunningState(before), after);
+  assert.deepEqual(diff.ended, ['parent-1'], 'only the top-level session notifies on completion');
+  assert.deepEqual([...diff.running], []);
+  assert.deepEqual(diff.dropped, [], 'subagent rows are ignored, not reported as dropped');
+});
+
+await check('watcher-ignores-subagent-transitions-end-to-end', async () => {
+  const rows = [
+    { sessionId: 'parent-1', running: true },
+    { sessionId: 'child-1', running: true, parentSessionId: 'parent-1' },
+  ];
+  const { watcher, state } = makeWatcher({ config: { watchSessions: true }, rows });
+  watcher.sync();
+  await settle();
+  assert.equal(state.sent.length, 0, 'baseline poll never notifies');
+  // Both flip idle in the same poll: only the parent may notify.
+  state.rows = [
+    { sessionId: 'parent-1', running: false },
+    { sessionId: 'child-1', running: false, parentSessionId: 'parent-1' },
+  ];
+  await watcher.pollOnce();
+  assert.deepEqual(state.sent, ['parent-1'], 'only the top-level session notifies; subagent child is ignored');
+  watcher.dispose();
+});
+
 // ------------------------------------------------------- server wiring
 
 await check('config-defaults-and-normalization', async () => {

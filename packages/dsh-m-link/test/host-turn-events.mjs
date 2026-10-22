@@ -99,4 +99,25 @@ check('missing/empty session id is ignored (never push a deep link with no targe
   assert.deepEqual(calls, []);
 });
 
+check('subagent / teammate sessions never notify (user decision 2026-10-22: top-level only)', () => {
+  const calls = [];
+  const handler = createHostTurnEventHandler({
+    notifyTurnEnd: (id) => calls.push(['turn-end', id]),
+    notifyFailure: (id) => calls.push(['failure', id]),
+  });
+  // The Host Session header carries origin/parentSession for delegated sessions.
+  handler({ id: 'child-origin', header: { origin: 'subagent' } }, turnEnd('completed'));
+  handler({ id: 'child-parent', header: { parentSession: 'parent-x' } }, turnEnd('error'));
+  assert.deepEqual(calls, [], 'no push for subagent child sessions');
+  // Top-level sessions (and headerless test doubles) keep notifying.
+  handler({ id: 'top-origin', header: { origin: 'top-level' } }, turnEnd('completed'));
+  handler({ id: 'plain' }, turnEnd('completed'));
+  handler({ id: 'top-parentless', header: { parentSession: '' } }, turnEnd('error'));
+  assert.deepEqual(calls, [
+    ['turn-end', 'top-origin'],
+    ['turn-end', 'plain'],
+    ['failure', 'top-parentless'],
+  ]);
+});
+
 console.log('host-turn-events: GO ' + String(checks) + '/' + String(checks));

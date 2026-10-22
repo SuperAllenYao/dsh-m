@@ -40,6 +40,8 @@ export function sessionRunningState(items) {
   for (const item of list) {
     if (item === null || typeof item !== 'object') continue;
     if (typeof item.sessionId !== 'string' || item.sessionId.length === 0) continue;
+    // Only top-level sessions: subagent/teammate children never push.
+    if (isSubagentSessionItem(item)) continue;
     if (item.running === true) running.add(item.sessionId);
   }
   return running;
@@ -65,6 +67,7 @@ export function diffRunningSessions(previousRunning, items) {
   const listed = new Set();
   for (const item of list) {
     if (item !== null && typeof item === 'object' && typeof item.sessionId === 'string') {
+      if (isSubagentSessionItem(item)) continue;
       listed.add(item.sessionId);
     }
   }
@@ -330,6 +333,11 @@ export function createHostTurnEventHandler({
       if (kind === undefined) return;
       const sessionId = session?.id;
       if (typeof sessionId !== 'string' || sessionId.length === 0) return;
+      // User decision 2026-10-22: only top-level sessions notify. Subagent /
+      // teammate child sessions are internal to the parent's turn; pushing them
+      // made a turn-end tap open the child session out of context (blank page /
+      // "Turn 2 stuck at the bottom" on the phone).
+      if (isSubagentSession(session)) return;
       if (kind === 'turn-end') {
         if (config.turnEnd === false) return;
         notifyTurnEnd(sessionId);
@@ -341,4 +349,35 @@ export function createHostTurnEventHandler({
       /* the host event bus must never break the link */
     }
   };
+}
+/**
+ * True when a Host `Session` (the object handed to `ctx.on('session/event')`)
+ * is a subagent / teammate child.
+ *
+ * User decision 2026-10-22: turn-end pushes go to **top-level sessions only**.
+ * The Host's durable session header carries `origin: 'subagent'` and/or
+ * `parentSession` for delegated sessions (see dsh-session header validation).
+ *
+ * @param {{header?: {origin?: unknown, parentSession?: unknown}}|null|undefined} session
+ * @returns {boolean}
+ */
+export function isSubagentSession(session) {
+  const header = session?.header;
+  if (header === null || typeof header !== 'object') return false;
+  if (header.origin === 'subagent') return true;
+  return typeof header.parentSession === 'string' && header.parentSession.length > 0;
+}
+
+/**
+ * True when one `session/list` row describes a subagent / teammate child.
+ * `session/list` exposes `parentSessionId` (header.parentSession) and the
+ * optional `origin`; the turn watcher keeps those two fields for that reason.
+ *
+ * @param {unknown} item
+ * @returns {boolean}
+ */
+export function isSubagentSessionItem(item) {
+  if (item === null || typeof item !== 'object') return false;
+  if (item.origin === 'subagent') return true;
+  return typeof item.parentSessionId === 'string' && item.parentSessionId.length > 0;
 }
