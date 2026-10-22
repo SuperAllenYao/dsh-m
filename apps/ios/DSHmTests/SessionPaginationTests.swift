@@ -1,0 +1,648 @@
+import XCTest
+@testable import DSHm
+
+/// task session-history 门禁：`session/page` 向上分页的 fixture 单测（Host 不可用，
+/// 全部由测试内的参考 Host 驱动）。
+///
+/// 协议语义已从 DSH 安装包的 session-controller 源码核实（2026-10-22）：
+///   - `end = min(throughSeq + 1, beforeSeq ?? throughSeq + 1)` -> **beforeSeq 独有（exclusive）**，
+///     throughSeq 含（inclusive）；
+///   - records 是该 seq 区间的**全量事件**（turn/start、工具事件都在），不是纯消息；
+///   - maxMessages 只数 append-origin 的 user/assistant 消息，工具组按 sourceEventSeqs
+///     的 groupStart 归并，所以返回事件条数可以 > maxMessages；
+///   - turnWindow 在 `turn/start` 处检查 `count >= minMessages && turns >= minTurns`，
+///     先到 maxMessages 或历史耗尽则按前者；
+///   - `hasMore = cut > 0`（页面最老下界 > 0 才有更早历史）。
+///
+/// `FixtureSessionHost` 是上述 `paginate` 的测试参考实现：它让状态机测试走真实的
+/// 请求/响应形状（经 JSONValue 往返），并把 beforeSeq exclusive、页边界、hasMore 的
+/// 语义一起锁死；同时校验客户端 wire 参数（缺键/键名错就直接失败）。
+final class SessionPaginationTests: XCTestCase {
+
+    // MARK: - Fixture host（Host paginate 的测试参考实现）
+
+    struct FixtureHostError: Error, LocalizedError {
+        var code: String
+        var message: String
+        var errorDescription: String? { "\(code): \(message)" }
+    }
+
+    final class FixtureSessionHost {
+        let events: [SessionEvent]
+        private let messageTypes: Set<String> = ["user/message", "assistant/message"]
+
+        init(events: [SessionEvent]) {
+            self.events = events
+            XCTAssertEqual(events.map(\.seq), Array(0..<events.count), "fixture 必须是 dense 0-based 日志")
+        }
+
+        var cursor: Int { events.last?.seq ?? -1 }
+
+        struct Page {
+            var events: [SessionEvent]
+            var hasMore: Bool
+            var cut: Int
+        }
+
+        /// opening / reconnect 的 `session/follow` 快照帧。
+        func openingSnapshot(
+            maxMessages: Int,
+            turnWindow: SessionWindowPolicy.TurnWindow?
+        ) -> JSONValue {
+            let page = paginate(
+                throughSeq: cursor,
+                beforeSeq: nil,
+                maxMessages: maxMessages,
+                turnWindow: turnWindow
+            )
+            return .object([
+                "type": .string("snapshot"),
+                "header": .object([
+                    "version": .int(4),
+                    "id": .string("fixture-session"),
+                    "cwd": .string("/tmp/ws"),
+                ]),
+                "cursor": .int(Int64(cursor)),
+                "records": .array(page.events.map(record)),
+                "hasMore": .bool(page.hasMore),
+                "projections": .object([
+                    "asOfSeq": .int(Int64(cursor)),
+                    "values": .object(["title": .string("Fixture session")]),
+                ]),
+                "assistantStream": .object(["revision": .int(0)]),
+            ])
+        }
+
+        /// opening 快照的最老事件 seq（首个 page 之前客户端已加载的最老记录）。
+        func openingOldest(maxMessages: Int, turnWindow: SessionWindowPolicy.TurnWindow?) -> Int? {
+            paginate(throughSeq: cursor, beforeSeq: nil, maxMessages: maxMessages, turnWindow: turnWindow)
+                .events.first?.seq
+        }
+
+        /// `session/page` 响应 `{records, hasMore}`。
+        func page(
+            throughSeq: Int,
+            beforeSeq: Int?,
+            maxMessages: Int,
+            turnWindow: SessionWindowPolicy.TurnWindow?
+        ) throws -> JSONValue {
+            // 与 Host 相同的入参校验（顺序/错误码无关紧要，只锁拒绝行为）。
+            guard throughSeq >= -1 else {
+                throw FixtureHostError(code: "gateway/bad-request", message: "throughSeq must be an integer greater than or equal to -1")
+            }
+            guard throughSeq <= cursor else {
+                throw FixtureHostError(code: "gateway/bad-request", message: "session page through seq \(throughSeq) is past cursor \(cursor)")
+            }
+            if let beforeSeq, beforeSeq < 0 {
+                throw FixtureHostError(code: "gateway/bad-request", message: "beforeSeq must be a non-negative safe integer")
+            }
+            guard maxMessages > 0 else {
+                throw FixtureHostError(code: "gateway/bad-request", message: "maxMessages must be a positive safe integer")
+            }
+            if let turnWindow {
+                guard turnWindow.minMessages > 0,
+                      turnWindow.minMessages <= maxMessages else {
+                    throw FixtureHostError(code: "gateway/bad-request", message: "turnWindow.minMessages must be a positive safe integer no greater than maxMessages")
+                }
+                guard turnWindow.minTurns > 0 else {
+                    throw FixtureHostError(code: "gateway/bad-request", message: "turnWindow.minTurns must be a positive safe integer")
+                }
+            }
+            let page = paginate(
+                throughSeq: throughSeq,
+                beforeSeq: beforeSeq,
+                maxMessages: maxMessages,
+                turnWindow: turnWindow
+            )
+            return .object([
+                "records": .array(page.events.map(record)),
+                "hasMore": .bool(page.hasMore),
+            ])
+        }
+
+        /// Host session-controller 的 `paginate` 逐行移植。
+        func paginate(
+            throughSeq: Int,
+            beforeSeq: Int?,
+            maxMessages: Int,
+            turnWindow: SessionWindowPolicy.TurnWindow?
+        ) -> Page {
+            let end = min(throughSeq + 1, beforeSeq ?? (throughSeq + 1))
+            var count = 0
+            var turns = 0
+            var cut = 0
+            if end > 0 {
+                for index in stride(from: end - 1, through: 0, by: -1) {
+                    let event = events[index]
+                    if let turnWindow, event.type == "turn/start" {
+                        turns += 1
+                        if count >= turnWindow.minMessages && turns >= turnWindow.minTurns {
+                            cut = index
+                            break
+                        }
+                    }
+                    guard messageTypes.contains(event.type), isAppendSurfaceEvent(event) else { continue }
+                    count += 1
+                    var groupStart = event.seq
+                    for source in event.sourceEventSeqs ?? [] where source < groupStart {
+                        groupStart = source
+                    }
+                    if count >= maxMessages {
+                        cut = groupStart
+                        break
+                    }
+                }
+            }
+            return Page(events: Array(events[cut..<max(end, cut)]), hasMore: cut > 0, cut: cut)
+        }
+
+        /// 当前 surface 的 append 事件（Host: isSurfaceEvent && surfaceOp === "append"）。
+        private func isAppendSurfaceEvent(_ event: SessionEvent) -> Bool {
+            guard let op = event.surfaceOp else { return false }
+            if let value = op.stringValue { return value == "append" }
+            return op["op"]?.stringValue == "append"
+        }
+
+        private func record(_ event: SessionEvent) -> JSONValue {
+            .object(["type": .string("event"), "event": wireValue(event)])
+        }
+
+        private func wireValue(_ event: SessionEvent) -> JSONValue {
+            let data = try! JSONEncoder().encode(event)
+            return try! JSONValue.jsonObject(from: data)
+        }
+    }
+
+    // MARK: - Fixtures
+
+    /// 40 个 turn、每个 turn 6 个事件（turn/start、user、tool/call、tool/result、
+    /// assistant、turn/end）= 240 个 dense 事件 / 80 条 append 消息；首窗 16 条消息
+    /// 只覆盖最近 8 个 turn，向后分页需要 2 页才能到 seq 0。
+    private func fixtureEvents(turns: Int = 40) -> [SessionEvent] {
+        var events: [SessionEvent] = []
+        var seq = 0
+        for turn in 1...turns {
+            events.append(event("turn/start", seq: seq, data: .object(["turn": .int(Int64(turn))])))
+            seq += 1
+            events.append(event("user/message", seq: seq, append: true, data: .object(["content": .array([])])))
+            seq += 1
+            events.append(event("tool/call", seq: seq, data: .object(["callId": .string("call-\(turn)")])))
+            seq += 1
+            events.append(event("tool/result", seq: seq, data: .object(["callId": .string("call-\(turn)")])))
+            seq += 1
+            events.append(event("assistant/message", seq: seq, append: true, data: .object(["message": .object(["content": .array([])])])))
+            seq += 1
+            events.append(event("turn/end", seq: seq, data: .object(["turn": .int(Int64(turn))])))
+            seq += 1
+        }
+        return events
+    }
+
+    private func event(
+        _ type: String,
+        seq: Int,
+        append: Bool = false,
+        data: JSONValue? = nil,
+        sources: [Int]? = nil
+    ) -> SessionEvent {
+        SessionEvent(
+            type: type,
+            seq: seq,
+            time: 1_792_510_000_000 + Int64(seq),
+            data: data,
+            surfaceOp: append ? .string("append") : nil,
+            sourceEventSeqs: sources
+        )
+    }
+
+    private func makeStore() -> SessionWindowCacheStore {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("SessionPaginationTests-\(UUID().uuidString)", isDirectory: true)
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock {
+            try? FileManager.default.removeItem(at: directory)
+        }
+        return SessionWindowCacheStore(directory: directory, identity: { "pagination-tests" })
+    }
+
+    @MainActor
+    private func makeViewModel(
+        host: FixtureSessionHost,
+        store: SessionWindowCacheStore,
+        firstWindow: Int = 16
+    ) -> SessionViewModel {
+        let viewModel = SessionViewModel(address: .session(sessionId: "fixture"), windowCache: store)
+        viewModel.applyStreamValue(host.openingSnapshot(
+            maxMessages: firstWindow,
+            turnWindow: SessionWindowPolicy.firstWindowTurnWindow(messages: firstWindow)
+        ))
+        return viewModel
+    }
+
+    /// 生产 loader 的替身：从 wire args 里取 throughSeq/beforeSeq/maxMessages/turnWindow
+    /// 并交给参考 Host —— 参数键名/类型错就直接失败，等于把 wire 契约纳入门禁。
+    private func hostLoader(
+        host: FixtureSessionHost,
+        onRequest: @escaping (Int, Int) -> Void = { _, _ in }
+    ) -> ([String: JSONValue]) async throws -> JSONValue {
+        { args in
+            guard let request = args["request"]?.objectValue else {
+                throw FixtureHostError(code: "client/bad-request", message: "missing request")
+            }
+            let throughSeq = Int(try Self.requireInt(request, "throughSeq"))
+            let beforeSeq = Int(try Self.requireInt(request, "beforeSeq"))
+            let maxMessages = Int(try Self.requireInt(request, "maxMessages"))
+            guard let window = request["turnWindow"]?.objectValue else {
+                throw FixtureHostError(code: "client/bad-request", message: "missing turnWindow")
+            }
+            let turnWindow = SessionWindowPolicy.TurnWindow(
+                minMessages: Int(try Self.requireInt(window, "minMessages")),
+                minTurns: Int(try Self.requireInt(window, "minTurns"))
+            )
+            onRequest(throughSeq, beforeSeq)
+            return try host.page(
+                throughSeq: throughSeq,
+                beforeSeq: beforeSeq,
+                maxMessages: maxMessages,
+                turnWindow: turnWindow
+            )
+        }
+    }
+
+    private static func requireInt(_ object: [String: JSONValue], _ key: String) throws -> Int64 {
+        guard let value = object[key]?.intValue else {
+            throw FixtureHostError(code: "client/bad-request", message: "missing \(key)")
+        }
+        return value
+    }
+
+    @MainActor
+    private func waitUntil(
+        timeout: TimeInterval = 3,
+        _ condition: () -> Bool
+    ) async {
+        let deadline = Date().addingTimeInterval(timeout)
+        while !condition(), Date() < deadline {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+    }
+
+    // MARK: - 1. wire 参数精确匹配 Host schema
+
+    func testOlderPageRequestMatchesHostSchemaExactly() throws {
+        let args = SessionViewModel.olderPageRequestArgs(
+            address: .session(sessionId: "s1"),
+            throughSeq: 42,
+            beforeSeq: 7
+        )
+        XCTAssertEqual(Set(args.keys), Set(["request"]))
+        let request = try XCTUnwrap(args["request"]?.objectValue)
+        XCTAssertEqual(
+            Set(request.keys),
+            Set(["address", "throughSeq", "beforeSeq", "maxMessages", "turnWindow"]),
+            "键名必须与 Host 的 session/page schema 逐字一致"
+        )
+        XCTAssertEqual(
+            request["address"],
+            .object(["kind": .string("session"), "sessionId": .string("s1")])
+        )
+        XCTAssertEqual(request["throughSeq"]?.intValue, 42)
+        XCTAssertEqual(request["beforeSeq"]?.intValue, 7)
+        XCTAssertEqual(request["maxMessages"]?.intValue, Int64(SessionWindowPolicy.pageWindowMessages))
+        XCTAssertTrue((40...60).contains(SessionWindowPolicy.pageWindowMessages))
+
+        let window = try XCTUnwrap(request["turnWindow"]?.objectValue)
+        XCTAssertEqual(Set(window.keys), Set(["minMessages", "minTurns"]))
+        XCTAssertEqual(window["minMessages"]?.intValue, Int64(SessionWindowPolicy.pageTurnWindow.minMessages))
+        XCTAssertEqual(window["minTurns"]?.intValue, Int64(SessionWindowPolicy.pageTurnWindow.minTurns))
+        XCTAssertLessThanOrEqual(
+            SessionWindowPolicy.pageTurnWindow.minMessages,
+            SessionWindowPolicy.pageWindowMessages,
+            "Host 校验: turnWindow.minMessages <= maxMessages"
+        )
+        XCTAssertGreaterThanOrEqual(SessionWindowPolicy.pageTurnWindow.minTurns, 6)
+
+        // 子会话（Agent Teams 成员）用 durable parent 地址。
+        let subagentArgs = SessionViewModel.olderPageRequestArgs(
+            address: .subagent(parentSessionId: "p", childSessionId: "c", mode: "unknown"),
+            throughSeq: 3,
+            beforeSeq: 1
+        )
+        XCTAssertEqual(
+            subagentArgs["request"]?["address"],
+            .object([
+                "kind": .string("subagent"),
+                "parentSessionId": .string("p"),
+                "childSessionId": .string("c"),
+                "mode": .string("unknown"),
+            ])
+        )
+    }
+
+    // MARK: - 2. 连续加载到第一条事件：无空洞、无重复请求、停在 hasMore=false
+
+    @MainActor
+    func testPagingWalksBackToFirstEventWithoutHoles() async throws {
+        let host = FixtureSessionHost(events: fixtureEvents())
+        let viewModel = makeViewModel(host: host, store: makeStore(), firstWindow: 16)
+        XCTAssertTrue(viewModel.hasMoreOlder, "follow 首帧 hasMore=true -> 视图才会触发\"加载更早\"")
+        let openingOldest = try XCTUnwrap(viewModel.oldestLoadedSeq)
+        XCTAssertEqual(openingOldest, host.openingOldest(
+            maxMessages: 16,
+            turnWindow: SessionWindowPolicy.firstWindowTurnWindow(messages: 16)
+        ))
+
+        var requests: [(throughSeq: Int, beforeSeq: Int)] = []
+        viewModel.olderPageLoader = hostLoader(host: host) { throughSeq, beforeSeq in
+            requests.append((throughSeq, beforeSeq))
+        }
+
+        var iterations = 0
+        while viewModel.hasMoreOlder {
+            iterations += 1
+            XCTAssertLessThan(iterations, 20, "分页循环必须有界")
+            await viewModel.loadOlderPageNowForTesting()
+            let seqs = viewModel.eventSeqs
+            XCTAssertEqual(Set(seqs).count, seqs.count, "窗口内不得出现重复 seq")
+            XCTAssertEqual(seqs, Array(seqs.first!...seqs.last!), "每次前置合并后窗口必须无空洞")
+        }
+
+        XCTAssertEqual(viewModel.eventSeqs, Array(0...host.cursor), "必须一路加载到第一条事件（seq 0）")
+        XCTAssertEqual(viewModel.oldestLoadedSeq, 0)
+        XCTAssertGreaterThanOrEqual(iterations, 2, "144 事件的会话首窗只覆盖最近一段，需要多页")
+
+        XCTAssertEqual(
+            requests.map(\.throughSeq),
+            Array(repeating: host.cursor, count: requests.count),
+            "throughSeq 全程使用 follow 首帧 cursor"
+        )
+        XCTAssertEqual(requests.first?.beforeSeq, openingOldest, "首页 beforeSeq = 当前最老已加载 seq")
+        XCTAssertEqual(
+            requests.map(\.beforeSeq),
+            requests.map(\.beforeSeq).sorted(by: >),
+            "beforeSeq 必须严格向后走"
+        )
+        XCTAssertEqual(
+            Set(requests.map(\.beforeSeq)).count,
+            requests.count,
+            "不重复请求同一页"
+        )
+        XCTAssertFalse(requests.contains { $0.beforeSeq == 0 }, "beforeSeq=0 永远不发（到 0 后 hasMore=false 停止）")
+    }
+
+    // MARK: - 3. 视图契约：重复/高频调用与并发去重
+
+    @MainActor
+    func testLoadOlderIfNeededDeduplicatesConcurrentCalls() async throws {
+        let host = FixtureSessionHost(events: fixtureEvents())
+        let viewModel = makeViewModel(host: host, store: makeStore(), firstWindow: 16)
+        var calls: [[String: JSONValue]] = []
+        var gate: CheckedContinuation<Void, Never>?
+        let delegate = hostLoader(host: host)
+        viewModel.olderPageLoader = { args in
+            calls.append(args)
+            await withCheckedContinuation { gate = $0 }
+            return try await delegate(args)
+        }
+
+        viewModel.loadOlderIfNeeded()
+        await waitUntil { !calls.isEmpty }
+        // 高频道重复调用（滚动回调）不允许叠加请求。
+        viewModel.loadOlderIfNeeded()
+        viewModel.loadOlderIfNeeded()
+        viewModel.loadOlderIfNeeded()
+        XCTAssertEqual(calls.count, 1, "并发去重：同一时间只有一个请求")
+        XCTAssertTrue(viewModel.isLoadingOlder)
+
+        gate?.resume()
+        gate = nil
+        await waitUntil { !viewModel.isLoadingOlder }
+        XCTAssertEqual(calls.count, 1)
+        XCTAssertEqual(viewModel.eventSeqs, Array(viewModel.eventSeqs.first!...host.cursor))
+
+        // 加载完成后再次上滑：下一请求用新的最老 seq。
+        viewModel.loadOlderIfNeeded()
+        await waitUntil { calls.count == 2 }
+        gate?.resume()
+        gate = nil
+        await waitUntil { !viewModel.isLoadingOlder }
+        XCTAssertEqual(calls.count, 2)
+    }
+
+    // MARK: - 4. 失败可重试、不破坏窗口、走 actionErrorText
+
+    @MainActor
+    func testFailedPageKeepsWindowAndIsRetryable() async throws {
+        let host = FixtureSessionHost(events: fixtureEvents())
+        let viewModel = makeViewModel(host: host, store: makeStore(), firstWindow: 16)
+        let before = viewModel.eventSeqs
+        let oldestBefore = try XCTUnwrap(viewModel.oldestLoadedSeq)
+        let delegate = hostLoader(host: host)
+        var attempts = 0
+        viewModel.olderPageLoader = { args in
+            attempts += 1
+            if attempts == 1 {
+                throw FixtureHostError(code: "transport", message: "连接中断")
+            }
+            return try await delegate(args)
+        }
+
+        await viewModel.loadOlderPageNowForTesting()
+        XCTAssertEqual(attempts, 1)
+        XCTAssertTrue(viewModel.hasMoreOlder, "失败后必须允许重试")
+        XCTAssertFalse(viewModel.isLoadingOlder)
+        XCTAssertNotNil(viewModel.actionErrorText, "失败用现有 actionErrorText 呈现，不弹 alert")
+        XCTAssertEqual(viewModel.eventSeqs, before, "分页失败不得破坏当前窗口")
+        XCTAssertEqual(viewModel.oldestLoadedSeq, oldestBefore)
+
+        await viewModel.loadOlderPageNowForTesting()
+        XCTAssertEqual(attempts, 2)
+        XCTAssertNil(viewModel.actionErrorText, "成功一次后清掉分页错误")
+        let oldestAfter = try XCTUnwrap(viewModel.oldestLoadedSeq)
+        XCTAssertLessThan(oldestAfter, oldestBefore, "重试成功后向前合并了一页")
+        XCTAssertEqual(
+            viewModel.eventSeqs,
+            Array(oldestAfter...(before.last ?? 0)),
+            "窗口保持连续、不丢最新一段"
+        )
+        XCTAssertTrue(viewModel.hasMoreOlder, "首窗 + 一页仍未到 seq 0")
+    }
+
+    // MARK: - 5. 没有更早历史时立即 no-op
+
+    @MainActor
+    func testLoadOlderIfNeededIsNoOpWithoutOlderHistory() async throws {
+        let host = FixtureSessionHost(events: fixtureEvents(turns: 2))
+        let viewModel = makeViewModel(host: host, store: makeStore(), firstWindow: 16)
+        XCTAssertFalse(viewModel.hasMoreOlder, "短会话首帧 hasMore=false")
+
+        var calls = 0
+        viewModel.olderPageLoader = { _ in
+            calls += 1
+            return .object([:])
+        }
+        viewModel.loadOlderIfNeeded()
+        viewModel.loadOlderIfNeeded()
+        try? await Task.sleep(nanoseconds: 100_000_000)
+        XCTAssertEqual(calls, 0, "hasMoreOlder=false 立即 no-op，不发请求")
+        XCTAssertFalse(viewModel.isLoadingOlder)
+    }
+
+    // MARK: - 6. 空页/异常页不得造成死循环
+
+    @MainActor
+    func testEmptyPageStopsPagingInsteadOfRequestingForever() async throws {
+        let host = FixtureSessionHost(events: fixtureEvents())
+        let viewModel = makeViewModel(host: host, store: makeStore(), firstWindow: 16)
+        var calls = 0
+        viewModel.olderPageLoader = { _ in
+            calls += 1
+            return .object(["records": .array([]), "hasMore": .bool(true)])
+        }
+        await viewModel.loadOlderPageNowForTesting()
+        XCTAssertEqual(calls, 1)
+        XCTAssertFalse(viewModel.hasMoreOlder, "空页必须终止分页")
+        await viewModel.loadOlderPageNowForTesting()
+        XCTAssertEqual(calls, 1, "终止后 loadOlderIfNeeded 是 no-op")
+    }
+
+    @MainActor
+    func testHostBadRequestSurfacesWithoutLosingWindow() async throws {
+        let host = FixtureSessionHost(events: fixtureEvents())
+        let viewModel = makeViewModel(host: host, store: makeStore(), firstWindow: 16)
+        let before = viewModel.eventSeqs
+        viewModel.olderPageLoader = { _ in
+            // Host 校验：throughSeq 越过 cursor。
+            try host.page(
+                throughSeq: host.cursor + 100,
+                beforeSeq: nil,
+                maxMessages: 40,
+                turnWindow: SessionWindowPolicy.pageTurnWindow
+            )
+        }
+        await viewModel.loadOlderPageNowForTesting()
+        XCTAssertNotNil(viewModel.actionErrorText)
+        XCTAssertEqual(viewModel.eventSeqs, before)
+        XCTAssertTrue(viewModel.hasMoreOlder)
+
+        // 换成正常 loader 后仍可恢复分页（窗口没有被破坏）。
+        viewModel.olderPageLoader = hostLoader(host: host)
+        await viewModel.loadOlderPageNowForTesting()
+        XCTAssertNil(viewModel.actionErrorText)
+        XCTAssertLessThan(viewModel.oldestLoadedSeq ?? Int.max, before.first ?? 0)
+    }
+
+    // MARK: - 7. 分页与重连 snapshot 共存
+
+    @MainActor
+    func testPagingSurvivesReconnectSnapshot() async throws {
+        let host = FixtureSessionHost(events: fixtureEvents())
+        let viewModel = makeViewModel(host: host, store: makeStore(), firstWindow: 16)
+        viewModel.olderPageLoader = hostLoader(host: host)
+
+        await viewModel.loadOlderPageNowForTesting()
+        let loadedBeforeReconnect = viewModel.eventSeqs
+        XCTAssertGreaterThan(loadedBeforeReconnect.count, 20)
+
+        // 重连：新快照窗口仍是最新一段（与已加载区间重叠）。
+        viewModel.applyStreamValue(host.openingSnapshot(
+            maxMessages: 16,
+            turnWindow: SessionWindowPolicy.firstWindowTurnWindow(messages: 16)
+        ))
+        XCTAssertEqual(viewModel.eventSeqs, loadedBeforeReconnect, "重连不得丢掉已加载历史")
+        XCTAssertEqual(viewModel.oldestLoadedSeq, loadedBeforeReconnect.first)
+
+        while viewModel.hasMoreOlder {
+            await viewModel.loadOlderPageNowForTesting()
+        }
+        XCTAssertEqual(viewModel.eventSeqs, Array(0...host.cursor))
+        XCTAssertEqual(viewModel.oldestLoadedSeq, 0)
+    }
+
+    // MARK: - 8. 冷启动：分页结果进缓存、下次打开不退化
+
+    @MainActor
+    func testPagedHistorySurvivesCacheRoundTripAndColdOpen() async throws {
+        let host = FixtureSessionHost(events: fixtureEvents())
+        let store = makeStore()
+        let viewModel = makeViewModel(host: host, store: store, firstWindow: 16)
+        viewModel.olderPageLoader = hostLoader(host: host)
+        while viewModel.hasMoreOlder {
+            await viewModel.loadOlderPageNowForTesting()
+        }
+        XCTAssertEqual(viewModel.eventSeqs, Array(0...host.cursor))
+        viewModel.saveWindowCacheNow()
+
+        let reopened = SessionViewModel(address: .session(sessionId: "fixture"), windowCache: store)
+        XCTAssertTrue(reopened.isShowingCachedWindow)
+        XCTAssertEqual(reopened.eventSeqs, Array(0...host.cursor), "冷启动恢复已加载区间，不退回 40 条窗口")
+        XCTAssertEqual(reopened.oldestLoadedSeq, 0)
+        XCTAssertFalse(reopened.hasMoreOlder)
+    }
+
+    // MARK: - 9. 参考 Host 语义（锁 beforeSeq exclusive / 工具组 / turnWindow）
+
+    func testFixtureHostPaginateMatchesVerifiedHostSemantics() {
+        let host = FixtureSessionHost(events: fixtureEvents(turns: 6))
+        let noWindow = host.paginate(throughSeq: host.cursor, beforeSeq: nil, maxMessages: 5, turnWindow: nil)
+        XCTAssertEqual(noWindow.events.last?.seq, host.cursor, "end 含 throughSeq")
+        XCTAssertEqual(noWindow.events.filter { $0.type == "user/message" || $0.type == "assistant/message" }.count, 5)
+        XCTAssertTrue(noWindow.hasMore)
+
+        // beforeSeq exclusive：绝不返回 seq >= beforeSeq 的事件。
+        let boundary = noWindow.events.first!.seq
+        let older = host.paginate(throughSeq: host.cursor, beforeSeq: boundary, maxMessages: 5, turnWindow: nil)
+        XCTAssertTrue(older.events.allSatisfy { $0.seq < boundary })
+        XCTAssertEqual(older.events.last?.seq, boundary - 1, "页尾紧贴 beforeSeq - 1，两页无重叠")
+        XCTAssertTrue(older.hasMore)
+
+        // 历史耗尽：cut == 0 -> hasMore = false。
+        let all = host.paginate(throughSeq: host.cursor, beforeSeq: nil, maxMessages: 10_000, turnWindow: nil)
+        XCTAssertEqual(all.cut, 0)
+        XCTAssertFalse(all.hasMore)
+
+        // maxMessages=1 + sourceEventSeqs 工具组：cut 落在 groupStart（可能不是消息）。
+        var withGroup = fixtureEvents(turns: 1)
+        // 在 assistant/message 上挂 sourceEventSeqs，指向更早的工具事件。
+        let assistantSeq = withGroup.first { $0.type == "assistant/message" }!.seq
+        withGroup[assistantSeq] = SessionEvent(
+            type: "assistant/message",
+            seq: assistantSeq,
+            time: withGroup[assistantSeq].time,
+            data: withGroup[assistantSeq].data,
+            surfaceOp: .string("append"),
+            sourceEventSeqs: [assistantSeq - 1]
+        )
+        let groupedHost = FixtureSessionHost(events: withGroup)
+        let grouped = groupedHost.paginate(throughSeq: groupedHost.cursor, beforeSeq: nil, maxMessages: 1, turnWindow: nil)
+        XCTAssertEqual(grouped.cut, assistantSeq - 1, "maxMessages 截断时按 sourceEventSeqs 的 groupStart 切")
+        XCTAssertEqual(grouped.events.first?.seq, assistantSeq - 1)
+
+        // turnWindow 组合：够 minMessages + minTurns 后停在 turn/start 起点。
+        let turning = host.paginate(
+            throughSeq: host.cursor,
+            beforeSeq: nil,
+            maxMessages: 20,
+            turnWindow: SessionWindowPolicy.TurnWindow(minMessages: 8, minTurns: 2)
+        )
+        XCTAssertEqual(turning.events.first?.type, "turn/start", "turnWindow 生效时页首对齐 turn 起点")
+        XCTAssertGreaterThanOrEqual(turning.events.filter { $0.type == "turn/start" }.count, 2)
+        let messageCount = turning.events.filter { $0.type == "user/message" || $0.type == "assistant/message" }.count
+        XCTAssertGreaterThanOrEqual(messageCount, 8)
+        XCTAssertLessThanOrEqual(messageCount, 20)
+
+        // 参数校验与 Host 一致。
+        XCTAssertThrowsError(try host.page(
+            throughSeq: host.cursor + 1,
+            beforeSeq: nil,
+            maxMessages: 10,
+            turnWindow: nil
+        ), "throughSeq 越过 cursor 必须被拒绝")
+        XCTAssertThrowsError(try host.page(
+            throughSeq: host.cursor,
+            beforeSeq: 0,
+            maxMessages: 10,
+            turnWindow: SessionWindowPolicy.TurnWindow(minMessages: 11, minTurns: 1)
+        ), "minMessages > maxMessages 必须被拒绝")
+    }
+}

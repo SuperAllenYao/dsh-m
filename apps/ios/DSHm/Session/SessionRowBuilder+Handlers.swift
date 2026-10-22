@@ -118,12 +118,21 @@ extension SessionRowBuilder {
         }
     }
 
+    /// Attaches a tool result to its already-rendered tool row; an orphan result
+    /// (no matching tool/call) is returned to the caller as a row to append.
+    ///
+    /// The orphan path used to take an `appendRow` closure as well as
+    /// `sections: inout`. That closure captures and mutates the same `sections`
+    /// array the inout access is still active on, which the Swift runtime reports as
+    /// an exclusivity violation and aborts the process (SIGABRT) in Debug/test
+    /// builds: replaying paged history that contains a tool result whose call row is
+    /// outside the loaded page crashed `SessionRowBuilder.build`. Returning the
+    /// content instead keeps the inout access exclusive.
     static func handleToolResult(
         event: SessionEvent,
         data: JSONValue?,
-        sections: inout [TurnSection],
-        appendRow: (FlowContent, SessionEvent, String, Int?) -> Void
-    ) {
+        sections: inout [TurnSection]
+    ) -> (content: FlowContent, suffix: String)? {
         let message = data?["message"]
         let content = message?["content"]
         let result = ToolResultItem(
@@ -136,7 +145,7 @@ extension SessionRowBuilder {
             ?? data?["toolCallId"]?.stringValue
             ?? data?["callId"]?.stringValue
         if let toolCallId, attachToolResult(callId: toolCallId, result: result, sections: &sections) {
-            return
+            return nil
         }
         let item = ToolCallItem(
             callId: toolCallId,
@@ -148,7 +157,7 @@ extension SessionRowBuilder {
             turn: data?["turn"]?.int ?? 0,
             step: nil
         )
-        appendRow(.tool(item), event, "tool-result", nil)
+        return (.tool(item), "tool-result")
     }
 
     static func handlePTCDispatchStart(event: SessionEvent, data: JSONValue?, sections: inout [TurnSection]) {

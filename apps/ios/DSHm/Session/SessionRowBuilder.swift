@@ -130,7 +130,12 @@ enum SessionRowBuilder {
                 let item = toolCall(from: data, event: event)
                 appendRow(.tool(item), event: event, suffix: "tool-\(item.callId ?? "seq-\(event.seq)")")
             case "tool/result":
-                handleToolResult(event: event, data: data, sections: &sections, appendRow: appendRow)
+                // Orphan results are appended here (not inside the handler) so the
+                // handler's inout `sections` access never overlaps the closure's
+                // mutation of the same array (Swift exclusivity abort).
+                if let orphan = handleToolResult(event: event, data: data, sections: &sections) {
+                    appendRow(orphan.content, event: event, suffix: orphan.suffix)
+                }
             case "tool/ptc-dispatch-start":
                 handlePTCDispatchStart(event: event, data: data, sections: &sections)
             case "tool/ptc-dispatch":

@@ -1,0 +1,573 @@
+import Network
+import XCTest
+@testable import DSHm
+
+// MARK: - ReconnectMetrics
+
+/// task-2 (reconnect chain < 1s): stage math + one-line format of `ReconnectMetrics`.
+final class ReconnectMetricsTests: XCTestCase {
+    private var now: TimeInterval = 1_000
+
+    override func setUp() {
+        super.setUp()
+        ReconnectMetrics.forceEnabledForTesting = true
+        ReconnectMetrics.clock = { [weak self] in self?.now ?? 1_000 }
+        ReconnectMetrics.reset()
+    }
+
+    override func tearDown() {
+        ReconnectMetrics.forceEnabledForTesting = nil
+        ReconnectMetrics.reset()
+        ReconnectMetrics.clock = { ProcessInfo.processInfo.systemUptime }
+        super.tearDown()
+    }
+
+    func testFullChainEmitsStageOffsetsAndTotal() throws {
+        ReconnectMetrics.beginPageEnter(reason: "listPage")
+        now += 0.050
+        ReconnectMetrics.markReconnectStart()
+        now += 0.250
+        ReconnectMetrics.markConnected()
+        now += 0.100
+        ReconnectMetrics.markListApplied()
+
+        let value = try XCTUnwrap(ReconnectMetrics.valueString)
+        XCTAssertTrue(value.hasPrefix("totalMs=400"), value)
+        XCTAssertTrue(value.contains("pageEnterMs=0"), value)
+        XCTAssertTrue(value.contains("reconnectStartMs=50"), value)
+        XCTAssertTrue(value.contains("connectedMs=300"), value)
+        XCTAssertTrue(value.contains("listAppliedMs=400"), value)
+        XCTAssertTrue(value.contains("reuse=0"), value)
+        XCTAssertTrue(value.contains("stage=complete"), value)
+        XCTAssertTrue(value.contains("reason=listPage"), value)
+        XCTAssertTrue(value.contains("beginEpochMs="), value)
+    }
+
+    func testTotalIsIncompleteUntilBothHalvesOfT1AreIn() {
+        ReconnectMetrics.beginPageEnter(reason: "listPage")
+        now += 0.100
+        ReconnectMetrics.markListApplied()
+        // connected missing: t1 is not reached, so no total yet.
+        XCTAssertTrue(ReconnectMetrics.valueString?.contains("totalMs=-1") ?? false)
+        now += 0.200
+        ReconnectMetrics.markConnected()
+        XCTAssertTrue(ReconnectMetrics.valueString?.contains("totalMs=300") ?? false)
+    }
+
+    func testEarlyListAppliedDoesNotShortenTotalBelowConnected() {
+        ReconnectMetrics.beginPageEnter(reason: "listPage")
+        now += 0.100
+        ReconnectMetrics.markListApplied() // early snapshot won the race
+        now += 0.300
+        ReconnectMetrics.markConnected()
+        // total = max(connected, listApplied) - t0
+        XCTAssertTrue(ReconnectMetrics.valueString?.contains("totalMs=400") ?? false)
+    }
+
+    func testReuseChainMeasuresListRefreshOnly() {
+        ReconnectMetrics.beginPageEnter(reason: "sceneActive")
+        ReconnectMetrics.markReuseDecision()
+        now += 0.120
+        ReconnectMetrics.markListApplied()
+        let value = ReconnectMetrics.valueString ?? ""
+        XCTAssertTrue(value.contains("reuse=1"), value)
+        XCTAssertTrue(value.contains("connectedMs=0"), value)
+        XCTAssertTrue(value.contains("totalMs=120"), value)
+        XCTAssertTrue(value.contains("stage=complete"), value)
+    }
+
+    func testPageEnterAgainKeepsEarliestT0() {
+        ReconnectMetrics.beginPageEnter(reason: "listPage")
+        now += 0.100
+        ReconnectMetrics.beginPageEnter(reason: "sceneActive") // same resume, second callback
+        now += 0.200
+        ReconnectMetrics.markConnected()
+        now += 0.100
+        ReconnectMetrics.markListApplied()
+        // t0 stays the first page-enter callback: 300ms to connected, 400ms total.
+        let value = ReconnectMetrics.valueString ?? ""
+        XCTAssertTrue(value.contains("connectedMs=300"), value)
+        XCTAssertTrue(value.contains("totalMs=400"), value)
+    }
+
+    func testPageEnterAfterLifetimeStartsFreshChain() {
+        ReconnectMetrics.beginPageEnter(reason: "listPage")
+        now += ReconnectMetrics.chainLifetime + 1
+        ReconnectMetrics.beginPageEnter(reason: "listPage")
+        now += 0.100
+        ReconnectMetrics.markConnected()
+        ReconnectMetrics.markListApplied()
+        let value = ReconnectMetrics.valueString ?? ""
+        XCTAssertTrue(value.contains("connectedMs=100"), value)
+        XCTAssertTrue(value.contains("totalMs=100"), value)
+    }
+
+    func testPathChangeAndFirstByteTimeoutAreCounted() {
+        ReconnectMetrics.beginPageEnter(reason: "listPage")
+        ReconnectMetrics.markPathChange()
+        ReconnectMetrics.markPathChange()
+        ReconnectMetrics.markFirstByteTimeout(source: "workspaceBaseline")
+        let value = ReconnectMetrics.valueString ?? ""
+        XCTAssertTrue(value.contains("pathChanges=2"), value)
+        XCTAssertTrue(value.contains("firstByteTimeouts=1"), value)
+        XCTAssertTrue(value.contains("invalidatedBy=firstByte/workspaceBaseline"), value)
+    }
+
+    func testMarksWithoutChainAreIgnored() {
+        ReconnectMetrics.markConnected()
+        ReconnectMetrics.markListApplied()
+        ReconnectMetrics.markReconnectStart()
+        XCTAssertNil(ReconnectMetrics.valueString)
+    }
+
+    func testDisabledUnlessE2EGateIsOn() {
+        ReconnectMetrics.forceEnabledForTesting = false
+        ReconnectMetrics.reset()
+        ReconnectMetrics.beginPageEnter(reason: "listPage")
+        ReconnectMetrics.markConnected()
+        XCTAssertNil(ReconnectMetrics.valueString, "no product behavior and no metrics outside E2E")
+    }
+
+    func testOnChangeHostReceivesSummary() {
+        var observed: [String] = []
+        ReconnectMetrics.onChange = { value in
+            if let value { observed.append(value) }
+        }
+        defer { ReconnectMetrics.onChange = nil }
+        ReconnectMetrics.beginPageEnter(reason: "listPage")
+        ReconnectMetrics.markConnected()
+        ReconnectMetrics.markListApplied()
+        XCTAssertFalse(observed.isEmpty)
+        XCTAssertTrue(observed.last?.contains("stage=complete") ?? false)
+    }
+
+    func testTotalMillisecondsPureFunction() throws {
+        XCTAssertNil(ReconnectMetrics.totalMilliseconds(pageEnterAt: 100, connectedAt: nil, listAppliedAt: nil))
+        XCTAssertEqual(
+            try XCTUnwrap(ReconnectMetrics.totalMilliseconds(pageEnterAt: 100, connectedAt: 100.3, listAppliedAt: 100.1)),
+            300,
+            accuracy: 0.001
+        )
+        XCTAssertEqual(
+            try XCTUnwrap(ReconnectMetrics.totalMilliseconds(pageEnterAt: 100, connectedAt: 100.1, listAppliedAt: 100.4)),
+            400,
+            accuracy: 0.001
+        )
+    }
+}
+
+// MARK: - Network path change detection
+
+/// task-2: only an interface/satisfaction flip may invalidate a live socket; a
+/// repeated identical path update must not restart a connection.
+final class NetworkPathChangeTests: XCTestCase {
+    private let wifi = NetworkPathSnapshot(
+        interface: .wifi, isSatisfied: true, isExpensive: false, isConstrained: false
+    )
+    private let cellular = NetworkPathSnapshot(
+        interface: .cellular, isSatisfied: true, isExpensive: true, isConstrained: false
+    )
+    private let offline = NetworkPathSnapshot(
+        interface: .unknown, isSatisfied: false, isExpensive: false, isConstrained: false
+    )
+
+    func testFirstSampleOnlyEstablishesTheBaseline() {
+        XCTAssertFalse(NetworkPathMonitor.isMeaningfulChange(from: nil, to: wifi))
+        XCTAssertFalse(NetworkPathMonitor.isMeaningfulChange(from: nil, to: offline))
+    }
+
+    func testInterfaceFlipIsMeaningful() {
+        XCTAssertTrue(NetworkPathMonitor.isMeaningfulChange(from: wifi, to: cellular))
+        XCTAssertTrue(NetworkPathMonitor.isMeaningfulChange(from: cellular, to: wifi))
+    }
+
+    func testSatisfactionFlipIsMeaningful() {
+        XCTAssertTrue(NetworkPathMonitor.isMeaningfulChange(from: wifi, to: offline))
+        XCTAssertTrue(NetworkPathMonitor.isMeaningfulChange(from: offline, to: wifi))
+    }
+
+    func testIdenticalPathIsNotMeaningful() {
+        XCTAssertFalse(NetworkPathMonitor.isMeaningfulChange(from: wifi, to: wifi))
+        XCTAssertFalse(NetworkPathMonitor.isMeaningfulChange(from: cellular, to: cellular))
+    }
+
+    func testExpenseOrConstraintChangeOnSameSatisfiedInterfaceIsMeaningful() {
+        let constrained = NetworkPathSnapshot(
+            interface: .cellular, isSatisfied: true, isExpensive: true, isConstrained: true
+        )
+        XCTAssertTrue(NetworkPathMonitor.isMeaningfulChange(from: cellular, to: constrained))
+    }
+
+    func testPreferredRelayMatchesPathSemantics() {
+        XCTAssertTrue(offline.prefersRelay, "unknown/offline keeps the relay-first legacy order")
+        XCTAssertTrue(cellular.prefersRelay)
+        XCTAssertFalse(wifi.prefersRelay)
+    }
+
+    @MainActor
+    func testMonitorIncrementsGenerationAndFiresOnlyOnMeaningfulChange() {
+        let monitor = NetworkPathMonitor(startImmediately: false)
+        var fired = 0
+        monitor.onMeaningfulChange = { fired += 1 }
+
+        monitor.applyForTesting(wifi)
+        XCTAssertEqual(monitor.changeGeneration, 0, "baseline sample is not a change")
+        XCTAssertEqual(fired, 0)
+
+        monitor.applyForTesting(wifi)
+        XCTAssertEqual(monitor.changeGeneration, 0)
+        XCTAssertEqual(fired, 0)
+
+        monitor.applyForTesting(cellular)
+        XCTAssertEqual(monitor.changeGeneration, 1)
+        XCTAssertEqual(fired, 1)
+        XCTAssertTrue(monitor.prefersRelay)
+
+        monitor.applyForTesting(offline)
+        XCTAssertEqual(monitor.changeGeneration, 2)
+        XCTAssertEqual(fired, 2)
+    }
+}
+
+// MARK: - Reconnect scheduling policy
+
+/// task-2: pure reconnect decisions extracted from `LinkService` (backoff bounds,
+/// candidate budget, path-aware dial order, connecting-round restart).
+final class ReconnectPolicyTests: XCTestCase {
+    func testBackoffBoundsAndCap() {
+        XCTAssertEqual(LinkService.reconnectDelayMs(attempt: 1, randomUnit: 0), 250, accuracy: 0.001)
+        XCTAssertEqual(LinkService.reconnectDelayMs(attempt: 1, randomUnit: 1), 500, accuracy: 0.001)
+        XCTAssertEqual(LinkService.reconnectDelayMs(attempt: 2, randomUnit: 0), 500, accuracy: 0.001)
+        XCTAssertEqual(LinkService.reconnectDelayMs(attempt: 2, randomUnit: 1), 1_000, accuracy: 0.001)
+        // Cap (10s) applies before jitter: 5-10s from attempt 6 on.
+        XCTAssertEqual(LinkService.reconnectDelayMs(attempt: 10, randomUnit: 1), 10_000, accuracy: 0.001)
+        // Jitter input is clamped.
+        XCTAssertEqual(LinkService.reconnectDelayMs(attempt: 1, randomUnit: -1), 250, accuracy: 0.001)
+        XCTAssertEqual(LinkService.reconnectDelayMs(attempt: 1, randomUnit: 9), 500, accuracy: 0.001)
+    }
+
+    func testCandidateBudget() {
+        XCTAssertEqual(LinkService.candidateTimeoutSeconds(index: 0, count: 2, pathChanged: false), 2)
+        XCTAssertEqual(LinkService.candidateTimeoutSeconds(index: 1, count: 2, pathChanged: false), 8)
+        XCTAssertEqual(LinkService.candidateTimeoutSeconds(index: 0, count: 2, pathChanged: true), 1.5)
+        XCTAssertEqual(LinkService.candidateTimeoutSeconds(index: 1, count: 3, pathChanged: true), 1.5)
+        XCTAssertEqual(LinkService.candidateTimeoutSeconds(index: 2, count: 3, pathChanged: true), 8)
+        // Single candidate: keeps the long budget.
+        XCTAssertEqual(LinkService.candidateTimeoutSeconds(index: 0, count: 1, pathChanged: true), 8)
+    }
+
+    func testPathChangedDialOrderProbesRelayFirstButKeepsLANFallback() {
+        let lan = URL(string: "https://192.168.1.9:8443")!
+        let relay = URL(string: "https://relay.example.com")!
+        XCTAssertEqual(
+            LinkService.pathChangedDialCandidates([lan, relay], pathChanged: true),
+            [relay, lan]
+        )
+        XCTAssertEqual(
+            LinkService.pathChangedDialCandidates([lan, relay], pathChanged: false),
+            [lan, relay],
+            "no path change: unchanged legacy order"
+        )
+        XCTAssertEqual(
+            LinkService.pathChangedDialCandidates([lan], pathChanged: true),
+            [lan],
+            "single candidate is never dropped"
+        )
+        // LAN candidates stay in the list as fallback (no Happy Eyeballs).
+        let ordered = LinkService.pathChangedDialCandidates([lan, relay], pathChanged: true)
+        XCTAssertEqual(ordered.count, 2)
+    }
+
+    func testConnectingRoundRestartRule() {
+        XCTAssertFalse(
+            LinkService.shouldRestartConnectingRound(roundStartGeneration: 3, pathGeneration: 3),
+            "a round already dialed on the new path must be allowed to finish"
+        )
+        XCTAssertTrue(
+            LinkService.shouldRestartConnectingRound(roundStartGeneration: 2, pathGeneration: 3),
+            "a round dialed before the path change is on the wrong network"
+        )
+    }
+}
+
+// MARK: - HTTPConnection first-byte watchdog
+
+/// task-2: the reused-socket first-byte watchdog (Lead-approved scope:
+/// `Net/HTTPConnection.swift`). Fake-clock seam = `simulateFirstByteTimeoutForTesting`
+/// so no test waits the real 0.8s budget.
+final class FirstByteTimeoutTests: XCTestCase {
+    private func request(_ path: String) -> HTTPRequest {
+        HTTPRequest(
+            method: "POST",
+            path: path,
+            headers: ["content-type": "application/json"],
+            body: Data("{}".utf8)
+        )
+    }
+
+    private func key(_ server: HoldableHTTPServer) -> HTTPConnectionKey {
+        HTTPConnectionKey(host: "127.0.0.1", port: server.port, pin: nil)
+    }
+
+    private func makePool() -> HTTPConnectionPool {
+        HTTPConnectionPool(config: HTTPConnectionPoolConfig(maxIdlePerOrigin: 2, idleTimeout: 10))
+    }
+
+    private func makeClient(pool: HTTPConnectionPool, server: HoldableHTTPServer) -> HTTPSClient {
+        HTTPSClient(
+            host: "127.0.0.1",
+            port: server.port,
+            leafPin: nil,
+            pool: pool,
+            parameters: NWParameters.tcp
+        )
+    }
+
+    func testBudgetIsTheSingleLeadApprovedConstant() {
+        XCTAssertEqual(HTTPConnection.firstByteTimeout, 0.8, accuracy: 0.0001)
+    }
+
+    func testReusedConnectionWithoutFirstByteFailsNotifiesAndIsDropped() async throws {
+        let server = try HoldableHTTPServer()
+        try await server.start()
+        defer { server.stop() }
+        let pool = makePool()
+        let client = makeClient(pool: pool, server: server)
+        // First request establishes the keep-alive connection (normal response).
+        let first = try await client.perform(request("/api/a"), timeout: 5)
+        XCTAssertEqual(first.status, 200)
+        let reused = try await checkout(pool: pool, key: key(server))
+        XCTAssertEqual(server.acceptedConnections, 1)
+
+        // Second request on the reused connection: the server never sends a byte.
+        server.holdsResponses = true
+        let timeoutNote = expectation(forNotification: .dshmHTTPFirstByteTimeout, object: nil) { note in
+            (note.userInfo?["endpoint"] as? String) == "/api/b"
+        }
+        let task = Task { try await reused.perform(self.request("/api/b"), timeout: 10) }
+        await server.waitForNextRequest()
+        reused.simulateFirstByteTimeoutForTesting()
+
+        await fulfillment(of: [timeoutNote], timeout: 2)
+        do {
+            _ = try await task.value
+            XCTFail("a reused socket with zero response bytes must fail")
+        } catch let error as LinkError {
+            guard case .timeout(let message) = error else {
+                return XCTFail("expected LinkError.timeout, got \(error)")
+            }
+            XCTAssertTrue(message.contains("首字节超时"), message)
+        }
+        XCTAssertTrue(reused.isClosed, "the dead socket must not be reusable")
+        XCTAssertEqual(pool.idleCount(for: key(server)), 0, "the dead socket must not be re-pooled")
+        XCTAssertEqual(server.acceptedConnections, 1)
+    }
+
+    func testFreshConnectionIsNotKilledByFirstByteWatchdog() async throws {
+        let server = try HoldableHTTPServer()
+        try await server.start()
+        defer { server.stop() }
+        server.holdsResponses = true
+        let connection = HTTPConnection(
+            key: key(server),
+            host: "127.0.0.1",
+            port: server.port,
+            leafPin: nil,
+            parametersOverride: NWParameters.tcp,
+            pool: nil
+        )
+        let task = Task { try await connection.perform(self.request("/api/slow"), timeout: 10) }
+        await server.waitForNextRequest()
+        // Not claimed from the pool: the watchdog must have no opinion (TCP/TLS and
+        // a slow first flight are legitimate).
+        connection.simulateFirstByteTimeoutForTesting()
+        server.releaseHeldResponse()
+        let response = try await task.value
+        XCTAssertEqual(response.status, 200, "a fresh connection's slow first byte is not a dead socket")
+    }
+
+    func testReusedConnectionWithPromptResponseIsUnchanged() async throws {
+        let server = try HoldableHTTPServer()
+        try await server.start()
+        defer { server.stop() }
+        let pool = makePool()
+        let client = makeClient(pool: pool, server: server)
+        let first = try await client.perform(request("/api/a"), timeout: 5)
+        XCTAssertEqual(first.status, 200)
+        let reused = try await checkout(pool: pool, key: key(server))
+        let second = try await reused.perform(request("/api/b"), timeout: 5)
+        XCTAssertEqual(second.status, 200)
+        // A completed request has no pending watchdog left to fire.
+        reused.simulateFirstByteTimeoutForTesting()
+        XCTAssertFalse(reused.isClosed)
+        XCTAssertEqual(server.acceptedConnections, 1, "keep-alive reuse must be unaffected")
+    }
+
+    private func checkout(
+        pool: HTTPConnectionPool,
+        key: HTTPConnectionKey
+    ) async throws -> HTTPConnection {
+        for _ in 0..<100 {
+            if let connection = pool.checkout(key) { return connection }
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        let message = "the keep-alive connection was never pooled"
+        XCTFail(message)
+        throw NSError(domain: "FirstByteTimeoutTests", code: 1, userInfo: [NSLocalizedDescriptionKey: message])
+    }
+}
+
+// MARK: - Loopback server that can hold responses
+
+/// Minimal HTTP/1.1 loopback server for the first-byte watchdog tests: one
+/// keep-alive connection, records each completed request, and can withhold the
+/// response until the test releases it.
+final class HoldableHTTPServer {
+    private let listener: NWListener
+    private let queue = DispatchQueue(label: "com.dshm.tests.holdable-server")
+    private let lock = NSLock()
+    private var connection: NWConnection?
+    private var buffer = Data()
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+    private var received = 0
+    private var delivered = 0
+    private var accepted = 0
+    private(set) var port: UInt16 = 0
+    var holdsResponses = false
+
+    init() throws {
+        listener = try NWListener(using: NWParameters.tcp, on: .any)
+    }
+
+    var acceptedConnections: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return accepted
+    }
+
+    func start() async throws {
+        listener.newConnectionHandler = { [weak self] nw in
+            self?.accept(nw)
+        }
+        let ready = FirstByteResumeOnce()
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            listener.stateUpdateHandler = { state in
+                switch state {
+                case .ready:
+                    ready.resume { continuation.resume() }
+                case .failed(let error):
+                    ready.resume { continuation.resume(throwing: error) }
+                default:
+                    break
+                }
+            }
+            listener.start(queue: queue)
+        }
+        port = listener.port?.rawValue ?? 0
+    }
+
+    func stop() {
+        listener.cancel()
+        lock.lock()
+        let current = connection
+        connection = nil
+        lock.unlock()
+        current?.cancel()
+    }
+
+    func waitForNextRequest() async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            lock.lock()
+            if received > delivered {
+                delivered += 1
+                lock.unlock()
+                continuation.resume()
+                return
+            }
+            waiters.append(continuation)
+            lock.unlock()
+        }
+    }
+
+    func releaseHeldResponse() {
+        lock.lock()
+        let current = connection
+        lock.unlock()
+        if let current { respond(on: current) }
+    }
+
+    private func accept(_ nw: NWConnection) {
+        lock.lock()
+        accepted += 1
+        connection = nw
+        lock.unlock()
+        nw.start(queue: queue)
+        receive(on: nw)
+    }
+
+    private func receive(on nw: NWConnection) {
+        nw.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) { [weak self] data, _, isComplete, error in
+            guard let self else { return }
+            var completedRequest = false
+            if let data, !data.isEmpty {
+                self.lock.lock()
+                self.buffer.append(data)
+                if self.headerBlockComplete(self.buffer) {
+                    self.buffer.removeAll()
+                    self.received += 1
+                    completedRequest = true
+                    if !self.waiters.isEmpty {
+                        self.delivered += 1
+                        self.waiters.removeFirst().resume()
+                    }
+                }
+                let hold = self.holdsResponses
+                self.lock.unlock()
+                if completedRequest, !hold {
+                    self.respond(on: nw)
+                }
+            }
+            if error == nil, !isComplete {
+                self.receive(on: nw)
+            }
+        }
+    }
+
+    private func headerBlockComplete(_ data: Data) -> Bool {
+        let bytes = [UInt8](data)
+        guard bytes.count >= 4 else { return false }
+        var index = 0
+        while index <= bytes.count - 4 {
+            if bytes[index] == 13, bytes[index + 1] == 10, bytes[index + 2] == 13, bytes[index + 3] == 10 {
+                return true
+            }
+            index += 1
+        }
+        return false
+    }
+
+    private func respond(on nw: NWConnection) {
+        let body = Data("{}".utf8)
+        let head = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: \(body.count)\r\n\r\n"
+        var data = Data(head.utf8)
+        data.append(body)
+        nw.send(content: data, completion: .contentProcessed { _ in })
+    }
+}
+
+/// Resumes a continuation exactly once (listener state updates can fire repeatedly).
+final class FirstByteResumeOnce {
+    private let lock = NSLock()
+    private var done = false
+
+    func resume(_ body: () -> Void) {
+        lock.lock()
+        if done {
+            lock.unlock()
+            return
+        }
+        done = true
+        lock.unlock()
+        body()
+    }
+}

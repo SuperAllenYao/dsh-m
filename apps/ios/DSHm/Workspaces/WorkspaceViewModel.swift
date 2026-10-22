@@ -73,6 +73,23 @@ final class WorkspaceViewModel: ObservableObject {
     /// P0-4/P0-5: when the last live snapshot was applied, so the reconnect path
     /// does not re-fetch the full list immediately after a successful early one.
     private var lastNetworkListAppliedAt: Date?
+
+    // MARK: - task-2 reconnect chain (page enter / stale-socket liveness)
+
+    /// Budget for the reused mux's first byte after a page enter / foreground
+    /// resume. Reusing a believed-alive mux means the first `workspace/follow`
+    /// baseline is the socket's first byte; a silently dead socket (network switch,
+    /// Mac sleep) delivers nothing and used to hang until the system TCP timeout.
+    /// 300-500ms per handoff §2.3(2); env-tunable for the live bench only.
+    static var reuseBaselineTimeoutMs: Int = {
+        let raw = ProcessInfo.processInfo.environment["DSHM_MUX_FIRST_BYTE_MS"] ?? ""
+        return Int(raw).map { min(5_000, max(50, $0)) } ?? 500
+    }()
+    private var baselineProbeTask: Task<Void, Never>?
+    private var baselineProbeGeneration = 0
+    /// One early `session/list` per bring-up window: it overlaps the mux handshake
+    /// instead of waiting for `.connected` (P0-4), and dedupes repeated phase changes.
+    private var lastEarlySnapshotAt: Date?
     private let defaults: UserDefaults
     private let cacheStore: SessionListCacheStore
     /// Raw wire JSON of the last successful `session/list` and `workspace/follow`
@@ -351,13 +368,7 @@ final class WorkspaceViewModel: ObservableObject {
         // P0-4 guard: never issue the early unary on a path where the stored origin
         // is a stale LAN address (it would hang for the full timeout instead of
         // letting the connect loop dial the relay first).
-        if link.prefersEarlyUnary,
-           Self.canLoadSessionsBeforeConnected(
-               hasCredentials: link.credentials != nil,
-               isConnected: link.phase.isConnected
-           ) {
-            loadSessions(silent: true)
-        }
+        startEarlySnapshotDuringBringup()
         guard link.phase.isConnected else {
             // Show the list chrome + connection banner instead of a forever spinner;
             // handleConnectionChange() starts the stream once the link is ready.
@@ -370,6 +381,8 @@ final class WorkspaceViewModel: ObservableObject {
         openWorkspaceStream()
         loadSessions()
         maybeStartPrewarm()
+        // task-2: the mux was believed alive, so its first byte must arrive now.
+        armReuseLivenessProbe()
         // Fallback: if no card ever appears (e.g. an empty cached list) still start
         // the raw deep-link restore after a beat.
         deferredRawFallbackTask?.cancel()
@@ -397,6 +410,8 @@ final class WorkspaceViewModel: ObservableObject {
         deferredRawRestoreTask = nil
         deferredRawFallbackTask?.cancel()
         deferredRawFallbackTask = nil
+        baselineProbeTask?.cancel()
+        baselineProbeTask = nil
         // Flush a pending debounced cache write (background: raw encode is ~1MB).
         listCacheSaveTask?.cancel()
         listCacheSaveTask = nil
@@ -427,6 +442,8 @@ final class WorkspaceViewModel: ObservableObject {
         reopenWorkspaceStream()
         loadSessions()
         maybeStartPrewarm()
+        // task-2: reuse is only valid if the first baseline lands within budget.
+        armReuseLivenessProbe()
     }
 
     private func observeForegroundResume() {
@@ -468,6 +485,9 @@ final class WorkspaceViewModel: ObservableObject {
         } else {
             workspaceStream?.cancel()
             workspaceStream = nil
+            // task-2: start the snapshot request while the mux is still handshaking
+            // so t1 = connected + listApplied instead of connected + list RTT.
+            startEarlySnapshotDuringBringup()
         }
     }
 
@@ -530,6 +550,8 @@ final class WorkspaceViewModel: ObservableObject {
         followState.apply(frame)
         if case .baseline = frame {
             isLoading = false
+            // task-2: the reused mux delivered its first byte within budget.
+            cancelReuseLivenessProbe()
         }
         errorText = nil
         rebuildGroups()
@@ -601,6 +623,81 @@ final class WorkspaceViewModel: ObservableObject {
         // P0-4 acceptance evidence: the live snapshot landed (may be *before*
         // `StartupMetrics.connMs` when the pre-connected request won).
         FirstScreenMetrics.markListApplied()
+        // task-2: t1's second half for the page-enter/foreground reconnect chain.
+        ReconnectMetrics.markListApplied()
+    }
+
+    // MARK: - task-2 reconnect chain (page enter / stale-socket liveness)
+
+    /// Pure probe verdict: a reused mux that has not produced its first baseline
+    /// within the budget, while the link still claims to be the same connected
+    /// generation, is presumed dead.
+    nonisolated static func shouldDeclareMuxDead(
+        baselineApplied: Bool,
+        elapsedMs: Double,
+        thresholdMs: Double,
+        stillConnected: Bool = true
+    ) -> Bool {
+        stillConnected && !baselineApplied && elapsedMs >= thresholdMs
+    }
+
+    /// Pure decision for the early snapshot: issue `session/list` while the mux is
+    /// still coming up so the request overlaps the handshake (P0-4).
+    nonisolated static func shouldStartEarlySnapshot(
+        prefersEarlyUnary: Bool,
+        hasCredentials: Bool,
+        isConnected: Bool
+    ) -> Bool {
+        prefersEarlyUnary
+            && canLoadSessionsBeforeConnected(hasCredentials: hasCredentials, isConnected: isConnected)
+    }
+
+    /// One speculative `session/list` per bring-up window, so repeated phase
+    /// changes (connecting -> reconnecting) do not stack requests.
+    private func startEarlySnapshotDuringBringup() {
+        guard let link, !link.manuallyDisconnected else { return }
+        guard Self.shouldStartEarlySnapshot(
+            prefersEarlyUnary: link.prefersEarlyUnary,
+            hasCredentials: link.credentials != nil,
+            isConnected: link.phase.isConnected
+        ) else { return }
+        if let last = lastEarlySnapshotAt, Date().timeIntervalSince(last) < 1.5 { return }
+        lastEarlySnapshotAt = Date()
+        loadSessions(silent: true)
+    }
+
+    /// Arms the reused-mux first-byte probe described by `reuseBaselineTimeoutMs`.
+    /// Only the reuse paths (page enter / foreground resume on a believed-alive
+    /// mux) call this: a freshly connected socket has no reason to be suspect.
+    private func armReuseLivenessProbe() {
+        guard let link, link.phase.isConnected else { return }
+        baselineProbeTask?.cancel()
+        baselineProbeGeneration += 1
+        let token = baselineProbeGeneration
+        let linkGeneration = link.generation
+        let thresholdMs = Self.reuseBaselineTimeoutMs
+        let threshold = Double(thresholdMs) / 1000
+        baselineProbeTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(threshold * 1_000_000_000))
+            guard !Task.isCancelled, let self else { return }
+            // A baseline frame (or a newer stream open) retires this probe.
+            let baselineApplied = token != self.baselineProbeGeneration
+            guard let link = self.link else { return }
+            let stillConnected = link.phase.isConnected && link.generation == linkGeneration
+            guard Self.shouldDeclareMuxDead(
+                baselineApplied: baselineApplied,
+                elapsedMs: Double(thresholdMs),
+                thresholdMs: Double(thresholdMs),
+                stillConnected: stillConnected
+            ) else { return }
+            link.noteTransportUnresponsive(source: "workspaceBaseline")
+        }
+    }
+
+    private func cancelReuseLivenessProbe() {
+        baselineProbeTask?.cancel()
+        baselineProbeTask = nil
+        baselineProbeGeneration += 1
     }
 
     // MARK: - M2b-2b in-app timing + detail prewarm

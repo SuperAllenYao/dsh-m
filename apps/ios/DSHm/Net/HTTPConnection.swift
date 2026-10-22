@@ -172,7 +172,22 @@ final class HTTPConnection {
         let bytes: Data
         let continuation: CheckedContinuation<HTTPResponse, Error>
         var timeoutItem: DispatchWorkItem?
+        /// task-2 (reconnect): first-byte watchdog state. Only reused keep-alive
+        /// connections are watched (see `scheduleFirstByteWatchdog`).
+        var firstByteSeen = false
+        var firstByteItem: DispatchWorkItem?
     }
+
+    /// task-2 (reconnect < 1s): budget for the **first response byte on a reused
+    /// (keep-alive) connection**. A socket that survived a Wi-Fi -> cellular switch
+    /// but is actually dead stays "open" locally; without this watchdog the first
+    /// unary call after the switch waited for the full 20s HTTP timeout before the
+    /// reconnect loop even started. Fresh connections (TCP/TLS handshake included)
+    /// are never watched: a slow network must not be mistaken for a dead socket.
+    ///
+    /// Single tunable constant by design (Lead decision): one place to adjust from
+    /// real-device data. 0.8s is deliberately conservative.
+    static let firstByteTimeout: TimeInterval = 0.8
 
     init(
         key: HTTPConnectionKey,
@@ -316,6 +331,7 @@ final class HTTPConnection {
                 self.handleClosure(LinkError.transport("发送失败：" + NetworkErrorInterpreter.message(for: error)))
                 return
             }
+            self.scheduleFirstByteWatchdog()
             self.receiveNext()
         })
     }
@@ -333,11 +349,17 @@ final class HTTPConnection {
     private func handleReceive(data: Data?, isComplete: Bool, error: NWError?) {
         if isTraceableClosed { return }
         if let data, !data.isEmpty {
-            guard pending != nil else {
+            guard self.pending != nil else {
                 // No pipelining: bytes while idle are a protocol violation.
                 closeInternal(notifyPool: true)
                 return
             }
+            // task-2: any response byte satisfies the reused-socket watchdog —
+            // including the case where the TCP migration kept a half-stale
+            // connection alive but slow.
+            self.pending?.firstByteSeen = true
+            self.pending?.firstByteItem?.cancel()
+            self.pending?.firstByteItem = nil
             parser.append(data)
             if let response = parser.completed {
                 completeResponse(response)
@@ -374,6 +396,7 @@ final class HTTPConnection {
         }
         self.pending = nil
         pending.timeoutItem?.cancel()
+        pending.firstByteItem?.cancel()
         var response = response
         response.observedLeafPin = pinCapture.pin
         let keepAlive = canKeepAlive(response: response, request: pending.request)
@@ -418,10 +441,58 @@ final class HTTPConnection {
         closeInternal(notifyPool: true)
     }
 
+    /// task-2 (reconnect): arms the reused-socket first-byte watchdog. Scheduled
+    /// **after** the request bytes went out, and only for connections claimed from
+    /// the idle pool: a fresh connection still has legitimate TCP/TLS/first-flight
+    /// latency, so it is never watched.
+    private func scheduleFirstByteWatchdog() {
+        guard wasReused, let pending else { return }
+        pending.firstByteItem?.cancel()
+        let requestId = pending.id
+        let item = DispatchWorkItem { [weak self] in
+            self?.handleFirstByteTimeout(requestId: requestId)
+        }
+        self.pending?.firstByteItem = item
+        queue.asyncAfter(deadline: .now() + Self.firstByteTimeout, execute: item)
+    }
+
+    /// task-2: a reused socket produced zero response bytes within
+    /// `firstByteTimeout`. Fail the request with a transport timeout, report the
+    /// condition (searchable log + NotificationCenter for `LinkService`), and drop
+    /// the socket so a dead keep-alive connection can never be checked out again.
+    private func handleFirstByteTimeout(requestId: Int) {
+        guard let pending, pending.id == requestId, !pending.firstByteSeen, wasReused else { return }
+        let endpoint = pending.request.path
+        let waitedMs = Self.firstByteTimeout * 1000
+        NSLog("[RECONNECT] firstByteTimeout endpoint=%@;waitedMs=%.0f", endpoint, waitedMs)
+        NotificationCenter.default.post(
+            name: .dshmHTTPFirstByteTimeout,
+            object: self,
+            userInfo: [
+                "endpoint": endpoint,
+                "waitedMs": waitedMs,
+                "host": host,
+                "port": Int(port),
+            ]
+        )
+        failPending(LinkError.timeout("首字节超时（复用连接 \(Int(waitedMs))ms 无响应）：\(endpoint)"))
+        closeInternal(notifyPool: true)
+    }
+
+    /// Test seam (fake clock): run the first-byte deadline now for the in-flight
+    /// request instead of waiting `firstByteTimeout` in real time.
+    func simulateFirstByteTimeoutForTesting() {
+        queue.sync { [weak self] in
+            guard let self, let requestId = self.pending?.id else { return }
+            self.handleFirstByteTimeout(requestId: requestId)
+        }
+    }
+
     private func failPending(_ error: Error) {
         guard let pending else { return }
         self.pending = nil
         pending.timeoutItem?.cancel()
+        pending.firstByteItem?.cancel()
         pending.continuation.resume(throwing: error)
     }
 
@@ -507,4 +578,13 @@ final class HTTPConnection {
             self?.closeInternal(notifyPool: false)
         }
     }
+}
+
+/// task-2 (reconnect): posted once per **reused** pooled connection whose first
+/// response byte did not arrive within `HTTPConnection.firstByteTimeout`.
+/// `LinkService` listens and invalidates the live transport (a dead unary socket
+/// and a dead mux almost always share the same network event), so the reconnect
+/// starts immediately instead of waiting for the full HTTP timeout.
+extension Notification.Name {
+    static let dshmHTTPFirstByteTimeout = Notification.Name("com.dshm.httpFirstByteTimeout")
 }

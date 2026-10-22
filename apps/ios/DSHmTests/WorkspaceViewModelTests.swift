@@ -469,4 +469,97 @@ final class WorkspaceViewModelTests: XCTestCase {
         XCTAssertEqual(AppModel.foregroundAction(phase: .unpaired, backgroundedSeconds: 8), .none)
         XCTAssertEqual(AppModel.foregroundAction(phase: .needsRepair("repair"), backgroundedSeconds: 8), .none)
     }
+
+    // MARK: - task-2: reconnect chain (page enter / stale-socket liveness)
+
+    func testDeclareMuxDeadDecisionMatrix() {
+        // First byte did arrive: never a dead socket, however late.
+        XCTAssertFalse(
+            WorkspaceViewModel.shouldDeclareMuxDead(
+                baselineApplied: true, elapsedMs: 10_000, thresholdMs: 500
+            )
+        )
+        // Byte still missing but the budget is not spent yet.
+        XCTAssertFalse(
+            WorkspaceViewModel.shouldDeclareMuxDead(
+                baselineApplied: false, elapsedMs: 499, thresholdMs: 500
+            )
+        )
+        // Budget spent with no byte: the reused socket is presumed dead.
+        XCTAssertTrue(
+            WorkspaceViewModel.shouldDeclareMuxDead(
+                baselineApplied: false, elapsedMs: 500, thresholdMs: 500
+            )
+        )
+        // A reconnect already changed the generation: nothing to declare.
+        XCTAssertFalse(
+            WorkspaceViewModel.shouldDeclareMuxDead(
+                baselineApplied: false,
+                elapsedMs: 5_000,
+                thresholdMs: 500,
+                stillConnected: false
+            )
+        )
+    }
+
+    @MainActor
+    func testReuseBaselineBudgetIsWithinHandoffRange() {
+        // 300-500ms per handoff §2.3(2); the env tunable may narrow it for the bench.
+        XCTAssertTrue((50...5_000).contains(WorkspaceViewModel.reuseBaselineTimeoutMs))
+    }
+
+    func testShouldStartEarlySnapshotDecisionMatrix() {
+        XCTAssertTrue(
+            WorkspaceViewModel.shouldStartEarlySnapshot(
+                prefersEarlyUnary: true, hasCredentials: true, isConnected: false
+            ),
+            "paired but not connected: the list request may overlap the handshake"
+        )
+        XCTAssertFalse(
+            WorkspaceViewModel.shouldStartEarlySnapshot(
+                prefersEarlyUnary: false, hasCredentials: true, isConnected: false
+            ),
+            "stale LAN origin on cellular: do not hang on the unary path"
+        )
+        XCTAssertFalse(
+            WorkspaceViewModel.shouldStartEarlySnapshot(
+                prefersEarlyUnary: true, hasCredentials: false, isConnected: false
+            )
+        )
+        XCTAssertFalse(
+            WorkspaceViewModel.shouldStartEarlySnapshot(
+                prefersEarlyUnary: true, hasCredentials: true, isConnected: true
+            ),
+            "already connected: the normal load path owns the request"
+        )
+    }
+
+    @MainActor
+    func testLiveListApplicationCompletesReconnectChain() throws {
+        var now: TimeInterval = 500
+        ReconnectMetrics.forceEnabledForTesting = true
+        ReconnectMetrics.clock = { now }
+        ReconnectMetrics.reset()
+        defer {
+            ReconnectMetrics.forceEnabledForTesting = nil
+            ReconnectMetrics.reset()
+            ReconnectMetrics.clock = { ProcessInfo.processInfo.systemUptime }
+        }
+        let (viewModel, defaults, suite) = makeViewModel()
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        ReconnectMetrics.beginPageEnter(reason: "listPage")
+        now += 0.250
+        ReconnectMetrics.markReconnectStart()
+        now += 0.300
+        ReconnectMetrics.markConnected()
+        now += 0.200
+        let value = try JSONDecoder().decode(JSONValue.self, from: Data(#"{"items":[]}"#.utf8))
+        try viewModel.applySessionListResponse(value)
+
+        let metrics = try XCTUnwrap(ReconnectMetrics.valueString)
+        XCTAssertTrue(metrics.contains("totalMs=750"), metrics)
+        XCTAssertTrue(metrics.contains("stage=complete"), metrics)
+        XCTAssertTrue(metrics.contains("listAppliedMs=750"), metrics)
+    }
 }

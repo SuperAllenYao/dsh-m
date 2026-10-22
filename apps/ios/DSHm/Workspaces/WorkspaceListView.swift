@@ -34,6 +34,11 @@ struct WorkspaceListView: View {
             SettingsView().environmentObject(app)
         }
         .task {
+            // task-2 (reconnect < 1s): t0 = page enter. Cancels a pending backoff
+            // wait and invalidates a stale (network-changed) mux before the view
+            // model asks for the snapshot, so the list request overlaps the mux
+            // handshake instead of queueing behind it.
+            app.link.handlePageEnter()
             viewModel.attach(link: app.link)
             viewModel.start()
         }
@@ -71,6 +76,7 @@ struct WorkspaceListView: View {
                 startupMetricsElement
                 prewarmMetricsElement
                 connectMetricsElement
+                reconnectMetricsElement
             }
         }
     }
@@ -118,6 +124,22 @@ struct WorkspaceListView: View {
                 .opacity(0.02)
                 .allowsHitTesting(false)
                 .accessibilityIdentifier("connect-metrics")
+                .accessibilityLabel(metrics)
+                .accessibilityValue(metrics)
+        }
+    }
+
+    /// task-2 E2E-gated reconnect-chain summary (`totalMs=..;pageEnterMs=..;...`,
+    /// handoff §2.3(6)). Hidden leaf element, same pattern as `connect-metrics`.
+    @ViewBuilder
+    private var reconnectMetricsElement: some View {
+        if let metrics = app.link.reconnectMetricsValue {
+            Text("reconnect-metrics")
+                .font(.system(size: 1))
+                .frame(width: 2, height: 2)
+                .opacity(0.02)
+                .allowsHitTesting(false)
+                .accessibilityIdentifier("reconnect-metrics")
                 .accessibilityLabel(metrics)
                 .accessibilityValue(metrics)
         }

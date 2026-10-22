@@ -11,6 +11,18 @@ import Foundation
 ///     (drop the window, re-open session/follow) rather than session/page patching
 ///   - assistant-stream revision must increment by exactly 1, otherwise the carrier
 ///     is considered broken and the stream must be re-opened.
+///
+/// Task session-history (2026-10-22): the window is no longer capped at the newest
+/// N messages. Older history is pulled in with the unary `session/page` endpoint
+/// and merged into the front of the window by `prepend(page:)`; that keeps the
+/// "newest first" fast paint (the follow snapshot is still phone-sized) while making
+/// the *entire* session reachable by scrolling up. The two ends are tracked
+/// separately:
+///   - `lastSeq` / `cursor`: newest applied position (live stream / snapshot);
+///   - `oldestSeq` / `hasMoreOlder`: front of the loaded window and whether the
+///     Host still has events before it (`session/page` `hasMore`).
+/// A reconnect snapshot therefore *preserves* the already-loaded older prefix
+/// instead of throwing the user's scroll position away.
 final class SessionJournal {
 
     enum Update: Equatable {
@@ -18,6 +30,9 @@ final class SessionJournal {
         case snapshotReplaced
         /// A batch of contiguous events was applied.
         case eventsApplied([Int])
+        /// Older `session/page` events were merged into the front of the window.
+        /// Carries the seqs actually inserted (already-loaded seqs are skipped).
+        case olderPrepended([Int])
         /// Duplicate event (seq <= lastSeq) ignored.
         case duplicate(Int)
         /// Sequence hole detected. Caller must rebuild from a new snapshot.
@@ -33,6 +48,13 @@ final class SessionJournal {
     private(set) var header: SessionHeader?
     private(set) var events: [SessionEvent] = []
     private(set) var lastSeq: Int = -1
+    /// Front of the loaded window (nil while empty). Always `events.first?.seq`;
+    /// kept as an explicit accessor because pagination keys `beforeSeq` off it.
+    var oldestSeq: Int? { events.first?.seq }
+    /// The Host still has events older than `oldestSeq` (last `session/page`
+    /// `hasMore`, or the opening snapshot's `hasMore`). False = history start
+    /// reached (or no snapshot yet).
+    private(set) var hasMoreOlder: Bool = false
     private(set) var projections: [String: JSONValue] = [:]
     private(set) var projectionsAsOfSeq: Int64?
     private(set) var assistantRevision: Int = 0
@@ -80,14 +102,41 @@ final class SessionJournal {
             if let last = deduped.last, event.seq <= last.seq { continue }
             deduped.append(event)
         }
+        // Task session-history: a reconnect / background-fill snapshot only covers
+        // the newest message window. Keep the older events the user already loaded
+        // (front-merged by `session/page`), otherwise every reconnect silently
+        // throws the loaded history away ("cold start/reconnect must not regress to
+        // the 40-message window").
+        //
+        // Only a *contiguous* prefix is kept: when the new snapshot's window starts
+        // past the loaded events (a long gap between reconnects), the two ranges
+        // would contain a hole; dropping the stale prefix and restarting pagination
+        // from the snapshot is safer than rendering a window with a hidden gap.
+        let previous = events
+        var preserved: [SessionEvent] = []
+        if let snapshotOldest = deduped.first?.seq {
+            let older = previous.filter { $0.seq < snapshotOldest }
+            if !older.isEmpty, let last = older.last, last.seq + 1 == snapshotOldest {
+                preserved = older
+            }
+        }
         header = snapshot.header
-        events = deduped
+        events = preserved + deduped
         cursor = snapshot.cursor
         lastSeq = snapshot.cursor
         projections = snapshot.projections?.values ?? [:]
         projectionsAsOfSeq = snapshot.projections?.asOfSeq
         assistantRevision = snapshot.assistantStream?.revision ?? 0
         hasMore = snapshot.hasMore ?? false
+        // The snapshot's own `hasMore` only describes its message window. When a
+        // loaded prefix was preserved, the paging state (whether *more* history
+        // exists before it) is already known and must win; otherwise the snapshot is
+        // the first word on older history.
+        if preserved.isEmpty {
+            hasMoreOlder = snapshot.hasMore ?? false
+        } else if events.first?.seq == 0 {
+            hasMoreOlder = false
+        }
         snapshotCount += 1
         liveAssistantText = ""
         return .snapshotReplaced
@@ -149,6 +198,72 @@ final class SessionJournal {
         return .eventsApplied([event.seq])
     }
 
+    // MARK: - Older history (unary session/page)
+
+    /// Merges one `session/page` result into the front of the window.
+    ///
+    /// Semantics (verified against the installed Host's session-controller
+    /// `paginate`, 2026-10-22):
+    ///   - `beforeSeq` is exclusive: a page holds events with `seq < beforeSeq`;
+    ///   - records are *all* events of that seq range (turn/start, tool events, ...),
+    ///     not just user/assistant messages;
+    ///   - `hasMore` = the page's oldest offset > 0, i.e. the Host has still older
+    ///     events than the page's first event.
+    ///
+    /// Merging never touches `lastSeq`/`cursor`/`events` after the front: the newest
+    /// position and the live stream are unaffected by scrolling up. Pages arrive in
+    /// descending seq order (each request uses the previous page's first seq as
+    /// `beforeSeq`), are re-sorted defensively, and de-duplicated against the
+    /// already-loaded window (the Host contract makes them disjoint; the dedupe only
+    /// protects against re-requesting the same page).
+    ///
+    /// A page that yields no new events stops pagination (`hasMoreOlder = false`)
+    /// so a Host-side inconsistency can never spin the caller in a request loop.
+    @discardableResult
+    func prepend(page: SessionPage) -> Update {
+        let incoming = page.records.compactMap { record -> SessionEvent? in
+            guard record.type == "event" else { return nil }
+            return record.event
+        }
+        return prepend(events: incoming, hasMoreOlder: page.hasMore)
+    }
+
+    /// Cache-restore / test seam for `prepend(page:)` without wire records.
+    @discardableResult
+    func prepend(events incoming: [SessionEvent], hasMoreOlder: Bool) -> Update {
+        let ascending = incoming.sorted { $0.seq < $1.seq }
+        let currentOldest = events.first?.seq
+        var merged: [SessionEvent] = []
+        merged.reserveCapacity(events.count + ascending.count)
+        var inserted: [Int] = []
+        for event in ascending {
+            // Defensive: the Host only returns events older than `beforeSeq`; keep
+            // anything at/after the current front out of the prefix merge.
+            if let currentOldest, event.seq >= currentOldest { continue }
+            if let last = merged.last, event.seq <= last.seq { continue }
+            merged.append(event)
+            inserted.append(event.seq)
+        }
+        merged.append(contentsOf: events)
+        events = merged
+        if inserted.isEmpty {
+            // Nothing new: stop pagination instead of asking the same page forever.
+            self.hasMoreOlder = false
+        } else {
+            self.hasMoreOlder = hasMoreOlder
+        }
+        if events.first?.seq == 0 {
+            self.hasMoreOlder = false
+        }
+        return .olderPrepended(inserted)
+    }
+
+    /// Restores the paging state from an on-disk window cache (see
+    /// `SessionWindowCachePayload`); never touches the event window itself.
+    func setHasMoreOlder(_ value: Bool) {
+        hasMoreOlder = events.first?.seq == 0 ? false : value
+    }
+
     /// Applies an assistant-stream frame; enforces strictly monotonic revision.
     @discardableResult
     func apply(assistantStream frame: AssistantStreamFrame) -> Update {
@@ -199,4 +314,19 @@ final class SessionJournal {
     func events(after seq: Int) -> [SessionEvent] {
         events.filter { $0.seq > seq }
     }
+}
+
+/// Result of the unary `session/page` endpoint (older history).
+///
+/// Wire shape verified against the installed Host's session-controller
+/// (`ApiSessionHistory.page`, 2026-10-22):
+/// `{records: [{"type":"event","event":{...}}], hasMore: Bool}`.
+///
+/// Request semantics (same source): `throughSeq` is the inclusive log cut taken
+/// from the corresponding `session/follow` opening frame (`snapshot.cursor`);
+/// `beforeSeq` is **exclusive** (`end = min(throughSeq + 1, beforeSeq ?? …)`), so
+/// the next request uses the current oldest loaded seq to walk strictly backwards.
+struct SessionPage: Decodable {
+    var records: [SnapshotRecord]
+    var hasMore: Bool
 }
