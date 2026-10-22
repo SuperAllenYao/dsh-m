@@ -6,7 +6,7 @@ DSH-m 通过自托管、TLS 证书钉扎的桥接，把 iPhone App **DSH-m** 连
 
 ## 状态
 
-当前版本 **v0.2.2**（2026-10-22）。已交付的能力：
+当前版本 **v0.2.3**（2026-10-23）。已交付的能力：
 
 **连接与配对**
 
@@ -14,10 +14,12 @@ DSH-m 通过自托管、TLS 证书钉扎的桥接，把 iPhone App **DSH-m** 连
 - 配对一次即可长期使用：手机以插件自签 CA 证书为信任锚，插件升级、证书重签（局域网 IP 变化 / 到期续期 / 手动轮换）、桌面端重启、切换网络都不需要重新配对；只有主动吊销设备或显式轮换 CA 才需要。
 - 连接稳定：首次启动链路就绪即进入；断线自动恢复（单 WSS 传输与断线恢复 `dsh-m/2`、按 origin 复用的 keep-alive 连接池）；待处理卡片在重连时不清空，重连后按事件 ID 幂等重投。
 - 公网访问：在桌面设置页一键部署自托管 relay，部署后进程内激活隧道（无需重载插件）。
+- 网络自适应：连接成功后自动学习 Mac 的最新端点；网络环境变化（Wi-Fi / 蜂窝 / 热点 / Mac 局域网 IP 变更）时自动选当前最快可用路径，收不到旧连接时由新连接接管，重连约 0.4s；同一 Wi-Fi 下冷启动约 1.6s 连上。
 
 **会话与交互**
 
 - 工作区 / 会话浏览与实时流；会话列表轻量投影，首屏更快。
+- 会话详情为一条平铺消息流（对齐 DSH 桌面端）：无 turn 卡片与按轮折叠；推理与工具调用按「过程组」折叠，文件变更卡在流尾；每行独立懒加载，长会话滚动更稳、下拉加载的新消息立即可见。
 - 子代理与工具调用视图；子代理入口常驻数量，只有真实运行中才播放边框流光，运行期间新启动的子代理即时计入。
 - 审批与用户提问：底部交互面板强制作答，可向下折叠查看会话输出，右上角「等待审批 / 等待作答」徽标可重新展开；多题问答一题一页（上一题 / 下一题、进度、单选自动前进、返回保留草稿、跳过与提交校验）；支持锁屏推送直接处理。
 - 统一底部弹层（模型 / 权限 / 子代理 / 文件变更 / 思考 / 工具详情）：从屏幕底部全宽弹出、高度随内容自适应并含底部安全区，按住顶部触摸条下滑即可收起。
@@ -138,7 +140,7 @@ DSH-m connects the iOS app **DSH-m** to your Mac's DSH desktop through a self-ho
 
 ## Status
 
-Current version **v0.2.2** (2026-10-22). What ships today:
+Current version **v0.2.3** (2026-10-23). What ships today:
 
 **Connection and pairing**
 
@@ -146,10 +148,12 @@ Current version **v0.2.2** (2026-10-22). What ships today:
 - Pair once and keep working: the phone anchors trust on the plugin's self-signed CA certificate, so plugin upgrades, certificate re-issues (LAN IP changes / expiry renewal / manual rotation), desktop restarts and network changes no longer require re-pairing; only revoking the device or explicitly rotating the CA does.
 - Reliable connection: the app enters as soon as the link is ready on first launch; automatic recovery after disconnects (single-WSS transport with resume `dsh-m/2`, per-origin keep-alive connection pooling); pending cards are not cleared on reconnect and are re-delivered idempotently by event ID.
 - Public access: deploy a self-hosted relay with one click from the desktop settings page; the tunnel activates in-process (no plugin reload).
+- Network-aware: after every successful connect the app learns the Mac's current endpoints; when the network environment changes (Wi-Fi / cellular / hotspot / Mac LAN IP change) it automatically picks the fastest reachable path and a new connection takes over from a silent stale one — a reconnect takes about 0.4s, and a same-Wi-Fi cold start connects in about 1.6s.
 
 **Sessions and interaction**
 
 - Workspace / session browsing with live streams; a lite session-list projection makes the first screen faster.
+- The session detail is a single flat message stream (matching the DSH desktop app): no turn cards or per-turn folding; reasoning and tool calls fold into process groups, the file-changes card sits at the end of the stream, and every row lazy-loads on its own, so long sessions stay smooth and newly paged-in messages appear immediately.
 - Subagent and tool-call views; the subagent entry keeps a persistent count, plays the border beam only while subagents are actually running, and counts subagents started while the session is open immediately.
 - Approvals and user questions: the bottom interaction panel makes answering mandatory, folds down so you can read the conversation output, and the top-right "waiting for approval / waiting for answer" badge re-opens it; multi-question prompts page one question at a time (previous / next, progress, auto-advance for single-select, drafts preserved, skip / submit validation); lock-screen push actions are supported.
 - Unified bottom popups (models / permissions / subagents / file changes / reasoning / tool details): full-width sheets rise from the screen edge, size themselves to their content plus the bottom safe area, and dismiss by dragging the top grabber down.
