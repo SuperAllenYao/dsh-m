@@ -349,4 +349,38 @@ final class SessionJournalTests: XCTestCase {
         XCTAssertTrue(journal.hasReachedOldest)
         XCTAssertFalse(journal.hasMoreOlder)
     }
+
+    // MARK: - task-7: 防洞（前置页必须与本窗口最老事件严格相接）
+
+    func testPrependRejectsNonAdjacentPage() {
+        let journal = SessionJournal()
+        journal.apply(snapshot: snapshot(cursor: 20, eventSeqs: 10...20, hasMore: true))
+        // 页 [4,5] 与当前最老 10 之间缺 6...9：整页拒绝，绝不制造洞。
+        XCTAssertEqual(journal.prepend(page: page(records: [4, 5], hasMore: true)), .olderPrepended([]))
+        XCTAssertEqual(journal.events.map(\.seq), Array(10...20), "带洞的页不得插入")
+        XCTAssertEqual(journal.oldestSeq, 10)
+        XCTAssertTrue(journal.hasMoreOlder, "拒绝后保持可重试")
+    }
+
+    func testPrependRejectsBlockWithInternalHole() {
+        let journal = SessionJournal()
+        journal.apply(snapshot: snapshot(cursor: 20, eventSeqs: 10...20, hasMore: true))
+        // 页尾 9+1=10 相接，但块内 6 -> 8 缺 7：同样拒绝。
+        XCTAssertEqual(journal.prepend(page: page(records: [5, 6, 8, 9], hasMore: true)), .olderPrepended([]))
+        XCTAssertEqual(journal.events.map(\.seq), Array(10...20))
+        XCTAssertTrue(journal.hasMoreOlder)
+    }
+
+    func testWindowContinuityHelpers() {
+        let journal = SessionJournal()
+        journal.apply(snapshot: snapshot(cursor: 4, eventSeqs: 0...4, hasMore: false))
+        XCTAssertTrue(journal.isWindowContiguous)
+        XCTAssertEqual(journal.trimToContiguousSuffix(), 0)
+        XCTAssertEqual(journal.dropOldestPrefix(2), 2)
+        XCTAssertEqual(journal.events.map(\.seq), [2, 3, 4])
+        XCTAssertEqual(journal.lastSeq, 4, "前端修复不动 lastSeq")
+        journal.markOlderHistoryUnloaded()
+        XCTAssertFalse(journal.hasReachedOldest, "前端修复后重新允许分页")
+        XCTAssertTrue(journal.hasMoreOlder)
+    }
 }

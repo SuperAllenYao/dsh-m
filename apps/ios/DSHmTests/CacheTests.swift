@@ -1700,5 +1700,115 @@ final class CacheTests: XCTestCase {
         print("[session-history] paged-history cache restore: bytes=\(size) events=2002 avg=\(String(format: "%.2f", average))ms samples=\(samples.map { String(format: "%.2f", $0) })")
         XCTAssertLessThan(average, 500, "大历史缓存恢复不得慢到秒级（实测 \(String(format: "%.2f", average))ms）")
     }
+
+    // MARK: - task-7: 非连续缓存窗口修复（洞 -> turn 丢失/假运行中）
+
+    @MainActor
+    func testCacheRestoreDropsNonContiguousOlderPrefix() throws {
+        let store = windowStore()
+        // 老前缀：turn 1–2（seq 0...7，自身连续）。
+        let olderPrefix = [
+            eventJSON("turn/start", seq: 0, data: "{\"turn\":1}"),
+            eventJSON("user/message", seq: 1, data: "{\"content\":[],\"source\":{\"kind\":\"user\"}}"),
+            eventJSON("assistant/message", seq: 2, data: "{\"message\":{\"content\":[]}}"),
+            eventJSON("turn/end", seq: 3, data: "{\"turn\":1}"),
+            eventJSON("turn/start", seq: 4, data: "{\"turn\":2}"),
+            eventJSON("user/message", seq: 5, data: "{\"content\":[],\"source\":{\"kind\":\"user\"}}"),
+            eventJSON("assistant/message", seq: 6, data: "{\"message\":{\"content\":[]}}"),
+            eventJSON("turn/end", seq: 7, data: "{\"turn\":2}"),
+        ]
+        // 新快照窗口：turn 8–9（seq 3005...3010），与老前缀之间缺 8...3004。
+        let window = [
+            eventJSON("turn/start", seq: 3005, data: "{\"turn\":8}"),
+            eventJSON("user/message", seq: 3006, data: "{\"content\":[],\"source\":{\"kind\":\"user\"}}"),
+            eventJSON("assistant/message", seq: 3007, data: "{\"message\":{\"content\":[]}}"),
+            eventJSON("turn/end", seq: 3008, data: "{\"turn\":8}"),
+            eventJSON("turn/start", seq: 3009, data: "{\"turn\":9}"),
+            eventJSON("user/message", seq: 3010, data: "{\"content\":[],\"source\":{\"kind\":\"user\"}}"),
+        ]
+        XCTAssertTrue(store.save(
+            sessionId: "s1",
+            snapshot: snapshotJSON(cursor: 3010, hasMore: true, events: window),
+            events: [],
+            olderEvents: olderPrefix.map { TestJSON.value($0) },
+            oldestSeq: 0,
+            hasMoreOlder: false,
+            hasReachedOldest: false
+        ))
+        let viewModel = SessionViewModel(address: .session(sessionId: "s1"), windowCache: store)
+        XCTAssertTrue(viewModel.isShowingCachedWindow)
+        // 洞被丢弃：窗口 = 快照窗口（连续），turn 1-2 不再以假 running 出现。
+        XCTAssertEqual(viewModel.eventSeqs, Array(3005...3010), "不连续老前缀必须丢弃")
+        XCTAssertEqual(viewModel.sections.map(\.turn), [8, 9], "turn 分组连续、无 turn 1 假运行中")
+        XCTAssertFalse(viewModel.sections.first?.isRunning ?? true, "turn 8 已结束")
+        XCTAssertEqual(viewModel.oldestLoadedSeq, 3005)
+        XCTAssertTrue(viewModel.hasMoreOlder, "丢弃前缀后必须允许重新拉取更早历史")
+        XCTAssertFalse(viewModel.reachedFirstEvent)
+    }
+
+    @MainActor
+    func testCacheRestoreKeepsOnlyContiguousSuffixOfOlderRange() throws {
+        let store = windowStore()
+        // 老前缀 seq 0...8 中缺 4（内部洞）：只保留与快照相接的 5...8。
+        let older = [0, 1, 2, 3, 5, 6, 7, 8].map { seq in
+            TestJSON.value(eventJSON("tool/call", seq: seq, data: "{}"))
+        }
+        let window = [
+            eventJSON("turn/start", seq: 9, data: "{\"turn\":3}"),
+            eventJSON("user/message", seq: 10, data: "{\"content\":[],\"source\":{\"kind\":\"user\"}}"),
+            eventJSON("turn/end", seq: 11, data: "{\"turn\":3}"),
+            eventJSON("turn/start", seq: 12, data: "{\"turn\":4}"),
+        ]
+        XCTAssertTrue(store.save(
+            sessionId: "s1",
+            snapshot: snapshotJSON(cursor: 12, hasMore: true, events: window),
+            events: [],
+            olderEvents: older,
+            oldestSeq: 0,
+            hasMoreOlder: false,
+            hasReachedOldest: false
+        ))
+        let viewModel = SessionViewModel(address: .session(sessionId: "s1"), windowCache: store)
+        XCTAssertEqual(viewModel.eventSeqs, Array(5...12), "只保留与快照相接的连续后缀")
+        XCTAssertEqual(viewModel.oldestLoadedSeq, 5)
+        XCTAssertTrue(viewModel.hasMoreOlder, "丢弃的 0...4 需要重新拉取")
+    }
+
+    @MainActor
+    func testSnapshotJumpDropsStaleOlderFramesFromCache() async throws {
+        let store = windowStore()
+        let viewModel = SessionViewModel(address: .session(sessionId: "s1"), windowCache: store)
+        viewModel.applyStreamValue(snapshotJSON(cursor: 3, hasMore: true, events: windowEvents()))
+        // 先分页拿到一页旧前缀（缓存里出现 olderEvents）。
+        viewModel.olderPageLoader = { _ in
+            .object([
+                "records": .array([
+                    .object([
+                        "type": .string("event"),
+                        "event": TestJSON.value(self.eventJSON(
+                            "user/message", seq: 0,
+                            data: "{\"content\":[],\"source\":{\"kind\":\"user\"}}"
+                        )),
+                    ]),
+                ]),
+                "hasMore": .bool(false),
+            ])
+        }
+        await viewModel.loadOlderPageNowForTesting()
+        XCTAssertEqual(viewModel.eventSeqs, Array(0...3))
+        viewModel.saveWindowCacheNow()
+        XCTAssertNotNil(store.load(sessionId: "s1")?.payload.olderEvents, "前置历史已进缓存")
+
+        // 窗口整体跳远（与本窗口不连续）：旧前缀不得留在缓存里，否则下次冷启动带洞。
+        let jumped = snapshotJSON(cursor: 50, hasMore: true, events: [
+            eventJSON("turn/start", seq: 45, data: "{\"turn\":9}"),
+            eventJSON("user/message", seq: 46, data: "{\"content\":[],\"source\":{\"kind\":\"user\"}}"),
+        ])
+        viewModel.applyStreamValue(jumped)
+        XCTAssertEqual(viewModel.eventSeqs, [45, 46])
+        viewModel.saveWindowCacheNow()
+        let payload = try XCTUnwrap(store.load(sessionId: "s1")?.payload)
+        XCTAssertNil(payload.olderEvents, "跳远后旧前缀必须从缓存清掉")
+    }
 }
 

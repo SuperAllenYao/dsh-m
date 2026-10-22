@@ -775,4 +775,35 @@ final class SessionPaginationTests: XCTestCase {
         let data = try! JSONEncoder().encode(event)
         return try! JSONValue.jsonObject(from: data)
     }
+
+    /// task-7 (c)：非相邻/带洞的页必须被拒绝，窗口不变、入口保持可重试。
+    @MainActor
+    func testNonAdjacentPageIsRejectedWithoutPunchingHole() async throws {
+        let host = FixtureSessionHost(events: fixtureEvents())
+        let viewModel = makeViewModel(host: host, store: makeStore(), firstWindow: 16)
+        let before = viewModel.eventSeqs
+        let oldestBefore = try XCTUnwrap(viewModel.oldestLoadedSeq)
+        var calls = 0
+        viewModel.olderPageLoader = { _ in
+            calls += 1
+            // 与当前最老 seq 之间缺了 6...oldestBefore-1：整页拒绝。
+            let records: [JSONValue] = (0..<6).map { seq in
+                .object(["type": .string("event"), "event": self.wireEvent(host.events[seq])])
+            }
+            return .object(["records": .array(records), "hasMore": .bool(true)])
+        }
+        await viewModel.loadOlderPageNowForTesting()
+        XCTAssertEqual(calls, 1)
+        XCTAssertEqual(viewModel.eventSeqs, before, "带洞的页不得插入")
+        XCTAssertEqual(viewModel.oldestLoadedSeq, oldestBefore)
+        XCTAssertTrue(viewModel.hasMoreOlder, "拒绝后保持可重试")
+        XCTAssertFalse(viewModel.isLoadingOlder)
+
+        // 换成相邻的正确页后可以继续分页。
+        viewModel.olderPageLoader = hostLoader(host: host)
+        await viewModel.loadOlderPageNowForTesting()
+        let newOldest = try XCTUnwrap(viewModel.oldestLoadedSeq)
+        XCTAssertLessThan(newOldest, oldestBefore)
+        XCTAssertEqual(viewModel.eventSeqs, Array(newOldest...host.cursor))
+    }
 }
