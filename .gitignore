@@ -71,3 +71,5 @@ packages/dsh-m-link/test/lib/mock-llm*.mjs
 !/README.md
 !/docs/release-notes/
 !/docs/release-notes/v0.2.2.md
+# 用户已授权入库（2026-10-23，「发版吧」+ 面板选「入库并推送」）：
+!/docs/release-notes/v0.2.3.md
