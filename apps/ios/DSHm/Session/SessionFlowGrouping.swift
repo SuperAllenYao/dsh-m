@@ -37,7 +37,7 @@ struct ProcessStep: Identifiable, Equatable {
 }
 
 /// Grouped rows for one turn: plain rows plus a folded process group.
-enum FlowRowGroup: Identifiable {
+enum FlowRowGroup: Identifiable, Equatable {
     case single(FlowRow)
     case process([ProcessStep])
 

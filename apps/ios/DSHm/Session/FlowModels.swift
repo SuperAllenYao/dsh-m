@@ -2,24 +2,6 @@ import Foundation
 
 // MARK: - Flow row model (built purely from session events; see SessionRowBuilder)
 
-enum TurnStatus: Equatable {
-    case running
-    case completed
-    case aborted
-    case interrupted
-    case error
-
-    var label: String {
-        switch self {
-        case .running: return L10n.t("运行中")
-        case .completed: return L10n.t("已完成")
-        case .aborted: return L10n.t("已中止")
-        case .interrupted: return L10n.t("已中断")
-        case .error: return L10n.t("出错")
-        }
-    }
-}
-
 struct ImageRef: Equatable, Hashable {
     var attachmentId: String?
     var mediaType: String?
@@ -235,29 +217,19 @@ struct FlowRow: Identifiable, Equatable {
     var content: FlowContent
 }
 
-struct TurnSection: Identifiable, Equatable {
-    var turn: Int
-    var status: TurnStatus
-    var summary: String?
-    var rows: [FlowRow]
-    var stepCount: Int
-    var startedAt: Int64?
-    var endedAt: Int64?
-    var fileChanges: FileChangeSummary?
- /// seq of the turn's `workspace/changes` event (key for /api/changes.summary).
-    var fileChangeSeq: Int?
-
-    var id: String { turn == 0 ? "orphan" : "turn-\(turn)" }
-
-    var isRunning: Bool { status == .running }
-
-    var shortSummary: String {
-        if let summary, !summary.isEmpty {
-            let oneLine = summary.replacingOccurrences(of: "\n", with: " ")
-            return oneLine.count > 42 ? String(oneLine.prefix(42)) + "…" : oneLine
-        }
-        return "Turn \(turn)"
-    }
+/// 会话详情的完整数据：**一条平铺的消息流**（对齐 DSH 桌面端）。
+///
+/// `turn/start` / `turn/end` 只是事件流里的逻辑边界，用来推导运行状态与「最近一轮」
+/// 的文件变更；它们**不再**对应任何 UI 区块（无 turn 卡片 / 状态点 / 折叠）。
+/// 设计决策：App 端删除 turn UI，与桌面端保持一致。
+struct SessionFlow: Equatable {
+    var rows: [FlowRow] = []
+ /// 已加载窗口里最新一轮已 `turn/start` 但尚未 `turn/end`。
+    var isRunning: Bool = false
+ /// 最新一轮 `workspace/changes` 事件的 seq（/api/changes.summary 精确取数的 key）。
+    var latestFileChangeSeq: Int?
+ /// 最新一轮工具结果 `meta.diffs` 的客户端聚合（精确取数不可用时的回退）。
+    var latestFileChanges: FileChangeSummary?
 }
 
 // MARK: - Content block helpers

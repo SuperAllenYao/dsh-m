@@ -16,7 +16,11 @@ final class SessionViewModel: ObservableObject {
  /// session from its parent (drives subagents/prompt + interruptByParent).
     let subagentContext: SubagentSessionContext?
 
-    @Published private(set) var sections: [TurnSection] = []
+ /// 会话流：**一条平铺的消息行流** + 运行状态 + 最新一轮文件变更。
+ /// 设计决策删除 turn UI，与 DSH 桌面端一致；turn 边界只参与派生状态。
+    @Published private(set) var flow = SessionFlow()
+ /// 渲染行速记（视图/单测读它，等价于 `flow.rows`）。
+    var rows: [FlowRow] { flow.rows }
     @Published private(set) var isLoading = true
     @Published private(set) var isRunning = false
     @Published private(set) var liveAssistantText: String = ""
@@ -85,7 +89,6 @@ final class SessionViewModel: ObservableObject {
  /// v5.4 task-13: runtime status of child subagent sessions (parent detail only).
     @Published private(set) var subagentRuntimes: [String: SubagentRuntime] = [:]
     @Published var draft: String = ""
-    @Published var expandedTurnIDs: Set<String> = []
  /// Exact-fetch (protocol §3.9) summaries keyed by workspace/changes seq.
     @Published private(set) var fileChangeSummaries: [Int: ChangesSummaryValue] = [:]
     @Published private(set) var fileChangeUnavailableSeqs: Set<Int> = []
@@ -179,10 +182,6 @@ final class SessionViewModel: ObservableObject {
  /// Pages merged by this VM instance — marks the "first page after a push
  /// deep-link reentry" in the E2E diagnostics (a reentry builds a fresh VM).
     private var olderPageMergedCount = 0
- /// Set when an older page just merged, consumed by `rebuildRows()` to expand
- /// the newly loaded oldest turn (A5: within-turn prepend landed inside a
- /// collapsed completed turn, so the pull looked like it did nothing).
-    private var olderPageJustMerged = false
  /// M2b-2c: in-app detail timing (`firstFrameMs=..;cacheHit=1;networkMs=..`),
  /// E2E-gated; surfaced through the hidden `detail-metrics` element.
     @Published private(set) var detailMetricsValue: String?
@@ -222,10 +221,6 @@ final class SessionViewModel: ObservableObject {
     private var pendingRebuild = false
  /// Last `isRunning` value used for the v5.4 queue flush (turn/end transition).
     private var lastKnownRunning = false
- /// 问题三 H3：turn 结束后保持展开的 turn id（对齐桌面端 ui-chat.collapseTiming:
- /// next-input）——turn 一结束就折叠成一行摘要会让视口上方高度骤减，内容"向上跳飞"。
- /// 只记住自动展开的那一轮：用户手动折叠后不再自动展开。
-    private var stickyExpandedTurnID: String?
  /// v5.4 task-13: debounced `session/list` refresh after relay/turn activity.
     private var subagentDebounceTask: Task<Void, Never>?
     private var lastSubagentCatalogIds: [String] = []
@@ -538,7 +533,7 @@ final class SessionViewModel: ObservableObject {
     private func maybeMarkDetailFirstFrame() {
         guard detailViewVisible, !detailFirstFrameMarked else { return }
  // First visible content = header title and/or the first message rows.
-        guard title != nil || !sections.isEmpty else { return }
+        guard title != nil || !rows.isEmpty else { return }
         detailFirstFrameMarked = true
         DetailMetrics.markFirstFrame()
         detailMetricsValue = DetailMetrics.valueString
@@ -598,7 +593,6 @@ final class SessionViewModel: ObservableObject {
         liveTextThrottleTask?.cancel()
         liveTextThrottleTask = nil
         olderPageAwaitingReconnect = false
-        olderPageJustMerged = false
         isLoadingOlder = false
         fillTask?.cancel()
         fillTask = nil
@@ -660,7 +654,7 @@ final class SessionViewModel: ObservableObject {
  /// - Anything already on screen (cache hit, reconnect, retry): the legacy full
  /// window, so a refresh never shrinks what the user can already see.
     private func requestedWindowMessages() -> Int {
-        if hasLiveSnapshot || didRestoreWindowFromCache || !sections.isEmpty {
+        if hasLiveSnapshot || didRestoreWindowFromCache || !rows.isEmpty {
             return fillWindowMessages
         }
         return firstWindowMessages
@@ -669,17 +663,17 @@ final class SessionViewModel: ObservableObject {
     private func openStream() {
         guard let link else { return }
         guard link.phase.isConnected else {
-            dbg("openStream deferred: phase=" + String(describing: link.phase) + " busy=" + String(link.phase.isBusy) + " sections=" + String(sections.count))
-            isLoading = sections.isEmpty
+            dbg("openStream deferred: phase=" + String(describing: link.phase) + " busy=" + String(link.phase.isBusy) + " sections=" + String(rows.count))
+            isLoading = rows.isEmpty
             streamErrorText = link.phase.isBusy ? nil : "连接未就绪"
             return
         }
         let messages = requestedWindowMessages()
-        if !hasLiveSnapshot && !didRestoreWindowFromCache && sections.isEmpty {
+        if !hasLiveSnapshot && !didRestoreWindowFromCache && rows.isEmpty {
  // P1.5-B evidence: what the very first request asked for.
             DetailMetrics.setFirstWindow(messages)
         }
-        isLoading = sections.isEmpty
+        isLoading = rows.isEmpty
         do {
             let turnWindow = messages >= fillWindowMessages
                 ? SessionWindowPolicy.fillWindowTurnWindow(messages: messages)
@@ -698,7 +692,7 @@ final class SessionViewModel: ObservableObject {
                     "turnWindow": turnWindow.jsonValue,
                 ]),
             ]
-            dbg("session/follow send: messages=" + String(messages) + " turnWindow=" + String(describing: turnWindow) + " sections=" + String(sections.count) + " cache=" + String(didRestoreWindowFromCache) + " hasLive=" + String(hasLiveSnapshot))
+            dbg("session/follow send: messages=" + String(messages) + " turnWindow=" + String(describing: turnWindow) + " sections=" + String(rows.count) + " cache=" + String(didRestoreWindowFromCache) + " hasLive=" + String(hasLiveSnapshot))
             stream = try link.openStream(
                 endpoint: "session/follow",
                 args: args,
@@ -1019,7 +1013,6 @@ final class SessionViewModel: ObservableObject {
                 if merged { olderPageMergedCount += 1 }
                 if merged {
                     olderPageAwaitingReconnect = false
-                    olderPageJustMerged = true
                     if olderPageErrorShown {
                         actionErrorText = nil
                         olderPageErrorShown = false
@@ -1284,7 +1277,6 @@ final class SessionViewModel: ObservableObject {
                 isShowingCachedWindow = false
                 cachedWindowIsStale = false
                 scheduleCacheSave()
-                ensureExpandedCurrentTurn()
                 if isFill {
  // P1.5-B: the legacy 40-message window replaced the small one;
  // this stream becomes the live one from now on.
@@ -1406,29 +1398,20 @@ final class SessionViewModel: ObservableObject {
         let echoCountBefore = pendingUserEchoes.count
         pendingUserEchoes.reconcile(events: journal.events)
         let retiredEchoes = echoCountBefore - pendingUserEchoes.count
-        sections = SessionRowBuilder.build(
+        flow = SessionRowBuilder.build(
             events: journal.events,
             pendingUserEchoes: pendingUserEchoes.echoes,
             nowMs: Self.epochMilliseconds()
         )
-        dbg("rebuild: events=" + String(journal.events.count) + " sections=" + String(sections.count) + " hasMoreOlder=" + String(journal.hasMoreOlder) + " oldest=" + String(journal.oldestSeq ?? -1) + " pendingEchoes=" + String(pendingUserEchoes.count) + (retiredEchoes > 0 ? " retired=" + String(retiredEchoes) : "") + " turns=" + sections.prefix(12).map { String($0.turn) + ($0.isRunning ? "*" : "") }.joined(separator: ","))
+        dbg("rebuild: events=" + String(journal.events.count) + " rows=" + String(flow.rows.count) + " hasMoreOlder=" + String(journal.hasMoreOlder) + " oldest=" + String(journal.oldestSeq ?? -1) + " pendingEchoes=" + String(pendingUserEchoes.count) + (retiredEchoes > 0 ? " retired=" + String(retiredEchoes) : "") + (flow.isRunning ? " running" : " idle"))
         syncOlderState()
         title = journal.title
         permissionsValue = journal.permissionsValue
         todos = journal.todos
         planActive = journal.plan?["active"]?.boolValue ?? false
         let wasRunning = lastKnownRunning
-        isRunning = sections.last?.isRunning ?? false
+        isRunning = flow.isRunning
         lastKnownRunning = isRunning
- // 问题三 H3：running → completed 的这一次刷新，把刚结束的 turn 留在展开态，
- // 直到用户下一次发送输入（sendPrompt）或新 turn 开始才折叠回摘要。
-        if wasRunning, !isRunning, let last = sections.last {
-            if let previous = stickyExpandedTurnID, previous != last.id {
-                expandedTurnIDs.remove(previous)
-            }
-            stickyExpandedTurnID = last.id
-            expandedTurnIDs.insert(last.id)
-        }
         publishLiveAssistantText(flush: true)
         approvalPolicy = journal.events.last(where: { $0.type == "approval/policy" })?.data?["policy"]?.stringValue
         sandboxMode = journal.events.last(where: { $0.type == "sandbox/mode" })?.data?["mode"]?.stringValue
@@ -1452,8 +1435,6 @@ final class SessionViewModel: ObservableObject {
                 await self?.refreshSubagentRuntime()
             }
         }
-        ensureExpandedCurrentTurn()
-        expandNewlyLoadedOlderTurnIfNeeded()
         requestFileChangeSummariesIfNeeded()
  // v5.4 queue: a finished turn automatically releases the oldest queued
  // prompt with mode=queue; the rest keep waiting for the next turn/end.
@@ -1468,26 +1449,6 @@ final class SessionViewModel: ObservableObject {
         if hasFullWindow {
             DetailMetrics.markFullWindowApplied()
             detailMetricsValue = DetailMetrics.valueString
-        }
-    }
-
- /// 真机 A5：更早页合并进一个**已存在的、已完成的 turn** 时，那条 turn
- /// 的 section 默认是折叠的 —— 用户下拉后只看到原来的 header，看起来「没刷出更早
- /// 消息」。合并成功后展开最老的 section，让刚加载的行立刻上屏。
-    private func expandNewlyLoadedOlderTurnIfNeeded() {
-        guard olderPageJustMerged else { return }
-        olderPageJustMerged = false
-        guard let first = sections.first else { return }
-        expandedTurnIDs.insert(first.id)
-    }
-
-    private func ensureExpandedCurrentTurn() {
-        guard let last = sections.last else { return }
- // 运行中的 turn 必须展开（哪怕用户展开了别的历史 turn）。
- // 已结束的 turn 不在这里反复插入：turn/end 那一次由 stickyExpandedTurnID 插入一次，
- // 用户手动折叠后不应该被下一次刷新再展开回来（交接文档 §7.4 第 3 条）。
-        if last.isRunning || expandedTurnIDs.isEmpty {
-            expandedTurnIDs.insert(last.id)
         }
     }
 
@@ -1673,11 +1634,6 @@ final class SessionViewModel: ObservableObject {
                     ]),
                 ])
             }
- // 问题三 H3：用户发出下一条输入时才折叠上一轮（桌面端 next-input 语义）。
-            if let sticky = stickyExpandedTurnID {
-                expandedTurnIDs.remove(sticky)
-                stickyExpandedTurnID = nil
-            }
             isRunning = true
             lastKnownRunning = true
  // Round2 §3: the host accepted the prompt, but `user/message` is only
@@ -1724,9 +1680,9 @@ final class SessionViewModel: ObservableObject {
  /// could briefly report idle between `session/prompt` and `turn/start`
  /// (queue-flush side effects). A pending row only ever needs appending.
     private func repaintPendingUserEchoes() {
-        sections = SessionRowBuilder.appendingPendingEchoes(
+        flow.rows = SessionRowBuilder.appendingPendingEchoes(
             pendingUserEchoes.echoes,
-            to: sections,
+            to: flow.rows,
             nowMs: Self.epochMilliseconds()
         )
     }
@@ -2194,15 +2150,15 @@ final class SessionViewModel: ObservableObject {
     }
 
     func toolCall(callId: String?) -> ToolCallItem? {
-        SessionRowBuilder.findToolCall(in: sections, callId: callId)
+        SessionRowBuilder.findToolCall(in: rows, callId: callId)
     }
 
  // MARK: - File changes (exact-fetch §3.9, meta.diffs fallback)
 
- /// Merged view for one turn: exact-fetch summary when the Host still holds it,
- /// otherwise the client-side meta.diffs aggregation.
-    func turnFileChanges(for section: TurnSection) -> TurnFileChanges? {
-        if let seq = section.fileChangeSeq, let summary = fileChangeSummaries[seq] {
+ /// 最新一轮合并后的文件变更视图：Host 仍保留时用精确取数，否则退回
+ /// 客户端 meta.diffs 聚合。turn UI 删除后只在流末尾保留「最近一轮」卡片。
+    var latestTurnFileChanges: TurnFileChanges? {
+        if let seq = flow.latestFileChangeSeq, let summary = fileChangeSummaries[seq] {
             return TurnFileChanges(
                 source: .exactFetch,
                 files: summary.files,
@@ -2211,33 +2167,30 @@ final class SessionViewModel: ObservableObject {
                 seq: seq
             )
         }
-        guard let fallback = section.fileChanges else { return nil }
+        guard let fallback = flow.latestFileChanges else { return nil }
         return TurnFileChanges(
             source: .metaDiffsFallback,
             files: fallback.files.map { ChangesSummaryValue.File(path: $0, display: ($0 as NSString).lastPathComponent, added: nil, deleted: nil) },
             added: fallback.additions,
             deleted: fallback.deletions,
-            seq: section.fileChangeSeq
+            seq: flow.latestFileChangeSeq
         )
     }
 
- /// Requests exact-fetch summaries for turns whose workspace/changes event is
- /// known; 404 (host restarted / session released) marks the turn for fallback.
+ /// Requests the exact-fetch summary of the newest turn's workspace/changes
+ /// event; 404 (host restarted / session released) marks it for fallback.
     private func requestFileChangeSummariesIfNeeded() {
-        guard let link else { return }
-        for section in sections {
-            guard let seq = section.fileChangeSeq else { continue }
-            if fileChangeSummaries[seq] != nil || fileChangeUnavailableSeqs.contains(seq) { continue }
-            if requestedFileChangeSeqs.contains(seq) { continue }
-            requestedFileChangeSeqs.insert(seq)
-            Task { [weak self] in
-                guard let self else { return }
-                do {
-                    let summary = try await link.changesSummary(sessionId: self.sessionId, seq: seq)
-                    self.fileChangeSummaries[seq] = summary
-                } catch {
-                    self.fileChangeUnavailableSeqs.insert(seq)
-                }
+        guard let link, let seq = flow.latestFileChangeSeq else { return }
+        if fileChangeSummaries[seq] != nil || fileChangeUnavailableSeqs.contains(seq) { return }
+        if requestedFileChangeSeqs.contains(seq) { return }
+        requestedFileChangeSeqs.insert(seq)
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let summary = try await link.changesSummary(sessionId: self.sessionId, seq: seq)
+                self.fileChangeSummaries[seq] = summary
+            } catch {
+                self.fileChangeUnavailableSeqs.insert(seq)
             }
         }
     }
