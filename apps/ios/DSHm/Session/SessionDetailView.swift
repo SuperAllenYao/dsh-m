@@ -33,11 +33,13 @@ struct SessionDetailView: View {
  /// 问题三（滚动定位）：粘底语义——只有用户停在底部附近时才自动跟随新内容，
  /// 上滑阅读历史时绝不被强制拉回底部（交接文档 §7.4 第 2 条）。
     @State private var isNearBottom = true
- /// 问题三：打开阶段锚底。本页初始内容是 loading 占位、消息异步上来，且缓存的
- /// 会话窗口会先于 live 快照上屏；在 live 快照落地（`hasLiveSnapshot`）之前，
- /// 每一次窗口替换都必须无条件贴底，否则粘底判定会被中间态打偏，出现
- /// "冷启动/通知深链进入后停在旧消息"（用户 报障）。
-    @State private var didAnchorLiveWindow = false
+ /// 问题三：用户是否**手动滚动过**。没有手动滚动之前，"贴最后一条消息"是硬约束
+ /// （打开阶段 + 流式增长都持续跟随）；只有用户真的上滑，才交还给粘底语义。
+ ///
+ /// 不能再用几何阈值/快照落地来判断"打开阶段结束"：冷启动与流式增长时布局中间态
+ /// 会让距离阈值瞬间判成"不在底部"，跟随就此停住，页面卡在会话中间
+ /// （用户 报障：点通知进入停在 turn 8，实际已到 turn 9）。
+    @State private var userHasScrolled = false
  /// 问题三 + 问题一：向上加载更早历史时的视觉锚点（旧的首条 section id）。
  /// 前置插入会让可见内容整体下移，加载完成后用它把旧视口重新钉回顶部。
     @State private var pendingPrependAnchorID: String?
@@ -696,19 +698,19 @@ struct SessionDetailView: View {
  // `.defaultScrollAnchor(.bottom)` 之外的这次补锚是唯一机会——onChange 不会触发。
             .onAppear {
                 guard !viewModel.sections.isEmpty else { return }
-                didAnchorLiveWindow = viewModel.hasLiveSnapshot
                 isNearBottom = true
                 scrollToBottom(proxy: proxy)
             }
- // 打开阶段：live 快照落地后结束"无条件锚底"，之后才交给粘底语义。
+ // 打开阶段：只要用户还没手动滚动过，新内容到达就贴底（含流式增长）。
             .onChange(of: viewModel.hasLiveSnapshot) { _, live in
-                guard live, !didAnchorLiveWindow else { return }
-                didAnchorLiveWindow = true
+                guard live, !userHasScrolled else { return }
                 isNearBottom = true
                 scrollToBottom(proxy: proxy)
             }
  // 粘底判定：iOS 18+ 用 ScrollGeometry 精确算距离；iOS 17 退化看底部锚点可见性。
             .modifier(StickToBottomObserver(isNearBottom: $isNearBottom))
+ // 用户手动滚动后不再强制贴底（上滑读历史时新内容不得把视图拉回底部）。
+            .modifier(UserScrollObserver { userHasScrolled = true })
  // 问题一对接：滑到接近顶部自动加载更早历史（问题一的分页状态机由 SessionViewModel 提供）。
             .modifier(NearTopObserver(onNearTop: triggerLoadOlder))
             .onChange(of: viewModel.isLoadingOlder) { _, loading in
@@ -748,12 +750,13 @@ struct SessionDetailView: View {
             .modifier(BottomSentinelFallback(isNearBottom: $isNearBottom))
     }
 
- /// 打开阶段（live 快照尚未落地）：缓存窗口/live 窗口的每次替换都无条件锚到底，
- /// 满足"打开即停在最后一条消息底部"。live 快照落地后才交给粘底语义。
-    private func applySectionChange(proxy: ScrollViewProxy) {
+ /// 内容变化时的跟随策略：
+ /// - 用户还没手动滚动过 → **无条件贴底**（打开即贴底，缓存窗口→live 窗口切换、
+ /// 流式增长期间也持续贴底）；
+ /// - 用户手动滚动过 → 只有当前还在底部附近才跟随（上滑读历史时绝不被拉回）。
+    private func followNewContent(proxy: ScrollViewProxy) {
         guard !viewModel.sections.isEmpty else { return }
-        if !didAnchorLiveWindow {
-            if viewModel.hasLiveSnapshot { didAnchorLiveWindow = true }
+        if !userHasScrolled {
             isNearBottom = true
             scrollToBottom(proxy: proxy)
             return
@@ -762,16 +765,19 @@ struct SessionDetailView: View {
         scrollToBottom(proxy: proxy)
     }
 
- /// 流式增量文本：只在贴底时跟随，用户上滑阅读时保持原位。
-    private func followLiveText(proxy: ScrollViewProxy) {
-        guard didAnchorLiveWindow, isNearBottom else { return }
-        scrollToBottom(proxy: proxy)
+ /// 新的会话 rows（缓存窗口 / 快照 / 增量事件）就绪。
+    private func applySectionChange(proxy: ScrollViewProxy) {
+        followNewContent(proxy: proxy)
     }
 
- /// 视口高度因兄弟视图插入/移除而变化时，贴底状态下重新锚底。
+ /// 流式增量文本。
+    private func followLiveText(proxy: ScrollViewProxy) {
+        followNewContent(proxy: proxy)
+    }
+
+ /// 视口高度因兄弟视图插入/移除而变化时重新锚底。
     private func rescrollIfNeeded(proxy: ScrollViewProxy) {
-        guard didAnchorLiveWindow, isNearBottom else { return }
-        scrollToBottom(proxy: proxy)
+        followNewContent(proxy: proxy)
     }
 
  /// H5：等布局提交后再滚，避免目标在 LazyVStack 里尚未实体化时 `scrollTo` 静默失效；
@@ -1216,6 +1222,31 @@ enum SessionDetailSheet: Identifiable {
         case .permission: return "permission"
         case .subagentList: return "subagent-list"
         case .modelSelection: return "model-selection"
+        }
+    }
+}
+
+/// 用户手动滚动的判定：iOS 18 用滚动阶段（`.interacting` 一定是手指拖动，
+/// `.decelerating` 只会出现在手势之后）；iOS 17 用 simultaneousGesture 兜底。
+/// 自动跟随是**无动画**的程序化滚动，不会进入 interacting/decelerating，
+/// 因此不会把自己误判成"用户滚动"。
+private struct UserScrollObserver: ViewModifier {
+    let onUserScroll: () -> Void
+
+    func body(content: Content) -> some View {
+        if #available(iOS 18.0, *) {
+            content.onScrollPhaseChange { _, phase in
+                switch phase {
+                case .interacting, .decelerating:
+                    onUserScroll()
+                default:
+                    break
+                }
+            }
+        } else {
+            content.simultaneousGesture(
+                DragGesture(minimumDistance: 8).onChanged { _ in onUserScroll() }
+            )
         }
     }
 }
