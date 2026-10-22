@@ -1,0 +1,69 @@
+# ---- build outputs / local artifacts ----
+DerivedData/
+build/
+.DS_Store
+*.xcresult/
+
+# ---- secrets: never commit ----
+*.p8
+*.pem
+*.key
+*.p12
+*.cer
+*.mobileprovision
+*.provisionprofile
+AuthKey_*.p8
+keys/
+secrets/
+.env
+.env.*
+*.secret
+*adminToken*
+*credentials*.json
+pair-payload*.json
+
+# ---- local development assets (intentionally not part of the public repo) ----
+/design/
+spikes/
+apps/ios/docs/
+apps/ios/scripts/
+apps/ios/DSHmUITests/
+docs/HANDOFF.zh.md
+docs/archive/
+docs/design/
+docs/ios/
+docs/research/
+docs/evidence/
+apps/ios/docs/evidence/
+apps/ios/docs/screenshots/
+packages/dsh-m-link/test/results/
+packages/dsh-m-link/test/m1-sim.mjs
+packages/dsh-m-link/test/screenshot.mjs
+packages/dsh-m-link/test/qr-decode.swift
+packages/dsh-m-link/assets/relay/linux-amd64/
+packages/dsh-m-link/assets/relay/linux-arm64/
+packages/dsh-m-relay/bench/
+packages/dsh-m-relay/scripts/bench.sh
+packages/dsh-m-relay/scripts/dev-demo.sh
+.ctxkit/
+.agents/
+
+# ---- dev-only files kept locally (excluded from the public tree) ----
+packages/dsh-m-link/README.zh.md
+packages/dsh-m-relay/README.zh.md
+packages/dsh-m-link/test/apns-probe.mjs
+packages/dsh-m-link/test/lan-endpoints-check.sh
+packages/dsh-m-link/test/m1-*.mjs
+packages/dsh-m-link/test/p1-isolated-e2e-assert.mjs
+packages/dsh-m-link/test/real-device-preflight.sh
+packages/dsh-m-link/test/run-m1.sh
+packages/dsh-m-link/test/lib/cdp.mjs
+packages/dsh-m-link/test/lib/mock-llm*.mjs
+
+# ── 非代码资产禁止入 git（2026-10-22 用户硬性规则）──────────────────────────
+# 文档一律不入库、不 push：README / AGENTS / 设计文档 / release notes / 交接文档 等。
+# 这些文件保存在本地磁盘即可（本地副本不会被删除）。
+*.md
+docs/
+AGENTS.md
+README

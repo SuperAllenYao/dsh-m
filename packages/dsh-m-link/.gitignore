@@ -1,0 +1,5 @@
+# Never commit APNs provider keys or local test artifacts.
+*.p8
+test/results/*.p8
+test/results/*.debug.json
+test/tmp/

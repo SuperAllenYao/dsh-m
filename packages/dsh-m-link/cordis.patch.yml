@@ -1,0 +1,69 @@
+# dsh-m-link bundle patch (M1).
+#
+# Two ways to mount this plugin into a profile:
+#  A. Bundle route (production): add "dsh-m-link" to dsh.profile.bundles in
+#     $DSH_HOME/profiles/<profile>/package.json (installed as a pnpm dependency),
+#     then this file is applied automatically.
+#  B. User-layer route (tests / manual): append the same row to the profile's own
+#     cordis.patch.yml (applied after every bundle layer). Requires the package
+#     to be resolvable from the profile directory, e.g.
+#       $DSH_HOME/profiles/<profile>/node_modules/dsh-m-link -> this package
+#
+# Row config (all optional; defaults shown):
+#   port            3466    TLS listener port
+#   bindHost        127.0.0.1  use 0.0.0.0 (or the Mac LAN IP) so a phone can
+#                   reach the origin; the QR payload then lists only LAN/tunnel
+#                   endpoints (loopback is never advertised to a phone unless
+#                   the deployment is loopback-only)
+#   pairTtlMs       90000   one-time pairing token TTL
+#   upstreamIdleMs  5000    keep a device's upstream mux briefly after disconnect
+#   hostName        ""      display name in the QR payload (defaults to the Mac
+#                           host name)
+#   origins         []      extra origins for the QR payload (tunnel / relay /
+#                           alternate LAN); strings like "https://dsh-x.example.com"
+#                           are advertised with trust=systemCA
+#   security:
+#     challengeTtlMs          90000   nonce/challenge validity window
+#     apiTokenTtlMs           3600000 short-lived unary bearer token
+#     muxTokenTtlMs           120000  single-use mux upgrade token
+#     maxAuthFailuresPerMinute 5      per-device signature failure cap
+#     allowLegacyCredential   false   accept the M0 long-term credential as a
+#                                     unary bearer (debug only)
+#   tls:
+#     additionalHosts         []      extra IP/host SANs for the leaf certificate
+#   notifications:
+#     enabled true / approval true / turnEnd true / failure true
+#   fetchRoutes:                      # read-only exact-fetch GET proxy for the phone
+#     enabled true                    # non-allowlisted /api/* GET -> 404 route/not-allowed
+#     allow:                          # exact-match paths, GET/HEAD only
+#       - /api/changes.summary        #   file-change summary (iOS file changes view)
+#       - /api/changes.diff           #   per-file diff
+#       - /api/file                   #   workspace file bytes (previews)
+#   apns:                             # leave unset -> explicit stub mode
+#     configFile: /Users/you/.dsh/keys/apns-config.yaml   # preferred: read apns.* from an out-of-repo YAML/JSON file
+#     keyFile: /Users/you/.dsh/plugin-data/dsh-m-link/apns/AuthKey_XXXX.p8
+#     keyId: XXXXXXXXXX
+#     teamId: XXXXXXXXXX
+#     topic: com.example.dshm          # iOS bundle id
+#     environment: production          # or sandbox
+#   contract:
+#     probeOnStart true / retryAttempts 10 / retryDelayMs 1500
+#   debug:                            # test-only; keep disabled in production
+#     enabled false / adminToken "" / pairPayloadFile false / reissuePairToken false
+- insert:
+    - id: dsh-m-link
+      name: dsh-m-link
+      config:
+        port: 3466
+        bindHost: 127.0.0.1
+        pairTtlMs: 90000
+        upstreamIdleMs: 5000
+        # origins: []
+        # tls:
+        #   additionalHosts: []
+        # apns:
+        #   keyFile: /Users/you/.dsh/plugin-data/dsh-m-link/apns/AuthKey_XXXX.p8
+        #   keyId: XXXXXXXXXX
+        #   teamId: XXXXXXXXXX
+        #   topic: com.example.dshm
+        #   environment: production

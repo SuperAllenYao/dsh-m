@@ -1,0 +1,78 @@
+# =============================================================================
+# dsh-m-link 发布配置示例（config.example.yml）
+#
+# 用途：交付给最终用户的「发布版」插件配置模板。包含 TLS 端口与配对、APNs 直推、
+#       用户自有服务器中继（relay）三部分；所有敏感位置一律是占位值。
+#
+# 用法（二选一）：
+#   A. 把下面整段 `- insert:` 追加到桌面 profile 的 cordis.patch.yml；
+#   B. 把 `config:` 下的键合并进 profile 里已有的 dsh-m-link 行（不要出现两个 id）。
+#   profile 路径：$DSH_HOME/profiles/desktop/cordis.patch.yml（$DSH_HOME 默认 ~/.dsh）
+#   改完必须**完整重启桌面 DSH** 生效；不要在插件运行时热改（会留僵尸 listener，
+#   见 packages/dsh-m-link/README.md 与 docs/deploy/INSTALL.zh.md。
+#
+# 发布版约束（本示例刻意不提供下列调试键，缺省即关闭）：
+#   - 不出现 debug 段：debug.enabled / debug.adminToken / debug.pairPayloadFile /
+#     debug.reissuePairToken 一律不配置；写出任意一个都等于引入调试通道。
+#   - 不内联任何 secret/token：relay secret 放 secretFile（0600，仓库外）；
+#     APNs 的 .p8 与 apns-config.yaml 放仓库外（0600）。
+#   - 真实服务器地址、pin、secret 不提交进仓库；交付文档用 <relay-host> 占位。
+#
+# 字段完整含义见 packages/dsh-m-link/README.md。未列出的键均取默认值。
+# =============================================================================
+- insert:
+    - id: dsh-m-link
+      name: dsh-m-link
+      config:
+        # --- TLS listener / 配对 -------------------------------------------------
+        # 发布前检查 1：端口空闲且与 App、文档约定一致。
+        #   lsof -ti "tcp:3466" -sTCP:LISTEN   # 有输出 = 端口被占用
+        port: 3466
+        # 发布前检查 2：真机 LAN 配对必须是 0.0.0.0（或 Mac 的 LAN IP）；
+        # 127.0.0.1 只对本机可见，手机会得到 Connection refused。
+        bindHost: 0.0.0.0
+        # 一次性配对令牌（二维码）有效期；缺省 90000（90 秒），发布版放宽到 10 分钟。
+        # 8 位配对码另有自己的 TTL（pairCodeTtlMs，默认 120000 / 120 秒，无需在此配置）。
+        pairTtlMs: 600000
+        # 桌面端显示名（出现在配对二维码与配对页），改成用户认得出的名字。
+        hostName: "<你的 Mac 名称>"
+
+        # --- APNs 直推（可选；不配置时 apns.mode=stub，只记录不投递）-------------
+        # 发布前检查 3：.p8 与 apns-config.yaml 必须在仓库之外且 chmod 600；
+        # 本字段指向「配置文件」，.p8 的真实路径写进那个文件里（见 packages/dsh-m-link/README.md）：
+        #   ~/.dsh/keys/apns-config.yaml
+        #     apns: { keyFile, keyId, teamId, topic: com.dshm.app, environment }
+        # 发布前检查 4：/health.apns.mode=ready，且 environment 与发布包一致
+        #（开发包 sandbox；TestFlight / App Store 用 production）。
+        apns:
+          configFile: /Users/<you>/.dsh/keys/apns-config.yaml
+
+        # --- 通知（可选；不配置即用默认值，全部开启）------------------------------
+        # M4：审批通知带「允许/拒绝」动作（解锁后执行）；问题作答通知；关键事件
+        # 同时发 content-available 静默推送做后台刷新（按设备 3s 合并）。
+        # 发布前检查：通知默认全开即可；如发布说明要求关闭某类通知，显式置 false（不要依赖删除字段）。
+        notifications:
+          enabled: true
+          approval: true
+          turnEnd: true
+          failure: true
+          questions: true
+          silent: true
+          silentMinIntervalMs: 3000
+
+        # --- 用户自有服务器中继（可选；纯 LAN 部署请整段删除）---------------------
+        # 三个值来自服务器 `dshm-relay init --print-json`（或设置页一键部署结果）：
+        #   controlOrigin = https://<public-host>:<控制端口>
+        #   pin           = relay 证书 DER 的 SHA-256（base64url，43 字符）
+        #   secretFile    = 本机 0600 文件，内容是 relay.secret
+        # 发布前检查 5：controlOrigin 是「控制通道」地址，不是 relay 分配的手机 bridge 端口。
+        # 发布前检查 6：pin/secret 与服务器当前 relay 一致；重装 relay 或轮换证书后必须同步，
+        #              否则 /health.tunnel.lastError 会报 pin-mismatch 或 auth/invalid。
+        # 发布前检查 7：secretFile 在仓库外且权限 0600；不要把 secret 内联进本文件。
+        tunnel:
+          enabled: true
+          controlOrigin: "https://<relay-host>:443"
+          pin: "<43 字符 base64url>"
+          secretFile: /Users/<you>/.dsh/plugin-data/dsh-m-link/tunnel.secret
+          # wantPort: 30001   # 可选：固定 bridge 端口，缺省由 relay 分配并持久化。
+          #                   # 该端口必须在 relay 的 bridgePorts 池内，否则报 port/unavailable。

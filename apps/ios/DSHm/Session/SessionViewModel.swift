@@ -1,0 +1,1449 @@
+import Combine
+import Foundation
+#if canImport(UIKit)
+import UIKit
+#endif
+
+/// Session detail state: owns the session/follow subscription, applies frames
+/// through SessionJournal and rebuilds render rows (turn grouping).
+@MainActor
+final class SessionViewModel: ObservableObject {
+    let sessionId: String
+    /// `session/follow` address. Subagent sessions (Agent Teams teammates) carry a
+    /// durable parent address; see SessionFollowAddress.
+    let address: SessionFollowAddress
+    /// v5.4 task-13: non-nil when this detail was opened as a child subagent
+    /// session from its parent (drives subagents/prompt + interruptByParent).
+    let subagentContext: SubagentSessionContext?
+
+    @Published private(set) var sections: [TurnSection] = []
+    @Published private(set) var isLoading = true
+    @Published private(set) var isRunning = false
+    @Published private(set) var liveAssistantText: String = ""
+    @Published private(set) var streamErrorText: String?
+    @Published private(set) var title: String?
+    @Published private(set) var permissionsValue: String?
+    @Published private(set) var todos: [JSONValue]?
+    @Published private(set) var planActive: Bool = false
+    @Published private(set) var modelSelectionText: String?
+    /// v0.2.0 model selection: `session/modelCatalog` result.
+    @Published private(set) var modelCatalog: ModelCatalog?
+    /// v0.2.0: current durable selection parsed from
+    /// `projections.values.modelSelection.next` (falls back to `lastUsed`).
+    @Published private(set) var modelSelection: ModelSelection?
+    @Published private(set) var modelCatalogLoading = false
+    @Published private(set) var modelCatalogErrorText: String?
+    /// A `session/selectModel` round trip is in flight (rows disabled).
+    @Published private(set) var modelSelecting = false
+    /// Selection submitted and awaiting the Host's answer (row spinner).
+    @Published private(set) var modelSelectionPending: ModelSelection?
+    /// Sheet-local failure text of the last selection attempt.
+    @Published private(set) var modelSelectionErrorText: String?
+    @Published private(set) var approvalPolicy: String?
+    @Published private(set) var sandboxMode: String?
+    /// M5: selectable permission presets of this session. Loaded lazily from the
+    /// read-only `permissionPresets/catalog` proxy when the permission sheet opens;
+    /// a failed load leaves the list empty so re-opening the sheet retries.
+    @Published private(set) var presetOptions: [PermissionPresetOption] = []
+    /// M5: host-recommended preset — the sheet's highlight fallback until the
+    /// session's own `permissions.currentValue` lands in the projections.
+    @Published private(set) var presetDefault: String?
+    /// M5: a `POST /session/permission` round trip is in flight (rows disabled).
+    @Published private(set) var permissionSwitching = false
+    /// M5: sheet-local failure text (preset switch or catalog load).
+    @Published private(set) var permissionSwitchError: String?
+    /// M5: catalog fetch in flight (drives the sheet placeholder).
+    @Published private(set) var permissionCatalogLoading = false
+    @Published private(set) var sending = false
+    @Published private(set) var actionErrorText: String?
+    @Published private(set) var lastEventAt: Date?
+
+    /// v5.5 §14.5: context-window usage of this session. Seeded from the
+    /// `session/follow` snapshot projections (first frame), then refreshed by the
+    /// throttled `session/list` read after `assistant/attempt` / turn activity.
+    @Published private(set) var contextPressure: ContextPressureValue?
+    /// v5.4: client-side prompt queue while a turn runs (see `PromptQueue`).
+    @Published private(set) var queuedPrompts = PromptQueue()
+    /// task-2 / tech-design §14: pending user-question calls of this session
+    /// (projection `userQuestions.active`; refreshed by snapshot and after answers).
+    @Published private(set) var activeUserQuestions: [UserQuestionCall] = []
+    /// v5.4 compatibility: the detail/list status line only needs the count.
+    var userQuestionsActiveCount: Int { activeUserQuestions.count }
+    /// v5.4: parsed parent `subagentCatalog` projection (task-13 consumes it).
+    @Published private(set) var subagentCatalog: [SubagentCatalogEntry] = []
+    /// v0.2.0 live discovery: the projection only arrives with a journal snapshot,
+    /// so children reported by `session/list` are kept separately and merged into
+    /// `subagentCatalog` (see `SubagentCatalogMerge`).
+    private var projectionSubagents: [SubagentCatalogEntry] = []
+    private var discoveredSubagents: [SubagentCatalogEntry] = []
+    /// v5.4 task-13: runtime status of child subagent sessions (parent detail only).
+    @Published private(set) var subagentRuntimes: [String: SubagentRuntime] = [:]
+    @Published var draft: String = ""
+    @Published var expandedTurnIDs: Set<String> = []
+    /// Exact-fetch (protocol §3.9) summaries keyed by workspace/changes seq.
+    @Published private(set) var fileChangeSummaries: [Int: ChangesSummaryValue] = [:]
+    @Published private(set) var fileChangeUnavailableSeqs: Set<Int> = []
+
+    private(set) var journal = SessionJournal()
+    /// M2b-2: the detail was first painted from the on-disk window cache. The live
+    /// `session/follow` snapshot replaces it (sequence de-duplication in
+    /// `SessionJournal`); the detail banner clears as soon as that snapshot lands.
+    @Published private(set) var isShowingCachedWindow = false
+    /// M2b-2: the restored window is older than the 24h display TTL (still shown).
+    @Published private(set) var cachedWindowIsStale = false
+    /// M2b-2: cache read + journal replay + first row rebuild inside `init`, in ms.
+        private(set) var cacheLoadMilliseconds: Double = 0
+    private let windowCache: SessionWindowCacheStore
+    /// P1.5-B: phone-sized first `session/follow` window (12–20 messages) and the
+    /// legacy 40-message window filled in the background after the first rows paint.
+    private(set) var firstWindowMessages: Int
+    private(set) var fillWindowMessages: Int
+    /// Raw wire frames kept for the next cache write: the latest snapshot frame and
+    /// the contiguous `event` objects that followed it.
+    private var cachedSnapshotFrame: JSONValue?
+    private var cachedEventFrames: [JSONValue] = []
+    private var cacheSaveTask: Task<Void, Never>?
+    private var hasLiveSnapshot = false
+    /// P1.5-B background fill: the delayed task + the second `session/follow`
+    /// stream that requeststhe legacy 40-message window. When its snapshot lands it
+    /// replaces the small window and becomes the live stream.
+    private var fillTask: Task<Void, Never>?
+    private var fillStream: RemoteStreamHandle?
+    /// Fill attempts for this open (bounded so a failing fill cannot loop).
+    private var fillAttempts = 0
+    /// True once the legacy full window (40 messages) is on screen.
+    private var hasFullWindow = false
+    /// Bound the persisted tail; when full, later events are no longer appended —
+    /// the cached window stays contiguous (and therefore replayable), just older.
+    private static let maxCachedEvents = 200
+    /// M2b-2c: in-app detail timing (`firstFrameMs=..;cacheHit=1;networkMs=..`),
+    /// E2E-gated; surfaced through the hidden `detail-metrics` element.
+    @Published private(set) var detailMetricsValue: String?
+    /// 体验收尾: E2E in-app send clock (`send-metrics` hidden element).
+    @Published private(set) var sendMetricsValue: String?
+    /// True when `init` restored the detail from the on-disk window cache.
+    private(set) var didRestoreWindowFromCache = false
+    private var detailViewVisible = false
+    private var detailFirstFrameMarked = false
+    private var requestedFileChangeSeqs: Set<Int> = []
+    private weak var link: LinkService?
+    /// M5 test seams: when set, the permission-sheet state machine reads/ writes
+    /// through these instead of the attached `LinkService` (unit tests have no
+    /// socket). Production leaves both nil.
+    var permissionCatalogLoader: (() async throws -> PermissionPresetCatalog)?
+    var permissionSwitcher: ((String) async throws -> SessionPermissionUpdate)?
+    /// M5: one successful catalog load per detail; failures stay retryable.
+    private var permissionCatalogLoaded = false
+    /// v0.2.0 model-selection test seams (unit tests have no socket).
+    var modelCatalogLoader: (() async throws -> ModelCatalog)?
+    var modelSelector: ((ModelSelection) async throws -> ModelSelection)?
+    /// v0.2.0: one successful model-catalog load per detail; failures retryable.
+    private var modelCatalogLoaded = false
+    /// Last live selection the cached catalog could not name (refresh trigger for
+    /// a desktop-side switch to a model this detail had not loaded yet).
+    private var modelCatalogUnknownSelection: ModelSelection?
+    private var stream: RemoteStreamHandle?
+    private var restartTask: Task<Void, Never>?
+    private var rebuildTask: Task<Void, Never>?
+    private var observedGeneration = -1
+    private var pendingRebuild = false
+    /// Last `isRunning` value used for the v5.4 queue flush (turn/end transition).
+    private var lastKnownRunning = false
+    /// v5.4 task-13: debounced `session/list` refresh after relay/turn activity.
+    private var subagentDebounceTask: Task<Void, Never>?
+    private var lastSubagentCatalogIds: [String] = []
+    /// Projection half of `activeUserQuestions` (`userQuestions.active`).
+    private var projectionUserQuestions: [UserQuestionCall] = []
+    /// Live half: `$events` `user-questions/request` waterfalls for this session.
+    /// Current builds use the legacy/blocking ask_user_question schema, so the
+    /// projection stays `{active: [], settled: []}` and this is the only source.
+    private var liveUserQuestionWaterfalls: [UserQuestionWaterfall] = []
+    private var pendingUserQuestionsCancellable: AnyCancellable?
+    /// M2a fix: link-phase observer that flushes prompts queued while offline.
+    private var phaseCancellable: AnyCancellable?
+    /// Call ids this client already answered (P0-1/P1-1): the journal projection
+    /// only refreshes on snapshots and `session/list` can return a stale
+    /// `active` list, so answered calls are suppressed until the Host stops
+    /// listing them. Ids are never reused, so suppression is permanent for the
+    /// lifetime of this view model.
+    private var locallyAnsweredCallIds: Set<String> = []
+    /// Duplicate/concurrent submit guard (T10): one answer batch per call at a
+    /// time; a racing second submit is rejected instead of double-sending.
+    private var userQuestionSubmitGate = UserQuestionSubmitGate()
+    /// Live waterfall ids dismissed because their turn was aborted (T10). The
+    /// Host does not always deliver a `$events` cancel frame for legacy blocking
+    /// asks, so aborting clears the card locally and keeps it hidden if the
+    /// pending list is republished.
+    private var dismissedLiveWaterfallEventIds: Set<String> = []
+
+    /// Display text for the v5.5 status-strip context cell.
+    /// `12.4k / 200k · 6%` when usage and window are known, `12.4k` with usage
+    /// only, `—` when nothing has been reported yet.
+    var contextPressureText: String { contextPressure?.displayText ?? "—" }
+
+    // MARK: - Model selection (v0.2.0)
+
+    /// Status-strip model entry content. `nil` for subagent sessions (desktop
+    /// parity: addressed subagent sessions expose no model selection).
+    var modelTriggerState: ModelTriggerState? {
+        guard !isSubagentSession else { return nil }
+        if let catalog = modelCatalog {
+            return catalog.triggerState(for: modelSelection, isLoading: modelCatalogLoading)
+        }
+        if modelCatalogLoading {
+            return ModelTriggerState(text: L10n.t("正在加载模型…"), isLoading: true)
+        }
+        return ModelTriggerState(text: L10n.t("请选择模型"), isLoading: false)
+    }
+
+    /// True when the status-strip model entry should open the selection sheet.
+    var canSelectModel: Bool { !isSubagentSession }
+
+    /// Child session id -> catalog label, used by collapsed relay cards.
+    var subagentLabels: [String: String] {
+        var labels: [String: String] = [:]
+        for entry in subagentCatalog {
+            labels[entry.id] = entry.displayLabel
+        }
+        return labels
+    }
+
+    // MARK: - Subagent context / capsule (v5.4 task-13)
+
+    var isSubagentSession: Bool { subagentContext != nil }
+    var isReadOnlySubagent: Bool { subagentContext?.isReadOnly ?? false }
+    var subagentReadOnlyReason: String? { subagentContext?.readOnlyReason }
+
+    /// Bottom capsule state for the parent (main) session detail.
+    var subagentCapsule: SubagentCapsuleState {
+        SubagentCapsuleState.resolve(catalogCount: subagentCatalog.count, runtimes: Array(subagentRuntimes.values))
+    }
+
+    init(
+        address: SessionFollowAddress,
+        subagentContext: SubagentSessionContext? = nil,
+        windowCache: SessionWindowCacheStore = SessionWindowCacheStore()
+    ) {
+        // M2b-2c: t0 for the detail in-app metric (init entry = first in-app work
+        // after the tap). E2E-gated; no product behavior.
+        DetailMetrics.begin(sessionId: address.sessionId)
+        self.address = address
+        self.sessionId = address.sessionId
+        self.subagentContext = subagentContext
+        self.windowCache = windowCache
+        // P1.5-B: the first live window is phone-sized; the legacy 40-message
+        // window is filled in the background once the first rows are on screen.
+        let firstWindow = SessionWindowPolicy.deviceFirstWindowMessages
+        self.firstWindowMessages = firstWindow
+        self.fillWindowMessages = SessionWindowPolicy.fillMessages(firstWindow: firstWindow)
+        // P1.5-B evidence before the first request is even opened; `openStream`
+        // overrides it when the actual request differs (cache hit -> wide window).
+        DetailMetrics.setFirstWindow(firstWindow)
+        // M2b-2: replay the cached window inside `init` (before the first SwiftUI
+        // render) so opening a session shows content immediately; `start()` then
+        // subscribes to the live stream and the snapshot replaces this window.
+        restoreCachedWindow()
+        DetailMetrics.setCacheHit(didRestoreWindowFromCache)
+        if didRestoreWindowFromCache {
+            DetailMetrics.markCacheRestored(milliseconds: cacheLoadMilliseconds)
+        }
+    }
+
+    /// Plain-session shorthand (APNs deep links know only the session id).
+    convenience init(sessionId: String) {
+        self.init(address: .session(sessionId: sessionId))
+    }
+
+    // MARK: - M2b-2 cold-start window cache
+
+    /// Rebuilds the journal from the cached snapshot + following events. A cache that
+    /// is corrupt, from another schema, or not contiguous is dropped silently and the
+    /// normal loading path takes over.
+    private func restoreCachedWindow() {
+        let started = Date()
+        defer { cacheLoadMilliseconds = Date().timeIntervalSince(started) * 1000 }
+        guard let cached = windowCache.load(sessionId: sessionId) else { return }
+        do {
+            let frame = try SessionStreamFrame.decode(cached.payload.snapshot)
+            guard case .snapshot(let snapshot) = frame else { return }
+            journal.apply(snapshot: snapshot)
+            for eventValue in cached.payload.events {
+                let event = try eventValue.decode(SessionEvent.self)
+                if case .gap = journal.apply(event: event) {
+                    // Cached events are not contiguous with the snapshot: showing a
+                    // window with holes would be worse than showing nothing.
+                    journal = SessionJournal()
+                    return
+                }
+            }
+            cachedSnapshotFrame = cached.payload.snapshot
+            cachedEventFrames = cached.payload.events
+            didRestoreWindowFromCache = true
+            isShowingCachedWindow = true
+            cachedWindowIsStale = cached.isStale
+            isLoading = false
+            rebuildRows()
+            contextPressure = journal.contextPressure
+        } catch {
+            journal = SessionJournal()
+        }
+    }
+
+    /// Test seam: apply one raw `session/follow` item value (snapshot/event/...).
+    func applyStreamValue(_ value: JSONValue?) {
+        handleItem(value)
+    }
+
+    /// Test seam: apply one raw item from the background-fill stream (the wide
+    /// legacy window that replaces the small first window).
+    func applyFillStreamValue(_ value: JSONValue?) {
+        handleItem(value, isFill: true)
+    }
+
+    /// Test seam: sequence numbers currently in the journal window.
+    var eventSeqs: [Int] { journal.events.map(\.seq) }
+
+    /// P1.5-B test seam: the window is still the small first one and a legacy
+    /// 40-message fill is warranted (`hasMore` = older history exists).
+    var needsFullWindowFill: Bool {
+        hasLiveSnapshot && !hasFullWindow && journal.hasMore
+            && fillWindowMessages > firstWindowMessages
+    }
+
+    /// Persists the latest snapshot + contiguous event tail, debounced so a running
+    /// turn does not write on every frame.
+    private func scheduleCacheSave() {
+        cacheSaveTask?.cancel()
+        cacheSaveTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            guard let self, !Task.isCancelled else { return }
+            self.cacheSaveTask = nil
+            self.saveWindowCacheNow()
+        }
+    }
+
+    /// Writes the cache only after a live snapshot exists: a cache restored without a
+    /// network round-trip must keep its original `savedAt` (it may be stale).
+    func saveWindowCacheNow() {
+        guard hasLiveSnapshot, let snapshot = cachedSnapshotFrame else { return }
+        // P1 resume base: record the channel cursor this window is aligned with (nil
+        // on the legacy path). Reserved for the Net/ stream-resume change; recording
+        // it now keeps the cache evidence complete without changing behaviour.
+        let channel = link?.p1Channel
+        windowCache.save(
+            sessionId: sessionId,
+            snapshot: snapshot,
+            events: cachedEventFrames,
+            windowMessages: hasFullWindow ? fillWindowMessages : firstWindowMessages,
+            hasMore: journal.hasMore,
+            p1Epoch: channel?.epoch,
+            p1Sid: channel?.lastAppliedSid
+        )
+    }
+
+    // MARK: - M2b-2c detail in-app timing
+
+    /// Called from `SessionDetailView.onAppear`: marks the detail's first frame once
+    /// the header title and/or the first message rows are available. Idempotent.
+    func markDetailViewAppeared() {
+        detailViewVisible = true
+        maybeMarkDetailFirstFrame()
+    }
+
+    private func maybeMarkDetailFirstFrame() {
+        guard detailViewVisible, !detailFirstFrameMarked else { return }
+        // First visible content = header title and/or the first message rows.
+        guard title != nil || !sections.isEmpty else { return }
+        detailFirstFrameMarked = true
+        DetailMetrics.markFirstFrame()
+        detailMetricsValue = DetailMetrics.valueString
+    }
+
+    private func markDetailNetworkApplied() {
+        DetailMetrics.markNetworkApplied()
+        detailMetricsValue = DetailMetrics.valueString
+    }
+
+    /// Called from `SessionDetailView` once the running/turn indicator is on
+    /// screen after a send (E2E in-app metric; no product behavior).
+    func markSendTurnVisible() {
+        SendMetrics.markTurnVisible()
+        sendMetricsValue = SendMetrics.valueString
+    }
+
+    // MARK: - Lifecycle
+
+    func attach(link: LinkService) {
+        self.link = link
+        // G1 (task-6): merge live `$events` user-question waterfalls into the
+        // published cards — on current builds the projection is always empty.
+        pendingUserQuestionsCancellable = link.$pendingUserQuestions
+            .receive(on: RunLoop.main)
+            .sink { [weak self] waterfalls in
+                self?.applyPendingUserQuestionWaterfalls(waterfalls)
+            }
+        // M2a fix: prompts typed while the transport is reconnecting are queued
+        // locally; flush the oldest one as soon as the link is connected again.
+        phaseCancellable = link.$phase
+            .receive(on: RunLoop.main)
+            .sink { [weak self] phase in
+                guard let self, phase.isConnected else { return }
+                self.maybeFlushQueued()
+            }
+    }
+
+    func start() {
+        guard let link else { return }
+        observedGeneration = link.generation
+        // Restore the live half immediately: the Combine sink only re-fires on
+        // changes, and a stop()/start() cycle clears the local cache.
+        applyPendingUserQuestionWaterfalls(link.pendingUserQuestionWaterfalls(forSession: sessionId))
+        openStream()
+    }
+
+    func stop() {
+        restartTask?.cancel()
+        rebuildTask?.cancel()
+        subagentDebounceTask?.cancel()
+        fillTask?.cancel()
+        fillTask = nil
+        fillStream?.cancel()
+        fillStream = nil
+        fillAttempts = 0
+        stream?.cancel()
+        stream = nil
+        // M2b-2: flush a pending debounced window write before leaving the screen.
+        cacheSaveTask?.cancel()
+        cacheSaveTask = nil
+        saveWindowCacheNow()
+        // Leaving the screen: drop the live half (the projection half stays in
+        // the journal and is restored by the next snapshot).
+        liveUserQuestionWaterfalls = []
+        rebuildActiveUserQuestions()
+    }
+
+    /// Called when the link generation changed (reconnect): rebuild from snapshot.
+    func handleGenerationChange(_ generation: Int) {
+        guard generation != observedGeneration else { return }
+        observedGeneration = generation
+        if generation > 0 {
+            reopenStream()
+        }
+        // M2a fix: prompts queued while offline go out as soon as we are back.
+        maybeFlushQueued()
+    }
+
+    private func reopenStream() {
+        restartTask?.cancel()
+        fillTask?.cancel()
+        fillTask = nil
+        fillStream?.cancel()
+        fillStream = nil
+        fillAttempts = 0
+        hasFullWindow = false
+        stream?.cancel()
+        stream = nil
+        openStream()
+    }
+
+    func retry() {
+        streamErrorText = nil
+        reopenStream()
+    }
+
+    /// M4 §4: a background (silent) push asked for fresh data while this detail is
+    /// open. Reopens `session/follow` so the snapshot replaces the cached rows —
+    /// the same path as the retry button. No-op while offline so a background
+    /// push can never paint a connection-error banner over the open session.
+    func refreshFromSilentPush() {
+        guard let link, link.phase.isConnected else { return }
+        reopenStream()
+    }
+
+    /// P1.5-B: window size for the next `session/follow`.
+    /// - First open with nothing on screen: phone-sized first window (fast paint).
+    /// - Anything already on screen (cache hit, reconnect, retry): the legacy full
+    ///   window, so a refresh never shrinks what the user can already see.
+    private func requestedWindowMessages() -> Int {
+        if hasLiveSnapshot || didRestoreWindowFromCache || !sections.isEmpty {
+            return fillWindowMessages
+        }
+        return firstWindowMessages
+    }
+
+    private func openStream() {
+        guard let link else { return }
+        guard link.phase.isConnected else {
+            isLoading = sections.isEmpty
+            streamErrorText = link.phase.isBusy ? nil : "连接未就绪"
+            return
+        }
+        let messages = requestedWindowMessages()
+        if !hasLiveSnapshot && !didRestoreWindowFromCache && sections.isEmpty {
+            // P1.5-B evidence: what the very first request asked for.
+            DetailMetrics.setFirstWindow(messages)
+        }
+        isLoading = sections.isEmpty
+        do {
+            let args: [String: JSONValue] = [
+                "request": .object([
+                    "address": address.jsonValue,
+                    "assistantStream": .bool(true),
+                    // P1.5-B: phone-sized window on a cold open; older history is
+                    // filled in the background (see scheduleBackgroundFillIfNeeded).
+                    "maxMessages": .int(Int64(messages)),
+                ]),
+            ]
+            stream = try link.openStream(
+                endpoint: "session/follow",
+                args: args,
+                onItem: { [weak self] value in
+                    self?.handleItem(value)
+                },
+                onEnd: { [weak self] in
+                    self?.streamErrorText = "会话流已结束"
+                },
+                onError: { [weak self] error in
+                    self?.streamErrorText = error.message.isEmpty ? error.code : error.message
+                    self?.isLoading = false
+                },
+                onClose: { [weak self] _, _ in
+                    // Transport lost: LinkService reconnects and bumps generation,
+                    // the view calls handleGenerationChange then.
+                    self?.isLoading = false
+                }
+            )
+            // A wide request (cache hit / reconnect) is already the full window; a
+            // small first window schedules the background fill after its snapshot.
+            hasFullWindow = messages >= fillWindowMessages
+        } catch {
+            streamErrorText = NetworkErrorInterpreter.message(for: error)
+            isLoading = false
+        }
+    }
+
+    // MARK: - P1.5-B background fill (legacy 40-message window)
+
+    /// Bound on fill retries per open: a persistent stream error must not loop.
+    private static let maxFillAttempts = 2
+
+    /// After the small first window is on screen, fetch the legacy 40-message window
+    /// on a second `session/follow` and promote it to the live stream. Short
+    /// sessions (`hasMore == false`) never fill: their first window is complete.
+    private func scheduleBackgroundFillIfNeeded() {
+        guard let link, link.phase.isConnected, stream != nil else { return }
+        guard needsFullWindowFill, fillAttempts < Self.maxFillAttempts else { return }
+        guard fillTask == nil, fillStream == nil else { return }
+        fillTask = Task { [weak self] in
+            // Let the first rows settle first: the user already sees content, and
+            // this delay keeps the fill from competing with the first paint.
+            try? await Task.sleep(nanoseconds: 600_000_000)
+            guard let self, !Task.isCancelled else { return }
+            self.fillTask = nil
+            self.openFillStream()
+        }
+    }
+
+    private func openFillStream() {
+        guard let link, link.phase.isConnected, stream != nil, needsFullWindowFill else { return }
+        fillAttempts += 1
+        do {
+            fillStream = try link.openStream(
+                endpoint: "session/follow",
+                args: [
+                    "request": .object([
+                        "address": address.jsonValue,
+                        "assistantStream": .bool(true),
+                        "maxMessages": .int(Int64(fillWindowMessages)),
+                    ])
+                ],
+                onItem: { [weak self] value in
+                    self?.handleItem(value, isFill: true)
+                },
+                onEnd: { [weak self] in self?.handleFillStreamFailure() },
+                onError: { [weak self] _ in self?.handleFillStreamFailure() },
+                onClose: { [weak self] _, _ in self?.handleFillStreamFailure() }
+            )
+        } catch {
+            fillStream = nil
+            handleFillStreamFailure()
+        }
+    }
+
+    /// The fill stream died before its snapshot: keep the small window live and
+    /// retry once (bounded by `maxFillAttempts`).
+    private func handleFillStreamFailure() {
+        fillStream = nil
+        guard needsFullWindowFill else { return }
+        scheduleBackgroundFillIfNeeded()
+    }
+
+    /// The fill snapshot replaced the small window: keep consuming that stream as
+    /// the live one and drop the small-window stream.
+    private func promoteFillStream() {
+        fillTask?.cancel()
+        fillTask = nil
+        stream?.cancel()
+        stream = fillStream
+        fillStream = nil
+    }
+
+    /// Paint the first rows without waiting for the 40ms rebuild debounce. Only the
+    /// first snapshot benefits (subsequent frames still coalesce).
+    private func paintFirstRowsImmediately() {
+        guard detailViewVisible, !detailFirstFrameMarked else { return }
+        rebuildTask?.cancel()
+        rebuildTask = nil
+        pendingRebuild = false
+        rebuildRows()
+    }
+
+    // MARK: - Frame handling
+
+    private func handleItem(_ value: JSONValue?, isFill: Bool = false) {
+        guard let value else { return }
+        lastEventAt = Date()
+        do {
+            let frame = try SessionStreamFrame.decode(value)
+            switch frame {
+            case .snapshot(let snapshot):
+                let update = journal.apply(snapshot: snapshot)
+                applyJournalUpdate(update)
+                // v5.5 §14.5 first frame: seed the context window from the
+                // snapshot projections (M1 gets no incremental projection pushes).
+                contextPressure = journal.contextPressure
+                isLoading = false
+                streamErrorText = nil
+                // M2b-2: the live snapshot supersedes the cached window; keep the
+                // raw frame and reset the event tail for the next cache write.
+                cachedSnapshotFrame = value
+                cachedEventFrames = []
+                hasLiveSnapshot = true
+                isShowingCachedWindow = false
+                cachedWindowIsStale = false
+                scheduleCacheSave()
+                ensureExpandedCurrentTurn()
+                if isFill {
+                    // P1.5-B: the legacy 40-message window replaced the small one;
+                    // this stream becomes the live one from now on.
+                    hasFullWindow = true
+                    promoteFillStream()
+                } else {
+                    // M2b-2c: live snapshot network cost (detail in-app metric).
+                    markDetailNetworkApplied()
+                    if !hasFullWindow {
+                        // P1.5-B: paint the first rows immediately (no 40ms debounce);
+                        // the full window is filled in behind.
+                        paintFirstRowsImmediately()
+                    }
+                }
+                if !hasFullWindow {
+                    scheduleBackgroundFillIfNeeded()
+                }
+            case .event(let event):
+                let update = journal.apply(event: event)
+                applyJournalUpdate(update)
+                // M2b-2: cache only events the journal actually appended, so the
+                // persisted tail stays contiguous with the cached snapshot (a
+                // duplicate/gap frame would make the cache unreplayable).
+                if case .eventsApplied = update,
+                   let rawEvent = value["event"],
+                   cachedEventFrames.count < Self.maxCachedEvents {
+                    cachedEventFrames.append(rawEvent)
+                    scheduleCacheSave()
+                }
+                // v5.4 task-13 / v5.5 §14.5: relay, turn and assistant-attempt
+                // activity refresh session-list-derived state (child runtime
+                // metadata + the context window). Debounced ≥2s so this never
+                // becomes a high-frequency poll.
+                if event.type == "turn/start" || event.type == "turn/end"
+                    || event.type == "assistant/attempt"
+                    || event.type.hasPrefix("agent-message")
+                    || event.type.hasPrefix("agent/") {
+                    scheduleSubagentRefreshFromActivity()
+                }
+            case .assistantStream(let frame):
+                let update = journal.apply(assistantStream: frame)
+                applyJournalUpdate(update)
+            case .unknown:
+                break
+            }
+        } catch {
+            // Include the frame type and the failing coding path: the bare
+            // Foundation text ("The data couldn't be read…") names nothing.
+            streamErrorText = "帧解析失败: \(FrameDecodeFailure.describe(error, frame: value))"
+        }
+    }
+
+    private func applyJournalUpdate(_ update: SessionJournal.Update) {
+        switch update {
+        case .snapshotReplaced:
+            pendingRebuild = true
+            scheduleRebuild()
+        case .eventsApplied:
+            pendingRebuild = true
+            scheduleRebuild()
+        case .duplicate, .ignored, .assistantStreamProgress:
+            liveAssistantText = journal.liveAssistantText
+        case .gap, .assistantRevisionGap:
+            // MVP policy: discard the local window and rebuild from a new
+            // snapshot (session/page hole patching is M2, protocol §4.3).
+            reopenStream()
+        }
+    }
+
+    private func scheduleRebuild() {
+        guard pendingRebuild else { return }
+        guard rebuildTask == nil else { return }
+        rebuildTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 40_000_000)
+            guard let self, !Task.isCancelled else { return }
+            self.rebuildTask = nil
+            guard self.pendingRebuild else { return }
+            self.pendingRebuild = false
+            self.rebuildRows()
+        }
+    }
+
+    private func rebuildRows() {
+        sections = SessionRowBuilder.build(events: journal.events)
+        title = journal.title
+        permissionsValue = journal.permissionsValue
+        todos = journal.todos
+        planActive = journal.plan?["active"]?.boolValue ?? false
+        let wasRunning = lastKnownRunning
+        isRunning = sections.last?.isRunning ?? false
+        lastKnownRunning = isRunning
+        liveAssistantText = journal.liveAssistantText
+        approvalPolicy = journal.events.last(where: { $0.type == "approval/policy" })?.data?["policy"]?.stringValue
+        sandboxMode = journal.events.last(where: { $0.type == "sandbox/mode" })?.data?["mode"]?.stringValue
+        // One parse feeds both surfaces: the strip/catalog display the durable
+        // intent (`next`), and the permission sheet shows the same model id (it
+        // used to read the lagging `lastUsed` only).
+        let liveModelSelection = ModelSelection(projection: journal.modelSelection)
+        modelSelection = liveModelSelection
+        modelSelectionText = liveModelSelection?.model
+        refreshModelCatalogForLiveSelectionIfNeeded()
+        applyUserQuestionProjection(journal.userQuestions)
+        projectionSubagents = (journal.subagentCatalog ?? []).compactMap(SubagentCatalogEntry.init(json:))
+        subagentCatalog = SubagentCatalogMerge.merge(
+            projection: projectionSubagents,
+            discovered: discoveredSubagents
+        )
+        let catalogIds = subagentCatalog.map(\.id)
+        if subagentContext == nil, !catalogIds.isEmpty, catalogIds != lastSubagentCatalogIds {
+            lastSubagentCatalogIds = catalogIds
+            Task { [weak self] in
+                await self?.refreshSubagentRuntime()
+            }
+        }
+        ensureExpandedCurrentTurn()
+        requestFileChangeSummariesIfNeeded()
+        // v5.4 queue: a finished turn automatically releases the oldest queued
+        // prompt with mode=queue; the rest keep waiting for the next turn/end.
+        if SessionQueuePolicy.shouldFlush(wasRunning: wasRunning, isRunning: isRunning, queuedCount: queuedPrompts.count) {
+            flushNextQueuedPrompt()
+        }
+        // M2b-2c: if the detail is already on screen (no cache hit -> first rows came
+        // from the live snapshot), this is the first visible content.
+        maybeMarkDetailFirstFrame()
+        // P1.5-B: the legacy 40-message window is on screen (background fill landed,
+        // or the open used the wide window). Evidence only, idempotent.
+        if hasFullWindow {
+            DetailMetrics.markFullWindowApplied()
+            detailMetricsValue = DetailMetrics.valueString
+        }
+    }
+
+    private func ensureExpandedCurrentTurn() {
+        if let last = sections.last, expandedTurnIDs.isEmpty {
+            expandedTurnIDs.insert(last.id)
+        }
+    }
+
+    // MARK: - Session-list derived refresh (v5.4 task-13 / v5.5 §14.5)
+
+    /// One `session/list` read that refreshes everything derived from the list:
+    /// - v5.5 §14.5: the context window of **this** session (normal detail or
+    ///   subagent detail — a subagent child is listed under its own child id, so
+    ///   `sessionId` matches both);
+    /// - v5.4 task-13: child `subagentRuntimes` for a parent detail with a catalog.
+    ///
+    /// Callers must debounce/poll: the activity trigger is a trailing ≥2s debounce
+    /// and the detail view's tick is 8s, so this is never a per-frame request.
+    /// A refresh that cannot read the list keeps the last known value.
+    func refreshSessionListDerived(pendingApprovalAgentIds: Set<String> = []) async {
+        guard let link else {
+            subagentRuntimes = [:]
+            return
+        }
+        guard let sessions = try? await link.listSessions() else { return }
+        contextPressure = ContextPressureResolver.refreshValue(
+            current: contextPressure,
+            sessionId: sessionId,
+            sessions: sessions
+        )
+        guard subagentContext == nil else {
+            subagentRuntimes = [:]
+            return
+        }
+        // v0.2.0 live discovery: the `subagentCatalog` projection only ships with a
+        // journal snapshot, so a child that starts while this detail is open would
+        // otherwise stay invisible until a reopen. `session/list` (already fetched)
+        // carries the same children — merge them in so the capsule/beam follows
+        // reality within one activity debounce.
+        let discovered = SubagentCatalogMerge.discovered(
+            sessions: sessions,
+            parentSessionId: sessionId
+        )
+        if discovered != discoveredSubagents {
+            discoveredSubagents = discovered
+            let merged = SubagentCatalogMerge.merge(
+                projection: projectionSubagents,
+                discovered: discovered
+            )
+            if merged != subagentCatalog {
+                subagentCatalog = merged
+            }
+        }
+        guard !subagentCatalog.isEmpty else {
+            subagentRuntimes = [:]
+            return
+        }
+        subagentRuntimes = SubagentRuntimeBuilder.make(
+            catalog: subagentCatalog,
+            sessions: sessions,
+            pendingApprovalAgentIds: pendingApprovalAgentIds
+        )
+    }
+
+    /// v5.4 compatibility wrapper: existing call sites keep their signature and
+    /// the legacy gating (only a parent detail with a catalog issues the request;
+    /// the detail view's 8s tick therefore stays network-free for other sessions).
+    /// The v5.5 context window for those sessions arrives through the activity
+    /// debounce below, whose first frame already comes from the snapshot.
+    func refreshSubagentRuntime(pendingApprovalAgentIds: Set<String> = []) async {
+        guard subagentContext == nil, !subagentCatalog.isEmpty else {
+            subagentRuntimes = [:]
+            return
+        }
+        await refreshSessionListDerived(pendingApprovalAgentIds: pendingApprovalAgentIds)
+    }
+
+    /// Trailing ≥2s debounced refresh after relay / turn / assistant-attempt
+    /// activity. v5.5: no longer gated on having a subagent catalog, so subagent
+    /// details and plain main sessions refresh their context window too.
+    private func scheduleSubagentRefreshFromActivity() {
+        subagentDebounceTask?.cancel()
+        subagentDebounceTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            guard !Task.isCancelled, let self else { return }
+            await self.refreshSessionListDerived()
+        }
+    }
+
+    // MARK: - Intents
+
+    /// Unified composer send (v5.4): while a turn runs the message joins the
+    /// client-side queue; when idle it is sent immediately with `mode=queue`.
+    ///
+    /// M2a fix: never dead-end on transport state. If the link is reconnecting or
+    /// offline the prompt is queued locally (with feedback) and flushed as soon as
+    /// the next connected phase arrives — the button used to be disabled/greyed
+    /// out in that window, which users read as "无法发送".
+    func submitDraft() {
+        let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty, !sending else { return }
+        draft = ""
+        SendMetrics.begin()
+        let connected = link?.phase.isConnected ?? false
+        if isRunning || !connected {
+            queuedPrompts.enqueue(text: text)
+            SendMetrics.markQueued()
+            sendMetricsValue = SendMetrics.valueString
+            // M2a UX: make the "queued" outcome perceptible (the user used to read
+            // the silent queue / grey button as a send failure).
+            #if canImport(UIKit)
+            UINotificationFeedbackGenerator().notificationOccurred(.success)
+            #endif
+            maybeFlushQueued()
+            return
+        }
+        Task { [weak self] in
+            guard let self else { return }
+            let sent = await sendPrompt(text: text, mode: "queue")
+            if !sent {
+                // Transport hiccup: keep the text (queue + offline banner) instead
+                // of silently dropping it.
+                queuedPrompts.enqueue(text: text)
+            }
+        }
+    }
+
+    /// Send queued prompts automatically once the link is connected and idle
+    /// (offline queue after a reconnect, or the running -> idle turn transition).
+    private func maybeFlushQueued() {
+        guard let link, link.phase.isConnected, !isRunning, !sending, !queuedPrompts.isEmpty else { return }
+        flushNextQueuedPrompt()
+    }
+
+    /// Queue bar tap: release the oldest queued prompt immediately as `steer`.
+    func steerFirstQueued() {
+        guard let link, link.phase.isConnected, !sending, let prompt = queuedPrompts.takeFirst() else { return }
+        Task { [weak self] in
+            guard let self else { return }
+            let sent = await self.sendPrompt(text: prompt.text, mode: "steer")
+            if !sent { self.queuedPrompts.restore(prompt) }
+        }
+    }
+
+    /// Turn/end flush: send the oldest queued prompt with `mode=queue`.
+    private func flushNextQueuedPrompt() {
+        guard !sending, let prompt = queuedPrompts.takeFirst() else { return }
+        Task { [weak self] in
+            guard let self else { return }
+            let sent = await self.sendPrompt(text: prompt.text, mode: "queue")
+            if !sent { self.queuedPrompts.restore(prompt) }
+        }
+    }
+
+    @discardableResult
+    private func sendPrompt(text: String, mode: String) async -> Bool {
+        guard let link else { return false }
+        sending = true
+        actionErrorText = nil
+        defer { sending = false }
+        do {
+            if let context = subagentContext {
+                // v5.4 task-13: continuable subagents accept subagents/prompt;
+                // one-shot / external children are read-only from the phone.
+                guard context.mode.isContinuable else {
+                    actionErrorText = context.readOnlyReason ?? "该子代理只读"
+                    return false
+                }
+                _ = try await link.subagentsPrompt(
+                    parentSessionId: context.parentSessionId,
+                    childSessionId: context.childSessionId,
+                    delivery: mode == "steer" ? "steer" : "queue",
+                    text: text
+                )
+            } else {
+                _ = try await link.unary("session/prompt", args: [
+                    "request": .object([
+                        "requestId": .string(UUID().uuidString.lowercased()),
+                        "sessionId": .string(sessionId),
+                        "mode": .string(mode),
+                        "content": .array([
+                            .object(["type": .string("text"), "text": .string(text)]),
+                        ]),
+                        "clientTimeZone": .string(TimeZone.current.identifier),
+                    ]),
+                ])
+            }
+            isRunning = true
+            lastKnownRunning = true
+            SendMetrics.markAccepted()
+            sendMetricsValue = SendMetrics.valueString
+            return true
+        } catch {
+            SendMetrics.markFailed()
+            sendMetricsValue = SendMetrics.valueString
+            actionErrorText = NetworkErrorInterpreter.message(for: error)
+            return false
+        }
+    }
+
+    func abort() async {
+        guard let link else { return }
+        actionErrorText = nil
+        do {
+            if let context = subagentContext {
+                // v5.4 task-13: interrupt a child session from its parent.
+                _ = try await link.subagentsInterruptByParent(
+                    parentSessionId: context.parentSessionId,
+                    childSessionId: context.childSessionId
+                )
+            } else {
+                _ = try await link.unary("session/cancel", args: [
+                    "request": .object(["sessionId": .string(sessionId)]),
+                ])
+            }
+            // T10: the aborted turn's pending live question can no longer be
+            // answered; clear the card without waiting for a $events cancel frame.
+            dismissLiveUserQuestionsForAbortedTurn()
+        } catch {
+            actionErrorText = NetworkErrorInterpreter.message(for: error)
+        }
+    }
+
+    func respond(approval: ApprovalWaterfall, outcome: ApprovalOutcome) async {
+        guard let link else { return }
+        actionErrorText = nil
+        do {
+            try await link.respondApproval(approval, outcome: outcome)
+        } catch {
+            actionErrorText = NetworkErrorInterpreter.message(for: error)
+        }
+    }
+
+    // MARK: - Session permission preset (M5)
+
+    /// Lazily loads the selectable preset catalog. Called when the permission sheet
+    /// opens; `force` re-fetches after a failure (the sheet's retry affordance).
+    /// A successful load is cached for the lifetime of this detail; a failure is
+    /// not, so re-opening the sheet retries.
+    func loadPermissionCatalogIfNeeded(force: Bool = false) async {
+        if !force, permissionCatalogLoaded { return }
+        guard !permissionCatalogLoading else { return }
+        permissionCatalogLoading = true
+        defer { permissionCatalogLoading = false }
+        do {
+            let catalog = try await fetchPermissionCatalog()
+            presetOptions = catalog.options
+            if let defaultPreset = catalog.defaultPreset, !defaultPreset.isEmpty {
+                presetDefault = defaultPreset
+            }
+            permissionCatalogLoaded = true
+            permissionSwitchError = nil
+        } catch {
+            permissionCatalogLoaded = false
+            permissionSwitchError = PermissionSwitchErrorText.message(for: error)
+        }
+    }
+
+    /// Selects `value` as this session's permission preset.
+    ///
+    /// Success updates `permissionsValue` optimistically; the host then emits
+    /// `permission/preset`, `approval/policy` and `sandbox/mode`, which
+    /// `rebuildRows` re-syncs from the journal — so the strip and the sheet agree
+    /// even when another client changes the preset meanwhile. Failure only fills
+    /// `permissionSwitchError`; the previous preset stays selected.
+    func switchPermissionPreset(_ value: String) async {
+        guard !permissionSwitching else { return }
+        permissionSwitching = true
+        permissionSwitchError = nil
+        defer { permissionSwitching = false }
+        do {
+            let update = try await submitPermission(preset: value)
+            permissionsValue = update.preset.isEmpty ? value : update.preset
+            if !update.catalog.options.isEmpty {
+                presetOptions = update.catalog.options
+                if let defaultPreset = update.catalog.defaultPreset, !defaultPreset.isEmpty {
+                    presetDefault = defaultPreset
+                }
+                permissionCatalogLoaded = true
+            }
+        } catch {
+            permissionSwitchError = PermissionSwitchErrorText.message(for: error)
+        }
+    }
+
+    /// True when `value` is the selected preset: the session's current value, or
+    /// the host default while `permissions.currentValue` has not landed yet.
+    func isPermissionPresetSelected(_ value: String) -> Bool {
+        (permissionsValue ?? presetDefault) == value
+    }
+
+    private func fetchPermissionCatalog() async throws -> PermissionPresetCatalog {
+        if let permissionCatalogLoader { return try await permissionCatalogLoader() }
+        guard let link else { throw LinkError.notConnected }
+        return try await link.permissionPresetCatalog()
+    }
+
+    private func submitPermission(preset: String) async throws -> SessionPermissionUpdate {
+        if let permissionSwitcher { return try await permissionSwitcher(preset) }
+        guard let link else { throw LinkError.notConnected }
+        return try await link.setSessionPermission(sessionId: sessionId, preset: preset)
+    }
+
+    // MARK: - Model selection (v0.2.0)
+
+    /// Loads `session/modelCatalog` once per detail (failure keeps the entry
+    /// retryable). Subagent sessions never load it.
+    func loadModelCatalogIfNeeded(force: Bool = false) async {
+        guard !isSubagentSession else { return }
+        if !force, modelCatalogLoaded { return }
+        guard !modelCatalogLoading else { return }
+        modelCatalogLoading = true
+        defer { modelCatalogLoading = false }
+        do {
+            let catalog = try await fetchModelCatalog()
+            modelCatalog = catalog
+            modelCatalogLoaded = true
+            modelCatalogErrorText = nil
+        } catch {
+            modelCatalogLoaded = false
+            modelCatalogErrorText = NetworkErrorInterpreter.message(for: error)
+        }
+    }
+
+    /// A model switch made on the desktop arrives live as a `model/selection`
+    /// event (patched into the projection by `SessionJournal`). When the cached
+    /// catalog cannot name that route yet — a provider/model added after this
+    /// detail loaded its catalog — the strip would fall back to "请选择模型", so
+    /// refresh the catalog once per unknown selection. `modelCatalogUnknownSelection`
+    /// makes that idempotent: repeated rebuilds for the same selection do not
+    /// re-fetch, and a failing refresh cannot loop.
+    private func refreshModelCatalogForLiveSelectionIfNeeded() {
+        guard !isSubagentSession, modelCatalogLoaded, let selection = modelSelection else { return }
+        guard let catalog = modelCatalog,
+              catalog.model(provider: selection.provider, id: selection.model) == nil else {
+            modelCatalogUnknownSelection = nil
+            return
+        }
+        guard modelCatalogUnknownSelection != selection else { return }
+        modelCatalogUnknownSelection = selection
+        Task { [weak self] in
+            await self?.loadModelCatalogIfNeeded(force: true)
+        }
+    }
+
+    /// Applies one model selection. The Host installs it for the next request
+    /// boundary; a running step keeps its model (desktop parity). On success the
+    /// local selection updates immediately so the strip/sheet agree; on failure
+    /// the sheet stays open with the error and the previous selection survives.
+    func selectModel(_ selection: ModelSelection) async {
+        guard !isSubagentSession, !modelSelecting else { return }
+        modelSelecting = true
+        modelSelectionPending = selection
+        modelSelectionErrorText = nil
+        defer {
+            modelSelecting = false
+            modelSelectionPending = nil
+        }
+        do {
+            let selected = try await submitModelSelection(selection)
+            modelSelection = selected
+            modelCatalogErrorText = nil
+        } catch {
+            modelSelectionErrorText = NetworkErrorInterpreter.message(for: error)
+        }
+    }
+
+    /// Clears the sheet-local selection error (called when the sheet opens).
+    func clearModelSelectionError() {
+        modelSelectionErrorText = nil
+    }
+
+    private func fetchModelCatalog() async throws -> ModelCatalog {
+        if let modelCatalogLoader { return try await modelCatalogLoader() }
+        guard let link else { throw LinkError.notConnected }
+        return try await link.modelCatalog()
+    }
+
+    private func submitModelSelection(_ selection: ModelSelection) async throws -> ModelSelection {
+        if let modelSelector { return try await modelSelector(selection) }
+        guard let link else { throw LinkError.notConnected }
+        return try await link.selectModel(sessionId: sessionId, selection: selection)
+    }
+
+    #if DEBUG
+    /// E2E screenshot hook: deterministic context-window percentage without a
+    /// Host ().
+    func installE2EContextPreview(percent: Int) {
+        let window = 1_000_000
+        contextPressure = ContextPressureValue(
+            projectedTokens: window * max(0, percent) / 100,
+            contextWindow: window
+        )
+    }
+
+    /// E2E screenshot hook: deterministic catalog/selection without a Host.
+    /// Gated by `DSHM_E2E=1` + `DSHM_E2E_MODEL=1` in SessionDetailView; no
+    /// product behavior.
+    func installE2EModelPreview() {
+        guard !isSubagentSession else { return }
+        modelCatalog = ModelCatalog(
+            defaultSelection: .init(provider: "deepseek-official", model: "deepseek-flash", reasoningEffort: "high"),
+            routableProviders: ["deepseek-official"],
+            groups: [
+                .init(id: "deepseek-account", name: "DeepSeek 账号", models: [
+                    .init(id: "deepseek-v3", name: "deepseek-v3", description: nil, reasoning: .init(
+                        efforts: [
+                            .init(id: "medium", name: "medium", description: nil),
+                            .init(id: "high", name: "high", description: nil),
+                        ],
+                        defaultEffort: "high"
+                    )),
+                ]),
+                .init(id: "deepseek-official", name: "DeepSeek", models: [
+                    .init(id: "deepseek-flash", name: "deepseek-flash", description: nil, reasoning: .init(
+                        efforts: [
+                            .init(id: "low", name: "low", description: nil),
+                            .init(id: "high", name: "high", description: nil),
+                            .init(id: "max", name: "max", description: nil),
+                        ],
+                        defaultEffort: "high"
+                    )),
+                    .init(id: "deepseek-pro", name: "deepseek-pro", description: nil, reasoning: .init(
+                        efforts: [
+                            .init(id: "medium", name: "medium", description: nil),
+                            .init(id: "high", name: "high", description: nil),
+                        ],
+                        defaultEffort: "medium"
+                    )),
+                ]),
+            ],
+            failures: []
+        )
+        modelCatalogLoaded = true
+        modelCatalogLoading = false
+        modelCatalogErrorText = nil
+        modelSelectionErrorText = nil
+        modelSelection = ModelSelection(
+            provider: "deepseek-official",
+            model: "deepseek-flash",
+            reasoningEffort: "high"
+        )
+    }
+    #endif
+
+    // MARK: - User questions (task-2 / tech-design §14)
+
+    /// Applies `projections.values.userQuestions` to the published state.
+    /// Called from `rebuildRows` (snapshot) and testable in isolation.
+    func applyUserQuestionProjection(_ value: JSONValue?) {
+        projectionUserQuestions = UserQuestionsProjection.parse(value).active
+        rebuildActiveUserQuestions()
+    }
+
+    /// True when `callId` was answered by this client and must stay hidden even
+    /// if a stale snapshot/event replay or a stale `session/list` read brings it
+    /// back (P0-1 / P1-1).
+    func isUserQuestionAnsweredLocally(_ callId: String) -> Bool {
+        locallyAnsweredCallIds.contains(callId)
+    }
+
+    /// Applies the live `$events` pending waterfalls (Combine subscription on
+    /// `link.$pendingUserQuestions`). Live calls are the only source on builds
+    /// whose projection stays empty (legacy/blocking ask_user_question schema);
+    /// on the same `callId` the projection wins.
+    func applyPendingUserQuestionWaterfalls(_ waterfalls: [UserQuestionWaterfall]) {
+        liveUserQuestionWaterfalls = waterfalls.filter {
+            $0.agentId == nil || $0.agentId == sessionId
+        }
+        rebuildActiveUserQuestions()
+    }
+
+    /// Merges the projection half and the live half into `activeUserQuestions`.
+    /// A live call without `wait.callId` uses its `eventId` as stable identity.
+    private func rebuildActiveUserQuestions() {
+        // A call without usable questions cannot be answered (it would render an
+        // empty card and submit an empty batch); hide it like an unparsable
+        // entry, mirroring the P1-4 guard on live waterfalls.
+        let projectionCalls = projectionUserQuestions.filter { !$0.questions.isEmpty }
+        var seen = Set(projectionCalls.map(\.callId))
+        var merged = projectionCalls
+        for waterfall in liveUserQuestionWaterfalls
+        where !dismissedLiveWaterfallEventIds.contains(waterfall.eventId) {
+            let callId = waterfall.callId ?? waterfall.eventId
+            guard !seen.contains(callId) else { continue }
+            seen.insert(callId)
+            merged.append(UserQuestionCall(callId: callId, state: .open, questions: waterfall.questions))
+        }
+        if !locallyAnsweredCallIds.isEmpty {
+            merged.removeAll { locallyAnsweredCallIds.contains($0.callId) }
+        }
+        activeUserQuestions = merged
+    }
+
+    /// Path that `submitUserQuestionAnswers(callId:)` will take; internal so the
+    /// open/live routing stays unit-testable without networking.
+    func userQuestionSubmitPath(callId: String) -> UserQuestionSubmitPath {
+        UserQuestionSubmitPlanner.path(
+            for: activeUserQuestions.first { $0.callId == callId },
+            pending: pendingUserQuestionWaterfallsForSubmit()
+        )
+    }
+
+    /// Union of the cached live half and the link's authoritative pending list
+    /// (deduplicated by `eventId`).
+    private func pendingUserQuestionWaterfallsForSubmit() -> [UserQuestionWaterfall] {
+        var result = liveUserQuestionWaterfalls
+        if let link {
+            for waterfall in link.pendingUserQuestionWaterfalls(forSession: sessionId)
+            where !result.contains(where: { $0.eventId == waterfall.eventId }) {
+                result.append(waterfall)
+            }
+        }
+        return result
+    }
+
+    /// Re-reads this session's `userQuestions.active` from `session/list`
+    /// (lighter than reopening `session/follow`) and republishes it.
+    ///
+    /// When `callId` is given, retries briefly until the answered call is gone
+    /// from the refreshed projection (guards against a stale list read).
+    func refreshUserQuestions(afterAnswering callId: String? = nil) async {
+        guard let link else { return }
+        var attempt = 0
+        while attempt < 3 {
+            guard let sessions = try? await link.listSessions() else { return }
+            guard let item = sessions.first(where: { $0.sessionId == sessionId }) else { return }
+            projectionUserQuestions = item.activeUserQuestions
+            rebuildActiveUserQuestions()
+            guard let callId, activeUserQuestions.contains(where: { $0.callId == callId }) else { return }
+            attempt += 1
+            if attempt < 3 { try? await Task.sleep(nanoseconds: 300_000_000) }
+        }
+    }
+
+    /// Answers one pending user-question call. Path selection depends on the
+    /// projection state: `continued` → unary `userQuestions/answer`;
+    /// `open` → live `$events/result` waterfall (only if this client holds the
+    /// live request), otherwise `UserQuestionSubmitError.noLiveRequest`.
+    ///
+    /// The answer always refreshes `activeUserQuestions` so the card disappears
+    /// (write-back), and `REPLY_QUEUED` is reported as `.queued` instead of an
+    /// error. Other errors are thrown to the UI (show NetworkErrorInterpreter).
+    @discardableResult
+    func submitUserQuestionAnswers(
+        callId: String,
+        answers: [UserQuestionAnswer]
+    ) async throws -> UserQuestionSubmitOutcome {
+        // Duplicate/concurrent guard (T10): reject a second submit for the same
+        // call while the first is in flight instead of sending twice.
+        guard userQuestionSubmitGate.begin(callId) else {
+            throw UserQuestionSubmitError.alreadySubmitting(callId)
+        }
+        defer { userQuestionSubmitGate.end(callId) }
+        let path = userQuestionSubmitPath(callId: callId)
+        switch path {
+        case .callNotFound:
+            throw UserQuestionSubmitError.callNotFound(callId)
+        case .noLiveRequest:
+            throw UserQuestionSubmitError.noLiveRequest
+        case .unsupportedState(let raw):
+            throw UserQuestionSubmitError.unsupportedState(raw)
+        case .unary, .live:
+            break
+        }
+        guard let link else { throw LinkError.notConnected }
+        switch path {
+        case .unary:
+            do {
+                let accepted = try await link.answerUserQuestions(
+                    sessionId: sessionId,
+                    callId: callId,
+                    answers: answers
+                )
+                let outcome = UserQuestionSubmitPlanner.outcome(accepted: accepted)
+                markUserQuestionAnsweredLocally(callId: callId)
+                await refreshUserQuestions(afterAnswering: callId)
+                return outcome
+            } catch {
+                if let outcome = UserQuestionSubmitPlanner.outcome(for: error) {
+                    markUserQuestionAnsweredLocally(callId: callId)
+                    await refreshUserQuestions(afterAnswering: callId)
+                    return outcome
+                }
+                throw error
+            }
+        case .live(let eventId):
+            try await link.answerUserQuestionsLive(eventId: eventId, answers: answers)
+            markUserQuestionAnsweredLocally(callId: callId)
+            await refreshUserQuestions(afterAnswering: callId)
+            return .answeredViaLiveEvents
+        case .callNotFound, .noLiveRequest, .unsupportedState:
+            // Validated above; kept for exhaustiveness.
+            throw UserQuestionSubmitError.callNotFound(callId)
+        }
+    }
+
+    /// Skips every question of one call (`selected: []`, protocol §3.7.2).
+    @discardableResult
+    func skipUserQuestion(callId: String) async throws -> UserQuestionSubmitOutcome {
+        guard let call = activeUserQuestions.first(where: { $0.callId == callId }) else {
+            throw UserQuestionSubmitError.callNotFound(callId)
+        }
+        return try await submitUserQuestionAnswers(
+            callId: callId,
+            answers: UserQuestionSubmitPlanner.skipAnswers(for: call)
+        )
+    }
+
+    /// T10: aborting the turn makes any still-pending live question of this
+    /// session unanswerable (the legacy blocking ask has no timeout, and the
+    /// Host may not send a `$events` cancel frame). Dismiss those cards locally;
+    /// a later cancel frame or projection refresh stays consistent because the
+    /// dismissed event ids are never shown again.
+    func dismissLiveUserQuestionsForAbortedTurn() {
+        guard !liveUserQuestionWaterfalls.isEmpty else { return }
+        dismissedLiveWaterfallEventIds.formUnion(liveUserQuestionWaterfalls.map(\.eventId))
+        liveUserQuestionWaterfalls = []
+        rebuildActiveUserQuestions()
+    }
+
+    /// Optimistic write-back: the answered call disappears immediately (from
+    /// both the projection half and the live half); the following
+    /// `session/list` / `$events` refresh corrects the truth.
+    func markUserQuestionAnsweredLocally(callId: String) {
+        // Suppress the call until the Host's projection stops listing it; this
+        // is what keeps a replayed stale snapshot / event rebuild from re-adding
+        // an already answered card (P0-1, P1-1).
+        locallyAnsweredCallIds.insert(callId)
+        projectionUserQuestions.removeAll { $0.callId == callId }
+        liveUserQuestionWaterfalls.removeAll { ($0.callId ?? $0.eventId) == callId }
+        rebuildActiveUserQuestions()
+    }
+
+    func toolCall(callId: String?) -> ToolCallItem? {
+        SessionRowBuilder.findToolCall(in: sections, callId: callId)
+    }
+
+    // MARK: - File changes (exact-fetch §3.9, meta.diffs fallback)
+
+    /// Merged view for one turn: exact-fetch summary when the Host still holds it,
+    /// otherwise the client-side meta.diffs aggregation.
+    func turnFileChanges(for section: TurnSection) -> TurnFileChanges? {
+        if let seq = section.fileChangeSeq, let summary = fileChangeSummaries[seq] {
+            return TurnFileChanges(
+                source: .exactFetch,
+                files: summary.files,
+                added: summary.added ?? summary.files.reduce(0) { $0 + ($1.added ?? 0) },
+                deleted: summary.deleted ?? summary.files.reduce(0) { $0 + ($1.deleted ?? 0) },
+                seq: seq
+            )
+        }
+        guard let fallback = section.fileChanges else { return nil }
+        return TurnFileChanges(
+            source: .metaDiffsFallback,
+            files: fallback.files.map { ChangesSummaryValue.File(path: $0, display: ($0 as NSString).lastPathComponent, added: nil, deleted: nil) },
+            added: fallback.additions,
+            deleted: fallback.deletions,
+            seq: section.fileChangeSeq
+        )
+    }
+
+    /// Requests exact-fetch summaries for turns whose workspace/changes event is
+    /// known; 404 (host restarted / session released) marks the turn for fallback.
+    private func requestFileChangeSummariesIfNeeded() {
+        guard let link else { return }
+        for section in sections {
+            guard let seq = section.fileChangeSeq else { continue }
+            if fileChangeSummaries[seq] != nil || fileChangeUnavailableSeqs.contains(seq) { continue }
+            if requestedFileChangeSeqs.contains(seq) { continue }
+            requestedFileChangeSeqs.insert(seq)
+            Task { [weak self] in
+                guard let self else { return }
+                do {
+                    let summary = try await link.changesSummary(sessionId: self.sessionId, seq: seq)
+                    self.fileChangeSummaries[seq] = summary
+                } catch {
+                    self.fileChangeUnavailableSeqs.insert(seq)
+                }
+            }
+        }
+    }
+
+    /// Loads `/api/changes.diff` for one file in a turn's change set.
+    func loadFileDiff(seq: Int, index: Int) async -> ChangesDiffValue? {
+        guard let link else { return nil }
+        do {
+            return try await link.changesDiff(sessionId: sessionId, seq: seq, index: index)
+        } catch {
+            actionErrorText = NetworkErrorInterpreter.message(for: error)
+            return nil
+        }
+    }
+}

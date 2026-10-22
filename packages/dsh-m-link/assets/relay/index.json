@@ -1,0 +1,16 @@
+{
+  "version": "0.1.0",
+  "generatedAt": "2026-10-21T07:56:08.083Z",
+  "binaries": {
+    "linux-amd64": {
+      "file": "linux-amd64/dshm-relay",
+      "sha256": "387f2d5c87cda496683b5112a9c1dd922e60a537c3c08e93f6f6026047272190",
+      "size": 7143586
+    },
+    "linux-arm64": {
+      "file": "linux-arm64/dshm-relay",
+      "sha256": "6f63543fba147cb4410f35b9294da6d5bf44673dd5b6216c0c1aaa477d524bf8",
+      "size": 6619298
+    }
+  }
+}
