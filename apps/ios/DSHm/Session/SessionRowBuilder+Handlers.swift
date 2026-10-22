@@ -7,7 +7,7 @@ extension SessionRowBuilder {
     static func handleUserMessage(
         event: SessionEvent,
         data: JSONValue?,
-        appendRow: (FlowContent, SessionEvent, String, Int?) -> Void
+        appendRow: (FlowContent, SessionEvent, String) -> Void
     ) {
         let source = data?["source"]
         let kind = source?["kind"]?.stringValue ?? "user"
@@ -23,7 +23,7 @@ extension SessionRowBuilder {
                 images: images,
                 time: event.time,
                 messageId: data?["id"]?.stringValue
-            )), event, "user", nil)
+            )), event, "user")
         case "agent-message":
             let summary = source?["summary"]?.stringValue
             appendRow(.relay(RelayCard(
@@ -31,19 +31,19 @@ extension SessionRowBuilder {
                 senderSessionId: source?["senderSessionId"]?.stringValue,
                 summary: summary,
                 images: images
-            )), event, "relay", nil)
+            )), event, "relay")
         case "subagent-settled":
             appendRow(.notice(NoticeCard(
                 title: "子代理结算",
                 text: source?["summary"]?.stringValue ?? text,
                 kind: kind
-            )), event, "notice-settled", nil)
+            )), event, "notice-settled")
         case "tool-jobs":
-            appendRow(.notice(NoticeCard(title: "后台任务", text: source?["summary"]?.stringValue ?? text, kind: kind)), event, "notice-jobs", nil)
+            appendRow(.notice(NoticeCard(title: "后台任务", text: source?["summary"]?.stringValue ?? text, kind: kind)), event, "notice-jobs")
         case "repeat-tool-reminder":
-            appendRow(.notice(NoticeCard(title: "提醒", text: text, kind: kind)), event, "notice-reminder", nil)
+            appendRow(.notice(NoticeCard(title: "提醒", text: text, kind: kind)), event, "notice-reminder")
         case "user-approval":
-            appendRow(.notice(NoticeCard(title: "审批回答", text: text, kind: kind)), event, "notice-approval", nil)
+            appendRow(.notice(NoticeCard(title: "审批回答", text: text, kind: kind)), event, "notice-approval")
         case "agent-instructions", "runtime-context", "skill-catalog", "time-context", "ptc-mode":
             return
         default:
@@ -54,7 +54,7 @@ extension SessionRowBuilder {
                 title: noticeTitle(kind: kind, form: form),
                 text: body,
                 kind: kind
-            )), event, "notice-\(kind)", nil)
+            )), event, "notice-\(kind)")
         }
     }
 
@@ -75,18 +75,18 @@ extension SessionRowBuilder {
         event: SessionEvent,
         data: JSONValue?,
         callIdsWithEvents: Set<String>,
-        appendRow: (FlowContent, SessionEvent, String, Int?) -> Void
+        appendRow: (FlowContent, SessionEvent, String) -> Void
     ) {
         let blocks = data?["message"]?["content"]?.arrayValue ?? []
         for (index, block) in blocks.enumerated() {
             switch block["type"]?.stringValue {
             case "reasoning":
                 if let text = block["text"]?.stringValue, !text.isEmpty {
-                    appendRow(.reasoning(text), event, "reasoning-\(index)", nil)
+                    appendRow(.reasoning(text), event, "reasoning-\(index)")
                 }
             case "text":
                 if let text = block["text"]?.stringValue, !text.isEmpty {
-                    appendRow(.text(text), event, "text-\(index)", nil)
+                    appendRow(.text(text), event, "text-\(index)")
                 }
             case "tool-call":
                 let callId = block["id"]?.stringValue ?? block["callId"]?.stringValue
@@ -111,7 +111,7 @@ extension SessionRowBuilder {
                     turn: data?["message"]?["turn"]?.int ?? 0,
                     step: nil
                 )
-                appendRow(.tool(item), event, "tool-block-\(index)", nil)
+                appendRow(.tool(item), event, "tool-block-\(index)")
             default:
                 continue
             }
@@ -122,16 +122,16 @@ extension SessionRowBuilder {
     /// (no matching tool/call) is returned to the caller as a row to append.
     ///
     /// The orphan path used to take an `appendRow` closure as well as
-    /// `sections: inout`. That closure captures and mutates the same `sections`
-    /// array the inout access is still active on, which the Swift runtime reports as
-    /// an exclusivity violation and aborts the process (SIGABRT) in Debug/test
+    /// `rows: inout`. That closure captures and mutates the same `rows` array the
+    /// inout access is still active on, which the Swift runtime reports as an
+    /// exclusivity violation and aborts the process (SIGABRT) in Debug/test
     /// builds: replaying paged history that contains a tool result whose call row is
     /// outside the loaded page crashed `SessionRowBuilder.build`. Returning the
     /// content instead keeps the inout access exclusive.
     static func handleToolResult(
         event: SessionEvent,
         data: JSONValue?,
-        sections: inout [TurnSection]
+        rows: inout [FlowRow]
     ) -> (content: FlowContent, suffix: String)? {
         let message = data?["message"]
         let content = message?["content"]
@@ -144,7 +144,7 @@ extension SessionRowBuilder {
         let toolCallId = message?["toolCallId"]?.stringValue
             ?? data?["toolCallId"]?.stringValue
             ?? data?["callId"]?.stringValue
-        if let toolCallId, attachToolResult(callId: toolCallId, result: result, sections: &sections) {
+        if let toolCallId, attachToolResult(callId: toolCallId, result: result, rows: &rows) {
             return nil
         }
         let item = ToolCallItem(
@@ -160,7 +160,7 @@ extension SessionRowBuilder {
         return (.tool(item), "tool-result")
     }
 
-    static func handlePTCDispatchStart(event: SessionEvent, data: JSONValue?, sections: inout [TurnSection]) {
+    static func handlePTCDispatchStart(event: SessionEvent, data: JSONValue?, rows: inout [FlowRow]) {
         let argumentsRaw = data?["arguments"]?.stringValue
         var arguments: [String: JSONValue] = [:]
         if let argumentsRaw,
@@ -180,10 +180,10 @@ extension SessionRowBuilder {
             step: nil
         )
         guard let parentCallId = data?["parentCallId"]?.stringValue else { return }
-        appendToolChild(parentCallId: parentCallId, child: child, sections: &sections)
+        appendToolChild(parentCallId: parentCallId, child: child, rows: &rows)
     }
 
-    static func handlePTCDispatch(event: SessionEvent, data: JSONValue?, sections: inout [TurnSection]) {
+    static func handlePTCDispatch(event: SessionEvent, data: JSONValue?, rows: inout [FlowRow]) {
         let message = data
         let result = ToolResultItem(
             isError: message?["isError"]?.boolValue ?? false,
@@ -192,49 +192,43 @@ extension SessionRowBuilder {
             images: MessageContent.images(from: message?["content"])
         )
         guard let subCallId = data?["subCallId"]?.stringValue else { return }
-        _ = attachToolResult(callId: subCallId, result: result, sections: &sections)
+        _ = attachToolResult(callId: subCallId, result: result, rows: &rows)
     }
 
-    static func updateApprovalRow(id: String?, outcome: String?, sections: inout [TurnSection]) {
+    static func updateApprovalRow(id: String?, outcome: String?, rows: inout [FlowRow]) {
         guard let id else { return }
-        for sectionIndex in sections.indices {
-            for rowIndex in sections[sectionIndex].rows.indices {
-                if case .approval(var item) = sections[sectionIndex].rows[rowIndex].content, item.id == id {
-                    item.outcome = outcome
-                    sections[sectionIndex].rows[rowIndex].content = .approval(item)
-                }
+        for rowIndex in rows.indices {
+            if case .approval(var item) = rows[rowIndex].content, item.id == id {
+                item.outcome = outcome
+                rows[rowIndex].content = .approval(item)
             }
         }
     }
 
-    static func updateJobRow(data: JSONValue?, sections: inout [TurnSection]) {
+    static func updateJobRow(data: JSONValue?, rows: inout [FlowRow]) {
         guard let jobId = data?["jobId"]?.stringValue else { return }
-        for sectionIndex in sections.indices {
-            for rowIndex in sections[sectionIndex].rows.indices {
-                if case .job(var item) = sections[sectionIndex].rows[rowIndex].content, item.jobId == jobId {
-                    item.status = data?["status"]?.stringValue ?? item.status
-                    item.finishedAt = data?["finishedAt"]?.intValue
-                    sections[sectionIndex].rows[rowIndex].content = .job(item)
-                }
+        for rowIndex in rows.indices {
+            if case .job(var item) = rows[rowIndex].content, item.jobId == jobId {
+                item.status = data?["status"]?.stringValue ?? item.status
+                item.finishedAt = data?["finishedAt"]?.intValue
+                rows[rowIndex].content = .job(item)
             }
         }
     }
 
     // MARK: - Row attachment helpers
 
-    static func attachToolResult(callId: String, result: ToolResultItem, sections: inout [TurnSection]) -> Bool {
-        for sectionIndex in sections.indices.reversed() {
-            for rowIndex in sections[sectionIndex].rows.indices.reversed() {
-                if case .tool(var item) = sections[sectionIndex].rows[rowIndex].content {
-                    if item.callId == callId {
-                        item.result = result
-                        sections[sectionIndex].rows[rowIndex].content = .tool(item)
-                        return true
-                    }
-                    if applyResultRecursively(callId: callId, result: result, item: &item) {
-                        sections[sectionIndex].rows[rowIndex].content = .tool(item)
-                        return true
-                    }
+    static func attachToolResult(callId: String, result: ToolResultItem, rows: inout [FlowRow]) -> Bool {
+        for rowIndex in rows.indices.reversed() {
+            if case .tool(var item) = rows[rowIndex].content {
+                if item.callId == callId {
+                    item.result = result
+                    rows[rowIndex].content = .tool(item)
+                    return true
+                }
+                if applyResultRecursively(callId: callId, result: result, item: &item) {
+                    rows[rowIndex].content = .tool(item)
+                    return true
                 }
             }
         }
@@ -254,14 +248,12 @@ extension SessionRowBuilder {
         return false
     }
 
-    static func appendToolChild(parentCallId: String, child: ToolCallItem, sections: inout [TurnSection]) {
-        for sectionIndex in sections.indices.reversed() {
-            for rowIndex in sections[sectionIndex].rows.indices.reversed() {
-                if case .tool(var item) = sections[sectionIndex].rows[rowIndex].content {
-                    if appendChildRecursively(parentCallId: parentCallId, child: child, item: &item) {
-                        sections[sectionIndex].rows[rowIndex].content = .tool(item)
-                        return
-                    }
+    static func appendToolChild(parentCallId: String, child: ToolCallItem, rows: inout [FlowRow]) {
+        for rowIndex in rows.indices.reversed() {
+            if case .tool(var item) = rows[rowIndex].content {
+                if appendChildRecursively(parentCallId: parentCallId, child: child, item: &item) {
+                    rows[rowIndex].content = .tool(item)
+                    return
                 }
             }
         }

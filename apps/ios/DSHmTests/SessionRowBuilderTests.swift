@@ -1,7 +1,24 @@
 import XCTest
 @testable import DSHm
 
+/// 平铺会话流契约（2026-10-23 用户拍板删除 turn UI 后）：
+///
+/// - `SessionRowBuilder.build(events:pendingUserEchoes:nowMs:)` 返回 `SessionFlow`：
+///   一条**连续**的 `rows` 消息流，跨 turn 不再分组（没有 turn 卡片 / 状态点 / 折叠）。
+/// - `turn/start` / `turn/end` **不产生任何行**，只推导两个值：
+///   - `isRunning`：窗口内最新一轮已 `turn/start` 未 `turn/end`；窗口从一轮中间开始时，
+///     最后一条 `turn/end` 之后又出现带 `data.turn` 的行事件也视为新一轮开始；
+///   - `latestFileChangeSeq` / `latestFileChanges`：只保留**最新一轮**的文件变更
+///     （`workspace/changes` 取最后一个 seq；工具结果 `meta.diffs` 客户端聚合回退）。
+/// - 乐观回显（`PendingUserEcho`）以「用户气泡 + 发送中…」两行追加在流尾，按
+///   `requestId` 幂等，由持久 `user/message` 的 `data.source.rpcId` 退休。
+///
+/// 旧的 `[TurnSection]` 分组、`TurnStatus` 与 `status(from:)` / `firstUserText(in:)`
+/// 已随 turn UI 一起删除；本文件只断言行顺序 / 行内容 / 行类型 / 工具结果挂载
+/// 以及上面三个派生值。
 final class SessionRowBuilderTests: XCTestCase {
+
+    // MARK: - Fixtures & helpers
 
     /// Builds a session/follow-like event log (fixtures are JSON strings so they
     /// exercise the same decoding path as the wire).
@@ -31,21 +48,42 @@ final class SessionRowBuilderTests: XCTestCase {
         ]
     }
 
-    func testTurnGroupingAndToolPairing() {
-        let sections = SessionRowBuilder.build(events: sampleEvents())
-        XCTAssertEqual(sections.count, 1)
-        let section = sections[0]
-        XCTAssertEqual(section.turn, 1)
-        XCTAssertEqual(section.status, .completed)
-        XCTAssertEqual(section.summary, "跑一下测试")
+    private func userTexts(in rows: [FlowRow]) -> [String] {
+        rows.compactMap { row -> String? in
+            if case .user(let bubble) = row.content { return bubble.text }
+            return nil
+        }
+    }
 
-        // user + reasoning + text + one tool row (assistant tool-call block is
-        // deduped by callId because a tool/call event exists)
+    private func sendingNotes(in rows: [FlowRow]) -> [String] {
+        rows.compactMap { row -> String? in
+            if case .systemNote(let text) = row.content { return text }
+            return nil
+        }
+    }
+
+    private func texts(in rows: [FlowRow]) -> [String] {
+        rows.compactMap { row -> String? in
+            if case .text(let text) = row.content { return text }
+            return nil
+        }
+    }
+
+    // MARK: - Flat rows (the whole session is one stream)
+
+    func testFlatRowsAndToolPairing() {
+        let flow = SessionRowBuilder.build(events: sampleEvents())
+        // turn/start (seq 1) and turn/end (seq 6) must not add rows: the stream is
+        // user + reasoning + text + one tool row (the assistant tool-call block is
+        // deduped by callId because a tool/call event exists).
+        XCTAssertEqual(flow.rows.map(\.seq), [2, 3, 3, 4])
+        XCTAssertEqual(userTexts(in: flow.rows), ["跑一下测试"])
+
         var userCount = 0
         var reasoningCount = 0
         var textCount = 0
         var toolCalls: [ToolCallItem] = []
-        for row in section.rows {
+        for row in flow.rows {
             switch row.content {
             case .user: userCount += 1
             case .reasoning: reasoningCount += 1
@@ -64,8 +102,9 @@ final class SessionRowBuilderTests: XCTestCase {
         XCTAssertEqual(call.result?.text, "✓ 14 tests passed")
         XCTAssertFalse(call.result?.isError ?? true)
 
-        let found = SessionRowBuilder.findToolCall(in: sections, callId: "call_1")
+        let found = SessionRowBuilder.findToolCall(in: flow.rows, callId: "call_1")
         XCTAssertEqual(found?.arguments["description"]?.stringValue, "run tests")
+        XCTAssertFalse(flow.isRunning, "the only turn has ended")
     }
 
     func testUserMessageSourceClassification() {
@@ -81,11 +120,10 @@ final class SessionRowBuilderTests: XCTestCase {
             {"content":[{"type":"text","text":"runtime context"}],"source":{"kind":"runtime-context","form":"snapshot"}}
             """)),
         ]
-        let sections = SessionRowBuilder.build(events: events)
-        let rows = sections.first?.rows ?? []
+        let flow = SessionRowBuilder.build(events: events)
         var relayCount = 0
         var noticeCount = 0
-        for row in rows {
+        for row in flow.rows {
             switch row.content {
             case .relay: relayCount += 1
             case .notice: noticeCount += 1
@@ -94,7 +132,7 @@ final class SessionRowBuilderTests: XCTestCase {
         }
         XCTAssertEqual(relayCount, 1)
         XCTAssertEqual(noticeCount, 1, "subagent-settled -> notice card")
-        XCTAssertEqual(rows.count, 2, "runtime-context must be hidden")
+        XCTAssertEqual(flow.rows.count, 2, "runtime-context must be hidden")
     }
 
     func testApprovalAskedDecidedPairing() {
@@ -105,23 +143,14 @@ final class SessionRowBuilderTests: XCTestCase {
             """)),
             TestJSON.event("approval/decided", seq: 3, data: TestJSON.value(#"{"id":"evt-1","outcome":"allowed-once"}"#)),
         ]
-        let sections = SessionRowBuilder.build(events: events)
-        let approvals = sections.first?.rows.compactMap { row -> ApprovalItem? in
+        let flow = SessionRowBuilder.build(events: events)
+        let approvals = flow.rows.compactMap { row -> ApprovalItem? in
             if case .approval(let item) = row.content { return item }
             return nil
-        } ?? []
+        }
         XCTAssertEqual(approvals.count, 1)
         XCTAssertEqual(approvals.first?.toolName, "bash")
         XCTAssertEqual(approvals.first?.outcome, "allowed-once")
-    }
-
-    func testTurnEndAbortedStatus() {
-        let events = [
-            TestJSON.event("turn/start", seq: 1, data: .object(["turn": .int(1)])),
-            TestJSON.event("turn/end", seq: 2, data: .object(["turn": .int(1), "reason": TestJSON.reason("aborted")])),
-        ]
-        let sections = SessionRowBuilder.build(events: events)
-        XCTAssertEqual(sections.first?.status, .aborted)
     }
 
     func testFileChangesAggregatedFromToolResultDiffs() {
@@ -137,10 +166,11 @@ final class SessionRowBuilderTests: XCTestCase {
              "meta":{"path":"a.ts","diffs":[{"path":"a.ts","oldText":"a","newText":"a\\nb"}]}}
             """)),
         ]
-        let sections = SessionRowBuilder.build(events: events)
-        let changes = try! XCTUnwrap(sections.first?.fileChanges)
+        let flow = SessionRowBuilder.build(events: events)
+        let changes = try! XCTUnwrap(flow.latestFileChanges)
         XCTAssertEqual(changes.files, ["a.ts"])
         XCTAssertGreaterThan(changes.additions, 0)
+        XCTAssertNil(flow.latestFileChangeSeq, "no workspace/changes event in this window")
     }
 
     func testWorkspaceChangesSeqIsCapturedForExactFetch() {
@@ -149,10 +179,10 @@ final class SessionRowBuilderTests: XCTestCase {
             TestJSON.event("workspace/changes", seq: 7, data: .object(["turn": .int(2)])),
             TestJSON.event("turn/end", seq: 9, data: .object(["turn": .int(2), "reason": TestJSON.reason("completed")])),
         ]
-        let sections = SessionRowBuilder.build(events: events)
-        XCTAssertEqual(sections.count, 1)
-        XCTAssertEqual(sections[0].fileChangeSeq, 7, "workspace/changes seq keys /api/changes.summary")
-        XCTAssertTrue(sections[0].rows.isEmpty, "workspace/changes stays hidden from the flow")
+        let flow = SessionRowBuilder.build(events: events)
+        XCTAssertEqual(flow.latestFileChangeSeq, 7, "workspace/changes seq keys /api/changes.summary")
+        XCTAssertTrue(flow.rows.isEmpty, "workspace/changes stays hidden from the flow")
+        XCTAssertFalse(flow.isRunning)
     }
 
     func testChangesSummaryAndDiffDecode() throws {
@@ -185,11 +215,11 @@ final class SessionRowBuilderTests: XCTestCase {
             {"jobId":"job-2","owner":"agent","kind":"bash","label":"vite dev","startedAt":3}
             """)),
         ]
-        let sections = SessionRowBuilder.build(events: events)
-        let jobRows = sections.first?.rows.compactMap { row -> JobItem? in
+        let flow = SessionRowBuilder.build(events: events)
+        let jobRows = flow.rows.compactMap { row -> JobItem? in
             if case .job(let job) = row.content { return job }
             return nil
-        } ?? []
+        }
         XCTAssertEqual(jobRows.count, 1, "tool-backed job events must not duplicate the step row")
         XCTAssertEqual(jobRows.first?.jobId, "job-2", "standalone background jobs still render")
     }
@@ -201,9 +231,9 @@ final class SessionRowBuilderTests: XCTestCase {
             TestJSON.event("compaction/prune", seq: 3),
             TestJSON.event("turn/start", seq: 4, data: .object(["turn": .int(1)])),
         ]
-        let sections = SessionRowBuilder.build(events: events)
-        XCTAssertEqual(sections.count, 1)
-        XCTAssertTrue(sections[0].rows.isEmpty)
+        let flow = SessionRowBuilder.build(events: events)
+        XCTAssertTrue(flow.rows.isEmpty)
+        XCTAssertTrue(flow.isRunning, "turn/start feeds isRunning even though it renders no row")
     }
 
     // MARK: - Optimistic user echo (steer / send-then-wait, round2 §3)
@@ -248,32 +278,20 @@ final class SessionRowBuilderTests: XCTestCase {
         """))
     }
 
-    private func userTexts(in sections: [TurnSection]) -> [String] {
-        sections.flatMap { $0.rows }.compactMap { row -> String? in
-            if case .user(let bubble) = row.content { return bubble.text }
-            return nil
-        }
-    }
-
-    private func sendingNotes(in sections: [TurnSection]) -> [String] {
-        sections.flatMap { $0.rows }.compactMap { row -> String? in
-            if case .systemNote(let text) = row.content { return text }
-            return nil
-        }
-    }
-
     func testPendingUserEchoPaintsImmediatelyAtEndOfRunningTurn() {
         let echo = steerEcho()
-        let sections = SessionRowBuilder.build(
+        let flow = SessionRowBuilder.build(
             events: runningTurnWithoutSteerEvent(),
             pendingUserEchoes: [echo],
             nowMs: echoNowMs
         )
-        XCTAssertEqual(sections.count, 1, "the pending prompt must not invent a second turn section")
-        XCTAssertEqual(sections[0].status, .running)
-        XCTAssertEqual(userTexts(in: sections), ["跑一遍全量测试", "插队：先别跑长命令"])
-        XCTAssertEqual(sendingNotes(in: sections), ["发送中…"])
-        let rows = sections[0].rows
+        // The pending prompt adds only its bubble + progress note to the flat flow:
+        // user(seq 2) + tool(seq 3) + the two echo rows.
+        XCTAssertEqual(flow.rows.count, 4, "the pending prompt must not invent extra rows")
+        XCTAssertTrue(flow.isRunning)
+        XCTAssertEqual(userTexts(in: flow.rows), ["跑一遍全量测试", "插队：先别跑长命令"])
+        XCTAssertEqual(sendingNotes(in: flow.rows), ["发送中…"])
+        let rows = flow.rows
         XCTAssertEqual(rows[rows.count - 2].id, "pending-\(echo.requestId)-user")
         XCTAssertEqual(rows[rows.count - 1].id, "pending-\(echo.requestId)-status")
         XCTAssertEqual(rows[rows.count - 2].seq, 4)
@@ -286,9 +304,9 @@ final class SessionRowBuilderTests: XCTestCase {
         let events = runningTurnWithoutSteerEvent() + [durableSteerEvent()]
         store.reconcile(events: events)
         XCTAssertTrue(store.isEmpty, "durable user/message carried source.rpcId === requestId")
-        let sections = SessionRowBuilder.build(events: events, pendingUserEchoes: store.echoes, nowMs: echoNowMs)
-        XCTAssertEqual(userTexts(in: sections), ["跑一遍全量测试", "插队：先别跑长命令"], "exactly one steer bubble, no duplicate")
-        XCTAssertTrue(sendingNotes(in: sections).isEmpty, "sending marker disappears when the echo retires")
+        let flow = SessionRowBuilder.build(events: events, pendingUserEchoes: store.echoes, nowMs: echoNowMs)
+        XCTAssertEqual(userTexts(in: flow.rows), ["跑一遍全量测试", "插队：先别跑长命令"], "exactly one steer bubble, no duplicate")
+        XCTAssertTrue(sendingNotes(in: flow.rows).isEmpty, "sending marker disappears when the echo retires")
         XCTAssertEqual(SessionRowBuilder.userMessageRpcId(of: events[events.count - 1]), "req-steer-1")
     }
 
@@ -301,10 +319,10 @@ final class SessionRowBuilderTests: XCTestCase {
             [SessionEvent](),
         ] {
             store.reconcile(events: events)
-            let sections = SessionRowBuilder.build(events: events, pendingUserEchoes: store.echoes, nowMs: echoNowMs)
+            let flow = SessionRowBuilder.build(events: events, pendingUserEchoes: store.echoes, nowMs: echoNowMs)
             XCTAssertEqual(store.count, 1)
-            XCTAssertEqual(userTexts(in: sections).last, "插队：先别跑长命令", "pending bubble still painted after rebuild")
-            XCTAssertEqual(sendingNotes(in: sections), ["发送中…"])
+            XCTAssertEqual(userTexts(in: flow.rows).last, "插队：先别跑长命令", "pending bubble still painted after rebuild")
+            XCTAssertEqual(sendingNotes(in: flow.rows), ["发送中…"])
         }
     }
 
@@ -313,13 +331,13 @@ final class SessionRowBuilderTests: XCTestCase {
         store.record(steerEcho())
         store.remove(requestId: "req-steer-1")
         XCTAssertTrue(store.isEmpty)
-        let sections = SessionRowBuilder.build(
+        let flow = SessionRowBuilder.build(
             events: runningTurnWithoutSteerEvent(),
             pendingUserEchoes: store.echoes,
             nowMs: echoNowMs
         )
-        XCTAssertEqual(userTexts(in: sections), ["跑一遍全量测试"], "failed steer leaves no ghost bubble")
-        XCTAssertTrue(sendingNotes(in: sections).isEmpty)
+        XCTAssertEqual(userTexts(in: flow.rows), ["跑一遍全量测试"], "failed steer leaves no ghost bubble")
+        XCTAssertTrue(sendingNotes(in: flow.rows).isEmpty)
     }
 
     func testDurableMessageWithoutRpcIdDoesNotRetireEcho() {
@@ -332,13 +350,14 @@ final class SessionRowBuilderTests: XCTestCase {
         XCTAssertEqual(store.count, 1, "only our own rpcId retires the echo (desktop messages have none)")
     }
 
-    func testPendingEchoOnEmptyJournalStartsRunningPlaceholderSection() {
-        let sections = SessionRowBuilder.build(events: [], pendingUserEchoes: [steerEcho()], nowMs: echoNowMs)
-        XCTAssertEqual(sections.count, 1)
-        XCTAssertEqual(sections[0].turn, 1)
-        XCTAssertEqual(sections[0].status, .running)
-        XCTAssertEqual(userTexts(in: sections), ["插队：先别跑长命令"])
-        XCTAssertEqual(sendingNotes(in: sections), ["发送中…"])
+    func testPendingEchoOnEmptyJournalPaintsFlatRows() {
+        let flow = SessionRowBuilder.build(events: [], pendingUserEchoes: [steerEcho()], nowMs: echoNowMs)
+        // No turn section is invented: the echo is two rows at the end of the
+        // otherwise empty stream, and no boundary event means "not running".
+        XCTAssertEqual(flow.rows.count, 2)
+        XCTAssertFalse(flow.isRunning, "a pending echo does not invent a running turn")
+        XCTAssertEqual(userTexts(in: flow.rows), ["插队：先别跑长命令"])
+        XCTAssertEqual(sendingNotes(in: flow.rows), ["发送中…"])
     }
 
     func testUnknownUserMessageSourceKindRendersNoticeInsteadOfBeingDropped() {
@@ -348,8 +367,8 @@ final class SessionRowBuilderTests: XCTestCase {
             {"content":[{"type":"text","text":"来自未知来源"}],"source":{"kind":"steer"}}
             """)),
         ]
-        let sections = SessionRowBuilder.build(events: events)
-        let notices = sections[0].rows.compactMap { row -> NoticeCard? in
+        let flow = SessionRowBuilder.build(events: events)
+        let notices = flow.rows.compactMap { row -> NoticeCard? in
             if case .notice(let card) = row.content { return card }
             return nil
         }
@@ -366,15 +385,15 @@ final class SessionRowBuilderTests: XCTestCase {
             pendingUserEchoes: [echo],
             nowMs: echoNowMs + timeout - 1
         )
-        XCTAssertEqual(sendingNotes(in: fresh), ["发送中…"], "still inside the timeout")
+        XCTAssertEqual(sendingNotes(in: fresh.rows), ["发送中…"], "still inside the timeout")
         let stale = SessionRowBuilder.build(
             events: runningTurnWithoutSteerEvent(),
             pendingUserEchoes: [echo],
             nowMs: echoNowMs + timeout
         )
-        XCTAssertTrue(sendingNotes(in: stale).isEmpty, "\"发送中…\" must never hang after the timeout")
+        XCTAssertTrue(sendingNotes(in: stale.rows).isEmpty, "\"发送中…\" must never hang after the timeout")
         XCTAssertEqual(
-            userTexts(in: stale).last,
+            userTexts(in: stale.rows).last,
             "插队：先别跑长命令",
             "the user's own bubble is kept until the durable event retires it"
         )
@@ -386,13 +405,13 @@ final class SessionRowBuilderTests: XCTestCase {
         let events = runningTurnWithoutSteerEvent() + [durableSteerEvent()]
         store.reconcile(events: events)
         XCTAssertTrue(store.isEmpty)
-        let sections = SessionRowBuilder.build(
+        let flow = SessionRowBuilder.build(
             events: events,
             pendingUserEchoes: store.echoes,
             nowMs: echoNowMs + SessionRowBuilder.PendingUserEchoStore.sendingIndicatorTimeoutMs * 10
         )
-        XCTAssertEqual(userTexts(in: sections), ["跑一遍全量测试", "插队：先别跑长命令"])
-        XCTAssertTrue(sendingNotes(in: sections).isEmpty)
+        XCTAssertEqual(userTexts(in: flow.rows), ["跑一遍全量测试", "插队：先别跑长命令"])
+        XCTAssertTrue(sendingNotes(in: flow.rows).isEmpty)
     }
 
     func testNextSendingIndicatorDeadlineIsEarliestEchoTimeout() {
@@ -423,15 +442,15 @@ final class SessionRowBuilderTests: XCTestCase {
         // The view model repaints the tail right after the RPC and again when the
         // "发送中…" marker expires; the same requestId must never paint twice.
         let echo = steerEcho()
-        var sections = SessionRowBuilder.build(events: runningTurnWithoutSteerEvent(), nowMs: echoNowMs)
+        var rows = SessionRowBuilder.build(events: runningTurnWithoutSteerEvent(), nowMs: echoNowMs).rows
         for _ in 0..<3 {
-            sections = SessionRowBuilder.appendingPendingEchoes([echo], to: sections, nowMs: echoNowMs)
+            rows = SessionRowBuilder.appendingPendingEchoes([echo], to: rows, nowMs: echoNowMs)
         }
-        XCTAssertEqual(userTexts(in: sections), ["跑一遍全量测试", "插队：先别跑长命令"])
-        XCTAssertEqual(sendingNotes(in: sections), ["发送中…"])
+        XCTAssertEqual(userTexts(in: rows), ["跑一遍全量测试", "插队：先别跑长命令"])
+        XCTAssertEqual(sendingNotes(in: rows), ["发送中…"])
         let refreshed = SessionRowBuilder.appendingPendingEchoes(
             [echo],
-            to: sections,
+            to: rows,
             nowMs: echoNowMs + SessionRowBuilder.PendingUserEchoStore.sendingIndicatorTimeoutMs
         )
         XCTAssertEqual(userTexts(in: refreshed), ["跑一遍全量测试", "插队：先别跑长命令"])
@@ -446,7 +465,7 @@ final class SessionRowBuilderTests: XCTestCase {
         XCTAssertEqual(store.echoes.first?.text, "新文本")
     }
 
-    // MARK: - Mid-turn window / turn-0 orphan (real-device regression 2026-10-22)
+    // MARK: - Mid-turn window (real-device regression 2026-10-22)
 
     /// Window shape taken from the real session log (session-daa07b5a…): the
     /// follow window starts at seq 3232 while `turn/start` for turn 8 is seq
@@ -472,28 +491,29 @@ final class SessionRowBuilderTests: XCTestCase {
         ]
     }
 
-    func testWindowStartingMidTurnPromotesOrphanToRealTurn() {
-        let sections = SessionRowBuilder.build(events: midTurnWindowEvents())
-        XCTAssertEqual(sections.count, 2, "no synthetic Turn 0 section for a window that starts mid-turn")
-        XCTAssertNil(sections.first(where: { $0.turn == 0 }), "the orphan must be promoted to its real turn")
-        let turn8 = sections[0]
-        XCTAssertEqual(turn8.turn, 8)
-        XCTAssertEqual(turn8.status, .completed)
-        XCTAssertEqual(userTexts(in: sections).first, "跑一遍真机回归", "the window's first rows belong to turn 8")
-        let noticeKinds = turn8.rows.compactMap { row -> String? in
+    func testWindowStartingMidTurnKeepsFlatRows() {
+        let flow = SessionRowBuilder.build(events: midTurnWindowEvents())
+        // Both turns share one continuous stream: the window tail that belongs to
+        // turn 8 and the turn-9 rows are just adjacent rows (no Turn 0 / headers).
+        XCTAssertEqual(flow.rows.map(\.seq), [3232, 3235, 3236, 3245])
+        XCTAssertEqual(userTexts(in: flow.rows).first, "跑一遍真机回归", "the window's first rows belong to turn 8")
+        let noticeKinds = flow.rows.compactMap { row -> String? in
             if case .notice(let notice) = row.content { return notice.kind }
             return nil
         }
         XCTAssertEqual(noticeKinds, ["subagent-settled"])
-        XCTAssertTrue(turn8.rows.contains { row in
+        XCTAssertTrue(flow.rows.contains { row in
             if case .text(let text) = row.content { return text == "收到，开始跑。" }
             return false
         })
-        XCTAssertEqual(sections[1].turn, 9)
-        XCTAssertEqual(sections[1].status, .completed)
+        XCTAssertTrue(flow.rows.contains { row in
+            if case .text(let text) = row.content { return text == "下一轮输出。" }
+            return false
+        })
+        XCTAssertFalse(flow.isRunning, "the newest turn (9) ended")
     }
 
-    func testPureNoticeWindowNeverRendersRunningOrphan() {
+    func testPureNoticeWindowIsNotRunning() {
         let events = [
             TestJSON.event("user/message", seq: 10, data: TestJSON.value("""
             {"content":[{"type":"text","text":"子代理结算摘要"}],"source":{"kind":"subagent-settled","summary":"子代理结算摘要"}}
@@ -505,16 +525,17 @@ final class SessionRowBuilderTests: XCTestCase {
             {"jobId":"job-1","kind":"bash","label":"xcodebuild","startedAt":1}
             """)),
         ]
-        let sections = SessionRowBuilder.build(events: events)
-        XCTAssertEqual(sections.count, 1)
-        XCTAssertEqual(sections[0].turn, 0)
-        XCTAssertEqual(sections[0].status, .completed, "an orphan window has no live turn to run")
-        XCTAssertFalse(sections[0].isRunning)
+        let flow = SessionRowBuilder.build(events: events)
+        // An orphan window (no turn/start) paints its rows, but no row carries a
+        // live turn, so the flow must not claim 运行中.
+        XCTAssertEqual(flow.rows.map(\.seq), [10, 11, 12])
+        XCTAssertNil(flow.latestFileChangeSeq)
+        XCTAssertFalse(flow.isRunning, "an orphan window has no live turn to run")
     }
 
     func testMidTurnWindowOfALiveTurnStaysRunning() {
-        // Same window shape, but the turn has not ended: promotion must keep the
-        // real turn header running (the closing guard only touches turn 0).
+        // Same window shape, but the turn has not ended and its rows carry
+        // `data.turn`: the flat flow still reports running.
         let events = [
             TestJSON.event("user/message", seq: 3232, data: TestJSON.value("""
             {"content":[{"type":"text","text":"跑一遍真机回归"}],"source":{"kind":"user"},"role":"user","id":"m1"}
@@ -523,23 +544,165 @@ final class SessionRowBuilderTests: XCTestCase {
             {"turn":8,"message":{"content":[{"type":"text","text":"正在跑。"}]}}
             """)),
         ]
-        let sections = SessionRowBuilder.build(events: events)
-        XCTAssertEqual(sections.count, 1)
-        XCTAssertEqual(sections[0].turn, 8)
-        XCTAssertTrue(sections[0].isRunning, "a live mid-turn window must keep the running header")
+        let flow = SessionRowBuilder.build(events: events)
+        XCTAssertEqual(flow.rows.count, 2)
+        XCTAssertTrue(flow.isRunning, "a live mid-turn window must keep the running indicator")
     }
 
-    func testTurnEndAlonePromotesOrphanToItsRealTurn() {
+    func testMidTurnWindowClosedByTurnEndStopsRunning() {
         let events = [
             TestJSON.event("user/message", seq: 3232, data: TestJSON.value("""
             {"content":[{"type":"text","text":"收尾消息"}],"source":{"kind":"user"},"role":"user","id":"m1"}
             """)),
             TestJSON.event("turn/end", seq: 3240, data: .object(["turn": .int(8), "reason": TestJSON.reason("completed")])),
         ]
-        let sections = SessionRowBuilder.build(events: events)
-        XCTAssertEqual(sections.count, 1)
-        XCTAssertEqual(sections[0].turn, 8, "turn/end closes the promoted window tail instead of leaving Turn 0")
-        XCTAssertEqual(sections[0].status, .completed)
-        XCTAssertEqual(userTexts(in: sections), ["收尾消息"])
+        let flow = SessionRowBuilder.build(events: events)
+        // turn/end renders nothing; it only closes the tail whose turn/start is
+        // outside the page, so the rows stay and running becomes false.
+        XCTAssertEqual(flow.rows.map(\.seq), [3232])
+        XCTAssertEqual(userTexts(in: flow.rows), ["收尾消息"])
+        XCTAssertFalse(flow.isRunning, "turn/end closes a window whose turn/start is outside the page")
+    }
+
+    // MARK: - Flat contract across turn boundaries (turn-UI removal 2026-10-23)
+
+    func testTurnBoundariesProduceNoRowsAcrossTurns() {
+        let events = [
+            TestJSON.event("turn/start", seq: 1, data: .object(["turn": .int(1)])),
+            TestJSON.event("user/message", seq: 2, data: TestJSON.value("""
+            {"content":[{"type":"text","text":"第一轮"}],"source":{"kind":"user"},"role":"user","id":"m1"}
+            """)),
+            TestJSON.event("assistant/message", seq: 3, data: TestJSON.value("""
+            {"turn":1,"message":{"content":[{"type":"text","text":"回复一"}]},"source":{"provider":"mock","model":"mock"}}
+            """)),
+            TestJSON.event("turn/end", seq: 4, data: .object(["turn": .int(1), "reason": TestJSON.reason("completed")])),
+            TestJSON.event("turn/start", seq: 5, data: .object(["turn": .int(2)])),
+            TestJSON.event("user/message", seq: 6, data: TestJSON.value("""
+            {"content":[{"type":"text","text":"第二轮"}],"source":{"kind":"user"},"role":"user","id":"m2"}
+            """)),
+            TestJSON.event("assistant/message", seq: 7, data: TestJSON.value("""
+            {"turn":2,"message":{"content":[{"type":"text","text":"回复二"}]},"source":{"provider":"mock","model":"mock"}}
+            """)),
+            TestJSON.event("turn/end", seq: 8, data: .object(["turn": .int(2), "reason": TestJSON.reason("completed")])),
+        ]
+        let flow = SessionRowBuilder.build(events: events)
+        XCTAssertEqual(
+            flow.rows.map(\.seq),
+            [2, 3, 6, 7],
+            "turn/start and turn/end add no rows; both turns share one continuous stream"
+        )
+        XCTAssertEqual(userTexts(in: flow.rows), ["第一轮", "第二轮"])
+        XCTAssertEqual(texts(in: flow.rows), ["回复一", "回复二"])
+        XCTAssertFalse(flow.isRunning)
+    }
+
+    // MARK: - isRunning derivation (boundaries only feed the indicator)
+
+    func testIsRunningBecomesTrueOnTurnStart() {
+        let flow = SessionRowBuilder.build(events: [
+            TestJSON.event("turn/start", seq: 1, data: .object(["turn": .int(1)])),
+        ])
+        XCTAssertTrue(flow.rows.isEmpty, "turn/start renders nothing")
+        XCTAssertTrue(flow.isRunning)
+    }
+
+    func testIsRunningBecomesFalseOnTurnEnd() {
+        let flow = SessionRowBuilder.build(events: [
+            TestJSON.event("turn/start", seq: 1, data: .object(["turn": .int(1)])),
+            TestJSON.event("turn/end", seq: 2, data: .object(["turn": .int(1), "reason": TestJSON.reason("completed")])),
+        ])
+        XCTAssertTrue(flow.rows.isEmpty)
+        XCTAssertFalse(flow.isRunning)
+    }
+
+    func testIsRunningIsFalseForWindowStartingMidTurn() {
+        // No turn/start and no turn/end inside the window, and no row event carries
+        // `data.turn`: the flow cannot know about a live turn, so it must not claim one.
+        let flow = SessionRowBuilder.build(events: [
+            TestJSON.event("user/message", seq: 3232, data: TestJSON.value("""
+            {"content":[{"type":"text","text":"窗口内消息"}],"source":{"kind":"user"},"role":"user","id":"m1"}
+            """)),
+        ])
+        XCTAssertEqual(userTexts(in: flow.rows), ["窗口内消息"])
+        XCTAssertFalse(flow.isRunning)
+    }
+
+    func testIsRunningTurnsTrueWhenRowAfterLastTurnEndCarriesNewerTurn() {
+        let events = [
+            TestJSON.event("turn/start", seq: 1, data: .object(["turn": .int(3)])),
+            TestJSON.event("turn/end", seq: 2, data: .object(["turn": .int(3), "reason": TestJSON.reason("completed")])),
+            TestJSON.event("assistant/message", seq: 3, data: TestJSON.value("""
+            {"turn":4,"message":{"content":[{"type":"text","text":"下一轮已经开始"}]},"source":{"provider":"mock","model":"mock"}}
+            """)),
+        ]
+        let flow = SessionRowBuilder.build(events: events)
+        XCTAssertEqual(texts(in: flow.rows), ["下一轮已经开始"])
+        XCTAssertTrue(flow.isRunning, "a turn-scoped row after the last turn/end means a new turn started")
+    }
+
+    // MARK: - Latest-turn file changes (only the newest turn counts)
+
+    func testLatestFileChangeSeqUsesLastWorkspaceChangesOfNewestTurn() {
+        let oldArgs = #"{"file_path":"old.ts"}"#
+        let newArgs = #"{"file_path":"new.ts"}"#
+        let oldCallJSON = """
+        {"callId":"call_old","name":"edit","arguments":\(TestJSON.quoted(oldArgs)),"turn":1,"step":1}
+        """
+        let newCallJSON = """
+        {"callId":"call_new","name":"edit","arguments":\(TestJSON.quoted(newArgs)),"turn":2,"step":1}
+        """
+        let events = [
+            TestJSON.event("turn/start", seq: 1, data: .object(["turn": .int(1)])),
+            TestJSON.event("workspace/changes", seq: 2, data: .object(["turn": .int(1)])),
+            TestJSON.event("tool/call", seq: 3, data: TestJSON.value(oldCallJSON)),
+            TestJSON.event("tool/result", seq: 4, data: TestJSON.value("""
+            {"name":"edit","message":{"content":[{"type":"text","text":"ok"}],"isError":false,"toolCallId":"call_old"},
+             "meta":{"path":"old.ts","diffs":[{"path":"old.ts","oldText":"x","newText":"x\\ny"}]}}
+            """)),
+            TestJSON.event("turn/end", seq: 5, data: .object(["turn": .int(1), "reason": TestJSON.reason("completed")])),
+            TestJSON.event("turn/start", seq: 6, data: .object(["turn": .int(2)])),
+            TestJSON.event("workspace/changes", seq: 7, data: .object(["turn": .int(2)])),
+            TestJSON.event("workspace/changes", seq: 8, data: .object(["turn": .int(2)])),
+            TestJSON.event("tool/call", seq: 9, data: TestJSON.value(newCallJSON)),
+            TestJSON.event("tool/result", seq: 10, data: TestJSON.value("""
+            {"name":"edit","message":{"content":[{"type":"text","text":"ok"}],"isError":false,"toolCallId":"call_new"},
+             "meta":{"path":"new.ts","diffs":[{"path":"new.ts","oldText":"x","newText":"x\\nz"}]}}
+            """)),
+            TestJSON.event("turn/end", seq: 11, data: .object(["turn": .int(2), "reason": TestJSON.reason("completed")])),
+        ]
+        let flow = SessionRowBuilder.build(events: events)
+        XCTAssertEqual(flow.latestFileChangeSeq, 8, "the last workspace/changes seq of the newest turn wins")
+        let changes = try! XCTUnwrap(flow.latestFileChanges)
+        XCTAssertEqual(changes.files, ["new.ts"], "the previous turn's diffs must not leak into the newest turn")
+        XCTAssertFalse(flow.isRunning)
+    }
+
+    func testNewTurnStartDropsPreviousWorkspaceChangesSeq() {
+        let events = [
+            TestJSON.event("turn/start", seq: 1, data: .object(["turn": .int(1)])),
+            TestJSON.event("workspace/changes", seq: 2, data: .object(["turn": .int(1)])),
+            TestJSON.event("turn/end", seq: 3, data: .object(["turn": .int(1), "reason": TestJSON.reason("completed")])),
+            TestJSON.event("turn/start", seq: 4, data: .object(["turn": .int(2)])),
+        ]
+        let flow = SessionRowBuilder.build(events: events)
+        XCTAssertNil(flow.latestFileChangeSeq, "a new turn makes the previous turn's seq stale")
+        XCTAssertTrue(flow.rows.isEmpty)
+        XCTAssertTrue(flow.isRunning)
+    }
+
+    /// The only turn boundary that still paints a row: a failed turn surfaces its
+    /// error in the flat flow (aborted turns stay silent — no status UI any more).
+    func testTurnEndErrorStillRendersErrorRow() {
+        let flow = SessionRowBuilder.build(events: [
+            TestJSON.event("turn/start", seq: 1, data: .object(["turn": .int(2)])),
+            TestJSON.event("turn/end", seq: 2, data: TestJSON.value(#"{"turn":2,"reason":{"kind":"error","error":{"message":"boom","code":"E42"}}}"#)),
+        ])
+        XCTAssertEqual(flow.rows.count, 1)
+        if case .error(let text) = flow.rows[0].content {
+            XCTAssertEqual(text, "E42: boom")
+        } else {
+            XCTFail("turn/end error must render an error row")
+        }
+        XCTAssertFalse(flow.isRunning)
     }
 }

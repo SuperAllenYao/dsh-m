@@ -540,7 +540,7 @@ struct SessionDetailView: View {
                 + ";hasMore=" + (viewModel.hasMoreOlder ? "1" : "0")
                 + ";loading=" + (viewModel.isLoadingOlder ? "1" : "0")
                 + ";error=" + error
-                + ";sections=" + String(viewModel.sections.count)
+                + ";rows=" + String(viewModel.rows.count)
                 + ";scrolled=" + (userHasScrolled ? "1" : "0")
                 + ";nearBottom=" + (isNearBottom ? "1" : "0")
                 + ";" + e2eScrollDebug
@@ -656,7 +656,7 @@ struct SessionDetailView: View {
         }
         if viewModel.isRunning {
             parts.append(L10n.t("运行中"))
-        } else if !viewModel.sections.isEmpty {
+        } else if !viewModel.rows.isEmpty {
             parts.append(L10n.t("空闲"))
         }
         return parts.joined(separator: " · ")
@@ -708,6 +708,12 @@ struct SessionDetailView: View {
 
     // MARK: - Message list
 
+    /// 平铺流的渲染分组：连续 reasoning/tool 行折成一个过程组，其余一行一组。
+    /// 与桌面端一致：分组是行级的，不按 turn 分块。
+    private var flowGroups: [FlowRowGroup] {
+        SessionFlowGrouping.groups(rows: viewModel.rows)
+    }
+
     private var messageList: some View {
         ScrollViewReader { proxy in
             ScrollView {
@@ -730,7 +736,7 @@ struct SessionDetailView: View {
                         }
                         .frame(maxWidth: .infinity)
                         .padding(.top, Theme.Spacing.xxl)
-                    } else if viewModel.sections.isEmpty, viewModel.streamErrorText == nil {
+                    } else if viewModel.rows.isEmpty, viewModel.streamErrorText == nil {
                         EmptyStateView(
                             icon: "text.bubble",
                             title: "还没有消息",
@@ -739,19 +745,27 @@ struct SessionDetailView: View {
                         .accessibilityIdentifier("session-empty")
                     }
 
-                    ForEach(viewModel.sections) { section in
-                        TurnSectionView(
-                            section: section,
-                            expandedTurnIDs: $viewModel.expandedTurnIDs,
+                    // 2026-10-23 用户拍板：删除 turn UI，与 DSH 桌面端一致——
+                    // 会话是一条平铺消息流，每行/每个折叠过程组都是 LazyVStack
+                    // 的直接子项（懒加载粒度从「整个 turn」降到「一行」）。
+                    ForEach(Array(flowGroups.enumerated()), id: \.element.id) { index, group in
+                        FlowRowGroupView(
+                            group: group,
                             sessionId: sessionId,
                             attachments: attachments,
                             pendingApprovalCallIds: Set(app.link.pendingApprovals.compactMap(\.callId)),
                             subagentLabels: viewModel.subagentLabels,
-                            onOpenTool: { present(.tool($0)) },
-                            fileChanges: viewModel.turnFileChanges(for: section),
-                            onOpenFileChanges: { present(.fileChanges($0)) }
+                            isNewestGroupRunning: viewModel.isRunning && index == flowGroups.count - 1,
+                            onOpenTool: { present(.tool($0)) }
                         )
                         .equatable()
+                    }
+
+                    // 最新一轮的文件变更（turn UI 删除后不再挂在 turn 收起区里）。
+                    if let fileChanges = viewModel.latestTurnFileChanges {
+                        FileChangesCard(changes: fileChanges) {
+                            present(.fileChanges(fileChanges))
+                        }
                     }
 
                     if !viewModel.liveAssistantText.isEmpty {
@@ -785,7 +799,7 @@ struct SessionDetailView: View {
             // 问题三 H1：内容已在首帧前就绪（缓存窗口/历史窗口）时，
             // `.defaultScrollAnchor(.bottom)` 之外的这次补锚是唯一机会——onChange 不会触发。
             .onAppear {
-                guard !viewModel.sections.isEmpty else { return }
+                guard !viewModel.rows.isEmpty else { return }
                 isNearBottom = true
                 scrollAnchorState.hardeningRemaining = 2
                 bottomSettleDeadline = ProcessInfo.processInfo.systemUptime + 5
@@ -810,7 +824,7 @@ struct SessionDetailView: View {
                 lastRecoveryUptime: $lastRecoveryUptime,
                 settleDeadline: bottomSettleDeadline,
                 userHasScrolled: userHasScrolled,
-                hasSections: !viewModel.sections.isEmpty,
+                hasSections: !viewModel.rows.isEmpty,
                 scrollToBottom: {
                     // 兜底重锚按「加固」处理：允许多拍让懒加载收敛。
                     scrollAnchorState.hardeningRemaining = max(scrollAnchorState.hardeningRemaining, 1)
@@ -824,7 +838,7 @@ struct SessionDetailView: View {
             .onChange(of: viewModel.isLoadingOlder) { _, loading in
                 if !loading { restorePrependAnchor(proxy: proxy) }
             }
-            .onChange(of: viewModel.sections) { _ in
+            .onChange(of: viewModel.rows) { _ in
                 // Keep the newest activity visible; LazyVStack off-screen rows are
                 // not in the accessibility tree, so this also keeps the live tool
                 // row reachable for UI automation.
@@ -866,7 +880,7 @@ struct SessionDetailView: View {
     ///   流式增长期间也持续贴底）；
     /// - 用户手动滚动过 → 只有当前还在底部附近才跟随（上滑读历史时绝不被拉回）。
     private func followNewContent(proxy: ScrollViewProxy) {
-        guard !viewModel.sections.isEmpty else { return }
+        guard !viewModel.rows.isEmpty else { return }
         if !userHasScrolled {
             isNearBottom = true
             scrollToBottom(proxy: proxy)
@@ -917,8 +931,8 @@ struct SessionDetailView: View {
                 // （真实布局落点，不用估算），再滚 LazyVStack 外的 bottomSentinel
                 // 对齐底部。顺序不能反：.bottom+未实体化目标会按估算落点，反而制造
                 // 上方空白（模拟器 A3 对照实测）。
-                if pass >= 1, !userHasScrolled, let lastSection = viewModel.sections.last?.id {
-                    proxy.scrollTo(lastSection, anchor: .top)
+                if pass >= 1, !userHasScrolled, let lastRow = viewModel.rows.last?.id {
+                    proxy.scrollTo(lastRow, anchor: .top)
                     await Task.yield()
                 }
                 proxy.scrollTo(Self.bottomAnchorID, anchor: .bottom)
@@ -957,8 +971,8 @@ struct SessionDetailView: View {
     private func triggerLoadOlder() {
         guard viewModel.hasMoreOlder, !viewModel.isLoadingOlder else { return }
         if pendingPrependAnchorID == nil {
-            pendingPrependAnchorID = viewModel.sections.first?.id
-            // 分页在同一个 turn 内也能前进：section id 不变时不能只靠它判断
+            pendingPrependAnchorID = viewModel.rows.first?.id
+            // 分页在同一个 turn 内也能前进：锚点 id 不变时不能只靠它判断
             // 「是否真的合并了新页」，log 的 oldest seq 才是可靠信号。
             pendingPrependOldestSeq = viewModel.oldestLoadedSeq
         }
@@ -1265,120 +1279,52 @@ struct SessionDetailView: View {
     }
 }
 
-/// One turn: collapsed summary when completed, expanded while running.
-struct TurnSectionView: View, Equatable {
-    var section: TurnSection
-    @Binding var expandedTurnIDs: Set<String>
+/// One render unit of the flat conversation stream (desktop parity: no turn cards):
+/// either a single row or a folded process group of consecutive reasoning/tool rows.
+/// Only the newest group may show the running step (the desktop paints a single
+/// tail indicator, never a per-turn status badge).
+struct FlowRowGroupView: View, Equatable {
+    var group: FlowRowGroup
     var sessionId: String
     @ObservedObject var attachments: AttachmentStore
     var pendingApprovalCallIds: Set<String> = []
     /// Child session id -> subagent catalog label (v5.4 collapsed relay cards).
     var subagentLabels: [String: String] = [:]
+    /// True only for the last group while the session runs.
+    var isNewestGroupRunning: Bool = false
     var onOpenTool: ((ToolCallItem) -> Void)? = nil
-    var fileChanges: TurnFileChanges? = nil
-    var onOpenFileChanges: ((TurnFileChanges) -> Void)? = nil
 
-    /// 只比较影响渲染的值：流式更新时未变化的 section 直接跳过 body 重算，
-    /// 避免整列表在每帧增量里重绘（真机滚动卡顿/频闪的另一半原因）。
-    /// 回调闭包与 attachments（@ObservedObject 自驱）不参与比较。
-    static func == (lhs: TurnSectionView, rhs: TurnSectionView) -> Bool {
-        lhs.section == rhs.section
+    /// 只比较影响渲染的值：流式更新时未变化的组直接跳过 body 重算
+    /// （真机滚动卡顿/频闪修复的一半原因）。回调闭包与 attachments 不参与比较。
+    static func == (lhs: FlowRowGroupView, rhs: FlowRowGroupView) -> Bool {
+        lhs.group == rhs.group
             && lhs.sessionId == rhs.sessionId
-            && lhs.isExpanded == rhs.isExpanded
             && lhs.pendingApprovalCallIds == rhs.pendingApprovalCallIds
             && lhs.subagentLabels == rhs.subagentLabels
-            && lhs.fileChanges == rhs.fileChanges
-    }
-    /// v5.3: consecutive reasoning + tool-call rows fold into one process group;
-    /// everything else is a normal row.
-    private var rowGroups: [FlowRowGroup] {
-        SessionFlowGrouping.groups(rows: section.rows)
-    }
-
-    private var isExpanded: Bool {
-        section.isRunning || expandedTurnIDs.contains(section.id)
-    }
-
-    private var statusColor: Color {
-        switch section.status {
-        case .running: return Theme.Palette.accent
-        case .completed: return Theme.Palette.textTertiary
-        case .aborted, .interrupted: return Theme.Palette.warning
-        case .error: return Theme.Palette.danger
-        }
+            && lhs.isNewestGroupRunning == rhs.isNewestGroupRunning
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: Theme.Spacing.s) {
-            Button {
-                guard !section.isRunning else { return }
-                withAnimation(Theme.Motion.quick) {
-                    if isExpanded {
-                        expandedTurnIDs.remove(section.id)
-                    } else {
-                        expandedTurnIDs.insert(section.id)
-                    }
-                }
-            } label: {
-                HStack(spacing: Theme.Spacing.xs) {
-                    Text("Turn \(section.turn)")
-                        .font(Theme.Typography.captionMedium)
-                        .foregroundStyle(Theme.Palette.textSecondary)
-                    Text(section.shortSummary)
-                        .font(Theme.Typography.caption)
-                        .foregroundStyle(Theme.Palette.textTertiary)
-                        .lineLimit(1)
-                    Spacer(minLength: Theme.Spacing.xs)
-                    StatusDot(color: statusColor, size: 5, pulsing: section.isRunning)
-                    Text(section.status.label)
-                        .font(Theme.Typography.label)
-                        .foregroundStyle(statusColor)
-                        .accessibilityIdentifier("turn-status-\(section.turn)")
-                    Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
-                        .font(.system(size: 9, weight: .semibold))
-                        .foregroundStyle(Theme.Palette.textTertiary)
-                }
-                .padding(Theme.Spacing.s)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .background(Theme.Palette.surface, in: RoundedRectangle(cornerRadius: Theme.Radius.lg, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: Theme.Radius.lg, style: .continuous)
-                    .strokeBorder(section.isRunning ? Theme.Palette.accentBorder : Theme.Palette.border, lineWidth: 1)
+        switch group {
+        case .single(let row):
+            FlowRowView(
+                row: row,
+                sessionId: sessionId,
+                attachments: attachments,
+                subagentLabels: subagentLabels,
+                onOpenTool: onOpenTool
             )
-            .accessibilityIdentifier("turn-header-\(section.turn)")
-
-            if isExpanded {
-                VStack(alignment: .leading, spacing: Theme.Spacing.xs) {
-                    ForEach(rowGroups) { group in
-                        switch group {
-                        case .single(let row):
-                            FlowRowView(
-                                row: row,
-                                sessionId: sessionId,
-                                attachments: attachments,
-                                subagentLabels: subagentLabels,
-                                onOpenTool: onOpenTool
-                            )
-                        case .process(let steps):
-                            ProcessGroupView(
-                                steps: steps,
-                                isRunning: section.isRunning,
-                                sessionId: sessionId,
-                                attachments: attachments,
-                                pendingApprovalCallIds: pendingApprovalCallIds,
-                                onOpenTool: onOpenTool
-                            )
-                        }
-                    }
-                    if let fileChanges {
-                        FileChangesCard(changes: fileChanges) { onOpenFileChanges?(fileChanges) }
-                    }
-                }
-                .padding(.leading, Theme.Spacing.xxs)
-            }
+            .accessibilityIdentifier("flow-row")
+        case .process(let steps):
+            ProcessGroupView(
+                steps: steps,
+                isRunning: isNewestGroupRunning,
+                sessionId: sessionId,
+                attachments: attachments,
+                pendingApprovalCallIds: pendingApprovalCallIds,
+                onOpenTool: onOpenTool
+            )
+            .accessibilityIdentifier("process-group")
         }
     }
 }

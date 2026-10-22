@@ -926,22 +926,43 @@ final class SessionPaginationTests: XCTestCase {
         XCTAssertLessThan(try XCTUnwrap(viewModel.oldestLoadedSeq), oldestBefore)
     }
 
-    /// 2026-10-22 真机 A5：页可能合并进一个**已存在的、已完成的 turn**（同 turn 内继续
-    /// 往前翻）。那种 turn 的 section 默认折叠，用户下拉后只看到原来的 header，看起来
-    /// 「没刷出更早消息」。合并成功后最老 section 必须自动展开，让新行立刻上屏。
+    /// 2026-10-22 真机 A5（原「展开最老 turn」）：turn UI/折叠已删除，下拉加载的
+    /// 更早历史不再需要「展开」动作——合并成功后新行必须直接出现在平铺流的头部，
+    /// 用户立刻看到刚拉下来的消息（oldest 前进 + rows 增长 + 原有行不乱序/不重复）。
     @MainActor
-    func testOlderPageMergeExpandsNewlyLoadedOldestTurn() async throws {
+    func testOlderPageMergePrependsRowsAndAdvancesOldest() async throws {
         let host = FixtureSessionHost(events: fixtureEvents())
         let viewModel = makeViewModel(host: host, store: makeStore(), firstWindow: 16)
-        let firstBefore = viewModel.sections.first?.id
+        // 首帧 rows rebuild 是 40ms debounce：先等它落地，才有稳定的基线。
+        await waitUntil { !viewModel.rows.isEmpty }
+        let oldestBefore = try XCTUnwrap(viewModel.oldestLoadedSeq)
+        let rowsBefore = viewModel.rows
+        let firstRowSeqBefore = try XCTUnwrap(rowsBefore.first?.seq)
+
         viewModel.olderPageLoader = hostLoader(host: host)
         await viewModel.loadOlderPageNowForTesting()
         // rows rebuild is debounced (~40ms) — the view-driven path lands it async.
-        await waitUntil { viewModel.sections.first?.id != firstBefore }
-        let oldestSection = try XCTUnwrap(viewModel.sections.first)
-        XCTAssertTrue(
-            viewModel.expandedTurnIDs.contains(oldestSection.id),
-            "the newly loaded oldest turn must be expanded so the pulled-in rows are visible on screen"
+        await waitUntil { viewModel.rows.count > rowsBefore.count }
+
+        XCTAssertLessThan(
+            try XCTUnwrap(viewModel.oldestLoadedSeq),
+            oldestBefore,
+            "前置加载后窗口最老 seq 必须前进"
+        )
+        XCTAssertGreaterThan(
+            viewModel.rows.count,
+            rowsBefore.count,
+            "更早的历史必须立即变成可渲染行（折叠已不存在，无需展开动作）"
+        )
+        XCTAssertLessThan(
+            try XCTUnwrap(viewModel.rows.first?.seq),
+            firstRowSeqBefore,
+            "前置页的行必须出现在平铺流头部"
+        )
+        XCTAssertEqual(
+            viewModel.rows.suffix(rowsBefore.count).map(\.seq),
+            rowsBefore.map(\.seq),
+            "前置加载只向前追加更早的行，不得打乱/重复原窗口的行"
         )
     }
 }

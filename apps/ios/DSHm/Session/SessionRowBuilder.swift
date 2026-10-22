@@ -1,9 +1,13 @@
 import Foundation
 
-/// Builds the conversation flow (turn -> rows) from a session event log.
+/// Builds the conversation flow (one flat stream of rows) from a session event log.
 ///
 /// Data-driven per ui-baseline: every row maps to an event / field; internal
 /// events listed in the baseline hidden list are skipped here.
+///
+/// 2026-10-23 用户拍板：App 端删除 turn UI，与 DSH 桌面端一致——会话就是一条
+/// 平铺的消息流。`turn/start`/`turn/end` 只用于推导运行状态与「最近一轮」的文件
+/// 变更，不再产生任何区块。
 enum SessionRowBuilder {
 
     // MARK: - Hidden event types (ui-baseline §3 hidden list)
@@ -164,11 +168,19 @@ enum SessionRowBuilder {
 
     // MARK: - Build
 
+    /// Flattens the event log into one continuous row stream.
+    ///
+    /// Turn boundaries only feed two derived values:
+    /// - `isRunning`: the newest turn of the loaded window started but has not ended
+    ///   (a window that starts mid-turn has no `turn/start`, so turn-scoped rows
+    ///   after the last `turn/end` keep the indicator truthful — and an ended
+    ///   session can never claim "运行中" any more);
+    /// - `latestFileChangeSeq` / `latestFileChanges`: the newest turn's file changes.
     static func build(
         events: [SessionEvent],
         pendingUserEchoes: [PendingUserEcho] = [],
         nowMs: Int64 = Int64(Date().timeIntervalSince1970 * 1000)
-    ) -> [TurnSection] {
+    ) -> SessionFlow {
         let sorted = events.sorted { $0.seq < $1.seq }
         var callIdsWithEvents = Set<String>()
         for event in sorted {
@@ -180,218 +192,145 @@ enum SessionRowBuilder {
             }
         }
 
-        var sections: [TurnSection] = []
-        var currentIndex: Int?
+        var rows: [FlowRow] = []
+        // 最新一轮是否仍在运行（只影响「运行中」指示，不再有 turn 区块）。
+        var running = false
+        var lastEndedTurn = 0
+        var newestTurnStarted = false
+        var newestTurnRowStart = 0
+        var latestFileChangeSeq: Int?
 
-        func ensureSection(turn: Int, time: Int64?) -> Int {
-            if let currentIndex, sections[currentIndex].turn == turn { return currentIndex }
-            if let existing = sections.firstIndex(where: { $0.turn == turn }) {
-                currentIndex = existing
-                return existing
-            }
-            sections.append(TurnSection(
-                turn: turn,
-                status: .running,
-                summary: nil,
-                rows: [],
-                stepCount: 0,
-                startedAt: time,
-                endedAt: nil,
-                fileChanges: nil,
-                fileChangeSeq: nil
-            ))
-            currentIndex = sections.count - 1
-            return sections.count - 1
-        }
-
-        /// Promote the turn-0 orphan in place once an event names its real turn.
-        ///
-        /// A follow window can start mid-turn (its `turn/start` is outside the
-        /// window), so the first row-producing events — `user/message` and other
-        /// notices carry no `data.turn` — open a section through
-        /// `activeIndex(for:)` with turn 0. Without promotion that section stays
-        /// "Turn 0 运行中" forever and the real `turn/end` can never close it
-        /// (real-device regression 2026-10-22, oldest=3232 / turn/start(8)=3225).
-        /// - Returns: the section index that now owns `turn`.
-        func promoteOrphan(at index: Int, to turn: Int) -> Int {
-            if let existing = sections.firstIndex(where: { $0.turn == turn }) {
-                // The orphan rows precede this section's rows in seq order, so
-                // merge them in front, then drop the orphan.
-                sections[existing].rows.insert(contentsOf: sections[index].rows, at: 0)
-                if sections[existing].startedAt == nil {
-                    sections[existing].startedAt = sections[index].startedAt
-                }
-                sections.remove(at: index)
-                return existing > index ? existing - 1 : existing
-            }
-            sections[index].turn = turn
-            return index
-        }
-
-        func activeIndex(for event: SessionEvent) -> Int {
-            if let index = currentIndex {
-                // Mid-turn window: the orphan gets its real turn as soon as an
-                // event carries one (`assistant/message`/`tool/call` do,
-                // `user/message` does not). Rows and order are preserved.
-                if sections[index].turn == 0,
-                   let turn = event.data?["turn"]?.int,
-                   turn > 0 {
-                    let promoted = promoteOrphan(at: index, to: turn)
-                    currentIndex = promoted
-                    return promoted
-                }
-                return index
-            }
-            let turn = event.data?["turn"]?.int ?? 0
-            return ensureSection(turn: turn, time: event.time)
-        }
-
-        func appendRow(_ content: FlowContent, event: SessionEvent, suffix: String, section explicitIndex: Int? = nil) {
-            let index = explicitIndex ?? activeIndex(for: event)
-            let row = FlowRow(id: "\(event.seq)-\(suffix)", seq: event.seq, content: content)
-            sections[index].rows.append(row)
+        func appendRow(_ content: FlowContent, event: SessionEvent, suffix: String) {
+            rows.append(FlowRow(id: "\(event.seq)-\(suffix)", seq: event.seq, content: content))
         }
 
         for event in sorted {
             // workspace/changes carries only {turn}; its seq is the key for the
-            // exact-fetch summary/diff routes (§3.9). Keep the seq per turn.
+            // exact-fetch summary/diff routes (§3.9). Only the newest turn's card
+            // survives the turn-UI removal, so keep the last one.
             if event.type == "workspace/changes" {
-                if let currentIndex {
-                    sections[currentIndex].fileChangeSeq = event.seq
-                } else if let turn = event.data?["turn"]?.int,
-                          let index = sections.firstIndex(where: { $0.turn == turn }) {
-                    sections[index].fileChangeSeq = event.seq
-                }
+                latestFileChangeSeq = event.seq
                 continue
             }
             guard !hiddenEventTypes.contains(event.type) else { continue }
             let data = event.data
             switch event.type {
             case "turn/start":
-                let turn = data?["turn"]?.int ?? ((sections.last?.turn ?? 0) + 1)
-                let index = ensureSection(turn: turn, time: event.time)
-                sections[index].status = .running
+                running = true
+                newestTurnStarted = true
+                newestTurnRowStart = rows.count
+                // 新一轮开始时上一轮的文件变更让位。
+                latestFileChangeSeq = nil
             case "turn/end":
-                let turn = data?["turn"]?.int ?? (sections.last?.turn ?? 0)
-                // Mid-turn window whose tail has no turn-bearing row event yet:
-                // this `turn/end` is the first event that names the turn, so
-                // close the promoted orphan as that turn instead of leaving
-                // "Turn 0" behind.
-                if turn > 0,
-                   !sections.contains(where: { $0.turn == turn }),
-                   let orphan = sections.firstIndex(where: { $0.turn == 0 }) {
-                    currentIndex = promoteOrphan(at: orphan, to: turn)
+                running = false
+                if let turn = data?["turn"]?.int, turn > lastEndedTurn {
+                    lastEndedTurn = turn
                 }
-                if let index = sections.firstIndex(where: { $0.turn == turn }) {
-                    let reason = data?["reason"]
-                    sections[index].status = status(from: reason)
-                    sections[index].endedAt = event.time
-                    if case .error = sections[index].status, let error = reason?["error"] {
-                        let message = error["message"]?.stringValue ?? "未知错误"
-                        let code = error["code"]?.stringValue
-                        appendRow(.error(code.map { "\($0): \(message)" } ?? message), event: event, suffix: "turn-end-error", section: index)
-                    }
-                }
-            case "user/message":
-                handleUserMessage(event: event, data: data, appendRow: appendRow)
-            case "assistant/message":
-                handleAssistantMessage(event: event, data: data, callIdsWithEvents: callIdsWithEvents, appendRow: appendRow)
-            case "tool/call":
-                let item = toolCall(from: data, event: event)
-                appendRow(.tool(item), event: event, suffix: "tool-\(item.callId ?? "seq-\(event.seq)")")
-            case "tool/result":
-                // Orphan results are appended here (not inside the handler) so the
-                // handler's inout `sections` access never overlaps the closure's
-                // mutation of the same array (Swift exclusivity abort).
-                if let orphan = handleToolResult(event: event, data: data, sections: &sections) {
-                    appendRow(orphan.content, event: event, suffix: orphan.suffix)
-                }
-            case "tool/ptc-dispatch-start":
-                handlePTCDispatchStart(event: event, data: data, sections: &sections)
-            case "tool/ptc-dispatch":
-                handlePTCDispatch(event: event, data: data, sections: &sections)
-            case "approval/asked":
-                let id = data?["id"]?.stringValue ?? "approval-\(event.seq)"
-                appendRow(.approval(ApprovalItem(
-                    id: id,
-                    toolName: data?["toolName"]?.stringValue,
-                    reason: data?["reason"]?.stringValue,
-                    outcome: nil
-                )), event: event, suffix: "approval")
-            case "approval/decided":
-                let id = data?["id"]?.stringValue
-                let outcome = data?["outcome"]?.stringValue
-                updateApprovalRow(id: id, outcome: outcome, sections: &sections)
-            case "todo/write":
-                let todos = (data?["todos"]?.arrayValue ?? []).compactMap { item -> TodoItem? in
-                    guard let content = item["content"]?.stringValue else { return nil }
-                    return TodoItem(content: content, status: item["status"]?.stringValue ?? "pending")
-                }
-                if !todos.isEmpty {
-                    appendRow(.plan(todos: todos, status: nil), event: event, suffix: "todos")
-                }
-            case "goal/change":
-                if let goal = data?["goal"] {
-                    appendRow(.goal(objective: goal["objective"]?.stringValue ?? "", phase: goal["phase"]?.stringValue), event: event, suffix: "goal")
-                }
-            case "deliverables/presented":
-                let files = (data?["files"]?.arrayValue ?? []).compactMap { item -> PresentedFile? in
-                    guard let path = item["path"]?.stringValue else { return nil }
-                    return PresentedFile(path: path, description: item["description"]?.stringValue)
-                }
-                if !files.isEmpty {
-                    appendRow(.deliverable(files: files), event: event, suffix: "deliverables")
-                }
-            case "job/registered":
-                // v5.3 "one row per step": tool-backed jobs are telemetry for a
-                // tool row that is already rendered (and whose result lives in
-                // the 05 detail sheet) — do not duplicate them in the main flow.
-                if data?["toolCall"] != nil { continue }
-                let job = JobItem(
-                    jobId: data?["jobId"]?.stringValue ?? "job-\(event.seq)",
-                    kind: data?["kind"]?.stringValue ?? "job",
-                    label: data?["label"]?.stringValue ?? "后台任务",
-                    status: "running",
-                    startedAt: data?["startedAt"]?.intValue,
-                    finishedAt: nil
-                )
-                appendRow(.job(job), event: event, suffix: "job-start")
-            case "job/settled":
-                if data?["toolCall"] != nil { continue }
-                updateJobRow(data: data, sections: &sections)
-            case "command/run":
-                appendRow(.command(data?["name"]?.stringValue ?? "命令"), event: event, suffix: "command")
-            case "command/done":
-                if let text = data?["text"]?.stringValue, !text.isEmpty {
-                    appendRow(.notice(NoticeCard(title: "命令结果", text: text, kind: "command-done")), event: event, suffix: "command-done")
+                if data?["reason"]?["kind"]?.stringValue == "error",
+                   let error = data?["reason"]?["error"] {
+                    let message = error["message"]?.stringValue ?? "未知错误"
+                    let code = error["code"]?.stringValue
+                    appendRow(.error(code.map { "\($0): \(message)" } ?? message), event: event, suffix: "turn-end-error")
                 }
             default:
-                continue
+                // 窗口可能从一轮中间开始（其 turn/start 在窗口外）：最后一条
+                // turn/end 之后又出现带 turn 的行事件，等价于新一轮已开始。
+                if !running, let turn = data?["turn"]?.int, turn > lastEndedTurn {
+                    running = true
+                }
+                switch event.type {
+                case "user/message":
+                    handleUserMessage(event: event, data: data, appendRow: appendRow)
+                case "assistant/message":
+                    handleAssistantMessage(event: event, data: data, callIdsWithEvents: callIdsWithEvents, appendRow: appendRow)
+                case "tool/call":
+                    let item = toolCall(from: data, event: event)
+                    appendRow(.tool(item), event: event, suffix: "tool-\(item.callId ?? "seq-\(event.seq)")")
+                case "tool/result":
+                    // Orphan results are appended here (not inside the handler) so the
+                    // handler's inout `rows` access never overlaps the closure's
+                    // mutation of the same array (Swift exclusivity abort).
+                    if let orphan = handleToolResult(event: event, data: data, rows: &rows) {
+                        appendRow(orphan.content, event: event, suffix: orphan.suffix)
+                    }
+                case "tool/ptc-dispatch-start":
+                    handlePTCDispatchStart(event: event, data: data, rows: &rows)
+                case "tool/ptc-dispatch":
+                    handlePTCDispatch(event: event, data: data, rows: &rows)
+                case "approval/asked":
+                    let id = data?["id"]?.stringValue ?? "approval-\(event.seq)"
+                    appendRow(.approval(ApprovalItem(
+                        id: id,
+                        toolName: data?["toolName"]?.stringValue,
+                        reason: data?["reason"]?.stringValue,
+                        outcome: nil
+                    )), event: event, suffix: "approval")
+                case "approval/decided":
+                    updateApprovalRow(id: data?["id"]?.stringValue, outcome: data?["outcome"]?.stringValue, rows: &rows)
+                case "todo/write":
+                    let todos = (data?["todos"]?.arrayValue ?? []).compactMap { item -> TodoItem? in
+                        guard let content = item["content"]?.stringValue else { return nil }
+                        return TodoItem(content: content, status: item["status"]?.stringValue ?? "pending")
+                    }
+                    if !todos.isEmpty {
+                        appendRow(.plan(todos: todos, status: nil), event: event, suffix: "todos")
+                    }
+                case "goal/change":
+                    if let goal = data?["goal"] {
+                        appendRow(.goal(objective: goal["objective"]?.stringValue ?? "", phase: goal["phase"]?.stringValue), event: event, suffix: "goal")
+                    }
+                case "deliverables/presented":
+                    let files = (data?["files"]?.arrayValue ?? []).compactMap { item -> PresentedFile? in
+                        guard let path = item["path"]?.stringValue else { return nil }
+                        return PresentedFile(path: path, description: item["description"]?.stringValue)
+                    }
+                    if !files.isEmpty {
+                        appendRow(.deliverable(files: files), event: event, suffix: "deliverables")
+                    }
+                case "job/registered":
+                    // v5.3 "one row per step": tool-backed jobs are telemetry for a
+                    // tool row that is already rendered (and whose result lives in
+                    // the 05 detail sheet) — do not duplicate them in the main flow.
+                    if data?["toolCall"] != nil { continue }
+                    let job = JobItem(
+                        jobId: data?["jobId"]?.stringValue ?? "job-\(event.seq)",
+                        kind: data?["kind"]?.stringValue ?? "job",
+                        label: data?["label"]?.stringValue ?? "后台任务",
+                        status: "running",
+                        startedAt: data?["startedAt"]?.intValue,
+                        finishedAt: nil
+                    )
+                    appendRow(.job(job), event: event, suffix: "job-start")
+                case "job/settled":
+                    if data?["toolCall"] != nil { continue }
+                    updateJobRow(data: data, rows: &rows)
+                case "command/run":
+                    appendRow(.command(data?["name"]?.stringValue ?? "命令"), event: event, suffix: "command")
+                case "command/done":
+                    if let text = data?["text"]?.stringValue, !text.isEmpty {
+                        appendRow(.notice(NoticeCard(title: "命令结果", text: text, kind: "command-done")), event: event, suffix: "command-done")
+                    }
+                default:
+                    continue
+                }
             }
-        }
-
-        // Closing guard: a window that starts mid-turn may never see the
-        // `turn/start`/`turn/end` owning its first rows (pagination window,
-        // restored cache hole). Such a detached section must never render as
-        // "运行中" — an ended session showed a permanent "Turn 0 运行中" card.
-        sections.removeAll { $0.turn == 0 && $0.rows.isEmpty }
-        for index in sections.indices where sections[index].turn == 0 {
-            sections[index].status = .completed
         }
 
         // Optimistic echo: painted last, so a prompt the user just sent stays at
         // the end of the flow until its durable user/message retires it.
-        sections = appendingPendingEchoes(pendingUserEchoes, to: sections, nowMs: nowMs)
+        rows = appendingPendingEchoes(pendingUserEchoes, to: rows, nowMs: nowMs)
 
-        // Aggregate file changes per turn from tool/result.meta.diffs
-        // (workspace/changes carries only {turn}; baseline §3.5/§6).
-        for index in sections.indices {
-            sections[index].fileChanges = aggregateFileChanges(rows: sections[index].rows)
-            if sections[index].summary == nil {
-                sections[index].summary = firstUserText(in: sections[index].rows)
-            }
-        }
-        return sections
+        // 最新一轮的文件变更：精确取数 seq（上面）+ 该轮工具结果 meta.diffs 的
+        // 客户端聚合回退（baseline §3.5/§6）。窗口从一轮中间开始时没有 turn/start，
+        // 聚合窗口退化为整窗。
+        let aggregateStart = newestTurnStarted ? min(newestTurnRowStart, rows.count) : 0
+        let latestFileChanges = aggregateFileChanges(rows: Array(rows[aggregateStart...]))
+        return SessionFlow(
+            rows: rows,
+            isRunning: running,
+            latestFileChangeSeq: latestFileChangeSeq,
+            latestFileChanges: latestFileChanges
+        )
     }
 
     /// Repaint only the optimistic tail rows (idempotent): the view model calls
@@ -400,47 +339,28 @@ enum SessionRowBuilder {
     /// queue-flush side effects) before `turn/start` lands.
     static func appendingPendingEchoes(
         _ echoes: [PendingUserEcho],
-        to sections: [TurnSection],
+        to rows: [FlowRow],
         nowMs: Int64 = Int64(Date().timeIntervalSince1970 * 1000)
-    ) -> [TurnSection] {
-        var result = sections
-        for index in result.indices {
-            result[index].rows.removeAll { $0.id.hasPrefix("pending-") }
-        }
+    ) -> [FlowRow] {
+        var result = rows.filter { !$0.id.hasPrefix("pending-") }
         appendPendingUserEchoes(echoes, to: &result, nowMs: nowMs)
         return result
     }
 
-    /// Append the optimistic echo rows to the newest section: the user bubble
+    /// Append the optimistic echo rows at the end of the flat flow: the user bubble
     /// itself plus a subtle "发送中…" system note. Two rows per echo with ids
     /// derived from `requestId`; the next rebuild replaces the whole pair when
     /// `reconcile(events:)` retires the echo (no duplicate bubble).
     private static func appendPendingUserEchoes(
         _ echoes: [PendingUserEcho],
-        to sections: inout [TurnSection],
+        to rows: inout [FlowRow],
         nowMs: Int64
     ) {
         guard !echoes.isEmpty else { return }
-        if sections.isEmpty {
-            // No turn events yet (fresh session): paint a running placeholder so
-            // the just-sent prompt is visible before `turn/start` lands.
-            sections.append(TurnSection(
-                turn: 1,
-                status: .running,
-                summary: nil,
-                rows: [],
-                stepCount: 0,
-                startedAt: echoes.first?.sentAt,
-                endedAt: nil,
-                fileChanges: nil,
-                fileChangeSeq: nil
-            ))
-        }
-        var seq = sections.flatMap { $0.rows }.map(\.seq).max() ?? 0
-        let index = sections.count - 1
+        var seq = rows.map(\.seq).max() ?? 0
         for echo in echoes {
             seq += 1
-            sections[index].rows.append(FlowRow(
+            rows.append(FlowRow(
                 id: "pending-\(echo.requestId)-user",
                 seq: seq,
                 content: .user(UserBubble(
@@ -454,7 +374,7 @@ enum SessionRowBuilder {
             // the progress marker expires so "发送中…" can never hang forever.
             guard PendingUserEchoStore.showsSendingIndicator(sentAt: echo.sentAt, nowMs: nowMs) else { continue }
             seq += 1
-            sections[index].rows.append(FlowRow(
+            rows.append(FlowRow(
                 id: "pending-\(echo.requestId)-status",
                 seq: seq,
                 content: .systemNote("发送中…")
@@ -462,18 +382,7 @@ enum SessionRowBuilder {
         }
     }
 
-    // MARK: - Status / parsing helpers
-
-    static func status(from reason: JSONValue?) -> TurnStatus {
-        switch reason?["kind"]?.stringValue {
-        case "completed": return .completed
-        case "aborted": return .aborted
-        case "interrupted": return .interrupted
-        case "error": return .error
-        case .some(let other): return other == "completed" ? .completed : .completed
-        case .none: return .completed
-        }
-    }
+    // MARK: - Parsing helpers
 
     static func toolCall(from data: JSONValue?, event: SessionEvent) -> ToolCallItem {
         let argumentsRaw = data?["arguments"]?.stringValue
@@ -528,16 +437,7 @@ enum SessionRowBuilder {
         return FileChangeSummary(files: files.sorted(), additions: additions, deletions: deletions)
     }
 
-    static func firstUserText(in rows: [FlowRow]) -> String? {
-        for row in rows {
-            if case .user(let bubble) = row.content, !bubble.text.isEmpty {
-                return bubble.text
-            }
-        }
-        return nil
-    }
-
-    static func findToolCall(in sections: [TurnSection], callId: String?) -> ToolCallItem? {
+    static func findToolCall(in rows: [FlowRow], callId: String?) -> ToolCallItem? {
         guard let callId else { return nil }
         func search(_ item: ToolCallItem) -> ToolCallItem? {
             if item.callId == callId { return item }
@@ -546,11 +446,9 @@ enum SessionRowBuilder {
             }
             return nil
         }
-        for section in sections {
-            for row in section.rows {
-                if case .tool(let item) = row.content, let hit = search(item) {
-                    return hit
-                }
+        for row in rows {
+            if case .tool(let item) = row.content, let hit = search(item) {
+                return hit
             }
         }
         return nil
