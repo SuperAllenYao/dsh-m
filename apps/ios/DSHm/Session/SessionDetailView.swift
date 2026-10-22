@@ -164,6 +164,25 @@ struct SessionDetailView: View {
                 refreshDerivedState()
             }
         }
+ // E2E paging self-test (env-gated, DEBUG): 自动向上翻页到最早事件，用来在真机上
+ // 验证 turn 分组/终止条件，无需手势。DSHM_E2E_PAGING=1 时启动。
+        .task(id: viewModel.hasLiveSnapshot) {
+            guard app.isE2EMode,
+                  ProcessInfo.processInfo.environment["DSHM_E2E_PAGING"] == "1",
+                  viewModel.hasLiveSnapshot,
+                  viewModel.hasMoreOlder else { return }
+            for _ in 0..<40 {
+                guard viewModel.hasMoreOlder else { break }
+                viewModel.loadOlderIfNeeded()
+                var spins = 0
+                while viewModel.isLoadingOlder, spins < 100 {
+                    try? await Task.sleep(nanoseconds: 100_000_000)
+                    spins += 1
+                }
+                try? await Task.sleep(nanoseconds: 150_000_000)
+            }
+            NSLog("[STREAMDBG] paging self-test done: hasMoreOlder=%@ oldest=%@", String(viewModel.hasMoreOlder), String(viewModel.oldestLoadedSeq ?? -1))
+        }
         .onChange(of: scenePhase) { _, phase in
  // A background gap can leave the last poll stale; refresh once when
  // we come back so the capsule never animates for a stopped child.
@@ -712,7 +731,7 @@ struct SessionDetailView: View {
  // 用户手动滚动后不再强制贴底（上滑读历史时新内容不得把视图拉回底部）。
             .modifier(UserScrollObserver { userHasScrolled = true })
  // 问题一对接：滑到接近顶部自动加载更早历史（问题一的分页状态机由 SessionViewModel 提供）。
-            .modifier(NearTopObserver(onNearTop: triggerLoadOlder))
+            .modifier(NearTopObserver(onPullAtTop: triggerLoadOlder))
             .onChange(of: viewModel.isLoadingOlder) { _, loading in
                 if !loading { restorePrependAnchor(proxy: proxy) }
             }
@@ -1274,20 +1293,37 @@ private struct StickToBottomObserver: ViewModifier {
     }
 }
 
-/// 问题一/问题三：滑近顶部时触发"加载更早"。iOS 18+ 用 ScrollGeometry 精确判定，
+/// 问题一/问题三：**每次下拉手势**到达顶部时加载一页更早历史。
+///
+/// 旧实现只在"是否贴顶"这个 Bool 翻转时触发。但前置加载完成后锚点恢复会把视口
+/// 留在顶部附近，Bool 一直是 true、不再翻转，于是后面几次下拉完全不触发，
+/// 用户只能去点按钮。现在改为：
+/// - 用 ScrollGeometry 持续跟踪"是否在顶部附近"；
+/// - 用户每一次滚动手势结束（interacting/decelerating → idle）时，只要还在顶部附近
+/// 就触发一次加载 —— 天然做到"一次下拉加载一页"，不会无节制连发。
 /// iOS 17 由顶部加载行是否实体化兜底（TopRowTrigger）。
 private struct NearTopObserver: ViewModifier {
-    let onNearTop: () -> Void
- /// 触发阈值：贴顶 80pt 内就预取，用户几乎感觉不到等待。
-    private static let threshold: CGFloat = 80
+    let onPullAtTop: () -> Void
+ /// 触发阈值：贴顶 120pt 内都算"在顶部"，滑到顶后自然松手就会命中。
+    private static let threshold: CGFloat = 120
+    @State private var isNearTop = true
 
     func body(content: Content) -> some View {
         if #available(iOS 18.0, *) {
-            content.onScrollGeometryChange(for: Bool.self) { geometry in
-                geometry.contentOffset.y <= Self.threshold
-            } action: { wasNearTop, nearTop in
-                if nearTop, !wasNearTop { onNearTop() }
-            }
+            content
+                .onScrollGeometryChange(for: Bool.self) { geometry in
+                    geometry.contentOffset.y <= Self.threshold
+                } action: { _, nearTop in
+                    isNearTop = nearTop
+                }
+                .onScrollPhaseChange { previousPhase, phase in
+ // 只认"用户手势结束"的那一刻；程序化跟随是瞬时无动画滚动，
+ // 不产生 interacting/decelerating，因此不会自我触发。
+                    let wasUserDriven = previousPhase == .interacting || previousPhase == .decelerating
+                    if phase == .idle, wasUserDriven, isNearTop {
+                        onPullAtTop()
+                    }
+                }
         } else {
             content
         }
