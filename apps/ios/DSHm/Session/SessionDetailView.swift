@@ -48,13 +48,13 @@ struct SessionDetailView: View {
     @State private var e2eScrollDebug = "offset=-;size=-;viewport=-"
  /// 兜底重锚次数：内容已就绪、用户没滚过却离底很远时自动拉回底部（最多 3 次）。
     @State private var bottomRecoveryAttempts = 0
- /// 贴底重锚的代号：新的一次贴底请求会让旧的延迟重锚作废（避免多次滚动互相抢跑）。
-    @State private var scrollAnchorGeneration = 0
- /// 首屏/大窗口的「加固贴底」剩余次数：只在打开或快照替换后的前几次贴底用多拍重锚，
- /// 流式更新期间一律单拍，避免频繁多点滚动造成卡顿/频闪。
-    @State private var hardeningAnchorsRemaining = 0
+ /// 贴底重锚代号 + 首屏加固次数（高频写入，放非观察容器避免逐次触发整页重绘）。
+    @StateObject private var scrollAnchorState = ScrollAnchorState()
  /// 兜底重锚冷却时间（systemUptime），避免流式几何抖动反复触发滚动。
     @State private var lastRecoveryUptime: TimeInterval = 0
+ /// 打开后的「贴底兜底」观察窗口截止时间：只在这段时间内做几何兜底，
+ /// 之后不再逐帧观察，避免长期占用主线程（滚动卡顿）。
+    @State private var bottomSettleDeadline: TimeInterval = 0
 
     init(address: SessionFollowAddress, subagentContext: SubagentSessionContext? = nil) {
         self.address = address
@@ -751,6 +751,7 @@ struct SessionDetailView: View {
                             fileChanges: viewModel.turnFileChanges(for: section),
                             onOpenFileChanges: { present(.fileChanges($0)) }
                         )
+                        .equatable()
                     }
 
                     if !viewModel.liveAssistantText.isEmpty {
@@ -786,7 +787,8 @@ struct SessionDetailView: View {
             .onAppear {
                 guard !viewModel.sections.isEmpty else { return }
                 isNearBottom = true
-                hardeningAnchorsRemaining = 2
+                scrollAnchorState.hardeningRemaining = 2
+                bottomSettleDeadline = ProcessInfo.processInfo.systemUptime + 5
                 scrollToBottom(proxy: proxy)
             }
  // 打开阶段：只要用户还没手动滚动过，新内容到达就贴底（含流式增长）。
@@ -794,7 +796,8 @@ struct SessionDetailView: View {
                 guard live, !userHasScrolled else { return }
                 isNearBottom = true
  // 快照替换/大窗口落屏：允许前 2 次多拍加固，之后单拍跟随。
-                hardeningAnchorsRemaining = 2
+                scrollAnchorState.hardeningRemaining = 2
+                bottomSettleDeadline = ProcessInfo.processInfo.systemUptime + 5
                 scrollToBottom(proxy: proxy)
             }
  // 粘底判定：iOS 18+ 用 ScrollGeometry 精确算距离；iOS 17 退化看底部锚点可见性。
@@ -805,11 +808,12 @@ struct SessionDetailView: View {
                 e2eScrollDebug: $e2eScrollDebug,
                 recoveryAttempts: $bottomRecoveryAttempts,
                 lastRecoveryUptime: $lastRecoveryUptime,
+                settleDeadline: bottomSettleDeadline,
                 userHasScrolled: userHasScrolled,
                 hasSections: !viewModel.sections.isEmpty,
                 scrollToBottom: {
  // 兜底重锚按「加固」处理：允许多拍让懒加载收敛。
-                    hardeningAnchorsRemaining = max(hardeningAnchorsRemaining, 1)
+                    scrollAnchorState.hardeningRemaining = max(scrollAnchorState.hardeningRemaining, 1)
                     scrollToBottom(proxy: proxy)
                 }
             ))
@@ -896,19 +900,19 @@ struct SessionDetailView: View {
  // 再滚 bottomSentinel 对齐底部。
  // 2) LazyVStack 高度估算要等行落定才收敛，大窗口需要 0/120/400ms 三拍。
  // 3) 每次贴底请求递增代号，旧请求的延迟拍自动作废，避免互相抢跑。
-        scrollAnchorGeneration += 1
-        let generation = scrollAnchorGeneration
+        scrollAnchorState.generation += 1
+        let generation = scrollAnchorState.generation
  // 加固贴底只在打开/快照替换后的前 2 次请求里多拍；流式更新期间单拍，
  // 否则每次文本增量都会触发 3 次滚动 → 真机滚动卡顿/频闪（用户）。
-        let harden = hardeningAnchorsRemaining > 0
-        if harden { hardeningAnchorsRemaining -= 1 }
+        let harden = scrollAnchorState.hardeningRemaining > 0
+        if harden { scrollAnchorState.hardeningRemaining -= 1 }
         let passes: [UInt64] = harden ? [0, 120, 400] : [0]
         for (pass, delayMs) in passes.enumerated() {
             Task { @MainActor in
                 if delayMs > 0 { try? await Task.sleep(nanoseconds: UInt64(delayMs) * 1_000_000) }
-                guard generation == scrollAnchorGeneration else { return }
+                guard generation == scrollAnchorState.generation else { return }
                 await Task.yield()
-                guard generation == scrollAnchorGeneration else { return }
+                guard generation == scrollAnchorState.generation else { return }
  // 第 2 拍起先「唤醒末段实体化」：滚到最后一个 section 的**顶部**
  // （真实布局落点，不用估算），再滚 LazyVStack 外的 bottomSentinel
  // 对齐底部。顺序不能反：.bottom+未实体化目标会按估算落点，反而制造
@@ -1262,7 +1266,7 @@ struct SessionDetailView: View {
 }
 
 /// One turn: collapsed summary when completed, expanded while running.
-struct TurnSectionView: View {
+struct TurnSectionView: View, Equatable {
     var section: TurnSection
     @Binding var expandedTurnIDs: Set<String>
     var sessionId: String
@@ -1274,6 +1278,17 @@ struct TurnSectionView: View {
     var fileChanges: TurnFileChanges? = nil
     var onOpenFileChanges: ((TurnFileChanges) -> Void)? = nil
 
+ /// 只比较影响渲染的值：流式更新时未变化的 section 直接跳过 body 重算，
+ /// 避免整列表在每帧增量里重绘。
+ /// 回调闭包与 attachments（@ObservedObject 自驱）不参与比较。
+    static func == (lhs: TurnSectionView, rhs: TurnSectionView) -> Bool {
+        lhs.section == rhs.section
+            && lhs.sessionId == rhs.sessionId
+            && lhs.isExpanded == rhs.isExpanded
+            && lhs.pendingApprovalCallIds == rhs.pendingApprovalCallIds
+            && lhs.subagentLabels == rhs.subagentLabels
+            && lhs.fileChanges == rhs.fileChanges
+    }
  /// v5.3: consecutive reasoning + tool-call rows fold into one process group;
  /// everything else is a normal row.
     private var rowGroups: [FlowRowGroup] {
@@ -1519,9 +1534,24 @@ struct NearTopPullTracker: Equatable {
     }
 }
 
+/// 高频滚动状态的「非观察」容器。
+///
+/// 真机反馈：上下滚动卡顿 + 频闪。根因是滚动相关的值状态每帧写入
+/// `@State` → 整个会话详情页每帧重新求值（消息列表极重）。这些状态只被手势闭包
+/// 读取、从不参与 body 布局，因此放进普通 class + `@StateObject`，写入不触发重绘。
+private final class NearTopPullTrackerBox: ObservableObject {
+    var tracker = NearTopPullTracker()
+}
+
+/// 贴底重锚的代号与首屏加固次数（同上：高频写入，不参与渲染）。
+private final class ScrollAnchorState: ObservableObject {
+    var generation = 0
+    var hardeningRemaining = 0
+}
+
 private struct NearTopObserver: ViewModifier {
     let onPullAtTop: () -> Void
-    @State private var tracker = NearTopPullTracker()
+    @StateObject private var trackerBox = NearTopPullTrackerBox()
 
     func body(content: Content) -> some View {
         if #available(iOS 18.0, *) {
@@ -1530,18 +1560,18 @@ private struct NearTopObserver: ViewModifier {
                     geometry.contentOffset.y
                 } action: { _, y in
  // 越过阈值的那一刻立即触发（不必等手势结束/回弹）。
-                    if tracker.updateOffset(y) { onPullAtTop() }
+                    if trackerBox.tracker.updateOffset(y) { onPullAtTop() }
                 }
                 .onScrollPhaseChange { previousPhase, phase in
                     switch phase {
                     case .interacting:
-                        if previousPhase != .interacting { tracker.gestureBegan() }
+                        if previousPhase != .interacting { trackerBox.tracker.gestureBegan() }
                     case .idle:
                         let wasUserDriven = previousPhase == .interacting || previousPhase == .decelerating
                         if wasUserDriven {
-                            if tracker.gestureEnded() { onPullAtTop() }
+                            if trackerBox.tracker.gestureEnded() { onPullAtTop() }
                         } else {
-                            tracker.resetGesture()
+                            trackerBox.tracker.resetGesture()
                         }
                     default:
                         break
@@ -1568,6 +1598,8 @@ private struct ScrollBoundsWatch: ViewModifier {
     @Binding var e2eScrollDebug: String
     @Binding var recoveryAttempts: Int
     @Binding var lastRecoveryUptime: TimeInterval
+ /// 只在这个 systemUptime 之前做「贴底兜底」观察（打开/快照落屏窗口）。
+    let settleDeadline: TimeInterval
     let userHasScrolled: Bool
     let hasSections: Bool
     let scrollToBottom: () -> Void
@@ -1588,8 +1620,10 @@ private struct ScrollBoundsWatch: ViewModifier {
                     geometry.contentSize.height - (geometry.contentOffset.y + geometry.containerSize.height)
                 } action: { _, distance in
                     guard !userHasScrolled, hasSections else { return }
+                    guard ProcessInfo.processInfo.systemUptime < settleDeadline else { return }
                     if distance <= 120 {
-                        recoveryAttempts = 0
+ // 只在需要时写状态：每帧写 @State 会让整页重绘（滚动卡顿根因）。
+                        if recoveryAttempts != 0 { recoveryAttempts = 0 }
                         return
                     }
                     guard recoveryAttempts < 3 else { return }

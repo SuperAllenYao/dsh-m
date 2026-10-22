@@ -215,6 +215,9 @@ final class SessionViewModel: ObservableObject {
  /// One-shot wakeup that rebuilds the rows when a pending echo's "发送中…"
  /// marker expires (see `schedulePendingEchoStaleRefresh`).
     private var pendingEchoStaleTask: Task<Void, Never>?
+ /// 流式文本节流任务：assistant-stream 每个增量都写 @Published 会让整页 Markdown
+ /// 重解析/重绘 → 真机滚动卡顿/频闪。合并到最多 10Hz。
+    private var liveTextThrottleTask: Task<Void, Never>?
     private var observedGeneration = -1
     private var pendingRebuild = false
  /// Last `isRunning` value used for the v5.4 queue flush (turn/end transition).
@@ -592,6 +595,8 @@ final class SessionViewModel: ObservableObject {
         subagentDebounceTask?.cancel()
         olderPageTask?.cancel()
         olderPageTask = nil
+        liveTextThrottleTask?.cancel()
+        liveTextThrottleTask = nil
         olderPageAwaitingReconnect = false
         olderPageJustMerged = false
         isLoadingOlder = false
@@ -1346,17 +1351,37 @@ final class SessionViewModel: ObservableObject {
  // Front merge: the rows above the current position changed, the newest
  // end did not. An empty result (defensive) has nothing to re-render.
             if seqs.isEmpty {
-                liveAssistantText = journal.liveAssistantText
+                publishLiveAssistantText()
             } else {
                 pendingRebuild = true
                 scheduleRebuild()
             }
         case .duplicate, .ignored, .assistantStreamProgress:
-            liveAssistantText = journal.liveAssistantText
+            publishLiveAssistantText()
         case .gap, .assistantRevisionGap:
  // MVP policy: discard the local window and rebuild from a new
  // snapshot (session/page hole patching is M2, protocol §4.3).
             reopenStream()
+        }
+    }
+
+ /// 流式文本最多 10Hz 发布；`flush` 用于 turn 结束/重建，立即同步到最新文本。
+    private func publishLiveAssistantText(flush: Bool = false) {
+        let latest = journal.liveAssistantText
+        if flush {
+            liveTextThrottleTask?.cancel()
+            liveTextThrottleTask = nil
+            if liveAssistantText != latest { liveAssistantText = latest }
+            return
+        }
+        if liveTextThrottleTask != nil { return }
+        if liveAssistantText != latest { liveAssistantText = latest }
+        liveTextThrottleTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 100_000_000)
+            guard let self, !Task.isCancelled else { return }
+            self.liveTextThrottleTask = nil
+            let newest = self.journal.liveAssistantText
+            if self.liveAssistantText != newest { self.liveAssistantText = newest }
         }
     }
 
@@ -1404,7 +1429,7 @@ final class SessionViewModel: ObservableObject {
             stickyExpandedTurnID = last.id
             expandedTurnIDs.insert(last.id)
         }
-        liveAssistantText = journal.liveAssistantText
+        publishLiveAssistantText(flush: true)
         approvalPolicy = journal.events.last(where: { $0.type == "approval/policy" })?.data?["policy"]?.stringValue
         sandboxMode = journal.events.last(where: { $0.type == "sandbox/mode" })?.data?["mode"]?.stringValue
  // One parse feeds both surfaces: the strip/catalog display the durable
