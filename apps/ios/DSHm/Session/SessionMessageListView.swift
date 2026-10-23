@@ -142,6 +142,8 @@ struct SessionMessageListView: UIViewRepresentable {
             backgroundColor = .clear
             contentView.backgroundColor = .clear
             selectionStyle = .none
+            // 展开/收起动画期间按 cell 边界裁剪内容，避免行高过渡中内容溢出压到相邻行。
+            contentView.clipsToBounds = true
             // 反转回来，让 SwiftUI 内容正立。
             transform = CGAffineTransform(scaleX: 1, y: -1)
         }
@@ -237,6 +239,11 @@ struct SessionMessageListView: UIViewRepresentable {
         private var lastGroupModes: [String: ProcessGroupMode] = [:]
         /// 上一次应用时的 running 标记：true→false 时最新组要从窗口态切到折叠态。
         private var lastRunningFlag = false
+        /// v0.2.7（2026-10-24 用户口径）：交互式展开/收起动画进行中。
+        /// 期间抑制「内容高度上报 → 80ms debounce 重测」与期望锚点纠正，避免与动画抢 offset。
+        private var isTogglingMode = false
+        /// 展开/收起动画时长（用户指定 150ms，非线性 ease-in-out）。
+        private static let modeToggleDuration: TimeInterval = 0.15
 
         init(_ parent: SessionMessageListView) {
             self.parent = parent
@@ -363,6 +370,26 @@ struct SessionMessageListView: UIViewRepresentable {
             return group.id == parent.items.last(where: { if case .group = $0 { return true }; return false })?.id
         }
 
+        // MARK: - 交互式展开/收起的锚点与方向（2026-10-24 用户口径）
+
+        /// 本次 apply 里被点击切换显示态的过程组（同一时刻通常只有一个）；
+        /// 若同时有多个，优先取「展开方向」的那个（展开才需要方向/自动上移处理）。
+        private static func toggledGroupTarget(
+            old: [String: ProcessGroupMode],
+            new: [String: ProcessGroupMode],
+            newIDs: Set<String>
+        ) -> String? {
+            let changed = new.keys.filter { newIDs.contains($0) && old[$0] != new[$0] }
+            guard !changed.isEmpty else { return nil }
+            if let expanding = changed.first(where: { isExpandMode(new[$0]) }) { return expanding }
+            return changed.sorted().first
+        }
+
+        /// 展开方向：已结束组 expanded / 运行中组 full。
+        private static func isExpandMode(_ mode: ProcessGroupMode?) -> Bool {
+            mode == .expanded || mode == .full
+        }
+
         // MARK: - 自撑高行重测（SwiftUI 内部展开/收起）
 
         /// 点击 cell 内的「思考/子代理卡片」等 SwiftUI 本地状态展开后，单元格内容变高，
@@ -372,12 +399,16 @@ struct SessionMessageListView: UIViewRepresentable {
         private var heightRefreshWork: DispatchWorkItem?
 
         func rowContentHeightChanged(rowID: String, contentHeight: CGFloat) {
+            // 展开/收起动画自己会重测行高；动画期间的上报不要再排一次 80ms 重测抢 offset。
+            guard !isTogglingMode else { return }
             guard contentHeight > 1,
                   let tableView,
                   let dataSource,
                   let indexPath = dataSource.indexPath(for: rowID) else { return }
             let rowHeight = tableView.rectForRow(at: indexPath).height
-            guard rowHeight > 1, contentHeight > rowHeight + 1 else { return }
+            // 变高和变矮都要重测：只处理变高会让「收起展开体」后旧行高留白，
+            // 上下文内容不跟随归位（用户 2026-10-24 报障：点收起思考块，上下内容没回到相应区域）。
+            guard rowHeight > 1, abs(contentHeight - rowHeight) > 1 else { return }
             scheduleRowHeightRefresh()
         }
 
@@ -488,6 +519,15 @@ struct SessionMessageListView: UIViewRepresentable {
                 return
             }
             frozenItems = nil
+            // 交互式展开/收起的「被点组」必须在提交 bookkeeping 之前算出：
+            // 下面会把 lastGroupModes 更新为新态，更新后再比对就拿不到 diff 了。
+            let toggledTargetID = pendingModeChange
+                ? Self.toggledGroupTarget(
+                    old: lastGroupModes,
+                    new: parent.processGroupModes,
+                    newIDs: newIDs
+                )
+                : nil
             // 只有确定要 apply 时才提交交互 bookkeeping（见上：避免 diff 被冻结门吞掉）。
             lastGroupModes = parent.processGroupModes
             lastRunningFlag = parent.isRunning
@@ -495,6 +535,57 @@ struct SessionMessageListView: UIViewRepresentable {
             let lastDataIDs = lastItems.reversed().map(\.id)
             if ids == lastDataIDs && changedIDs.isEmpty {
                 if wantsBottom { forceBottom(tableView) }
+                return
+            }
+
+            // v0.2.7（2026-10-24 用户口径）：交互式展开/收起必须「组头固定」——
+            // 向下展开、向上收起，150ms ease-in-out 非线性动画；内容超出屏幕时自动上移保证可见。
+            // 反转列表天然是「贴底锚定」（cell 增长向上），所以这里单独走一条带锚点的动画路径：
+            // 按「组头视觉顶边不动」算出目标 offset，再在同一动画块里完成行高重测与 offset 过渡。
+            if pendingModeChange,
+               let targetID = toggledTargetID,
+               let beforeIndexPath = dataSource.indexPath(for: targetID) {
+                let rectBefore = tableView.rectForRow(at: beforeIndexPath)
+                let offsetBefore = tableView.contentOffset
+                let expanding = Self.isExpandMode(parent.processGroupModes[targetID])
+                groupLookup = newGroupLookup
+                lastItems = items
+                heightRefreshWork?.cancel()
+                isTogglingMode = true
+                isAdjustingOffset = true
+                var modeSnapshot = NSDiffableDataSourceSnapshot<String, String>()
+                modeSnapshot.appendSections(["main"])
+                modeSnapshot.appendItems(ids, toSection: "main")
+                if !changedIDs.isEmpty { modeSnapshot.reconfigureItems(changedIDs) }
+                UIView.animate(
+                    withDuration: Self.modeToggleDuration,
+                    delay: 0,
+                    options: [.curveEaseInOut, .beginFromCurrentState, .allowUserInteraction]
+                ) {
+                    dataSource.apply(modeSnapshot, animatingDifferences: false)
+                    tableView.layoutIfNeeded()
+                    if !changedIDs.isEmpty {
+                        // 失效自撑高缓存，按新内容高度重测算行高。
+                        tableView.performBatchUpdates(nil) { _ in }
+                        tableView.layoutIfNeeded()
+                    }
+                    guard let afterIndexPath = dataSource.indexPath(for: targetID) else { return }
+                    let rectAfter = tableView.rectForRow(at: afterIndexPath)
+                    // 用户口径（2026-10-24 二次确认）：点击的组头在屏幕上**严格不动**。
+                    // 反转列表里 cell 的视觉顶边对应 rect.maxY：保持它不动 = 组头固定；
+                    // 展开向下长高、收起自下而上收回，绝不做自动上移（内容超出屏幕时由用户滚动查看）。
+                    let targetY = offsetBefore.y + (rectAfter.maxY - rectBefore.maxY)
+                    let maxY = max(0, tableView.contentSize.height - tableView.bounds.height + tableView.adjustedContentInset.bottom)
+                    let clampedY = min(max(targetY, 0), maxY)
+                    tableView.setContentOffset(CGPoint(x: offsetBefore.x, y: clampedY), animated: false)
+                } completion: { [weak self] _ in
+                    guard let self, let tableView = self.tableView else { return }
+                    self.isAdjustingOffset = false
+                    self.isTogglingMode = false
+                    tableView.layoutIfNeeded()
+                    self.freezeAnchorFromCurrentViewport(tableView)
+                    self.updateNearBottom(tableView: tableView)
+                }
                 return
             }
 

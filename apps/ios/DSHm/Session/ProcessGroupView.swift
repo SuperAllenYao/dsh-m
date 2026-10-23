@@ -21,50 +21,38 @@ struct ProcessGroupView: View {
     var onOpenTool: ((ToolCallItem) -> Void)? = nil
     var onOpenReasoning: ((String) -> Void)? = nil
 
-    private var exceptions: [ProcessStep] {
-        SessionFlowGrouping.exceptionSteps(steps, pendingApprovalCallIds: pendingApprovalCallIds)
-    }
-
-    private var foldable: [ProcessStep] {
-        SessionFlowGrouping.foldableSteps(steps, pendingApprovalCallIds: pendingApprovalCallIds)
-    }
-
     private var summaryText: String {
         SessionFlowGrouping.localizedSummaryText(steps)
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: Theme.Spacing.xs) {
-            if foldable.count >= 2 {
+            // 步骤按事件顺序整体分组（失败/待审批步骤也在序列里，见 v0.2.7 用户口径）：
+            // 折叠态只有一行摘要；展开后按原始顺序展示全部步骤。
+            if steps.count >= 2 {
                 container {
                     headerRow
-                    switch mode {
-                    case .window:
-                        stepsWindow
-                    case .full, .expanded:
-                        stepsInline
-                    case .collapsed:
-                        EmptyView()
+                    Group {
+                        switch mode {
+                        case .window:
+                            stepsWindow
+                        case .full, .expanded:
+                            stepsInline
+                        case .collapsed:
+                            EmptyView()
+                        }
                     }
+                    .clipped()
+                    // 用户口径（2026-10-24）：展开/收起 150ms ease-in-out 非线性动画，
+                    // 向下展开、向上收起；UIKit 侧同步动画 row 高度与 contentOffset。
+                    .animation(.easeInOut(duration: 0.15), value: mode)
                 }
-            } else if let only = foldable.first {
+            } else if let only = steps.first {
                 // 单步过程不成组：保持内联一行（无四态）。
                 container {
                     stepRow(only)
                         .accessibilityElement(children: .contain)
                         .accessibilityIdentifier("process-single-row")
-                }
-            }
-
-            // 失败/待审批步骤始终可见（即使组处于折叠态），保持既有语义。
-            if !exceptions.isEmpty {
-                container {
-                    ForEach(Array(exceptions.enumerated()), id: \.element.id) { index, step in
-                        if index > 0 { hairline(inset: 34) }
-                        stepRow(step)
-                            .accessibilityElement(children: .contain)
-                            .accessibilityIdentifier("process-exception-row")
-                    }
                 }
             }
         }
@@ -81,7 +69,8 @@ struct ProcessGroupView: View {
                     .font(.system(size: 14, weight: .semibold))
                     .foregroundStyle(Theme.Palette.accent)
                     .frame(width: 14)
-                Text(L10n.f("过程 · %lld 步", steps.count))
+                // 用户口径（2026-10-24）：组头不出现「过程」二字。
+                Text(L10n.f("%lld 步", steps.count))
                     .font(.system(size: 12, weight: .semibold))
                     .foregroundStyle(Theme.Palette.textPrimary)
                     .lineLimit(1)
@@ -114,29 +103,22 @@ struct ProcessGroupView: View {
         .accessibilityValue("mode:\(mode.rawValue)")
     }
 
-    /// 纯图标切换件（无文字）：运行中＝向外/向内双箭头；已结束＝chevron。
+    /// 纯图标切换件（无文字），与 DSH 桌面端 TurnProcess 箭头一致：
+    /// 折叠/窗口态＝右箭头 ▶（chevron.right），展开/全高态＝下箭头 ▼（chevron.down）；
+    /// 旋转 100ms 过渡（桌面端箭头 transition:transform .1s）。
     @ViewBuilder
     private var toggleGlyph: some View {
-        switch mode {
-        case .window, .full:
-            Image(systemName: mode == .window ? "arrow.up.left.and.arrow.down.right" : "arrow.down.right.and.arrow.up.left")
-                .font(.system(size: 11, weight: .semibold))
-                .foregroundStyle(Theme.Palette.textSecondary)
-                .frame(width: 26, height: 26)
-                .background(Theme.Palette.surfaceRaised, in: Circle())
-                .overlay(Circle().strokeBorder(Theme.Palette.borderStrong, lineWidth: 1))
-                .accessibilityIdentifier("process-group-toggle")
-        case .collapsed:
-            Image(systemName: "chevron.right")
-                .font(.system(size: 8, weight: .semibold))
-                .foregroundStyle(Theme.Palette.textTertiary)
-                .accessibilityIdentifier("process-group-toggle")
-        case .expanded:
-            Image(systemName: "chevron.down")
-                .font(.system(size: 8, weight: .semibold))
-                .foregroundStyle(Theme.Palette.textTertiary)
-                .accessibilityIdentifier("process-group-toggle")
-        }
+        Image(systemName: "chevron.down")
+            .font(.system(size: 12, weight: .semibold))
+            .foregroundStyle(Theme.Palette.textTertiary)
+            .rotationEffect(.degrees(isExpandedForGlyph ? 0 : -90))
+            .animation(.easeInOut(duration: 0.1), value: mode)
+            .accessibilityIdentifier("process-group-toggle")
+    }
+
+    /// 箭头是否处于「展开」朝向（下箭头）。
+    private var isExpandedForGlyph: Bool {
+        mode == .full || mode == .expanded
     }
 
     // MARK: - 步骤列表
@@ -157,22 +139,33 @@ struct ProcessGroupView: View {
                     .accessibilityIdentifier("process-step-row")
             }
         }
-        .frame(height: windowHeight, alignment: .bottom)
+        .frame(height: resolvedWindowHeight, alignment: .bottom)
         .clipped()
-        .animation(Theme.Motion.quick, value: foldable.count)
+        .animation(Theme.Motion.quick, value: steps.count)
         .accessibilityIdentifier("process-steps-window")
     }
 
     /// 固定窗口内展示的「最近 N 步」（尾部切片，随新步骤上移）。
     private var windowSteps: [ProcessStep] {
-        let capacity = max(1, Int(windowHeight / 29))
-        return Array(foldable.suffix(capacity))
+        // 整行吸附（向下取整）：窗口只展示完整行，高度 = 行数 × 29 ≤ 设计窗口高，
+        // 不会出现半行/底部空白（大屏 1/3 屏 318.7pt 实测 → 10 行 = 290pt，仍在 280–360 区间）。
+        let capacity = max(1, Int(windowHeight / Self.stepRowHeight))
+        return Array(steps.suffix(capacity))
     }
+
+    /// 窗口实际高度：内容不足一屏 1/3 时按内容收紧（用户口径：不允许一大片空白），
+    /// 最多不超过设计高度（≈会话可视高 1/3，页面传入 clamp 280–360pt）。
+    private var resolvedWindowHeight: CGFloat {
+        min(windowHeight, CGFloat(windowSteps.count) * Self.stepRowHeight)
+    }
+
+    /// 单步行高（28pt 行 + 1pt hairline），与 windowSteps 的容量计算保持一致。
+    private static let stepRowHeight: CGFloat = 29
 
     /// 全量内联（运行中「全高」/ 已结束「展开历史」）：同步 VStack。
     private var stepsInline: some View {
         VStack(spacing: 0) {
-            ForEach(foldable) { step in
+            ForEach(steps) { step in
                 hairline(inset: 34)
                 stepRow(step)
                     // 每行一个显式 AX 元素：容器 VStack 不是独立 AX 节点，
