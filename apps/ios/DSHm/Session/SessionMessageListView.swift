@@ -392,14 +392,21 @@ struct SessionMessageListView: UIViewRepresentable {
 
  // MARK: - 自撑高行重测（SwiftUI 内部展开/收起）
 
- /// 点击 cell 内的「思考/子代理卡片」等 SwiftUI 本地状态展开后，单元格内容变高，
- /// 但 UITableView 的自撑高缓存不会自动失效 → 展开内容被旧行高裁剪/覆盖
- /// 。这里由 cell 上报内容高度，
- /// 与当前行高比较后做一次合并（80ms debounce）的可见行重测，并保持阅读锚点。
+ /// 点击 cell 内的「思考 / 子代理卡片 / 过程组」等展开体后，单元格内容高度变化，
+ /// 但 UITableView 的自撑高缓存不会自动失效 → 展开内容被旧行高裁剪/覆盖。
+ ///
+ /// 统一交互（用户 口径）：**被点击的那一行在屏幕上的位置严格不动**，
+ /// 展开内容把下方 UI 向下挤开；收起时反向拉回。150ms ease-in-out。
+ /// 因此这里以「本轮内容高度发生变化的那一行」为锚点（其视觉顶边固定），
+ /// 不再以底部可见行为锚点（那会让被点行随展开向上移动）。
         private var heightRefreshWork: DispatchWorkItem?
+ /// 本轮待重测的「内容高度发生变化」的行（通常就是用户点击的那一行）。
+        private var pendingHeightChangeRowID: String?
+ /// 行展开/收起动画时长（与过程组展开一致：150ms 非线性 ease-in-out）。
+        private static let rowExpandDuration: TimeInterval = 0.15
 
         func rowContentHeightChanged(rowID: String, contentHeight: CGFloat) {
- // 展开/收起动画自己会重测行高；动画期间的上报不要再排一次 80ms 重测抢 offset。
+ // 过程组展开/收起动画自己会重测行高；动画期间的上报不要再排一次重测抢 offset。
             guard !isTogglingMode else { return }
             guard contentHeight > 1,
                   let tableView,
@@ -409,6 +416,7 @@ struct SessionMessageListView: UIViewRepresentable {
  // 变高和变矮都要重测：只处理变高会让「收起展开体」后旧行高留白，
  // 上下文内容不跟随归位（用户 报障：点收起思考块，上下内容没回到相应区域）。
             guard rowHeight > 1, abs(contentHeight - rowHeight) > 1 else { return }
+            pendingHeightChangeRowID = rowID
             scheduleRowHeightRefresh()
         }
 
@@ -421,26 +429,54 @@ struct SessionMessageListView: UIViewRepresentable {
 
         private func refreshVisibleRowHeights() {
             guard let tableView, let dataSource else { return }
-            guard !tableView.isTracking, !tableView.isDecelerating else { return }
-            let anchor = captureAnchor(tableView: tableView)
+            guard !isTogglingMode else { return }
+ // 手势滚动中先等一轮，避免动画与手势互相拉扯。
+            guard !tableView.isTracking, !tableView.isDecelerating else {
+                scheduleRowHeightRefresh()
+                return
+            }
+            let pinRowID = pendingHeightChangeRowID
+            pendingHeightChangeRowID = nil
+            var pinBefore: (rect: CGRect, offset: CGPoint)?
+            if let pinRowID, let indexPath = dataSource.indexPath(for: pinRowID) {
+                pinBefore = (tableView.rectForRow(at: indexPath), tableView.contentOffset)
+            }
+ // 兜底：定位不到变更行时，退回「最底部可见行」锚点（保持旧行为）。
+            let fallbackAnchor = pinBefore == nil ? captureAnchor(tableView: tableView) : nil
             isAdjustingOffset = true
-            UIView.performWithoutAnimation {
+            UIView.animate(
+                withDuration: Self.rowExpandDuration,
+                delay: 0,
+                options: [.curveEaseInOut, .beginFromCurrentState, .allowUserInteraction]
+            ) {
                 tableView.performBatchUpdates(nil) { _ in }
-            }
-            tableView.layoutIfNeeded()
-            if let anchor, let indexPath = dataSource.indexPath(for: anchor.rowID) {
-                let rect = tableView.rectForRow(at: indexPath)
-                let delta = (rect.minY - tableView.contentOffset.y) - anchor.screenY
-                if abs(delta) > 0.5 {
-                    var offset = tableView.contentOffset
-                    offset.y += delta
+                tableView.layoutIfNeeded()
+                if let pinBefore, let pinRowID, let indexPath = dataSource.indexPath(for: pinRowID) {
+ // 反转列表：cell 视觉顶边 = rect.maxY。保持它不动 = 被点击行的入口位置严格不动，
+ // 展开内容把下方 UI 向下挤开；收起时反向拉回。
+                    let rectAfter = tableView.rectForRow(at: indexPath)
+                    var targetY = pinBefore.offset.y + (rectAfter.maxY - pinBefore.rect.maxY)
                     let maxY = max(0, tableView.contentSize.height - tableView.bounds.height + tableView.adjustedContentInset.bottom)
-                    offset.y = min(max(offset.y, 0), maxY)
-                    tableView.setContentOffset(offset, animated: false)
+                    targetY = min(max(targetY, 0), maxY)
+                    tableView.setContentOffset(CGPoint(x: pinBefore.offset.x, y: targetY), animated: false)
+                } else if let fallbackAnchor, let indexPath = dataSource.indexPath(for: fallbackAnchor.rowID) {
+                    let rect = tableView.rectForRow(at: indexPath)
+                    let delta = (rect.minY - tableView.contentOffset.y) - fallbackAnchor.screenY
+                    if abs(delta) > 0.5 {
+                        var offset = tableView.contentOffset
+                        offset.y += delta
+                        let maxY = max(0, tableView.contentSize.height - tableView.bounds.height + tableView.adjustedContentInset.bottom)
+                        offset.y = min(max(offset.y, 0), maxY)
+                        tableView.setContentOffset(offset, animated: false)
+                    }
                 }
+            } completion: { [weak self] _ in
+                guard let self, let tableView = self.tableView else { return }
+                self.isAdjustingOffset = false
+                tableView.layoutIfNeeded()
+                self.freezeAnchorFromCurrentViewport(tableView)
+                self.updateNearBottom(tableView: tableView)
             }
-            isAdjustingOffset = false
-            freezeAnchorFromCurrentViewport(tableView)
         }
 
  // MARK: - apply
