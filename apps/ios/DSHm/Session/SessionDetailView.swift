@@ -290,9 +290,9 @@ struct SessionDetailView: View {
         VStack(spacing: 0) {
             header
             Rectangle().fill(Theme.Palette.border).frame(height: 1)
-            if viewModel.isShowingCachedWindow {
-                cacheStatusBanner
-            }
+            // 2026-10-23 真机闪回修复：不再插入「显示本地缓存，正在同步…」横幅。
+            // 横幅随快照到达而移除，会让列表高度突变 → 内容上跳/回落 + 一帧整页闪烁；
+            // 热缓存每次打开必现。首屏缓存本来就是无感加速，不需要这条提示。
             messageList
             if let note = answeredQuestionNote {
                 answeredQuestionRow(note)
@@ -562,28 +562,6 @@ struct SessionDetailView: View {
         }
     }
 
-    // MARK: - M2b-2 cache-first banner
-
-    /// The cached window is on screen while the live `session/follow` snapshot is
-    /// still in flight; it disappears by itself once the snapshot lands.
-    private var cacheStatusBanner: some View {
-        HStack(spacing: Theme.Spacing.xs) {
-            ProgressView()
-                .tint(Theme.Palette.accent)
-                .scaleEffect(0.7)
-            Text(viewModel.cachedWindowIsStale
-                 ? L10n.t("显示本地缓存（已过期），正在同步…")
-                 : L10n.t("显示本地缓存，正在同步…"))
-                .font(Theme.Typography.label)
-                .foregroundStyle(Theme.Palette.textSecondary)
-            Spacer(minLength: 0)
-        }
-        .padding(.horizontal, Theme.Spacing.m)
-        .padding(.vertical, Theme.Spacing.xs)
-        .background(Theme.Palette.surface)
-        .accessibilityIdentifier("session-cache-status")
-    }
-
     // MARK: - Header
 
     private var header: some View {
@@ -809,16 +787,18 @@ struct SessionDetailView: View {
                 isNearBottom = true
                 scrollAnchorState.hardeningRemaining = 2
                 bottomSettleDeadline = ProcessInfo.processInfo.systemUptime + 5
-                scrollToBottom(proxy: proxy)
+                scrollDbg("onAppear rows=\(viewModel.rows.count)")
+                scrollToBottom(proxy: proxy, reason: "onAppear")
             }
             // 打开阶段：只要用户还没手动滚动过，新内容到达就贴底（含流式增长）。
             .onChange(of: viewModel.hasLiveSnapshot) { _, live in
+                scrollDbg("hasLiveSnapshot=\(live) rows=\(viewModel.rows.count) userScrolled=\(userHasScrolled)")
                 guard live, !userHasScrolled else { return }
                 isNearBottom = true
                 // 快照替换/大窗口落屏：允许前 2 次多拍加固，之后单拍跟随。
                 scrollAnchorState.hardeningRemaining = 2
                 bottomSettleDeadline = ProcessInfo.processInfo.systemUptime + 5
-                scrollToBottom(proxy: proxy)
+                scrollToBottom(proxy: proxy, reason: "snapshot")
             }
             // 粘底判定：iOS 18+ 用 ScrollGeometry 精确算距离；iOS 17 退化看底部锚点可见性。
             .modifier(StickToBottomObserver(isNearBottom: $isNearBottom))
@@ -834,7 +814,7 @@ struct SessionDetailView: View {
                 scrollToBottom: {
                     // 兜底重锚按「加固」处理：允许多拍让懒加载收敛。
                     scrollAnchorState.hardeningRemaining = max(scrollAnchorState.hardeningRemaining, 1)
-                    scrollToBottom(proxy: proxy)
+                    scrollToBottom(proxy: proxy, reason: "boundsRecovery")
                 }
             ))
             // 用户手动滚动后不再强制贴底（上滑读历史时新内容不得把视图拉回底部）。
@@ -857,6 +837,7 @@ struct SessionDetailView: View {
                 let prependOnly = newRows.count > oldRows.count
                     && oldRows.first?.id != newRows.first?.id
                     && oldRows.last?.id == newRows.last?.id
+                scrollDbg("rows change \(oldRows.count)->\(newRows.count) prependOnly=\(prependOnly) userScrolled=\(userHasScrolled) nearBottom=\(isNearBottom)")
                 if prependOnly { return }
                 // Keep the newest activity visible; LazyVStack off-screen rows are
                 // not in the accessibility tree, so this also keeps the live tool
@@ -868,11 +849,10 @@ struct SessionDetailView: View {
             .onChange(of: viewModel.liveAssistantText) { _ in
                 followLiveText(proxy: proxy)
             }
-            // 问题三：ScrollView 的兄弟视图会改变视口高度（缓存横幅插在列表上方、
-            // 底部问答提示插在列表下方），高度一变底部就会被裁掉，所以贴底时重锚一次。
-            .onChange(of: viewModel.isShowingCachedWindow) { _ in
-                rescrollIfNeeded(proxy: proxy)
-            }
+            // 问题三：ScrollView 的兄弟视图会改变视口高度（底部问答提示插在列表下方），
+            // 高度一变底部就会被裁掉，所以贴底时重锚一次。
+            // 2026-10-23：缓存横幅已移除（它会随快照到达消失，造成内容上跳/闪一帧），
+            // 因此不再监听 isShowingCachedWindow。
             .onChange(of: answeredQuestionCallId) { _ in
                 rescrollIfNeeded(proxy: proxy)
             }
@@ -882,6 +862,14 @@ struct SessionDetailView: View {
     // MARK: - 问题三：滚动锚定（首帧锚底 / 粘底 / 布局突变重锚）
 
     private static let bottomAnchorID = "bottom"
+
+    /// 2026-10-23 真机闪回取证的轻量日志（仅 `DSHM_SCROLLDBG=1` 时输出；无重编码/无 UI 影响）。
+    private static let scrollDbgLogging =
+        ProcessInfo.processInfo.environment["DSHM_SCROLLDBG"] == "1"
+    private func scrollDbg(_ message: @autoclosure () -> String) {
+        guard Self.scrollDbgLogging else { return }
+        NSLog("[SCROLLDBG] %@", message())
+    }
 
     /// 底部锚点：滚动目标 + iOS 17 上"是否接近底部"的退化探测点。
     private var bottomSentinel: some View {
@@ -899,11 +887,11 @@ struct SessionDetailView: View {
         guard !viewModel.rows.isEmpty else { return }
         if !userHasScrolled {
             isNearBottom = true
-            scrollToBottom(proxy: proxy)
+            scrollToBottom(proxy: proxy, reason: "follow")
             return
         }
-        guard isNearBottom else { return }
-        scrollToBottom(proxy: proxy)
+        guard isNearBottom else { scrollDbg("follow skipped (not near bottom)"); return }
+        scrollToBottom(proxy: proxy, reason: "follow-nearBottom")
     }
 
     /// 新的会话 rows（缓存窗口 / 快照 / 增量事件）就绪。
@@ -923,7 +911,7 @@ struct SessionDetailView: View {
 
     /// H5：等布局提交后再滚，避免目标在 LazyVStack 里尚未实体化时 `scrollTo` 静默失效；
     /// 自动跟随一律不加动画（H2：动画会把高度突变放大成跳变）。
-    private func scrollToBottom(proxy: ScrollViewProxy) {
+    private func scrollToBottom(proxy: ScrollViewProxy, reason: String = "") {
         // 多拍重锚（真机 A3/A4 回归）：
         // 1) 只滚 LazyVStack 外的 bottomSentinel 时，大窗口会出现「offset 已在底部、
         //    但末段行没有实体化 → 整屏空白」；先滚最后一个 section（强制实体化末段），
@@ -937,20 +925,24 @@ struct SessionDetailView: View {
         let harden = scrollAnchorState.hardeningRemaining > 0
         if harden { scrollAnchorState.hardeningRemaining -= 1 }
         let passes: [UInt64] = harden ? [0, 120, 400] : [0]
+        scrollDbg("scrollToBottom reason=\(reason) gen=\(generation) harden=\(harden) rows=\(viewModel.rows.count) near=\(isNearBottom) scrolled=\(userHasScrolled)")
         for (pass, delayMs) in passes.enumerated() {
             Task { @MainActor in
                 if delayMs > 0 { try? await Task.sleep(nanoseconds: UInt64(delayMs) * 1_000_000) }
                 guard generation == scrollAnchorState.generation else { return }
                 await Task.yield()
                 guard generation == scrollAnchorState.generation else { return }
-                // 第 2 拍起先「唤醒末段实体化」：滚到最后一个 section 的**顶部**
-                // （真实布局落点，不用估算），再滚 LazyVStack 外的 bottomSentinel
-                // 对齐底部。顺序不能反：.bottom+未实体化目标会按估算落点，反而制造
-                // 上方空白（模拟器 A3 对照实测）。
-                if pass >= 1, !userHasScrolled, let lastRow = viewModel.rows.last?.id {
-                    proxy.scrollTo(lastRow, anchor: .top)
-                    await Task.yield()
+                // 2026-10-23 真机闪回修复（已验证）：这里**绝不能**用 `scrollTo(lastRow, .top)`
+                // 去「唤醒末段实体化」——它会把最后一行顶到视口最上方，最后一行下方没有内容，
+                // 于是整整一帧是空的（用户看到「整页黑屏快速闪一下」），下一拍再滚回底部。
+                // 加固的 0/120/400ms 两拍 → 两次黑屏闪；ScrollBoundsWatch 兜底再插入一拍 → 跳动。
+                // 改用 `scrollTo(lastRow, .bottom)`：同样是真实末行（frame 精确、可实体化），
+                // 但对齐的是底部，视口内容不变、不产生空帧；随后 sentinel 对齐底部只差 1pt。
+                if !userHasScrolled, let lastRow = viewModel.rows.last?.id {
+                    scrollDbg("scrollToBottom pass=\(pass) target=lastRow(\(lastRow)) anchor=.bottom")
+                    proxy.scrollTo(lastRow, anchor: .bottom)
                 }
+                scrollDbg("scrollToBottom pass=\(pass) target=sentinel anchor=.bottom")
                 proxy.scrollTo(Self.bottomAnchorID, anchor: .bottom)
             }
         }
@@ -967,6 +959,7 @@ struct SessionDetailView: View {
     private func handleHistoryPrepend(proxy: ScrollViewProxy) {
         scrollAnchorState.prependEpoch += 1
         let epoch = scrollAnchorState.prependEpoch
+        scrollDbg("historyPrepend epoch=\(epoch) rows=\(viewModel.rows.count) userScrolled=\(userHasScrolled) near=\(isNearBottom)")
         if !userHasScrolled || isNearBottom {
             scrollAnchorState.lastPrependHandling = "pin"
             pinToBottomAfterPrepend(proxy: proxy, epoch: epoch)
@@ -1029,6 +1022,7 @@ struct SessionDetailView: View {
                 guard epoch == scrollAnchorState.prependEpoch,
                       generation == scrollAnchorState.generation,
                       isNearBottom else { return }
+                scrollDbg("prependPin delay=\(pass.delayMs) target=\(pass.target)")
                 proxy.scrollTo(pass.target, anchor: .bottom)
             }
         }

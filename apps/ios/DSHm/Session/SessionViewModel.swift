@@ -336,6 +336,15 @@ final class SessionViewModel: ObservableObject {
         NSLog("[STREAMDBG] %@", message())
     }
 
+    /// 2026-10-23 真机闪回取证的轻量日志（仅 `DSHM_SCROLLDBG=1`；不做编码/无额外 UI 影响）。
+    private static let scrollDbgLogging =
+        ProcessInfo.processInfo.environment["DSHM_SCROLLDBG"] == "1"
+
+    private func scrollDbg(_ message: @autoclosure () -> String) {
+        guard Self.scrollDbgLogging else { return }
+        NSLog("[SCROLLDBG] %@", message())
+    }
+
     // MARK: - First-paint cache (newest up-to-4 screens, chunked)
 
     /// Kicks off the off-main cache read. Called from init: it must never block the
@@ -391,16 +400,12 @@ final class SessionViewModel: ObservableObject {
         syncFillDiagnostics()
         rebuildRows()
         maybeMarkDetailFirstFrame()
-        cachedChunksTask = Task { [weak self] in
-            guard let self else { return }
-            for chunk in payload.chunks.dropFirst() {
-                if Task.isCancelled { return }
-                let update = self.journal.prepend(events: chunk, hasMoreOlder: true)
-                self.applyJournalUpdate(update)
-                await Task.yield()
-            }
-            self.startHistoryFillIfPossible()
-        }
+        // 2026-10-23 真机闪回修复：只应用 chunk0（最新一屏，用于首帧秒开）。
+        // 其余缓存屏不再逐块 prepend 进可见列表——每块都会重建 rows 并触发一次滚底，
+        // 真机上表现为「内容出现后 1–2 秒内整页快速闪两次 + 视口上跳再回底」
+        // （热缓存每次打开必现，与会话大小无关）。更早的历史交给后台补齐引擎
+        // （HistoryFiller）从 Host 拉，用户看到的内容一致，但不再有中途插入抖动。
+        startHistoryFillIfPossible()
     }
 
     /// Applies the newest cached screen as a synthetic snapshot: header/projections
@@ -1124,14 +1129,17 @@ final class SessionViewModel: ObservableObject {
     private func applyJournalUpdate(_ update: SessionJournal.Update) {
         switch update {
         case .snapshotReplaced:
+            scrollDbg("journal snapshotReplaced")
             pendingRebuild = true
             scheduleRebuild()
         case .eventsApplied:
+            scrollDbg("journal eventsApplied")
             pendingRebuild = true
             scheduleRebuild()
         case .olderPrepended(let seqs):
             // Front merge: the rows above the current position changed, the newest
             // end did not. An empty result (defensive) has nothing to re-render.
+            scrollDbg("journal olderPrepended n=\(seqs.count) fillState=\(historyFillState.rawValue) deferred=\(prependRenderDeferred)")
             if seqs.isEmpty {
                 publishLiveAssistantText()
             } else if historyFillState == .loading {
@@ -1206,6 +1214,7 @@ final class SessionViewModel: ObservableObject {
         let retiredEchoes = echoCountBefore - pendingUserEchoes.count
         let events = journal.events
         let nowMs = Self.epochMilliseconds()
+        var branch = "none"
         // Incremental render (2026-10-23): the journal window only changes at the
         // tail (live events), at the front (history pages) or wholesale (snapshot /
         // reconnect reset). Auto-detect which one happened so a running session with
@@ -1215,20 +1224,26 @@ final class SessionViewModel: ObservableObject {
            let last = events.last?.seq {
             if first == range.lowerBound, last == range.upperBound {
                 // Window unchanged (derived refresh only): keep the folded rows.
+                branch = "unchanged"
             } else if first == range.lowerBound, last > range.upperBound {
+                branch = "append"
                 let appended = events.filter { $0.seq > range.upperBound }
                 renderState.append(events: appended, pendingUserEchoes: pendingUserEchoes.echoes, nowMs: nowMs)
             } else if last == range.upperBound, first < range.lowerBound {
+                branch = "prepend"
                 let prepended = events.filter { $0.seq < range.lowerBound }
                 renderState.prepend(events: prepended, pendingUserEchoes: pendingUserEchoes.echoes, nowMs: nowMs)
             } else {
+                branch = "reset"
                 renderState.reset(events: events, pendingUserEchoes: pendingUserEchoes.echoes, nowMs: nowMs)
             }
         } else {
+            branch = "initial-reset"
             renderState.reset(events: events, pendingUserEchoes: pendingUserEchoes.echoes, nowMs: nowMs)
         }
         flow = renderState.flow
         flowGroups = renderState.groups
+        scrollDbg("rebuild branch=\(branch) events=\(events.count) rows=\(flow.rows.count) oldest=\(journal.oldestSeq ?? -1) hasMore=\(journal.hasMoreOlder ? 1 : 0)")
         dbg("rebuild: events=" + String(events.count) + " rows=" + String(flow.rows.count) + " hasMoreOlder=" + String(journal.hasMoreOlder) + " oldest=" + String(journal.oldestSeq ?? -1) + " pendingEchoes=" + String(pendingUserEchoes.count) + (retiredEchoes > 0 ? " retired=" + String(retiredEchoes) : "") + (flow.isRunning ? " running" : " idle"))
         syncFillDiagnostics()
         title = journal.title

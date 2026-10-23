@@ -600,20 +600,24 @@ final class CacheTests: XCTestCase {
         XCTAssertFalse(viewModel.cachedWindowIsStale, "快照之后才完成的缓存恢复不得标记缓存过期")
     }
 
+    /// 2026-10-23 真机闪回修复后：首屏缓存**只应用 chunk0（最新一屏）**。
+    /// 其余缓存屏不再逐块 prepend 进可见列表（每块都会重建 rows + 滚底，真机上表现为
+    /// 内容出现后整页快速闪两次 + 视口上跳再回底）；更早历史交给后台补齐引擎。
     @MainActor
-    func testFirstPaintCacheMergesOlderChunksInBackground() async throws {
+    func testFirstPaintCacheRestoresOnlyNewestScreen() async throws {
         let store = windowStore()
         let events = firstPaintEvents(count: 100) // 50 append 消息 -> 3 屏
         XCTAssertTrue(store.save(
             sessionId: "s1", cursor: 99, hasMore: true, header: nil, projections: nil,
             events: events, windowMessages: 16
         ))
+        let expectedChunk0 = try XCTUnwrap(store.load(sessionId: "s1")?.payload.chunks.first)
         let viewModel = SessionViewModel(address: .session(sessionId: "s1"), windowCache: store)
         await viewModel.awaitFirstPaintCacheForTesting()
         XCTAssertTrue(viewModel.didRestoreFirstPaintCache)
         XCTAssertEqual(viewModel.eventSeqs.last, 99, "chunk0 = 最新一屏，先上屏")
-        await waitUntil { viewModel.eventSeqs.count == 100 }
-        XCTAssertEqual(viewModel.eventSeqs, Array(0...99), "其余屏在后台合并，覆盖全部缓存事件")
+        XCTAssertEqual(viewModel.eventSeqs, expectedChunk0.map(\.seq), "只应用 chunk0，其余屏不再中途插入")
+        XCTAssertLessThan(viewModel.eventSeqs.count, 100, "其余缓存屏不逐块插入（避免真机闪回）")
     }
 
     @MainActor
