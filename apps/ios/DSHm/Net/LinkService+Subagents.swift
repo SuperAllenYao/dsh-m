@@ -83,10 +83,28 @@ extension LinkService {
         ])
     }
 
+ /// Wire args for the subagent/capsule `session/list` read.
+ ///
+ /// P1.5-A: this is the highest-frequency list read in the App — an open detail
+ /// polls it on the 8 s tick (`SessionDetailView`) and on every ≥2 s activity
+ /// debounce (`SessionViewModel.scheduleSubagentRefreshFromActivity`) — so it
+ /// **must** opt in to the plugin's lite projection trim
+ /// (`packages/dsh-m-link/lib/list-lite.js`). Without the hint the plugin
+ /// returns the untouched ~1.5 MB response (~357 KB gzipped) on every poll;
+ /// with it, rows keep exactly the fields the derived state reads
+ /// (`contextPressure`, `userQuestions.active`, `running`, `agentAvailable`,
+ /// `origin`/`parentSessionId` for the subagent catalog).
+ ///
+ /// Kept as a pure builder (no socket) so the opt-in contract is unit-tested:
+ /// `P15LiteListTests.testListSessionsRequestArgsCarryLiteHint`.
+    nonisolated static func listSessionsRequestArgs() -> [String: JSONValue] {
+        SessionListLite.requestArgs()
+    }
+
  /// Lightweight `session/list` read used by the subagent capsule/list refresh
  /// (running/agentAvailable/updatedAt/userQuestions metadata).
     func listSessions() async throws -> [SessionListItem] {
-        let value = try await unary("session/list", args: ["_request": .object([:])], timeout: 20)
+        let value = try await unary("session/list", args: Self.listSessionsRequestArgs(), timeout: 20)
         return try value.decode(SessionListValue.self).items
     }
 }

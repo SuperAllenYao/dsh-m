@@ -168,6 +168,13 @@ struct SessionDetailView: View {
         .onChange(of: app.link.generation) { generation in
             viewModel.handleGenerationChange(generation)
         }
+        .onChange(of: app.link.phase) { _, phase in
+ // P0 fallback: the generation-only path misses silent dsh-m/2 resumes
+ // (P1 retain keeps the generation) and any phase flip that lands before
+ // this `.onChange` is installed. The view-model call is idempotent, so
+ // the extra trigger can never open a second `session/follow`.
+            viewModel.handleLinkPhaseChange(phase)
+        }
         .onChange(of: viewModel.isRunning) { _, running in
  // E2E in-app send metric: the running/turn indicator is now on screen.
             if running {

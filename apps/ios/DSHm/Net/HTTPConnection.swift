@@ -186,8 +186,16 @@ final class HTTPConnection {
  /// are never watched: a slow network must not be mistaken for a dead socket.
  ///
  /// Single tunable constant by design (Lead decision): one place to adjust from
- /// real-device data. 0.8s is deliberately conservative.
-    static let firstByteTimeout: TimeInterval = 0.8
+ /// real-device data.
+ ///
+ /// real-device calibration: 0.8s fired on a **slow but alive** relay
+ /// path — a 5G/relay round under head-of-line blocking routinely pushes a large
+ /// response past 800ms (`/api/session/list` is 1.46MB raw / 357KB gzip and the
+ /// tunnel carries session/page concurrently). This watchdog only *reports*; the
+ /// whole-transport teardown decision lives in `LinkService`, which now verifies
+ /// the path before forcing a reconnect. 1.5s keeps dead-socket detection fast on
+ /// LAN while tolerating a relay stall that is still making progress.
+    static let firstByteTimeout: TimeInterval = 1.5
 
     init(
         key: HTTPConnectionKey,

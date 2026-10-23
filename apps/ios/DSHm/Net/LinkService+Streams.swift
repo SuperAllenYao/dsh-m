@@ -18,7 +18,14 @@ extension LinkService {
  /// Before failing the candidate, reopen `$events` once on the same mux: a
  /// lost open/ready frame is a stream-level fault, so a fresh stream can
  /// recover without paying for a new TLS + mux-token round.
-    func openEventsAndWaitReady(mux: RemoteMux) async throws {
+ ///
+ /// the wait is now bounded by the caller's per-candidate attempt
+ /// budget (`timeout`). The old hard-coded 15s + 5s sat **outside** the round
+ /// budget, so a single-candidate round could take ≈26s while the UI showed
+ /// 「正在连接 Mac…」 (handoff §5.4-2). Cap: first wait ≤6s, reopen ≤2s.
+    func openEventsAndWaitReady(mux: RemoteMux, timeout: TimeInterval) async throws {
+        let firstWait = max(1.0, min(timeout, 6))
+        let reopenWait = max(0.8, min(timeout, 2))
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             self.readyContinuation = continuation
             self.readyHandshakeGeneration &+= 1
@@ -26,14 +33,20 @@ extension LinkService {
             self.openEventsStream(
                 mux: mux,
                 generation: self.readyHandshakeGeneration,
-                timeout: 15
+                timeout: firstWait,
+                reopenTimeout: reopenWait
             )
         }
     }
 
- /// One `$events` open plus its `ready` wait (15s first try, 5s after the
+ /// One `$events` open plus its `ready` wait (bounded first try, then the
  /// one-shot reopen, so a dead candidate still fails within a bounded window).
-    private func openEventsStream(mux: RemoteMux, generation: Int, timeout: TimeInterval) {
+    private func openEventsStream(
+        mux: RemoteMux,
+        generation: Int,
+        timeout: TimeInterval,
+        reopenTimeout: TimeInterval
+    ) {
         do {
             self.eventsStream = try mux.openStream(
                 endpoint: "$events",
@@ -66,13 +79,13 @@ extension LinkService {
         self.readyTimeoutTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
             guard let self, !Task.isCancelled else { return }
-            self.handleReadyTimeout(mux: mux, generation: generation)
+            self.handleReadyTimeout(mux: mux, generation: generation, reopenTimeout: reopenTimeout)
         }
     }
 
  /// First timeout reopens `$events` on the same mux; the second fails the
  /// candidate and the regular legacy reconnect path takes over.
-    private func handleReadyTimeout(mux: RemoteMux, generation: Int) {
+    private func handleReadyTimeout(mux: RemoteMux, generation: Int, reopenTimeout: TimeInterval) {
         guard generation == readyHandshakeGeneration, readyContinuation != nil else { return }
         guard !readyReopenUsed else {
             failReady(LinkError.timeout("$events ready"))
@@ -84,7 +97,12 @@ extension LinkService {
         readyHandshakeGeneration &+= 1
         eventsStream?.cancel()
         eventsStream = nil
-        openEventsStream(mux: mux, generation: readyHandshakeGeneration, timeout: 5)
+        openEventsStream(
+            mux: mux,
+            generation: readyHandshakeGeneration,
+            timeout: reopenTimeout,
+            reopenTimeout: reopenTimeout
+        )
     }
 
  /// Fails the current ready wait. Transport-loss paths call this
