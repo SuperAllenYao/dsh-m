@@ -14,7 +14,7 @@ struct WorkspaceListView: View {
                 .padding(.horizontal, Theme.Spacing.pageInset)
                 .padding(.top, Theme.Spacing.xs)
 
-            if viewModel.loadedFromCache && (viewModel.isRefreshing || viewModel.cacheIsStale) {
+            if viewModel.loadedFromCache && (viewModel.showCacheRefreshBanner || viewModel.cacheIsStale) {
                 cacheStatusBanner
                     .padding(.horizontal, Theme.Spacing.pageInset)
                     .padding(.bottom, Theme.Spacing.s)
@@ -204,15 +204,20 @@ struct WorkspaceListView: View {
         // M2b-2: the first paint came from disk; say so while the network refresh
         // runs (or when the snapshot is past the 24h display TTL).
         guard viewModel.loadedFromCache else { return summary }
-        if viewModel.isRefreshing { return L10n.f("%@ · 本地缓存", summary) }
+        // 2026-10-23 冷启动 <1s：只有「刷新真正变慢」（>800ms，见
+        // WorkspaceViewModel.cacheRefreshBannerDelayMs）才提示本地缓存；正常的
+        // 亚秒级刷新不再出现「· 本地缓存」字样。
+        if viewModel.showCacheRefreshBanner { return L10n.f("%@ · 本地缓存", summary) }
         if viewModel.cacheIsStale { return L10n.f("%@ · 缓存已过期", summary) }
         return summary
     }
 
-    /// M2b-2: cache-first paint indicator (a fresh network list hides it).
+    /// M2b-2: cache-first paint indicator (a fresh network list hides it). The
+    /// refreshing variant is delayed (`showCacheRefreshBanner`) so a <1s refresh
+    /// never flashes 「本地缓存 · 正在刷新…」.
     private var cacheStatusBanner: some View {
         HStack(spacing: Theme.Spacing.xs) {
-            if viewModel.isRefreshing {
+            if viewModel.showCacheRefreshBanner {
                 ProgressView()
                     .tint(Theme.Palette.accent)
                     .scaleEffect(0.7)
@@ -221,7 +226,7 @@ struct WorkspaceListView: View {
                     .font(.system(size: 11, weight: .regular))
                     .foregroundStyle(Theme.Palette.warning)
             }
-            Text(L10n.t(viewModel.isRefreshing ? "本地缓存 · 正在刷新…" : "本地缓存 · 已超过 24 小时"))
+            Text(L10n.t(viewModel.showCacheRefreshBanner ? "本地缓存 · 正在刷新…" : "本地缓存 · 已超过 24 小时"))
                 .font(Theme.Typography.label)
                 .foregroundStyle(Theme.Palette.textSecondary)
             Spacer(minLength: 0)

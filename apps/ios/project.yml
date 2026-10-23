@@ -34,8 +34,8 @@ targets:
         INFOPLIST_KEY_NSLocalNetworkUsageDescription: "DSH-m 需要访问局域网以连接你 Mac 上的 DSH 服务"
         INFOPLIST_KEY_NSBonjourServices: ["_dshm._tcp"]
         INFOPLIST_KEY_UIBackgroundModes: ["remote-notification"]
-        MARKETING_VERSION: "0.2.3"
-        CURRENT_PROJECT_VERSION: "5"
+        MARKETING_VERSION: "0.2.5"
+        CURRENT_PROJECT_VERSION: "7"
     scheme:
       testTargets:
         - DSHmTests

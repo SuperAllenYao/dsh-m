@@ -297,37 +297,100 @@ final class ReconnectPolicyTests: XCTestCase {
     }
 
     func testCandidateBudget() {
-        XCTAssertEqual(LinkService.candidateTimeoutSeconds(index: 0, count: 2, pathChanged: false), 2)
+        // 2026-10-23 real-device calibration: a healthy 5G+relay round measured
+        // candidateMs=1577–1602ms, so non-last candidates need >2s.
+        XCTAssertEqual(LinkService.candidateTimeoutSeconds(index: 0, count: 2, pathChanged: false), 3)
         XCTAssertEqual(LinkService.candidateTimeoutSeconds(index: 1, count: 2, pathChanged: false), 8)
-        XCTAssertEqual(LinkService.candidateTimeoutSeconds(index: 0, count: 2, pathChanged: true), 1.5)
-        XCTAssertEqual(LinkService.candidateTimeoutSeconds(index: 1, count: 3, pathChanged: true), 1.5)
+        XCTAssertEqual(LinkService.candidateTimeoutSeconds(index: 0, count: 2, pathChanged: true), 2.5)
+        XCTAssertEqual(LinkService.candidateTimeoutSeconds(index: 1, count: 3, pathChanged: true), 2.5)
         XCTAssertEqual(LinkService.candidateTimeoutSeconds(index: 2, count: 3, pathChanged: true), 8)
         // Single candidate: keeps the long budget.
         XCTAssertEqual(LinkService.candidateTimeoutSeconds(index: 0, count: 1, pathChanged: true), 8)
     }
 
     func testRoundBudgetPerPath() {
-        // Single candidate: nothing to switch to, but still capped below the old
-        // 8s-dial + backoff tail.
+        // Single candidate: nothing to switch to — the full candidate budget.
         XCTAssertEqual(
             LinkService.roundBudgetSeconds(candidateCount: 1, hasSameSubnetLAN: false, hasRelay: true),
-            6
+            8
         )
         // Same LAN: LAN should answer fast, relay fallback still usable.
         XCTAssertEqual(
             LinkService.roundBudgetSeconds(candidateCount: 2, hasSameSubnetLAN: true, hasRelay: true),
-            3
+            4
         )
-        // Cross-network: relay + stale LAN fallback must finish inside 1.5s.
+        // Cross-network: relay first + stale LAN fallback. Must cover one healthy
+        // relay round (~1.6s measured on a real device) plus a bounded fallback;
+        // the old 1.5s budget was shorter than the round itself.
         XCTAssertEqual(
             LinkService.roundBudgetSeconds(candidateCount: 2, hasSameSubnetLAN: false, hasRelay: true),
-            1.5
+            5
         )
         // LAN-only fallback keeps a usable budget.
         XCTAssertEqual(
             LinkService.roundBudgetSeconds(candidateCount: 2, hasSameSubnetLAN: false, hasRelay: false),
-            3
+            4
         )
+    }
+
+    /// 2026-10-23 冷启动 <1s：relay-first 跨网路径必须跳过拨号前的串行发现+探测
+    /// （真机实测该段 1577–1614ms，占 connectMs 的 ~65%），直接拨 relay。
+    func testRelayFirstFastPathDecision() {
+        let relay = URL(string: "https://121.41.112.232:30000")!
+        let lan = URL(string: "https://192.168.5.10:3466")!
+        // Cross-network (cellular) with relay ordered first: dial immediately.
+        XCTAssertTrue(LinkService.shouldDialRelayImmediately(
+            prefersRelay: true,
+            orderedCandidates: [relay, lan],
+            local: nil
+        ))
+        // Same-Wi-Fi LAN-first path keeps the convergence budget (it decides which
+        // LAN origin is reachable).
+        XCTAssertFalse(LinkService.shouldDialRelayImmediately(
+            prefersRelay: false,
+            orderedCandidates: [lan, relay],
+            local: nil
+        ))
+        // Single candidate: nothing to converge / discover before dialing.
+        XCTAssertFalse(LinkService.shouldDialRelayImmediately(
+            prefersRelay: true,
+            orderedCandidates: [relay],
+            local: nil
+        ))
+        // Relay-first but the first ordered candidate is not a relay -> no fast path.
+        XCTAssertFalse(LinkService.shouldDialRelayImmediately(
+            prefersRelay: true,
+            orderedCandidates: [lan, relay],
+            local: nil
+        ))
+    }
+
+    /// 2026-10-23 冷启动 <1s（列表侧）：连接池预热必须选「当前网络可达」的 origin，
+    /// 蜂窝/跨网时优先 relay 候选，避免把 ~3s 预热预算打到失效 LAN 上。
+    func testPoolWarmupOriginSelection() {
+        let relay = "https://121.41.112.232:30000"
+        let lan = "https://192.168.5.10:3466"
+        XCTAssertEqual(
+            LinkService.poolWarmupOrigin(
+                current: lan,
+                stored: [lan, relay],
+                prefersRelay: true,
+                local: nil
+            )?.absoluteString,
+            relay,
+            "cellular: warm the relay, never the stale LAN"
+        )
+        XCTAssertEqual(
+            LinkService.poolWarmupOrigin(
+                current: lan,
+                stored: [lan, relay],
+                prefersRelay: false,
+                local: nil
+            )?.absoluteString,
+            lan,
+            "LAN path: warm the stored current origin first"
+        )
+        XCTAssertNil(LinkService.poolWarmupOrigin(current: nil, stored: [], prefersRelay: true, local: nil))
     }
 
     func testAttemptBudgetNeverExceedsTheRoundBudget() {
@@ -558,7 +621,10 @@ final class FirstByteTimeoutTests: XCTestCase {
     }
 
     func testBudgetIsTheSingleLeadApprovedConstant() {
-        XCTAssertEqual(HTTPConnection.firstByteTimeout, 0.8, accuracy: 0.0001)
+        // 2026-10-23: raised 0.8 -> 1.5 after a real-device false kill on a slow
+        // (but alive) 5G relay path; the teardown decision now also verifies the
+        // path with a fresh /health probe before invalidating the transport.
+        XCTAssertEqual(HTTPConnection.firstByteTimeout, 1.5, accuracy: 0.0001)
     }
 
     func testReusedConnectionWithoutFirstByteFailsNotifiesAndIsDropped() async throws {

@@ -212,4 +212,21 @@ final class P15LiteListTests: XCTestCase {
         XCTAssertEqual(SessionListLite.requestValue, "lite")
         XCTAssertEqual(SessionListLite.responseHeader, "x-dshm-list-lite")
     }
+
+    /// Regression guard (P0 list-poll amplification): the open detail is the
+    /// highest-frequency `session/list` caller — 8 s tick plus the ≥2 s activity
+    /// debounce both go through `LinkService.listSessions()`. That call site used
+    /// to send `_request = {}` (no lite hint), so the plugin returned the untouched
+    /// ~1.5 MB response (~357 KB gzipped) on every poll. The wire args must be the
+    /// lite opt-in, and nothing else may leak into the legacy-shaped envelope.
+    func testListSessionsRequestArgsCarryLiteHint() {
+        let args = LinkService.listSessionsRequestArgs()
+        XCTAssertEqual(
+            args,
+            SessionListLite.requestArgs(),
+            "detail/subagent list poll must opt in to the plugin's lite projection"
+        )
+        XCTAssertEqual(args["_request"]?.objectValue?["listMode"]?.stringValue, "lite")
+        XCTAssertEqual(args.count, 1, "the legacy envelope only carries `_request`")
+    }
 }
