@@ -173,13 +173,21 @@ final class SessionViewModel: ObservableObject {
     /// old code marked the fill terminally `failed` with `hasMore=1` — the session
     /// never reached its first event until reopened.
     private static let historyFillTransientRetryLimit = 30
-    /// 2026-10-23 真机空白修复：后台补齐期间**暂停**把 prepend 结果发布到可见 rows。
-    ///
-    /// 每批 history page 都会从顶部插入内容，真机上（尤其冷启动直达/通知深链入口 +
-    /// 13MB 大会话）每次插入都会让 SwiftUI 的 LazyVStack 丢掉可见内容若干帧——用户看到
-    /// 整页空白 ↔ 内容反复闪回，最长 1–5s。数据照常进入 journal（补齐语义不变），
-    /// 但 rows 只在补齐完成后发布一次：补齐期间用户看到的是稳定的缓存窗口。
-    private var prependRenderDeferred = false
+
+    // MARK: - DEBUG-only 自动化取证钩子（生产 env 不设置 → 零行为）
+    //
+    // `DSHM_FILL_PACE_MS`：把补齐每页之间的间隔拉长，好让自动化真机场景能跨多个
+    //   插入批次持续滚动（只改节奏，不改数据/布局/发布语义）。
+    private static let jitterFillPaceSeconds: Double = {
+        #if DEBUG
+        guard let raw = ProcessInfo.processInfo.environment["DSHM_FILL_PACE_MS"],
+              let ms = Double(raw), ms > 0 else { return 0 }
+        return ms / 1000.0
+        #else
+        return 0
+        #endif
+    }()
+
     /// A history/older batch was merged but its rows rebuild has not run yet: the
     /// view anchors on historyBatchToken, so the token must change *after* the rows
     /// are on screen.
@@ -597,8 +605,6 @@ final class SessionViewModel: ObservableObject {
         cachedChunksTask = nil
         firstPaintCacheTask?.cancel()
         firstPaintCacheTask = nil
-        // 2026-10-23 空白修复：离屏时丢弃尚未发布的补齐 rows（详情已不可见）。
-        prependRenderDeferred = false
         pendingHistoryBatch = false
         // P0: leaving the screen retires the deferred-open wait; a late phase flip
         // must not open a stream for a detail that is gone.
@@ -632,8 +638,6 @@ final class SessionViewModel: ObservableObject {
         // Allow the filler to restart for the new window: the in-flight page keyed
         // on the old front is cancelled, and the next snapshot/front will re-arm it.
         historyFillState = .idle
-        // 2026-10-23 空白修复：重连后窗口会被新 snapshot 整体替换，丢弃未发布的补齐 rows。
-        prependRenderDeferred = false
         pendingHistoryBatch = false
         // An explicit reopen supersedes any pending deferred open; `openStream()`
         // re-arms the wait when the link is still down.
@@ -792,7 +796,14 @@ final class SessionViewModel: ObservableObject {
     }
 
     private var historyPageMessages: Int {
-        SessionWindowPolicy.historyPageMessages(isRelay: NetworkPathMonitor.shared.prefersRelay)
+        #if DEBUG
+        // 自动化真机取证：允许把页调小，让补齐插入分成更多批次（只影响测试节奏）。
+        if let raw = ProcessInfo.processInfo.environment["DSHM_FILL_PAGE_MESSAGES"],
+           let value = Int(raw), value > 0 {
+            return value
+        }
+        #endif
+        return SessionWindowPolicy.historyPageMessages(isRelay: NetworkPathMonitor.shared.prefersRelay)
     }
 
     /// Starts the automatic fill when the prerequisites are met. Safe to call from
@@ -853,13 +864,15 @@ final class SessionViewModel: ObservableObject {
                 retriedStalePage = false
                 historyFillFailures = 0
                 historyFillTransientRetries = 0
-                // 2026-10-23 空白修复：补齐期间不逐页发布 rows（见 prependRenderDeferred），
-                // 只更新 journal/缓存；rows 在补齐完成时一次性发布。
-                if !prependRenderDeferred {
-                    rebuildNowForHistoryBatch()
-                }
+                // v0.2.6 滚动修复：逐批发布（不再延迟）。视口稳定性由视图侧的
+                // scrollPosition(id:anchor:) 锚定保证，插入本身不改变可见内容。
+                rebuildNowForHistoryBatch()
                 syncFillDiagnostics()
                 saveWindowCacheNow()
+                // DEBUG 取证：拉长页间隔，让自动化场景跨越多个插入批次（生产 0）。
+                if Self.jitterFillPaceSeconds > 0 {
+                    try? await Task.sleep(nanoseconds: UInt64(Self.jitterFillPaceSeconds * 1_000_000_000))
+                }
             case .terminal:
                 markHistoryFillCompleted()
                 return
@@ -878,7 +891,6 @@ final class SessionViewModel: ObservableObject {
                 }
                 historyFillTransientRetries += 1
                 if historyFillTransientRetries > Self.historyFillTransientRetryLimit {
-                    flushDeferredPrependRender()
                     historyFillState = .failed
                     syncFillDiagnostics()
                     return
@@ -887,7 +899,6 @@ final class SessionViewModel: ObservableObject {
             case .failed:
                 historyFillFailures += 1
                 if historyFillFailures > 5 {
-                    flushDeferredPrependRender()
                     historyFillState = .failed
                     syncFillDiagnostics()
                     return
@@ -978,10 +989,6 @@ final class SessionViewModel: ObservableObject {
         guard historyFillState != .completed else { return }
         historyFillState = .completed
         historyFillCompletedAt = Date()
-        // 2026-10-23 空白修复：把补齐期间推迟的 rows 一次性发布（顶部一次插入全部历史）。
-        // 只在这里发布，补齐期间用户一直看到稳定的缓存窗口；发布后由视图的
-        // historyBatchToken 处理器做一次贴底/锚定。
-        flushDeferredPrependRender()
         if let started = historyFillStartedAt {
             let milliseconds = Date().timeIntervalSince(started) * 1000
             DetailMetrics.markHistoryFillCompleted(
@@ -997,24 +1004,12 @@ final class SessionViewModel: ObservableObject {
         publishDetailMetricsValue()
     }
 
-    /// Publishes rows for history pages that were merged while `prependRenderDeferred`
-    /// was set. Runs at most one rows rebuild for the whole fill (the fixed blank cause).
-    private func flushDeferredPrependRender() {
-        guard prependRenderDeferred else { return }
-        prependRenderDeferred = false
-        pendingHistoryBatch = true
-        pendingRebuild = true
-        rebuildRows()
-    }
-
     private func pauseHistoryFillForOffline() {
         // From idle too: a cold open while offline must show pausedOffline so the
         // reconnect resumes it (a plain idle would look like "nothing to load").
         guard historyFillState == .loading || historyFillState == .idle else { return }
         historyFillTask?.cancel()
         historyFillTask = nil
-        // Whatever history was merged before going offline should become visible.
-        flushDeferredPrependRender()
         historyFillState = .pausedOffline
         syncFillDiagnostics()
     }
@@ -1139,14 +1134,8 @@ final class SessionViewModel: ObservableObject {
         case .olderPrepended(let seqs):
             // Front merge: the rows above the current position changed, the newest
             // end did not. An empty result (defensive) has nothing to re-render.
-            scrollDbg("journal olderPrepended n=\(seqs.count) fillState=\(historyFillState.rawValue) deferred=\(prependRenderDeferred)")
+            scrollDbg("journal olderPrepended n=\(seqs.count) fillState=\(historyFillState.rawValue)")
             if seqs.isEmpty {
-                publishLiveAssistantText()
-            } else if historyFillState == .loading {
-                // 2026-10-23 真机空白修复：补齐仍在进行时，把 rows 发布推迟到补齐完成
-                // 一次性发布（见 `prependRenderDeferred` 注释）。journal 已更新、补齐
-                // 语义不变，只是不再每页都扰动可见列表。
-                prependRenderDeferred = true
                 publishLiveAssistantText()
             } else {
                 pendingHistoryBatch = true
