@@ -620,6 +620,20 @@ final class WorkspaceViewModel: ObservableObject {
 
     private func loadSessionsNow(silent: Bool = false) async {
         guard let link, link.credentials != nil else { return }
+ // T2(B1)：冷启动首屏列表先等 HTTPS 池预热（上限 350ms），让随后的
+ // auth+list 复用预热建好的 TLS，而不是再自付一次 ~200-300ms 握手。只有
+ // 「首份网络列表未落地」+「预热在飞」才等：热路径零额外延迟；预热失败/超时/
+ // 已完成都立即走原路径（等待不抛错、也不取消预热任务）。
+        if Self.shouldAwaitPoolWarmup(
+            networkApplied: networkApplied,
+            warmupInFlight: link.isPoolWarmupInFlight
+        ) {
+            let waitStartedAt = Date()
+            await link.awaitPoolWarmup(timeoutMs: Self.poolWarmupWaitTimeoutMs)
+            let waitedMs = Int(Date().timeIntervalSince(waitStartedAt) * 1000)
+            coldStartDebug("pool warm-up waited \(waitedMs)ms")
+            guard !Task.isCancelled else { return }
+        }
  // P0-4: every request gets an id; a superseded response (cancelled task or
  // the early pre-`connected` request losing the race) is dropped instead of
  // overwriting a newer snapshot.
@@ -704,6 +718,22 @@ final class WorkspaceViewModel: ObservableObject {
         stillConnected: Bool = true
     ) -> Bool {
         stillConnected && !baselineApplied && elapsedMs >= thresholdMs
+    }
+
+ // MARK: - T2(B1)：冷启动列表等 HTTPS 池预热
+
+ /// 冷启动首屏列表等待预热的预算（handoff §3.2：≤350ms，超时直接走原路径）。
+    static let poolWarmupWaitTimeoutMs = 350
+
+ /// 是否该在发 early `session/list` 前先等冷启动 HTTPS 池预热。
+ ///
+ /// 只有「首份网络列表还没落地（冷启动）」+「预热任务在飞」两个条件同时成立才等，
+ /// 保证热路径（已 applied / 预热已完成 / 从未预热）零额外延迟。
+    nonisolated static func shouldAwaitPoolWarmup(
+        networkApplied: Bool,
+        warmupInFlight: Bool
+    ) -> Bool {
+        !networkApplied && warmupInFlight
     }
 
  /// Pure decision for the early snapshot: issue `session/list` while the mux is

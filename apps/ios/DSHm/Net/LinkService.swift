@@ -156,6 +156,10 @@ final class LinkService: ObservableObject {
     var eventsHandshakeTask: Task<Void, Never>?
  /// 冷启动 <1s：共享 HTTPS 连接池预热任务（见 `warmHTTPSPoolIfColdStart`）。
     private var poolWarmupTask: Task<Void, Never>?
+ /// T2(B1)：预热任务是否仍在飞——early list 等待它的唯一条件。
+ /// 任务结束（成功或失败）后 `warmHTTPSPoolIfColdStart` 的 `defer` 会把上面
+ /// 的句柄置 nil，所以这里为 false 即「无需等待」，热路径零延迟。
+    var isPoolWarmupInFlight: Bool { poolWarmupTask != nil }
  /// Generation of the legacy `$events` ready handshake (v0.1.1 Bug 1). Stream
  /// callbacks and the timeout task capture it, so a retired stream (the one
  /// abandoned by the one-shot reopen) can neither resume nor fail the
@@ -1852,6 +1856,19 @@ final class LinkService: ObservableObject {
         }
     }
 
+ /// T2(B1)：冷启动首屏列表前等 HTTPS 池预热就绪，最多 `timeoutMs` 毫秒。
+ ///
+ /// 竞态语义（以下三种情况都**不抛错、不取消预热任务**）：
+ /// - 没有在飞的预热（热路径 / 预热已完成 / 从未预热）：立即返回，零额外延迟；
+ /// - 预热在飞：等它结束；超时按 `timeoutMs` 上限返回，预热继续在后台跑完，
+ /// 后续请求（含已放行的列表请求）仍能复用它建好的连接；
+ /// - 预热失败：任务内部 `try?` 吞掉 `/health` 错误后正常结束，这里按「完成」
+ /// 返回，调用方直接走原路径（该付的 TLS 照付，不影响正确性）。
+    func awaitPoolWarmup(timeoutMs: Int) async {
+        guard let task = poolWarmupTask else { return }
+        await PoolWarmupWait.wait(for: task, timeoutMs: timeoutMs)
+    }
+
  /// Pure origin choice for the cold-start pool warm-up (unit-tested). Same rule as
  /// the dial order: cellular/cross-network warms the relay candidate, LAN paths
  /// warm the stored current origin.
@@ -2321,6 +2338,56 @@ extension LinkService {
         pathGeneration: Int
     ) -> Bool {
         roundStartGeneration < pathGeneration
+    }
+}
+
+// MARK: - T2(B1)：冷启动预热限时等待
+
+/// 限时等待一个**已经启动**的预热任务结束，供 `LinkService.awaitPoolWarmup` 与单测共用。
+///
+/// 为什么不能直接 `await task.value`：那会一直等到任务结束、拿不到超时上限。
+/// 这里让「任务完成」和「超时」两个一次性唤醒者竞速，先到者唤醒调用方，另一个
+/// 什么都不做——**既不取消也不等待**预热任务：超时后预热继续在后台跑完，后续
+/// 请求仍可复用它建好的连接。
+enum PoolWarmupWait {
+ /// 等 `task` 结束，最多 `timeoutMs` 毫秒；永不抛错。
+ ///
+ /// - `timeoutMs <= 0`：立即返回（不额外等待）；
+ /// - 超时：按上限返回，任务本身继续在后台跑；
+ /// - 任务完成（无论其内部 `/health` 成功还是失败）：立即返回。
+    static func wait(for task: Task<Void, Never>, timeoutMs: Int) async {
+        guard timeoutMs > 0 else { return }
+ // 上限 60s：防止异常入参造成 UInt64 纳秒溢出（生产调用方只用 350ms 量级）。
+        let clampedMs = min(timeoutMs, 60_000)
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            let resumeOnce = ResumeOnce(continuation)
+            Task {
+                await task.value
+                resumeOnce.resume()
+            }
+            Task {
+                try? await Task.sleep(nanoseconds: UInt64(clampedMs) * 1_000_000)
+                resumeOnce.resume()
+            }
+        }
+    }
+
+ /// 两个竞速唤醒者只有第一个真正 resume continuation（double resume 会崩）。
+    private final class ResumeOnce: @unchecked Sendable {
+        private let lock = NSLock()
+        private var continuation: CheckedContinuation<Void, Never>?
+
+        init(_ continuation: CheckedContinuation<Void, Never>) {
+            self.continuation = continuation
+        }
+
+        func resume() {
+            lock.lock()
+            let pending = continuation
+            continuation = nil
+            lock.unlock()
+            pending?.resume()
+        }
     }
 }
 
