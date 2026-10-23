@@ -154,6 +154,8 @@ final class LinkService: ObservableObject {
  /// 冷启动 <1s：`$events` ready 握手已从「在线」判定里解耦，改成
  /// connected 之后的后台任务（失败则按传输失联重连）。这里保留句柄便于取消。
     var eventsHandshakeTask: Task<Void, Never>?
+ /// 冷启动 <1s：共享 HTTPS 连接池预热任务（见 `warmHTTPSPoolIfColdStart`）。
+    private var poolWarmupTask: Task<Void, Never>?
  /// Generation of the legacy `$events` ready handshake (v0.1.1 Bug 1). Stream
  /// callbacks and the timeout task capture it, so a retired stream (the one
  /// abandoned by the one-shot reopen) can neither resume nor fail the
@@ -986,6 +988,9 @@ final class LinkService: ObservableObject {
             local: localNetwork,
             pathChanged: pathChanged
         )
+ // 冷启动 <1s（列表侧）：预热共享 HTTPS 池，让 t0+~100ms 就发出的
+ // early session/list 复用已建好的 TLS，而不是再付一次 ~300ms 握手。
+        warmHTTPSPoolIfColdStart(prefersRelay: prefersRelay, local: localNetwork)
  // 跨网络自愈（用户）：mDNS 拿 Mac **当前** 端点 + 对候选并行打
  // /health，两项都带预算（≤1.2–1.5s）。网络刚变时这一步把"按旧顺序串行盲试"
  // 变成一次并行收敛，第一拨就落在可达地址上。
@@ -1294,6 +1299,22 @@ final class LinkService: ObservableObject {
         }
         let port = UInt16(origin.port ?? 443)
 
+ // cold start <1s（第二级）：TCP+TLS 建立与 mux token 的
+ // challenge/verify 互不依赖。真机拆解显示 TLS 段 ~300ms、auth 段 ~100ms，
+ // 且原本是「auth 用一条 TLS 连接、WSS 再建一条 TLS」的串行两段。
+ // 这里先把 WSS 的 TLS 连接放到后台并行建立，auth 完成后再发 upgrade，
+ // 把第二段 TLS 从关键路径上消掉（预期 −150~250ms）。
+        let ws = WSSClient(
+            host: host,
+            port: port,
+            path: "/api/remote.mux",
+            headers: [:],
+            leafPin: leafPin,
+            caCertBase64: credentials?.caCertBase64
+        )
+        self.ws = ws
+        let wsPrepare = Task { try await ws.prepareConnection(timeout: timeout) }
+
  // Cold-start critical path: the unary api token and the mux
  // token are two independent 2-RTT challenge/verify rounds. Mint them
  // **concurrently** (purpose-scoped in-flight tasks) instead of serializing
@@ -1311,6 +1332,9 @@ final class LinkService: ObservableObject {
             muxToken = try await authenticateToken(purpose: "mux", timeout: timeout)
         } catch {
             apiTokenPrefetch.cancel()
+            wsPrepare.cancel()
+            ws.close()
+            self.ws = nil
             let reason = NetworkErrorInterpreter.message(for: error)
             if isCredentialRejection(error) { return .credentialRejected(reason) }
  // Cross-network: `503 {error:"host/inactive"}` means this origin's
@@ -1321,19 +1345,28 @@ final class LinkService: ObservableObject {
             return .failed(reason)
         }
         ConnectionMetrics.markAuth()
-        if Task.isCancelled { return .failed(L10n.t("已取消")) }
+        if Task.isCancelled {
+            apiTokenPrefetch.cancel()
+            wsPrepare.cancel()
+            ws.close()
+            self.ws = nil
+            return .failed(L10n.t("已取消"))
+        }
 
-        let ws = WSSClient(
-            host: host,
-            port: port,
-            path: "/api/remote.mux",
-            headers: ["authorization": "Bearer \(muxToken)"],
-            leafPin: leafPin,
-            caCertBase64: credentials?.caCertBase64
-        )
-        self.ws = ws
         do {
-            try await ws.connect(timeout: timeout)
+            try await wsPrepare.value
+        } catch {
+            apiTokenPrefetch.cancel()
+            self.ws = nil
+            let reason = NetworkErrorInterpreter.message(for: error)
+            if isCredentialRejection(error) { return .credentialRejected(reason) }
+            let failureClass = Self.failureClass(for: error)
+            if failureClass.isFastReject { return .fastRejected(reason, failureClass) }
+            return .failed(reason)
+        }
+        ws.setUpgradeHeaders(["authorization": "Bearer \(muxToken)"])
+        do {
+            try await ws.upgrade(timeout: timeout)
         } catch {
             apiTokenPrefetch.cancel()
             self.ws = nil
@@ -1780,6 +1813,60 @@ final class LinkService: ObservableObject {
             return resume.isEmpty ? nil : resume
         }
         return resume.isEmpty ? base : base + ";" + resume
+    }
+
+ // MARK: - 冷启动 HTTPS 池预热
+
+ /// 冷启动时预热共享 HTTPS 连接池。
+ ///
+ /// 真机拆解：early `session/list` 在 t0+~100ms 就发出，但连接池是空的 → 首个
+ /// 请求（api token 认证）要先付一次 TLS，列表请求再复用同一条
+ /// 连接。这里在启动连接轮次的同时用一次轻量 `/health` 打通 TCP+TLS 并留在池里，
+ /// 认证/列表都直接复用 → 列表侧预期 −200~300ms。
+ ///
+ /// 只在「本次进程还没成功连过」时执行；网络切换/重连不重复预热。选择 origin 的
+ /// 规则与拨号序一致：蜂窝/跨网优先 relay 候选，避免预热打到失效 LAN 上。
+    private func warmHTTPSPoolIfColdStart(prefersRelay: Bool, local: LocalIPv4Network?) {
+        guard lastConnectedAt == nil, poolWarmupTask == nil, let credentials else { return }
+        guard let origin = Self.poolWarmupOrigin(
+            current: credentials.origin,
+            stored: credentials.originCandidates,
+            prefersRelay: prefersRelay,
+            local: local
+        ) else { return }
+        let leafPin = credentials.leafPin
+        let caCertBase64 = credentials.caCertBase64
+        linkDebug("pool warm-up -> " + Self.originLabel(origin))
+        poolWarmupTask = Task { [weak self] in
+            defer { self?.poolWarmupTask = nil }
+ // A plain GET /health over the shared pool: TLS handshake + one round trip,
+ // connection stays pooled for the auth/list requests that follow.
+            _ = try? await HTTPSClient.json(
+                origin: origin,
+                method: "GET",
+                path: "/health",
+                leafPin: leafPin,
+                caCertBase64: caCertBase64,
+                timeout: 3
+            )
+        }
+    }
+
+ /// Pure origin choice for the cold-start pool warm-up (unit-tested). Same rule as
+ /// the dial order: cellular/cross-network warms the relay candidate, LAN paths
+ /// warm the stored current origin.
+    nonisolated static func poolWarmupOrigin(
+        current: String?,
+        stored: [String]?,
+        prefersRelay: Bool,
+        local: LocalIPv4Network?
+    ) -> URL? {
+        let candidates = PairingOriginSelector.reconnectCandidates(current: current, stored: stored)
+        if prefersRelay,
+           let relay = candidates.first(where: { candidateRole(host: $0.host, local: local) == .relay }) {
+            return relay
+        }
+        return candidates.first
     }
 
  // MARK: - 运行时端点自愈（用户：任何网络都要连得上，且极致快）

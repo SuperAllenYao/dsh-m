@@ -53,7 +53,7 @@ final class WSSClient: @unchecked Sendable {
     private let host: String
     private let port: UInt16
     private let path: String
-    private let extraHeaders: [String: String]
+    private var extraHeaders: [String: String]
     private let leafPin: String
 
     private let queue = DispatchQueue(label: "com.dshm.ws-client")
@@ -67,6 +67,9 @@ final class WSSClient: @unchecked Sendable {
     private var handshakeDone = false
     private var finished = false
     private var continuation: CheckedContinuation<Void, Error>?
+ /// cold start <1s: continuation for the TCP+TLS-only first phase
+ /// (`prepareConnection`). Resumed on `.ready`, failed with the same error paths.
+    private var readyContinuation: CheckedContinuation<Void, Error>?
     private var pingTimer: DispatchSourceTimer?
     private var pingSentAt: Date?
  /// Cancelled as soon as the 101 upgrade completes (see `WSSConnectTimeout`).
@@ -88,14 +91,50 @@ final class WSSClient: @unchecked Sendable {
 
  // MARK: - Connect
 
+ /// One-shot connect (prepare + upgrade). Kept for `P1Transport` and any caller
+ /// that does not need to overlap the TLS handshake with other work.
     func connect(timeout: TimeInterval = 15) async throws {
+        try await prepareConnection(timeout: timeout)
+        try await upgrade(timeout: timeout)
+    }
+
+ /// cold start <1s: establish TCP+TLS **only**. The caller can overlap
+ /// this with the mux-token round trip and then call `upgrade(timeout:)` once the
+ /// token is known — removing one full TLS handshake (~150–250ms on a 5G relay)
+ /// from the "connect" critical path.
+    func prepareConnection(timeout: TimeInterval = 15) async throws {
         try await withCheckedThrowingContinuation { continuation in
-            self.continuation = continuation
-            queue.async { self.start(timeout: timeout) }
+            self.readyContinuation = continuation
+            queue.async { self.startTLS(timeout: timeout) }
         }
     }
 
-    private func start(timeout: TimeInterval) {
+ /// Set the HTTP upgrade headers (e.g. the bearer mux token) after prepare.
+    func setUpgradeHeaders(_ headers: [String: String]) {
+        extraHeaders = headers
+    }
+
+ /// Send the WebSocket upgrade on the prepared TLS connection and wait for 101.
+    func upgrade(timeout: TimeInterval = 15) async throws {
+        try await withCheckedThrowingContinuation { continuation in
+            self.continuation = continuation
+            queue.async { [weak self] in
+                guard let self else { return }
+                guard self.connection != nil, !self.finished else {
+                    let pending = self.continuation
+                    self.continuation = nil
+                    pending?.resume(throwing: LinkError.notConnected)
+                    return
+                }
+                self.connectTimeout.arm(on: self.queue, after: timeout) { [weak self] in
+                    self?.fail(LinkError.timeout("mux 升级"))
+                }
+                self.sendHandshake()
+            }
+        }
+    }
+
+    private func startTLS(timeout: TimeInterval) {
         let parameters = PinnedTLS.parameters(leafPin: leafPin, caCertBase64: caCertBase64, capture: pinCapture, connectTimeout: min(timeout, 15))
         let hostPort = NWEndpoint.hostPort(host: NWEndpoint.Host(host), port: NWEndpoint.Port(rawValue: port) ?? 443)
         let connection = NWConnection(to: hostPort, using: parameters)
@@ -104,7 +143,11 @@ final class WSSClient: @unchecked Sendable {
             guard let self else { return }
             switch state {
             case .ready:
-                self.sendHandshake()
+ // TCP+TLS is up: the upgrade is now the caller's decision.
+                self.connectTimeout.cancel()
+                let pending = self.readyContinuation
+                self.readyContinuation = nil
+                pending?.resume()
             case .failed(let error):
                 self.fail(LinkError.transport("mux 连接 \(self.host):\(self.port) 失败：" + NetworkErrorInterpreter.message(for: error)))
             case .cancelled:
@@ -114,10 +157,9 @@ final class WSSClient: @unchecked Sendable {
             }
         }
         connection.start(queue: queue)
- // Must be disarmed by `processHandshake()`: otherwise this deadline kills
- // a healthy socket `timeout` seconds after a successful upgrade.
+ // Must be disarmed on `.ready`: the upgrade arms its own deadline.
         connectTimeout.arm(on: queue, after: timeout) { [weak self] in
-            self?.fail(LinkError.timeout("mux 升级"))
+            self?.fail(LinkError.timeout("mux 连接建立"))
         }
     }
 
@@ -352,6 +394,9 @@ final class WSSClient: @unchecked Sendable {
         pingTimer = nil
         connection?.cancel()
         connection = nil
+        let ready = readyContinuation
+        readyContinuation = nil
+        ready?.resume(throwing: LinkError.httpStatus(409, reason.isEmpty ? "mux 关闭" : reason))
         let continuation = self.continuation
         self.continuation = nil
         if let continuation {
@@ -369,6 +414,9 @@ final class WSSClient: @unchecked Sendable {
         pingTimer = nil
         connection?.cancel()
         connection = nil
+        let ready = readyContinuation
+        readyContinuation = nil
+        ready?.resume(throwing: error)
         let continuation = self.continuation
         self.continuation = nil
         if let continuation {
