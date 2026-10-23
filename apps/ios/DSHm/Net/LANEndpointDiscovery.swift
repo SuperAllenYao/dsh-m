@@ -64,17 +64,23 @@ enum LANEndpointDiscovery {
                 .compactMap { EndpointHealing.normalizedHTTPSOrigin($0) }
             return Result(origins: origins, hostId: mac.hostId, relayOrigin: mac.relayOrigin)
         }
-        // browse 成功但 /health 打不通：至少把 TXT 的 relay 带回去（它不依赖旧地址）。
-        return Result(hostId: matched.first?.hostId, relayOrigin: matched.first?.relayOrigin)
+        // browse 成功但 /health 打不通：不把未经校验的 TXT relay 带回去。
+        // 2026-10-23 真机根因修复（handoff §5.4-1 / N-04）：旧实现会在这里返回
+        // `matched.first?.relayOrigin`，等于把「从未验证过、可能属于别的 Mac」的
+        // 中继端点写进拨号序；隔离 stack 已复现该注入导致 App 连到错误 relay。
+        return Result(hostId: matched.first?.hostId)
     }
 
     /// 选择要探测的 Mac。
     ///
-    /// 优先 hostId 精确匹配；旧凭据没有 hostId、或 Mac 重置了身份（hostId 变化）时，
-    /// **只有唯一一台 Mac 在广播**才采用它——多台时绝不猜，避免连到别人的 Mac。
+    /// 优先 hostId 精确匹配。2026-10-23 根因修复（N-04）：
+    /// - **已知 hostId → 只接受精确匹配**，绝不「唯一一台就采纳」（否则公司 Wi-Fi
+    ///   下同事的 Mac 会被当成自己的，端点注入当前配对）；
+    /// - 旧凭据没有 hostId（hostId == nil）时，**只有唯一一台 Mac 在广播**才采用它
+    ///   ——这是唯一无法比对身份的兼容路径。
     nonisolated static func matchMacs(_ macs: [DiscoveredMac], hostId: String?) -> [DiscoveredMac] {
-        if let hostId, let matched = macs.first(where: { $0.hostId == hostId }) {
-            return [matched]
+        if let hostId {
+            return macs.filter { $0.hostId == hostId }
         }
         if macs.count == 1 { return [macs[0]] }
         return []

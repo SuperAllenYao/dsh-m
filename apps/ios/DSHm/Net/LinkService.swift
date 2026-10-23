@@ -162,6 +162,10 @@ final class LinkService: ObservableObject {
     private var endpointsDirty = true
     /// Observer for `HTTPConnection`'s reused-socket first-byte watchdog.
     private var firstByteTimeoutObserver: NSObjectProtocol?
+    /// 2026-10-23 真机根因修复：首字节看门狗不再直接拆传输，先做一次
+    /// 「新连接 /health」存活校验；这里是校验去抖与在飞任务。
+    private var lastFirstByteVerificationAt: Date?
+    private var transportVerificationTask: Task<Void, Never>?
 
     /// Short-lived api token (auto-refreshed on expiry/401).
     var apiToken: String?
@@ -796,11 +800,62 @@ final class LinkService: ObservableObject {
 
     /// A pooled unary request hit `HTTPConnection.firstByteTimeout`. Only a request
     /// against the *current* origin says anything about the live mux transport.
+    ///
+    /// 2026-10-23 real-device root-cause fix: a first-byte timeout on ONE pooled
+    /// request is **not** proof that the whole transport is dead. On 5G/relay the
+    /// shared tunnel carries `session/list` (1.46MB raw / 357KB gzip) and
+    /// `session/page` concurrently; head-of-line blocking routinely pushes a small
+    /// request's first byte past the watchdog while the mux is perfectly alive.
+    /// Real-device evidence (11:53:30): three timeouts within 350ms tore down a live
+    /// transport and started a ~25s reconnect storm ("连接无响应，正在重连…").
+    ///
+    /// New rule: verify the path on a **fresh** connection before invalidating the
+    /// mux. `/health` (pinned TLS, 1.2s) alive → keep the transport (the failed
+    /// request is retried by its caller on a fresh pooled connection). Dead → the
+    /// path really changed (or Mac/relay went away) → reconnect now. Bursts are
+    /// debounced so one stall cannot launch several probes/teardowns.
     private func handleFirstByteTimeout(endpoint: String, host: String?) {
         guard let currentHost = credentials?.originURL?.host, let host, currentHost == host else {
             return
         }
-        noteTransportUnresponsive(source: "unary:" + endpoint)
+        guard phase.isConnected, !manuallyDisconnected, !isConnecting else { return }
+        let now = Date()
+        if let last = lastFirstByteVerificationAt, now.timeIntervalSince(last) < 2.0 {
+            linkDebug("unary firstByte timeout burst (" + endpoint + ") ignored while verifying")
+            return
+        }
+        lastFirstByteVerificationAt = now
+        transportVerificationTask?.cancel()
+        transportVerificationTask = Task { [weak self] in
+            guard let self else { return }
+            let alive = await self.probeCurrentOriginHealth(timeout: 1.2)
+            guard !Task.isCancelled, self.phase.isConnected, !self.isConnecting else { return }
+            if alive {
+                self.linkDebug("unary firstByte timeout (" + endpoint + ") but fresh /health ok; keeping transport")
+                return
+            }
+            self.noteTransportUnresponsive(source: "unary:" + endpoint)
+        }
+    }
+
+    /// Fresh-connection `/health` probe used before invalidating a live transport.
+    /// Deliberately bypasses the HTTP pool: a dead keep-alive socket must not be
+    /// allowed to decide whether the network path is alive.
+    private func probeCurrentOriginHealth(timeout: TimeInterval) async -> Bool {
+        guard let credentials, let origin = credentials.originURL else { return false }
+        do {
+            let response = try await HTTPSClient.json(
+                origin: origin,
+                method: "GET",
+                path: "/health",
+                leafPin: credentials.leafPin,
+                caCertBase64: credentials.caCertBase64,
+                timeout: timeout
+            )
+            return response.status == 200 && response.json["ok"]?.boolValue == true
+        } catch {
+            return false
+        }
     }
 
     func disconnect(clearCredentials: Bool) {
@@ -936,6 +991,12 @@ final class LinkService: ObservableObject {
         var failures: [String] = []
         var failureClasses: [CandidateFailureClass] = []
         var roundBudgetExhausted = false
+        /// 2026-10-23: credential rejections are recorded per candidate instead of
+        /// ending the round on the first one. A rejected credential is only fatal
+        /// (`needsRepair`, user must re-pair) when **every** candidate rejects it —
+        /// otherwise a self-healed/stale origin could turn a recoverable round into
+        /// a permanent offline state.
+        var credentialRejections: [String] = []
         for (index, origin) in dialCandidates.enumerated() {
             if Task.isCancelled {
                 isConnecting = false
@@ -1005,10 +1066,11 @@ final class LinkService: ObservableObject {
                     milliseconds: (ReconnectMetrics.clock() - candidateStartedAt) * 1000,
                     result: CandidateFailureClass.credentialRejected.rawValue
                 )
-                isConnecting = false
+                credentialRejections.append(reason)
+                failures.append(host + ": " + reason)
                 lastErrorText = reason
-                phase = .needsRepair(reason)
-                return
+                linkDebug("round: credentialRejected " + Self.originLabel(origin) + " " + reason)
+                // Keep walking: only an all-candidates rejection means re-pairing.
             case .fastRejected(let reason, let failureClass):
                 linkDebug("round: fastRejected " + Self.originLabel(origin) + " " + reason)
                 ReconnectMetrics.markCandidateAttempt(
@@ -1039,6 +1101,13 @@ final class LinkService: ObservableObject {
         }
         isConnecting = false
         guard !Task.isCancelled else { return }
+        // Only when every candidate rejected the credential is re-pairing the only
+        // remedy; a single rejected (stale/healed) origin must not end the round.
+        if !credentialRejections.isEmpty, credentialRejections.count >= dialCandidates.count {
+            lastErrorText = credentialRejections.last
+            phase = .needsRepair(credentialRejections.last ?? L10n.t("配对凭据被拒绝，请重新配对"))
+            return
+        }
         if roundBudgetExhausted {
             ReconnectMetrics.markRoundBudgetExhausted()
             failureClasses.append(.timeout)
@@ -1197,7 +1266,7 @@ final class LinkService: ObservableObject {
         }
         self.mux = mux
         do {
-            try await openEventsAndWaitReady(mux: mux)
+            try await openEventsAndWaitReady(mux: mux, timeout: timeout)
         } catch {
             apiTokenPrefetch.cancel()
             let reason = NetworkErrorInterpreter.message(for: error)
@@ -1654,7 +1723,11 @@ final class LinkService: ObservableObject {
             : []
         let (mdns, observations) = await (discovered, probed)
         var origins = mdns.origins
-        if let relay = mdns.relayOrigin { origins.append(relay) }
+        // 2026-10-23 根因修复（N-04）：只有「广播的 hostId 与配对 hostId 一致」（或旧
+        // 凭据没有 hostId 时由 matchMacs 的唯一一台规则采纳）才把 mDNS relay 端点写进
+        // 拨号序。hostId 不匹配的发现结果永不使用——那是别的 Mac/DSH 实例的中继。
+        let mdnsHostMatches = credentials.hostId == nil || mdns.hostId == credentials.hostId
+        if let relay = mdns.relayOrigin, mdnsHostMatches { origins.append(relay) }
         let probeSummary = EndpointHealing.rankProbes(observations)
             .map { "\($0.origin)=\($0.result)\( $0.latencyMs)ms" }
             .joined(separator: ",")
@@ -1839,17 +1912,24 @@ extension LinkService {
     }
 
     /// Per-candidate budget inside one round. The last candidate keeps a longer
-    /// budget so a slow-but-working relay still connects; the others are bounded at
-    /// 2s (1.5s after a path change) because a reachable origin completes
-    /// TCP+TLS+auth well under 1s, and a stale LAN address must not burn 4s before
-    /// the relay is dialed.
+    /// budget so a slow-but-working relay still connects; the others are bounded so
+    /// a stale LAN address cannot burn time before the relay is dialed.
+    ///
+    /// 2026-10-23 real-device calibration (iPhone 16 Pro Max on 5G + relay): a
+    /// **healthy** legacy connect measured `candidateMs=1577–1602ms` end-to-end
+    /// (TLS + mux auth + WSS upgrade + `$events` ready), and a degraded-path
+    /// `/auth/challenge` attempt was aborted at 1617ms. The old 1.5s/2s budgets
+    /// therefore cancelled attempts that were about to succeed (two failed rounds
+    /// in the 11:53 cold-start storm: 2.35s connected → 800ms watchdog kill →
+    /// two 1.5s-budget rounds aborted → 28.4s total). Non-last candidates now get
+    /// 3s (2.5s after a path change) so one healthy 5G relay round fits.
     nonisolated static func candidateTimeoutSeconds(
         index: Int,
         count: Int,
         pathChanged: Bool
     ) -> TimeInterval {
         if index >= count - 1 { return 8 }
-        return pathChanged ? 1.5 : 2
+        return pathChanged ? 2.5 : 3
     }
 
     // MARK: Candidate role + path-aware order (cross-network requirement)
@@ -1907,19 +1987,25 @@ extension LinkService {
 
     /// Fixed total budget for walking the candidates of one round. This removes the
     /// old 10s+ tail where every serial candidate burned its own timeout.
-    /// - single candidate: nothing to switch to, but still capped at 6s (8s dial +
-    ///   backoff used to be the worst-case tail);
-    /// - same-LAN multi-candidate: LAN should answer fast, relay fallback usable -> 3s;
-    /// - cross-network multi-candidate (relay first + LAN fallback): 1.5s total.
+    /// - single candidate: nothing to switch to; give it the full 8s candidate
+    ///   budget (the old 6s cap could not even cover a slow relay round);
+    /// - same-LAN multi-candidate: LAN should answer fast, relay fallback usable -> 4s;
+    /// - cross-network multi-candidate (relay first + stale LAN fallback): 5s.
+    ///
+    /// 2026-10-23 real-device calibration: the old cross-network 1.5s round budget is
+    /// shorter than one healthy relay round (`candidateMs≈1.6s`), so whenever the
+    /// `/health` probes all failed the relay attempt was guaranteed to be cancelled
+    /// at 1.5s — the exact mechanism that turned a 800ms stall into a 28.4s
+    /// cold-start storm. 5s covers the relay attempt plus one bounded LAN fallback.
     nonisolated static func roundBudgetSeconds(
         candidateCount: Int,
         hasSameSubnetLAN: Bool,
         hasRelay: Bool
     ) -> TimeInterval {
-        guard candidateCount > 1 else { return 6 }
-        if hasSameSubnetLAN { return 3 }
-        guard hasRelay else { return 3 }
-        return 1.5
+        guard candidateCount > 1 else { return 8 }
+        if hasSameSubnetLAN { return 4 }
+        guard hasRelay else { return 4 }
+        return 5
     }
 
     /// Clamped per-candidate timeout, or nil when the round budget is exhausted

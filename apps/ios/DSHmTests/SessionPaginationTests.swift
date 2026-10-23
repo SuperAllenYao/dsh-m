@@ -966,3 +966,104 @@ final class SessionPaginationTests: XCTestCase {
         )
     }
 }
+
+// MARK: - P0: detail deferred open (link not ready → unbounded spinner)
+
+/// `openStream()` cannot open while the link is down. The old code dropped that
+/// open and relied on `generation` changing, which misses silent dsh-m/2 resumes
+/// (P1 retain keeps the generation) and any phase flip that lands before the
+/// view's `.onChange` is installed. These tests pin the bounded recovery policy:
+/// wait while the link is busy → open exactly once when it is connected → surface
+/// a retryable error after the deadline instead of spinning forever.
+final class DeferredStreamOpenTests: XCTestCase {
+
+    func testDeferredOpenWaitsWhileLinkIsBusy() {
+        XCTAssertEqual(
+            DeferredStreamOpenPolicy.action(
+                phaseIsConnected: false,
+                isDeferred: true,
+                hasOpenStream: false,
+                deadlineElapsed: false
+            ),
+            .wait,
+            "a busy/reconnecting link must keep waiting, not fail early and not open"
+        )
+    }
+
+    func testDeferredOpenOpensOnceWhenLinkBecomesConnected() {
+        XCTAssertEqual(
+            DeferredStreamOpenPolicy.action(
+                phaseIsConnected: true,
+                isDeferred: true,
+                hasOpenStream: false,
+                deadlineElapsed: false
+            ),
+            .open,
+            "phase → connected must open the deferred session/follow once"
+        )
+    }
+
+    func testDeferredOpenIsIdempotentWhenStreamAlreadyOpen() {
+        // Covers the double trigger: the Combine phase sink and the view's
+        // `.onChange(of: app.link.phase)` both fire for the same transition.
+        XCTAssertEqual(
+            DeferredStreamOpenPolicy.action(
+                phaseIsConnected: true,
+                isDeferred: true,
+                hasOpenStream: true,
+                deadlineElapsed: false
+            ),
+            .idle,
+            "an already-open stream must never be reopened (frames would be dropped)"
+        )
+        XCTAssertEqual(
+            DeferredStreamOpenPolicy.action(
+                phaseIsConnected: true,
+                isDeferred: true,
+                hasOpenStream: true,
+                deadlineElapsed: true
+            ),
+            .idle,
+            "a late deadline must not fail a detail whose stream is already live"
+        )
+    }
+
+    func testDeferredOpenFailsAfterDeadlineWhileStillOffline() {
+        XCTAssertEqual(
+            DeferredStreamOpenPolicy.action(
+                phaseIsConnected: false,
+                isDeferred: true,
+                hasOpenStream: false,
+                deadlineElapsed: true
+            ),
+            .fail,
+            "after the budget the detail must show the retry entry, not an endless spinner"
+        )
+    }
+
+    func testDeferredOpenWithoutDeferralIsIdle() {
+        for connected in [true, false] {
+            for elapsed in [true, false] {
+                XCTAssertEqual(
+                    DeferredStreamOpenPolicy.action(
+                        phaseIsConnected: connected,
+                        isDeferred: false,
+                        hasOpenStream: false,
+                        deadlineElapsed: elapsed
+                    ),
+                    .idle,
+                    "nothing was deferred: the phase observer must be a no-op"
+                )
+            }
+        }
+    }
+
+    @MainActor
+    func testDeferredOpenBudgetIsBounded() {
+        XCTAssertEqual(
+            SessionViewModel.deferredStreamOpenTimeout,
+            10,
+            "P0 spec: a deferred detail open gives up after 10 s and shows retry"
+        )
+    }
+}

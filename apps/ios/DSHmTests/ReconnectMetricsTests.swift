@@ -297,36 +297,39 @@ final class ReconnectPolicyTests: XCTestCase {
     }
 
     func testCandidateBudget() {
-        XCTAssertEqual(LinkService.candidateTimeoutSeconds(index: 0, count: 2, pathChanged: false), 2)
+        // 2026-10-23 real-device calibration: a healthy 5G+relay round measured
+        // candidateMs=1577–1602ms, so non-last candidates need >2s.
+        XCTAssertEqual(LinkService.candidateTimeoutSeconds(index: 0, count: 2, pathChanged: false), 3)
         XCTAssertEqual(LinkService.candidateTimeoutSeconds(index: 1, count: 2, pathChanged: false), 8)
-        XCTAssertEqual(LinkService.candidateTimeoutSeconds(index: 0, count: 2, pathChanged: true), 1.5)
-        XCTAssertEqual(LinkService.candidateTimeoutSeconds(index: 1, count: 3, pathChanged: true), 1.5)
+        XCTAssertEqual(LinkService.candidateTimeoutSeconds(index: 0, count: 2, pathChanged: true), 2.5)
+        XCTAssertEqual(LinkService.candidateTimeoutSeconds(index: 1, count: 3, pathChanged: true), 2.5)
         XCTAssertEqual(LinkService.candidateTimeoutSeconds(index: 2, count: 3, pathChanged: true), 8)
         // Single candidate: keeps the long budget.
         XCTAssertEqual(LinkService.candidateTimeoutSeconds(index: 0, count: 1, pathChanged: true), 8)
     }
 
     func testRoundBudgetPerPath() {
-        // Single candidate: nothing to switch to, but still capped below the old
-        // 8s-dial + backoff tail.
+        // Single candidate: nothing to switch to — the full candidate budget.
         XCTAssertEqual(
             LinkService.roundBudgetSeconds(candidateCount: 1, hasSameSubnetLAN: false, hasRelay: true),
-            6
+            8
         )
         // Same LAN: LAN should answer fast, relay fallback still usable.
         XCTAssertEqual(
             LinkService.roundBudgetSeconds(candidateCount: 2, hasSameSubnetLAN: true, hasRelay: true),
-            3
+            4
         )
-        // Cross-network: relay + stale LAN fallback must finish inside 1.5s.
+        // Cross-network: relay first + stale LAN fallback. Must cover one healthy
+        // relay round (~1.6s measured on a real device) plus a bounded fallback;
+        // the old 1.5s budget was shorter than the round itself.
         XCTAssertEqual(
             LinkService.roundBudgetSeconds(candidateCount: 2, hasSameSubnetLAN: false, hasRelay: true),
-            1.5
+            5
         )
         // LAN-only fallback keeps a usable budget.
         XCTAssertEqual(
             LinkService.roundBudgetSeconds(candidateCount: 2, hasSameSubnetLAN: false, hasRelay: false),
-            3
+            4
         )
     }
 
@@ -558,7 +561,10 @@ final class FirstByteTimeoutTests: XCTestCase {
     }
 
     func testBudgetIsTheSingleLeadApprovedConstant() {
-        XCTAssertEqual(HTTPConnection.firstByteTimeout, 0.8, accuracy: 0.0001)
+        // 2026-10-23: raised 0.8 -> 1.5 after a real-device false kill on a slow
+        // (but alive) 5G relay path; the teardown decision now also verifies the
+        // path with a fresh /health probe before invalidating the transport.
+        XCTAssertEqual(HTTPConnection.firstByteTimeout, 1.5, accuracy: 0.0001)
     }
 
     func testReusedConnectionWithoutFirstByteFailsNotifiesAndIsDropped() async throws {
