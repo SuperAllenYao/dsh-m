@@ -333,8 +333,39 @@ final class ReconnectPolicyTests: XCTestCase {
         )
     }
 
-    func testAttemptBudgetNeverExceedsTheRoundBudget() {
-        XCTAssertNil(LinkService.attemptBudget(baseTimeout: 8, remainingRoundBudget: 0))
+    /// 2026-10-23 冷启动 <1s：relay-first 跨网路径必须跳过拨号前的串行发现+探测
+    /// （真机实测该段 1577–1614ms，占 connectMs 的 ~65%），直接拨 relay。
+    func testRelayFirstFastPathDecision() {
+        let relay = URL(string: "https://121.41.112.232:30000")!
+        let lan = URL(string: "https://192.168.5.10:3466")!
+        // Cross-network (cellular) with relay ordered first: dial immediately.
+        XCTAssertTrue(LinkService.shouldDialRelayImmediately(
+            prefersRelay: true,
+            orderedCandidates: [relay, lan],
+            local: nil
+        ))
+        // Same-Wi-Fi LAN-first path keeps the convergence budget (it decides which
+        // LAN origin is reachable).
+        XCTAssertFalse(LinkService.shouldDialRelayImmediately(
+            prefersRelay: false,
+            orderedCandidates: [lan, relay],
+            local: nil
+        ))
+        // Single candidate: nothing to converge / discover before dialing.
+        XCTAssertFalse(LinkService.shouldDialRelayImmediately(
+            prefersRelay: true,
+            orderedCandidates: [relay],
+            local: nil
+        ))
+        // Relay-first but the first ordered candidate is not a relay -> no fast path.
+        XCTAssertFalse(LinkService.shouldDialRelayImmediately(
+            prefersRelay: true,
+            orderedCandidates: [lan, relay],
+            local: nil
+        ))
+    }
+
+    func testAttemptBudgetNeverExceedsTheRoundBudget() {        XCTAssertNil(LinkService.attemptBudget(baseTimeout: 8, remainingRoundBudget: 0))
         XCTAssertNil(
             LinkService.attemptBudget(baseTimeout: 8, remainingRoundBudget: 0.05),
             "no point dialing with 50ms of the round budget left"

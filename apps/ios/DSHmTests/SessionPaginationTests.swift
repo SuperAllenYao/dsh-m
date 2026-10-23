@@ -1067,3 +1067,32 @@ final class DeferredStreamOpenTests: XCTestCase {
         )
     }
 }
+
+/// 2026-10-23 冷启动 <1s（用户人工验收）的列表缓存策略：
+/// - 「本地缓存 · 正在刷新…」只在刷新真正变慢（≥800ms）时出现，亚秒级刷新不闪文案；
+/// - 缓存首帧期间对 live `session/list` 做有界重试（400→5000ms，最多 5 次），
+///   让「桌面端重启后首次启动」这类连接慢启动窗口内的列表在 1s 级自愈。
+@MainActor
+final class CacheRefreshPolicyTests: XCTestCase {
+
+    func testCacheRefreshBannerIsHiddenForFastRefresh() {
+        XCTAssertFalse(WorkspaceViewModel.shouldShowCacheRefreshBanner(elapsedMs: 0))
+        XCTAssertFalse(
+            WorkspaceViewModel.shouldShowCacheRefreshBanner(elapsedMs: 799),
+            "a sub-1s refresh must not flash the cache banner"
+        )
+        XCTAssertTrue(WorkspaceViewModel.shouldShowCacheRefreshBanner(elapsedMs: 800))
+        XCTAssertTrue(WorkspaceViewModel.shouldShowCacheRefreshBanner(elapsedMs: 10_000))
+        XCTAssertEqual(WorkspaceViewModel.cacheRefreshBannerDelayMs, 800)
+    }
+
+    func testStaleListRetryScheduleIsBoundedAndIncreasing() {
+        let delays = WorkspaceViewModel.staleListRetryDelaysMs
+        XCTAssertEqual(delays, [400, 800, 1600, 3200, 5_000])
+        XCTAssertEqual(delays.count, 5, "bounded retries: no infinite polling")
+        for (previous, next) in zip(delays, delays.dropFirst()) {
+            XCTAssertLessThan(previous, next, "retry backoff must grow")
+        }
+        XCTAssertLessThanOrEqual(delays.last ?? 0, 5_000, "last retry stays inside the cold-start window")
+    }
+}
