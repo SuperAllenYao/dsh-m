@@ -1006,9 +1006,23 @@ struct SessionDetailView: View {
         isNearBottom = true
         // 自动补齐每批都要贴底，不做首屏加固多拍（多拍 = 每批 3 次滚动 → 闪动）。
         scrollAnchorState.hardeningRemaining = 0
-        scrollToBottom(proxy: proxy)
+        scrollAnchorState.generation += 1
         let generation = scrollAnchorState.generation
+        let lastRow = viewModel.rows.last?.id
         Task { @MainActor in
+            await Task.yield()
+            guard generation == scrollAnchorState.generation else { return }
+            // 2026-10-23 真机回归（热缓存打开 13.2MB 大会话：补齐期间内容区全黑 3.5s，
+            // 几何一直「贴底 + 尺寸正常」，但 AX 只有 3 行 → 末段行未实体化）：
+            // 这是本文件 `scrollToBottom` 注释里记录过的已知问题——只滚 LazyVStack 外的
+            // bottomSentinel 时 offset 已贴底、末段行却没实体化，渲染出整屏空白。
+            // 补齐每批 prepend 后先滚真实末行强制实体化末段，再对齐 sentinel（顺序不能反，
+            // 与 scrollToBottom 的 pass>=1 修复一致）；两次滚动同一拍提交，不引入多拍闪动。
+            if let lastRow {
+                proxy.scrollTo(lastRow, anchor: .top)
+                guard generation == scrollAnchorState.generation else { return }
+            }
+            proxy.scrollTo(Self.bottomAnchorID, anchor: .bottom)
             // LazyVStack 前置插入后高度估算会再收敛一次；120ms 后补一拍校正。
             try? await Task.sleep(nanoseconds: 120_000_000)
             guard epoch == scrollAnchorState.prependEpoch,
