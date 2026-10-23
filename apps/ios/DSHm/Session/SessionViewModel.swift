@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import QuartzCore
 #if canImport(UIKit)
 import UIKit
 #endif
@@ -399,11 +400,21 @@ final class SessionViewModel: ObservableObject {
         }
         DetailMetrics.setCacheHit(true)
         DetailMetrics.markCacheRestored(milliseconds: cacheLoadMilliseconds)
+        #if DEBUG
+        PerfProbe.shared.measure("cacheRestoreApply", ["chunks": payload.chunks.count]) {
+            if journal.events.isEmpty {
+                applyCachedSyntheticSnapshot(payload)
+            } else {
+                mergeCachedOlderEvents(payload: payload, olderThan: journal.oldestSeq ?? Int.max)
+            }
+        }
+        #else
         if journal.events.isEmpty {
             applyCachedSyntheticSnapshot(payload)
         } else {
             mergeCachedOlderEvents(payload: payload, olderThan: journal.oldestSeq ?? Int.max)
         }
+        #endif
         isLoading = false
         syncFillDiagnostics()
         rebuildRows()
@@ -483,7 +494,23 @@ final class SessionViewModel: ObservableObject {
             asOfSeq: journal.projectionsAsOfSeq,
             values: journal.projections
         )
-        windowCache.save(
+        #if DEBUG
+        PerfProbe.shared.measure("cacheSave", [
+            "events": journal.events.count,
+            "cursor": journal.cursor,
+        ]) {
+            windowCache.saveAsync(
+                sessionId: sessionId,
+                cursor: journal.cursor,
+                hasMore: journal.hasMore,
+                header: journal.header,
+                projections: projections,
+                events: journal.events,
+                windowMessages: firstWindowMessages
+            )
+        }
+        #else
+        windowCache.saveAsync(
             sessionId: sessionId,
             cursor: journal.cursor,
             hasMore: journal.hasMore,
@@ -492,6 +519,7 @@ final class SessionViewModel: ObservableObject {
             events: journal.events,
             windowMessages: firstWindowMessages
         )
+        #endif
     }
 
     // MARK: - M2b-2c detail in-app timing
@@ -868,7 +896,9 @@ final class SessionViewModel: ObservableObject {
                 // scrollPosition(id:anchor:) 锚定保证，插入本身不改变可见内容。
                 rebuildNowForHistoryBatch()
                 syncFillDiagnostics()
-                saveWindowCacheNow()
+                // 卡顿修复（2026-10-23 用户真机手点）：补齐期间不再逐批写窗口缓存。
+                // 单次写盘要编码 ~4MB JSON（实测每批 ~59ms），即便挪到后台也会和滑动抢 CPU；
+                // 最终状态由 markHistoryFillCompleted() 统一写，中途被杀最多重拉一次历史。
                 // DEBUG 取证：拉长页间隔，让自动化场景跨越多个插入批次（生产 0）。
                 if Self.jitterFillPaceSeconds > 0 {
                     try? await Task.sleep(nanoseconds: UInt64(Self.jitterFillPaceSeconds * 1_000_000_000))
@@ -932,6 +962,9 @@ final class SessionViewModel: ObservableObject {
             beforeSeq: beforeSeq,
             maxMessages: historyPageMessages
         )
+        #if DEBUG
+        let fetchStart = CACurrentMediaTime()
+        #endif
         let value: JSONValue
         do {
             if let historyPageLoader {
@@ -951,17 +984,32 @@ final class SessionViewModel: ObservableObject {
             return historyPageLoader == nil ? .retryTransient : .failed
         }
         if Task.isCancelled { return .cancelled }
+        #if DEBUG
+        PerfProbe.shared.record("pageNetwork", ms: (CACurrentMediaTime() - fetchStart) * 1000)
+        #endif
         let page: SessionPage
         do {
             // A payload/contract break is deterministic: retrying would spin forever.
-            page = try value.decode(SessionPage.self)
+            // 卡顿修复（2026-10-23 真机手点）：JSONValue.decode 内部是
+            // JSONEncoder(JSONValue) + JSONDecoder(目标类型) 的双重转换，多 MB 历史页
+            // 在 main actor 上做是数百毫秒级卡死（用户实测每批 ~0.5s）。改到后台队列。
+            page = try await Self.decodeOffMain(value, SessionPage.self, name: "pageDecodeBG")
         } catch {
             dbg("history page decode failed: " + String(describing: error))
             return .failed
         }
         let oldestBefore = journal.oldestSeq
+        #if DEBUG
+        let prependStart = CACurrentMediaTime()
+        let update = journal.prepend(page: page)
+        PerfProbe.shared.record("pagePrepend", ms: (CACurrentMediaTime() - prependStart) * 1000)
+        let applyStart2 = CACurrentMediaTime()
+        applyJournalUpdate(update)
+        PerfProbe.shared.record("pageApplyJournal", ms: (CACurrentMediaTime() - applyStart2) * 1000)
+        #else
         let update = journal.prepend(page: page)
         applyJournalUpdate(update)
+        #endif
         let oldestAfter = journal.oldestSeq
         let merged: Bool = {
             guard let before = oldestBefore, let after = oldestAfter else { return false }
@@ -1060,16 +1108,88 @@ final class SessionViewModel: ObservableObject {
 
     // MARK: - Frame handling
 
+    /// 待解码的 stream frame（保证顺序：单飞 + FIFO）。
+    private var pendingFrameValues: [JSONValue] = []
+    private var frameDecodeInFlight = false
+
+    /// JSONValue.decode 内部是「JSONValue → JSON 编码 → 目标类型解码」的双重转换，
+    /// 大会话的 snapshot / 大 tool result 事件在 main actor 解码会造成数百毫秒卡顿。
+    /// 这里把解码放到后台串行队列，按 FIFO 回主线程处理，顺序与原来一致。
     private func handleItem(_ value: JSONValue?) {
         guard let value else { return }
         lastEventAt = Date()
-        do {
-            let frame = try SessionStreamFrame.decode(value)
-            switch frame {
+        pendingFrameValues.append(value)
+        drainFrameDecodeIfNeeded()
+    }
+
+    private func drainFrameDecodeIfNeeded() {
+        guard !frameDecodeInFlight, !pendingFrameValues.isEmpty else { return }
+        let value = pendingFrameValues.removeFirst()
+        frameDecodeInFlight = true
+        let started = CACurrentMediaTime()
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result: Result<SessionStreamFrame, Error> = Result {
+                try SessionStreamFrame.decode(value)
+            }
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                #if DEBUG
+                PerfProbe.shared.record("frameDecodeBG", ms: (CACurrentMediaTime() - started) * 1000)
+                #endif
+                self.frameDecodeInFlight = false
+                switch result {
+                case .success(let frame):
+                    self.processFrame(frame)
+                case .failure(let error):
+                    // Include the frame type and the failing coding path: the bare
+                    // Foundation text ("The data couldn't be read…") names nothing.
+                    let detail = FrameDecodeFailure.describe(error, frame: value)
+                    self.dbg("frame decode failed: " + detail)
+                    self.streamErrorText = "帧解析失败: " + detail
+                }
+                self.drainFrameDecodeIfNeeded()
+            }
+        }
+    }
+
+    /// 把 JSONValue.decode（内部是 JSONValue→JSON 编码→目标类型解码 的双重转换）
+    /// 挪到后台队列执行；主线程只做一次 await，不阻塞渲染。
+    private nonisolated static func decodeOffMain<T: Decodable>(
+        _ value: JSONValue,
+        _ type: T.Type,
+        name: String
+    ) async throws -> T {
+        try await withCheckedThrowingContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                let started = CACurrentMediaTime()
+                do {
+                    let decoded = try value.decode(type)
+                    #if DEBUG
+                    PerfProbe.shared.record(name, ms: (CACurrentMediaTime() - started) * 1000)
+                    #endif
+                    continuation.resume(returning: decoded)
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    private func processFrame(_ frame: SessionStreamFrame) {
+        switch frame {
             case .snapshot(let snapshot):
                 dbg("snapshot: records=" + String(snapshot.records.count) + " cursor=" + String(snapshot.cursor) + " hasMore=" + String(describing: snapshot.hasMore))
+                #if DEBUG
+                let update = PerfProbe.shared.measure("snapshotJournalApply", ["records": snapshot.records.count]) {
+                    journal.apply(snapshot: snapshot)
+                }
+                PerfProbe.shared.measure("snapshotApplyJournalUpdate") {
+                    applyJournalUpdate(update)
+                }
+                #else
                 let update = journal.apply(snapshot: snapshot)
                 applyJournalUpdate(update)
+                #endif
                 // v5.5 §14.5 first frame: seed the context window from the
                 // snapshot projections (M1 gets no incremental projection pushes).
                 contextPressure = journal.contextPressure
@@ -1110,14 +1230,8 @@ final class SessionViewModel: ObservableObject {
             case .assistantStream(let frame):
                 let update = journal.apply(assistantStream: frame)
                 applyJournalUpdate(update)
-            case .unknown:
-                break
-            }
-        } catch {
-            // Include the frame type and the failing coding path: the bare
-            // Foundation text ("The data couldn't be read…") names nothing.
-            dbg("frame decode failed: " + FrameDecodeFailure.describe(error, frame: value))
-            streamErrorText = "帧解析失败: \(FrameDecodeFailure.describe(error, frame: value))"
+        case .unknown:
+            break
         }
     }
 
@@ -1177,7 +1291,15 @@ final class SessionViewModel: ObservableObject {
         rebuildTask?.cancel()
         rebuildTask = nil
         pendingRebuild = false
+        #if DEBUG
+        PerfProbe.shared.measure("rebuildHistoryBatch", [
+            "events": journal.events.count,
+        ]) {
+            rebuildRows()
+        }
+        #else
         rebuildRows()
+        #endif
     }
 
     private func scheduleRebuild() {
@@ -1194,6 +1316,16 @@ final class SessionViewModel: ObservableObject {
     }
 
     private func rebuildRows() {
+        #if DEBUG
+        PerfProbe.shared.measure("rebuildRows", ["events": journal.events.count]) {
+            rebuildRowsImpl()
+        }
+        #else
+        rebuildRowsImpl()
+        #endif
+    }
+
+    private func rebuildRowsImpl() {
         // Optimistic echoes (round2 §3): retire the ones whose durable
         // `user/message` arrived (matched by `data.source.rpcId`), then paint
         // the rest at the tail of the flow. Sitting outside the journal means a

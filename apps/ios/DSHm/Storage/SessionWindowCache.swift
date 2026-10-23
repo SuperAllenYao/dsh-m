@@ -247,6 +247,86 @@ final class SessionWindowCacheStore {
         return chunks
     }
 
+    /// One pending (or in-flight) background write. Only the newest one is kept:
+    /// a history fill can trigger a save every batch, and re-encoding intermediate
+    /// windows is wasted CPU.
+    private struct SaveWork {
+        /// nil = 后台写入时再读身份（避免主线程 keychain/identity 读取开销）。
+        let identity: String?
+        let sessionId: String
+        let cursor: Int
+        let hasMore: Bool?
+        let header: SessionHeader?
+        let projections: ProjectionValues?
+        let events: [SessionEvent]
+        let windowMessages: Int?
+        let messagesPerScreen: Int
+        let screens: Int
+    }
+
+    private let saveQueue = DispatchQueue(label: "com.dshm.session-window-cache.save", qos: .utility)
+    private let pendingLock = NSLock()
+    private var pendingWork: SaveWork?
+    private var drainScheduled = false
+
+    /// 后台队列版本（合并写入）：主线程只做参数捕获，分屏/编码/原子写全部在 utility 队列。
+    /// 历史补齐每批都会写缓存，同步做（每批 ~29ms）会直接造成滑动卡顿。
+    @discardableResult
+    func saveAsync(
+        sessionId: String,
+        cursor: Int,
+        hasMore: Bool?,
+        header: SessionHeader?,
+        projections: ProjectionValues?,
+        events: [SessionEvent],
+        windowMessages: Int? = nil,
+        messagesPerScreen: Int = SessionWindowPolicy.maxFirstWindowMessages,
+        screens: Int = SessionWindowPolicy.cachedScreens
+    ) -> Bool {
+        guard !events.isEmpty else { return false }
+        let work = SaveWork(
+            identity: nil,
+            sessionId: sessionId,
+            cursor: cursor,
+            hasMore: hasMore,
+            header: header,
+            projections: projections,
+            events: events,
+            windowMessages: windowMessages,
+            messagesPerScreen: messagesPerScreen,
+            screens: screens
+        )
+        pendingLock.lock()
+        pendingWork = work
+        let schedule = !drainScheduled
+        drainScheduled = true
+        pendingLock.unlock()
+        if schedule {
+            saveQueue.async { [weak self] in self?.drainSaves() }
+        }
+        return true
+    }
+
+    private func drainSaves() {
+        while true {
+            pendingLock.lock()
+            guard let work = pendingWork else {
+                drainScheduled = false
+                pendingLock.unlock()
+                return
+            }
+            pendingWork = nil
+            pendingLock.unlock()
+            #if DEBUG
+            PerfProbe.shared.measure("cacheSaveBG", ["events": work.events.count]) {
+                _ = writeNow(work)
+            }
+            #else
+            _ = writeNow(work)
+            #endif
+        }
+    }
+
     /// Persists the newest screens screens derived from chronological events.
     /// Oldest screens are dropped when the encoded payload exceeds the byte budget.
     @discardableResult
@@ -262,21 +342,39 @@ final class SessionWindowCacheStore {
         screens: Int = SessionWindowPolicy.cachedScreens
     ) -> Bool {
         guard let identity = identity(), !events.isEmpty else { return false }
-        var payload = SessionWindowCachePayload(
-            schemaVersion: Self.schemaVersion,
-            savedAt: now(),
+        return writeNow(SaveWork(
             identity: identity,
             sessionId: sessionId,
             cursor: cursor,
             hasMore: hasMore,
             header: header,
             projections: projections,
+            events: events,
+            windowMessages: windowMessages,
+            messagesPerScreen: messagesPerScreen,
+            screens: screens
+        ))
+    }
+
+    private func writeNow(_ work: SaveWork) -> Bool {
+        guard let identity = work.identity ?? identity() else { return false }
+        let sessionId = work.sessionId
+        let events = work.events
+        var payload = SessionWindowCachePayload(
+            schemaVersion: Self.schemaVersion,
+            savedAt: now(),
+            identity: identity,
+            sessionId: sessionId,
+            cursor: work.cursor,
+            hasMore: work.hasMore,
+            header: work.header,
+            projections: work.projections,
             chunks: Self.screenChunks(
                 events: events,
-                messagesPerScreen: messagesPerScreen,
-                screens: screens
+                messagesPerScreen: work.messagesPerScreen,
+                screens: work.screens
             ),
-            windowMessages: windowMessages
+            windowMessages: work.windowMessages
         )
         guard !payload.chunks.isEmpty else { return false }
         guard var data = CacheIO.encode(payload) else { return false }

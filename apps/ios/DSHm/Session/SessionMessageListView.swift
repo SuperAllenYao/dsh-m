@@ -28,11 +28,25 @@ final class AnchoredTableView: UITableView {
     var onLayoutPass: (() -> Void)?
     private var isReentrant = false
     override func layoutSubviews() {
+        #if DEBUG
+        let probeStart = CACurrentMediaTime()
+        #endif
         super.layoutSubviews()
-        guard !isReentrant else { return }
+        guard !isReentrant else {
+            #if DEBUG
+            PerfProbe.shared.record("layoutPass", ms: (CACurrentMediaTime() - probeStart) * 1000, ["reentrant": 1])
+            #endif
+            return
+        }
         isReentrant = true
         onLayoutPass?()
         isReentrant = false
+        #if DEBUG
+        PerfProbe.shared.record("layoutPass", ms: (CACurrentMediaTime() - probeStart) * 1000, [
+            "visible": visibleCells.count,
+            "h": Double(bounds.height),
+        ])
+        #endif
     }
 }
 
@@ -93,10 +107,9 @@ struct SessionMessageListView: UIViewRepresentable {
 
     // MARK: - Cell
 
-    final class MessageCell: UITableViewCell, JitterProbeIdentifiable {
+    final class MessageCell: UITableViewCell {
         static let reuseID = "SessionMessageCell"
         var rowID: String = ""
-        var jitterRowID: String { rowID }
 
         override init(style: UITableViewCell.CellStyle, reuseIdentifier: String?) {
             super.init(style: style, reuseIdentifier: reuseIdentifier)
@@ -110,6 +123,9 @@ struct SessionMessageListView: UIViewRepresentable {
         required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
         func configure(_ parent: SessionMessageListView, item: SessionMessageItem, isNewest: Bool) {
+            #if DEBUG
+            let probeStart = CACurrentMediaTime()
+            #endif
             rowID = item.id
             contentConfiguration = UIHostingConfiguration {
                 Group {
@@ -144,6 +160,9 @@ struct SessionMessageListView: UIViewRepresentable {
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
             .margins(.all, 0)
+            #if DEBUG
+            PerfProbe.shared.record("cellConfig", ms: (CACurrentMediaTime() - probeStart) * 1000)
+            #endif
         }
     }
 
@@ -355,6 +374,11 @@ struct SessionMessageListView: UIViewRepresentable {
             tableView.layoutIfNeeded()
             #if DEBUG
             let applyMs = (CACurrentMediaTime() - applyStart) * 1000
+            PerfProbe.shared.record("apply", ms: applyMs, [
+                "diffMs": diffMs,
+                "inserted": insertedIDs.count,
+                "changed": changedIDs.count,
+            ])
             if applyMs > 8 {
                 ScrollJitterProbe.shared?.event("applyDur", [
                     "diffMs": diffMs,
@@ -566,3 +590,10 @@ struct SessionMessageListView: UIViewRepresentable {
         }
     }
 }
+
+#if DEBUG
+/// 帧级探针的行标识（协议只在 DEBUG 存在，Release 构建不得引用）。
+extension SessionMessageListView.MessageCell: JitterProbeIdentifiable {
+    var jitterRowID: String { rowID }
+}
+#endif
