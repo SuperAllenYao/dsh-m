@@ -23,6 +23,14 @@ enum SessionMessageItem: Equatable {
     }
 }
 
+/// cell 内容实际高度（SwiftUI 内部状态变化后上报给 table，用于自撑高重测）。
+private struct RowContentHeightKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
 /// 过程组行高取证开关：真机 DEBUG 构建下设 `DSHM_PROCDBG=1` 时，
 /// 每次行重测后打印可见过程组的行高与 hosting 内容高度（默认关闭，零开销）。
 enum ProcessGroupDebug {
@@ -125,6 +133,9 @@ struct SessionMessageListView: UIViewRepresentable {
     final class MessageCell: UITableViewCell {
         static let reuseID = "SessionMessageCell"
         var rowID: String = ""
+        /// 用于上报「cell 内容高度」→ 触发自撑高重测（点击展开这类 SwiftUI 内部状态变化
+        /// 不会让 UITableView 自动重测行高，内容会一直被旧行高裁剪）。
+        weak var coordinator: Coordinator?
 
         override init(style: UITableViewCell.CellStyle, reuseIdentifier: String?) {
             super.init(style: style, reuseIdentifier: reuseIdentifier)
@@ -183,6 +194,16 @@ struct SessionMessageListView: UIViewRepresentable {
                 .padding(.horizontal, Theme.Spacing.pageInset)
                 .padding(.vertical, Theme.Spacing.s / 2)
                 .frame(maxWidth: .infinity, alignment: .leading)
+                .background(
+                    GeometryReader { geo in
+                        Color.clear.preference(key: RowContentHeightKey.self, value: geo.size.height)
+                    }
+                )
+                .onPreferenceChange(RowContentHeightKey.self) { [weak self] height in
+                    // [weak self] 防止 cell↔hosting 循环引用；coordinator 在 cellForRow 里注入。
+                    guard let self else { return }
+                    self.coordinator?.rowContentHeightChanged(rowID: item.id, contentHeight: height)
+                }
             }
             .margins(.all, 0)
             #if DEBUG
@@ -236,6 +257,7 @@ struct SessionMessageListView: UIViewRepresentable {
                       let item = self.item(for: itemID) else {
                     return UITableViewCell()
                 }
+                cell.coordinator = self   // 点击展开后上报内容高度 → 触发自撑高重测
                 cell.configure(self.parent, item: item, isNewest: self.isNewest(item))
                 #if DEBUG
                 ScrollJitterProbe.shared?.register(rowID: itemID, view: cell)
@@ -250,6 +272,8 @@ struct SessionMessageListView: UIViewRepresentable {
         }
 
         func detach() {
+            heightRefreshWork?.cancel()
+            heightRefreshWork = nil
             #if DEBUG
             offsetObservation?.invalidate()
             offsetObservation = nil
@@ -339,6 +363,55 @@ struct SessionMessageListView: UIViewRepresentable {
             return group.id == parent.items.last(where: { if case .group = $0 { return true }; return false })?.id
         }
 
+        // MARK: - 自撑高行重测（SwiftUI 内部展开/收起）
+
+        /// 点击 cell 内的「思考/子代理卡片」等 SwiftUI 本地状态展开后，单元格内容变高，
+        /// 但 UITableView 的自撑高缓存不会自动失效 → 展开内容被旧行高裁剪/覆盖
+        /// （真机报障：单独思考块点开看不到全部内容）。这里由 cell 上报内容高度，
+        /// 与当前行高比较后做一次合并（80ms debounce）的可见行重测，并保持阅读锚点。
+        private var heightRefreshWork: DispatchWorkItem?
+
+        func rowContentHeightChanged(rowID: String, contentHeight: CGFloat) {
+            guard contentHeight > 1,
+                  let tableView,
+                  let dataSource,
+                  let indexPath = dataSource.indexPath(for: rowID) else { return }
+            let rowHeight = tableView.rectForRow(at: indexPath).height
+            guard rowHeight > 1, contentHeight > rowHeight + 1 else { return }
+            scheduleRowHeightRefresh()
+        }
+
+        private func scheduleRowHeightRefresh() {
+            heightRefreshWork?.cancel()
+            let work = DispatchWorkItem { [weak self] in self?.refreshVisibleRowHeights() }
+            heightRefreshWork = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.08, execute: work)
+        }
+
+        private func refreshVisibleRowHeights() {
+            guard let tableView, let dataSource else { return }
+            guard !tableView.isTracking, !tableView.isDecelerating else { return }
+            let anchor = captureAnchor(tableView: tableView)
+            isAdjustingOffset = true
+            UIView.performWithoutAnimation {
+                tableView.performBatchUpdates(nil) { _ in }
+            }
+            tableView.layoutIfNeeded()
+            if let anchor, let indexPath = dataSource.indexPath(for: anchor.rowID) {
+                let rect = tableView.rectForRow(at: indexPath)
+                let delta = (rect.minY - tableView.contentOffset.y) - anchor.screenY
+                if abs(delta) > 0.5 {
+                    var offset = tableView.contentOffset
+                    offset.y += delta
+                    let maxY = max(0, tableView.contentSize.height - tableView.bounds.height + tableView.adjustedContentInset.bottom)
+                    offset.y = min(max(offset.y, 0), maxY)
+                    tableView.setContentOffset(offset, animated: false)
+                }
+            }
+            isAdjustingOffset = false
+            freezeAnchorFromCurrentViewport(tableView)
+        }
+
         // MARK: - apply
 
         func apply(items: [SessionMessageItem], batchToken: Int) {
@@ -361,19 +434,20 @@ struct SessionMessageListView: UIViewRepresentable {
             for item in lastItems { previousIDs.insert(item.id) }
             // v0.2.7：显示态（window/full/collapsed/expanded）不参与 FlowRowGroup 等价，
             // 单独比对后并入 changedIDs，走同一条「reconfigure + 重测行高」路径。
-            if parent.processGroupModes != lastGroupModes {
+            // NOTE: bookkeeping 必须等「确定要 apply」之后再提交——否则被下面的
+            // 「读历史时冻结尾部」门拦掉时，diff 已被吞掉，用户点击永远不生效。
+            let pendingModeChange = parent.processGroupModes != lastGroupModes
+            if pendingModeChange {
                 for id in parent.processGroupModes.keys where newIDs.contains(id) {
                     if !changedIDs.contains(id) { changedIDs.append(id) }
                 }
-                lastGroupModes = parent.processGroupModes
             }
             // 阶段切换（running true→false）：最新组要从「运行中窗口」自动切到「折叠一行」。
-            if parent.isRunning != lastRunningFlag {
-                lastRunningFlag = parent.isRunning
-                if let lastGroupID = items.last(where: { if case .group = $0 { return true }; return false })?.id,
-                   !changedIDs.contains(lastGroupID) {
-                    changedIDs.append(lastGroupID)
-                }
+            let pendingPhaseChange = parent.isRunning != lastRunningFlag
+            if pendingPhaseChange,
+               let lastGroupID = items.last(where: { if case .group = $0 { return true }; return false })?.id,
+               !changedIDs.contains(lastGroupID) {
+                changedIDs.append(lastGroupID)
             }
             let insertedIDs = newIDs.subtracting(previousIDs)
             // 数据开头新增 = 视觉底部新内容；数据末尾新增 = 视觉顶部历史补齐。
@@ -406,11 +480,17 @@ struct SessionMessageListView: UIViewRepresentable {
             let wasNearBottom = isNearBottom && tableView.contentOffset.y <= 140
 
             // 用户正在读历史（不在近底部）时，非历史补齐的变化（新流式行/文本增长）先冻结。
-            if didInitialBottom, !isNearBottom, !historyAppend, !wantsBottom {
+            // 例外：用户交互（点击展开/收起过程组、turn 结束自动折叠）必须立刻生效，
+            // 不能被冻结门吞掉（真机报障：读历史时点「过程 · N 步」没有任何反应）。
+            if didInitialBottom, !isNearBottom, !historyAppend, !wantsBottom,
+               !pendingModeChange, !pendingPhaseChange {
                 frozenItems = items
                 return
             }
             frozenItems = nil
+            // 只有确定要 apply 时才提交交互 bookkeeping（见上：避免 diff 被冻结门吞掉）。
+            lastGroupModes = parent.processGroupModes
+            lastRunningFlag = parent.isRunning
 
             let lastDataIDs = lastItems.reversed().map(\.id)
             if ids == lastDataIDs && changedIDs.isEmpty {

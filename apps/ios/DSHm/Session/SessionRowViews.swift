@@ -226,6 +226,7 @@ struct ReasoningRowView: View {
             }
             .buttonStyle(.plain)
             .accessibilityIdentifier("reasoning-row")
+            .accessibilityValue(expanded ? "expanded" : "collapsed")
             if expanded {
                 Text(text)
                     .font(Theme.Typography.caption)
@@ -234,6 +235,7 @@ struct ReasoningRowView: View {
                     .padding(.horizontal, Theme.Spacing.s)
                     .padding(.bottom, Theme.Spacing.s)
                     .textSelection(.enabled)
+                    .accessibilityIdentifier("reasoning-full-text")
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
