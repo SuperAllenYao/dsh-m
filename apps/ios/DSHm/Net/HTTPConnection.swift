@@ -150,6 +150,8 @@ final class HTTPConnection {
     private let pinCapture: PinCapture
     private var pending: PendingRequest?
     private var ready = false
+ /// T2(A): a TLS-only prewarm waiting for `.ready` (no request pending).
+    private var readyWait: ReadyWait?
     private var receiveInFlight = false
     private var idleTimer: DispatchWorkItem?
     private var nextRequestId = 0
@@ -176,6 +178,12 @@ final class HTTPConnection {
  /// connections are watched (see `scheduleFirstByteWatchdog`).
         var firstByteSeen = false
         var firstByteItem: DispatchWorkItem?
+    }
+
+ /// One in-flight `awaitReadyAndCheckIn` waiter. Queue-confined like `pending`.
+    private struct ReadyWait {
+        let continuation: CheckedContinuation<Bool, Never>
+        var timeoutItem: DispatchWorkItem?
     }
 
  /// task-2 (reconnect < 1s): budget for the **first response byte on a reused
@@ -273,6 +281,70 @@ final class HTTPConnection {
         stateLock.lock()
         idle = value
         stateLock.unlock()
+    }
+
+ // MARK: - TLS-only prewarm)
+
+ /// 等到 TCP+TLS `.ready`，**不发任何 HTTP 请求**，然后把连接标记 idle 并放回
+ /// 共享池——等价于一次 keep-alive 响应后的空闲态（idle timer + 一个空闲
+ /// receive 做存活探测），后续 checkout 走的是完全相同的复用路径。
+ ///
+ /// - true：连接已入池，同一 key 的后续请求可直接复用它；
+ /// - false：超时/握手失败/连接关闭/不可池化（pool == nil），连接已丢弃。
+ /// 不抛错；调用方失败时忽略即可（后续请求走原路径）。
+    func awaitReadyAndCheckIn(timeout: TimeInterval) async -> Bool {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+            queue.async { [weak self] in
+                guard let self else {
+                    continuation.resume(returning: false)
+                    return
+                }
+                self.beginReadyWait(continuation: continuation, timeout: timeout)
+            }
+        }
+    }
+
+    private func beginReadyWait(continuation: CheckedContinuation<Bool, Never>, timeout: TimeInterval) {
+        guard !isTraceableClosed else {
+            continuation.resume(returning: false)
+            return
+        }
+ // `.ready` may have landed before the await started (init already dialed).
+        if ready, pending == nil {
+            continuation.resume(returning: checkInAfterReady())
+            return
+        }
+        var wait = ReadyWait(continuation: continuation)
+        let item = DispatchWorkItem { [weak self] in
+            self?.timeoutReadyWait()
+        }
+        wait.timeoutItem = item
+        readyWait = wait
+        queue.asyncAfter(deadline: .now() + max(0.05, timeout), execute: item)
+    }
+
+    private func timeoutReadyWait() {
+        guard readyWait != nil else { return }
+ // closeInternal resumes the waiter with false and tears the socket down.
+        closeInternal(notifyPool: false)
+    }
+
+ /// Shared `.ready` + no pending request path: mark idle, hand to the pool,
+ /// arm the idle timer and the idle liveness receive (same as a keep-alive
+ /// response). Returns false when the connection cannot be pooled.
+    private func checkInAfterReady() -> Bool {
+        guard let pool, !isTraceableClosed else {
+            closeInternal(notifyPool: false)
+            return false
+        }
+        if isIdle { return true }
+        setIdle(true)
+        if let evicted = pool.checkin(self) {
+            evicted.closeFromPool()
+        }
+        armIdleTimer()
+        receiveNext()
+        return true
     }
 
  // MARK: - Requests
@@ -512,7 +584,15 @@ final class HTTPConnection {
         case .ready:
             ready = true
             observedLeafPin = pinCapture.pin
-            if pending != nil { sendPending() }
+            if pending != nil {
+                sendPending()
+            } else if let wait = readyWait {
+ // T2(A): TLS-only prewarm completed — hand the ready
+ // connection to the idle pool, exactly like a keep-alive response.
+                readyWait = nil
+                wait.timeoutItem?.cancel()
+                wait.continuation.resume(returning: checkInAfterReady())
+            }
         case .failed(let error):
             handleClosure(LinkError.transport("连接 \(host):\(port) 失败：" + NetworkErrorInterpreter.message(for: error)))
         case .waiting(let error):
@@ -555,6 +635,13 @@ final class HTTPConnection {
         stateLock.unlock()
         idleTimer?.cancel()
         idleTimer = nil
+ // T2(A): a prewarm waiter must be released when the handshake
+ // fails or the connection is torn down (exactly-once resume).
+        if let wait = readyWait {
+            readyWait = nil
+            wait.timeoutItem?.cancel()
+            wait.continuation.resume(returning: false)
+        }
         if let pending {
             self.pending = nil
             pending.timeoutItem?.cancel()

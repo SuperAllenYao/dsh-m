@@ -294,6 +294,45 @@ final class HTTPSClient {
 
  // MARK: - Convenience
 
+ /// T2(A)：冷启动 **TLS-only 预热**。
+ ///
+ /// 只做 TCP+TLS 握手（等 `.ready`），**不发任何 HTTP 请求**，然后把连接标记
+ /// idle 放回共享池；随后同 origin 的 auth/list 请求可直接 checkout 这条连接，
+ /// 省掉一次完整 handshake 与 `/health` 的 1 个 RTT（真机 5G relay 单跳
+ /// ~150–300ms）。池里已有空闲连接时直接返回 true，不再重复建连。
+ ///
+ /// 超时/握手失败/不可池化时返回 false 并丢弃连接：调用方忽略即可，后续请求
+ /// 走原路径（该付的 TLS 照付，行为不变）。
+    static func prewarmTLS(
+        origin: URL,
+        leafPin: String?,
+        caCertBase64: String? = nil,
+        timeout: TimeInterval = 3,
+        pool: HTTPConnectionPool = .shared,
+        parameters: NWParameters? = nil
+    ) async -> Bool {
+        guard let host = origin.host, !host.isEmpty else { return false }
+        let port = UInt16(origin.port ?? 443)
+        let key = HTTPConnectionKey(
+            host: host,
+            port: port,
+            pin: PinFormat.normalize(leafPin),
+            caCertHash: caCertBase64.map { PinFormat.sha256Hex(Data($0.utf8)) }
+        )
+ // 连接轮次重试时池里可能已有空闲连接：无需再建一条。
+        if pool.idleCount(for: key) > 0 { return true }
+        let connection = HTTPConnection(
+            key: key,
+            host: host,
+            port: port,
+            leafPin: leafPin,
+            caCertBase64: caCertBase64,
+            parametersOverride: parameters,
+            pool: pool
+        )
+        return await connection.awaitReadyAndCheckIn(timeout: timeout)
+    }
+
  /// JSON unary call against the link origin (POST /api/<endpoint>).
  /// The trailing `pool`/`parameters` are a test seam (transport-level tests
  /// inject a plain local transport); production call sites use the defaults.

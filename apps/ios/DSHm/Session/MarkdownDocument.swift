@@ -541,7 +541,13 @@ final class MarkdownDocumentCache {
         if let boxed = cache.object(forKey: key) {
             return boxed.blocks
         }
+        #if DEBUG
+        let blocks = PerfProbe.shared.measure("mdParse", ["len": text.count]) {
+            MarkdownParser.parse(text)
+        }
+        #else
         let blocks = MarkdownParser.parse(text)
+        #endif
         lock.lock()
         missCountStorage += 1
         lock.unlock()
