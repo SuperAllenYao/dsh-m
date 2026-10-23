@@ -62,7 +62,7 @@ import { mintResumeTicket, MuxRpcChannel, P1_LIMITS, TicketUseGuard, verifyResum
 import { detectListLiteRequest, LIST_LITE_HEADER, trimSessionListResponse } from './list-lite.js';
 
 const PLUGIN_NAME = 'dsh-m-link';
-const PLUGIN_VERSION = '0.2.4';
+const PLUGIN_VERSION = '0.2.5';
 const MUX_PATH = '/api/remote.mux';
 
 /**
