@@ -164,6 +164,15 @@ final class SessionViewModel: ObservableObject {
     private var historyFillPages = 0
     private var historyFillBytes = 0
     private var historyFillFailures = 0
+ /// Consecutive *transient* (link/transport) page failures. Reset on any progress;
+ /// bounded by `historyFillTransientRetryLimit` so a flaky 5G/relay burst keeps
+ /// retrying (unconditional full history) without spinning forever.
+    private var historyFillTransientRetries = 0
+ /// ~30 retries with 1/2/4s capped backoff ≈ 2 minutes of tolerated link trouble.
+ /// A real-device 10× run once hit 6 consecutive transient failures (~30s) and the
+ /// old code marked the fill terminally `failed` with `hasMore=1` — the session
+ /// never reached its first event until reopened.
+    private static let historyFillTransientRetryLimit = 30
  /// A history/older batch was merged but its rows rebuild has not run yet: the
  /// view anchors on historyBatchToken, so the token must change *after* the rows
  /// are on screen.
@@ -794,6 +803,9 @@ final class SessionViewModel: ObservableObject {
         case progress
         case terminal
         case retryStalePage
+ /// Transport/link failure: retry with capped backoff instead of failing the
+ /// whole fill (the requirement is unconditional full history).
+        case retryTransient
         case failed
         case cancelled
     }
@@ -822,6 +834,7 @@ final class SessionViewModel: ObservableObject {
             case .progress:
                 retriedStalePage = false
                 historyFillFailures = 0
+                historyFillTransientRetries = 0
                 rebuildNowForHistoryBatch()
                 syncFillDiagnostics()
                 saveWindowCacheNow()
@@ -835,6 +848,19 @@ final class SessionViewModel: ObservableObject {
                 } else {
                     retriedStalePage = true
                 }
+            case .retryTransient:
+ // Offline: park the fill and let the reconnect path resume it.
+                guard historyPageLoader != nil || (link?.phase.isConnected ?? false) else {
+                    pauseHistoryFillForOffline()
+                    return
+                }
+                historyFillTransientRetries += 1
+                if historyFillTransientRetries > Self.historyFillTransientRetryLimit {
+                    historyFillState = .failed
+                    syncFillDiagnostics()
+                    return
+                }
+                await sleepTransientBackoff()
             case .failed:
                 historyFillFailures += 1
                 if historyFillFailures > 5 {
@@ -855,6 +881,15 @@ final class SessionViewModel: ObservableObject {
         try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
     }
 
+ /// Backoff for transient transport failures: 1s, 2s, then 4s cap (never 8s):
+ /// a 5G/relay hiccup should recover quickly instead of freezing the fill for
+ /// long stretches; the retry budget bounds the total.
+    private func sleepTransientBackoff() async {
+        let exponent = max(0, min(historyFillTransientRetries - 1, 2))
+        let seconds = min(pow(2.0, Double(exponent)), 4.0)
+        try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+    }
+
     private func fetchHistoryPage(beforeSeq: Int) async -> HistoryPageOutcome {
         let args = Self.historyPageRequestArgs(
             address: address,
@@ -862,8 +897,8 @@ final class SessionViewModel: ObservableObject {
             beforeSeq: beforeSeq,
             maxMessages: historyPageMessages
         )
+        let value: JSONValue
         do {
-            let value: JSONValue
             if let historyPageLoader {
                 value = try await historyPageLoader(args)
             } else if let link {
@@ -871,36 +906,48 @@ final class SessionViewModel: ObservableObject {
             } else {
                 return .failed
             }
-            if Task.isCancelled { return .cancelled }
-            let page = try value.decode(SessionPage.self)
-            let oldestBefore = journal.oldestSeq
-            let update = journal.prepend(page: page)
-            applyJournalUpdate(update)
-            let oldestAfter = journal.oldestSeq
-            let merged: Bool = {
-                guard let before = oldestBefore, let after = oldestAfter else { return false }
-                return after < before
-            }()
- // Count the page even when it is also the terminal one (a short session
- // that fits in one page used to report pages=0).
-            if merged {
-                historyFillPages += 1
-                if Self.e2eFillDiagnosticsEnabled || Self.e2eFillDiagnosticsTestOverride {
-                    historyFillBytes += CacheIO.encode(value)?.count ?? 0
-                }
-            }
-            if page.records.isEmpty || !journal.hasMoreOlder {
-                return .terminal
-            }
-            guard merged else { return .retryStalePage }
-            dbg("history page merged: pages=" + String(historyFillPages)
-                + " oldest=" + String(journal.oldestSeq ?? -1)
-                + " rows=" + String(rows.count))
-            return .progress
         } catch {
-            dbg("history page failed: " + NetworkErrorInterpreter.message(for: error))
+            if Task.isCancelled { return .cancelled }
+            dbg("history page fetch failed: " + NetworkErrorInterpreter.message(for: error))
+ // Real link failures are transient (5G/relay hiccups); retrying with a
+ // bounded budget is what makes "unconditional full history" hold. The
+ // test-only loader keeps the old semantics (count as terminal failure)
+ // so the filler unit tests can still drive the failure path deterministically.
+            return historyPageLoader == nil ? .retryTransient : .failed
+        }
+        if Task.isCancelled { return .cancelled }
+        let page: SessionPage
+        do {
+ // A payload/contract break is deterministic: retrying would spin forever.
+            page = try value.decode(SessionPage.self)
+        } catch {
+            dbg("history page decode failed: " + String(describing: error))
             return .failed
         }
+        let oldestBefore = journal.oldestSeq
+        let update = journal.prepend(page: page)
+        applyJournalUpdate(update)
+        let oldestAfter = journal.oldestSeq
+        let merged: Bool = {
+            guard let before = oldestBefore, let after = oldestAfter else { return false }
+            return after < before
+        }()
+ // Count the page even when it is also the terminal one (a short session
+ // that fits in one page used to report pages=0).
+        if merged {
+            historyFillPages += 1
+            if Self.e2eFillDiagnosticsEnabled || Self.e2eFillDiagnosticsTestOverride {
+                historyFillBytes += CacheIO.encode(value)?.count ?? 0
+            }
+        }
+        if page.records.isEmpty || !journal.hasMoreOlder {
+            return .terminal
+        }
+        guard merged else { return .retryStalePage }
+        dbg("history page merged: pages=" + String(historyFillPages)
+            + " oldest=" + String(journal.oldestSeq ?? -1)
+            + " rows=" + String(rows.count))
+        return .progress
     }
 
     private func markHistoryFillCompleted() {
@@ -963,6 +1010,7 @@ final class SessionViewModel: ObservableObject {
             + ";holes=" + String(holes)
             + ";hasMore=" + (journal.hasMoreOlder ? "1" : "0")
             + ";failures=" + String(historyFillFailures)
+            + ";retries=" + String(historyFillTransientRetries)
             + ";gen=" + String(link?.generation ?? -1)
     }
 
