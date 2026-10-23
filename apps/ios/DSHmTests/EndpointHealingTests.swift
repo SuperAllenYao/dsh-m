@@ -1,3 +1,4 @@
+import Network
 import XCTest
 @testable import DSHm
 
@@ -189,5 +190,56 @@ final class EndpointHealingTests: XCTestCase {
             prefersRelay: false
         )
         XCTAssertEqual(order.filter { $0.host == "192.168.5.10" }.count, 1)
+    }
+}
+
+// MARK: - 2026-10-23 真机根因修复（N-04）：mDNS 自愈的 hostId 校验
+
+/// 端点自愈只能在「确认是已配对的同一台 Mac」时使用发现结果：
+/// 已知 hostId 必须精确匹配（绝不「唯一一台就采纳」）；旧凭据没有 hostId 时
+/// 只有唯一一台广播才可采用。否则公司 Wi-Fi 下同事的 Mac 会被当成自己的，
+/// 把错误的中继端点注入当前配对（隔离 stack 已复现 → 连不上 Mac）。
+final class LANEndpointDiscoveryMatchTests: XCTestCase {
+
+    private func mac(hostId: String, name: String, relay: String? = nil) -> DiscoveredMac {
+        DiscoveredMac(
+            hostId: hostId,
+            hostName: name,
+            serviceName: name + "._dshm._tcp.local",
+            txt: ["hostId": hostId],
+            endpoint: .hostPort(
+                host: NWEndpoint.Host("127.0.0.1"),
+                port: NWEndpoint.Port(rawValue: 3466) ?? 3466
+            ),
+            relayOrigin: relay
+        )
+    }
+
+    func testMatchMacsUsesExactHostIdOnly() {
+        let mine = mac(hostId: "4aca5cf901a94a2c", name: "DSH-m-Mac")
+        let other = mac(hostId: "deadbeefdeadbeef", name: "Colleague-Mac", relay: "https://10.0.0.9:30000")
+
+        XCTAssertEqual(
+            LANEndpointDiscovery.matchMacs([other, mine], hostId: "4aca5cf901a94a2c").map(\.hostId),
+            ["4aca5cf901a94a2c"]
+        )
+        // Known hostId + only a different Mac broadcasting -> never adopt it.
+        XCTAssertTrue(
+            LANEndpointDiscovery.matchMacs([other], hostId: "4aca5cf901a94a2c").isEmpty,
+            "已知 hostId 不匹配时绝不能采纳别的 Mac 的广播"
+        )
+    }
+
+    func testMatchMacsUniqueAdoptOnlyWhenHostIdUnknown() {
+        let other = mac(hostId: "deadbeefdeadbeef", name: "Colleague-Mac")
+        XCTAssertEqual(
+            LANEndpointDiscovery.matchMacs([other], hostId: nil).map(\.hostId),
+            ["deadbeefdeadbeef"],
+            "旧凭据没有 hostId 时，唯一一台广播是唯一可采纳的兼容路径"
+        )
+        XCTAssertTrue(
+            LANEndpointDiscovery.matchMacs([other, other], hostId: nil).isEmpty,
+            "多台广播时绝不猜"
+        )
     }
 }

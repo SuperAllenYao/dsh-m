@@ -349,12 +349,30 @@ export class BonjourResponder {
     }
   }
 
-  /** Refresh TXT values (relay origin appears after tunnel ready) and re-announce. */
-  update(partial = {}) {
+  /**
+   * Refresh TXT values (relay origin appears after tunnel ready) and re-announce.
+   *
+   * 2026-10-23 real-device root-cause fix: `addresses` may also be refreshed here.
+   * The responder used to capture the Mac's LAN IPs once at plugin start; after a
+   * Wi-Fi/subnet change it kept answering A records for the stale addresses, so
+   * the phone could never resolve/dial the Mac's *current* LAN origin and every
+   * connection fell back to the relay (live evidence: 08:31+ LAN auths = 0).
+   * `link-server.refreshLanEndpoints()` passes the freshly collected addresses.
+   */
+  update(partial = {}, options = {}) {
     // Sanitize the incoming patch before merging: callers may not widen the TXT
     // contract (an invalid/numeric `pair` value is silently ignored, keeping the
     // `pair=code` capability marker already in the record).
     this.baseTxt = { ...this.baseTxt, ...sanitizeTxt(partial) };
+    if (Array.isArray(options.addresses)) {
+      const next = [...new Set(options.addresses.filter(
+        (ip) => typeof ip === 'string' && /^\d{1,3}(\.\d{1,3}){3}$/.test(ip)
+      ))];
+      // An empty set means "no non-loopback IPv4 right now" (Wi-Fi off). Keep the
+      // previous answers rather than advertising nothing: the phone still has the
+      // relay, and the next successful refresh replaces them.
+      if (next.length > 0) this.addresses = next;
+    }
     if (this.started) this.announce();
     return this.txtValues();
   }
