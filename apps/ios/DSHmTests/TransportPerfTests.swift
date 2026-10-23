@@ -540,17 +540,27 @@ final class TransportPerfTests: XCTestCase {
         XCTAssertEqual(value["plain"]?.boolValue, true)
     }
 
-    func testGzipDecodeRejectsMalformedBody() {
-        var response = HTTPResponse(
-            status: 200,
+    /// task-4 (2026-10-24): a gzip header around a body that does not decompress
+    /// must NOT throw LinkError.transport — the link plugin's exact-fetch
+    /// passthrough forwards a stale `content-encoding` header (undici inflates the
+    /// upstream body but keeps the header), and masking the HTTP status turned a
+    /// Host 404 into a retryable transport error (the file-change card then
+    /// disappeared after the retry budget). Now the raw body + status are handed
+    /// back so callers can act on httpStatus.
+    func testGzipDecodeFallsBackToRawBodyWhenBodyIsNotGzip() throws {
+        let raw = Data([0x1f, 0x8b, 0x08, 0x00]) // truncated gzip: decompression fails
+        let response = HTTPResponse(
+            status: 404,
             headers: ["content-encoding": "gzip"],
-            body: Data([0x1f, 0x8b, 0x08, 0x00]),
+            body: raw,
             observedLeafPin: nil
         )
-        XCTAssertThrowsError(try HTTPSClient.decodeBody(of: response))
+        let decoded = try HTTPSClient.decodeBody(of: response)
+        XCTAssertEqual(decoded.status, 404, "the HTTP status must survive a body decode failure")
+        XCTAssertEqual(decoded.body, raw, "the raw wire body is handed back untouched")
         // Plain responses pass through untouched.
-        response = HTTPResponse(status: 200, headers: [:], body: Data(#"{"ok":true}"#.utf8), observedLeafPin: nil)
-        XCTAssertEqual(try HTTPSClient.decodeBody(of: response).bodyText, #"{"ok":true}"#)
+        let plain = HTTPResponse(status: 200, headers: [:], body: Data(#"{"ok":true}"#.utf8), observedLeafPin: nil)
+        XCTAssertEqual(try HTTPSClient.decodeBody(of: plain).bodyText, #"{"ok":true}"#)
     }
 
     func testGzipDecodesLargeBodyIncrementally() throws {

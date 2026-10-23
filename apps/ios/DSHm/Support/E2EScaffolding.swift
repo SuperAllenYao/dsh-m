@@ -1,5 +1,6 @@
 #if DEBUG
 import Foundation
+import UIKit
 
 /// DEBUG-only E2E launch injections. Compiled out of Release builds entirely.
 ///
@@ -18,6 +19,11 @@ enum E2EScaffolding {
 
     static func applyLaunchEnvironment(defaults: UserDefaults = .standard) {
         let env = ProcessInfo.processInfo.environment
+        // E2E：关掉 UIKit 隐式动画，让等待从「按动画时长 sleep」变成「等 AX 状态值变化」。
+        // 三重门：DEBUG 编译 + DSHM_E2E=1 + 显式 env；Release 完全不编译，无产品行为。
+        if isEnabled, env["DSHM_E2E_DISABLE_ANIMATIONS"] == "1" {
+            UIView.setAnimationsEnabled(false)
+        }
         if env["DSHM_RESET_RELAY_CONFIG"] == "1" {
             RelayConfigStore.save(nil, defaults: defaults)
         }
