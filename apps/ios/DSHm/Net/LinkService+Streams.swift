@@ -1,5 +1,31 @@
 import Foundation
 
+/// One-line diagnostics for the exact-fetch file-change routes (§3.9).
+///
+/// Enable on a DEBUG build with `DSHM_CHANGESDBG=1` (for example
+/// `xcrun devicectl device process launch --console --environment DSHM_CHANGESDBG=1 …`).
+/// Silent in production. Every failure line carries what is needed to explain a
+/// meta.diffs fallback in the field: seq, route, resolved origin, relay
+/// preference, error type/text, HTTP status and elapsed ms.
+enum ChangesDebugLog {
+    static let isEnabled: Bool = {
+        #if DEBUG
+        return ProcessInfo.processInfo.environment["DSHM_CHANGESDBG"] == "1"
+        #else
+        return false
+        #endif
+    }()
+
+    static func log(_ message: @autoclosure () -> String) {
+        guard isEnabled else { return }
+        NSLog("[CHANGESDBG] %@", message())
+    }
+}
+
+/// Bound for the alternate-channel exact-fetch attempt: a LAN probe on a
+/// cellular path must not double the primary 20 s timeout.
+private let exactFetchAlternateTimeout: TimeInterval = 8
+
 /// LinkService: $events subscription, approval answers, unary calls and
 /// logical stream opening.
 extension LinkService {
@@ -506,45 +532,160 @@ extension LinkService {
 
  // MARK: - Exact-fetch routes (§3.9: changes.summary / changes.diff)
 
+ /// Ordered origins to try for one exact-fetch GET (at most two), preferred first.
+ ///
+ /// Mirrors the cold-start list override (`earlyListOriginOverride()`, v0.2.5):
+ /// on cellular/cross-network the persisted `credentials.originURL` is the Mac's
+ /// LAN address, which a phone off that network can never reach — the exact summary
+ /// fetch then timed out and permanently fell back to the meta.diffs aggregate (the
+ /// cross-end file-count mismatch, handoff §2). A LAN alternate is dropped on those
+ /// paths because dialing it could only burn the timeout a second time.
+ /// `nonisolated static` so the ordering is unit-tested.
+    nonisolated static func exactFetchOriginCandidates(
+        persisted: URL?,
+        stored: [String]?,
+        relayOverride: URL?,
+        prefersRelay: Bool
+    ) -> [URL] {
+        guard let current = relayOverride ?? persisted else { return [] }
+        var ordered: [URL] = [current]
+        let candidates = PairingOriginSelector.reconnectCandidates(
+            current: persisted?.absoluteString,
+            stored: stored
+        )
+        for candidate in candidates where candidate != current {
+            if prefersRelay, PairingOriginSelector.isLANHost(candidate.host) { continue }
+            ordered.append(candidate)
+            break
+        }
+        return ordered
+    }
+
+ /// Ordered exact-fetch origins for the current network path.
+    private func exactFetchOrigins() -> [URL] {
+        guard let credentials else { return [] }
+        return Self.exactFetchOriginCandidates(
+            persisted: credentials.originURL,
+            stored: credentials.originCandidates,
+            relayOverride: earlyListOriginOverride(),
+            prefersRelay: NetworkPathMonitor.shared.prefersRelay
+        )
+    }
+
  /// GET an allowlisted exact-fetch route through the link proxy with the
  /// short-lived api token (auto-refresh once on 401).
+ ///
+ /// task-2: the origin is the same reachable LAN/relay origin the unary path uses
+ /// (`earlyListOriginOverride()`), with the alternate channel as one bounded
+ /// fallback when the failure is transport-level (not a Host 404). Diagnostics are
+ /// one line per attempt behind `DSHM_CHANGESDBG=1`.
     func exactFetchJSON(path: String, query: [String: String], timeout: TimeInterval = 20) async throws -> JSONValue? {
-        guard let credentials, let origin = credentials.originURL else { throw LinkError.notPaired }
-        var token = try await ensureAPIToken()
-        do {
-            let result = try await HTTPSClient.exactGETJSON(
-                origin: origin,
-                path: path,
-                query: query,
-                token: token,
-                leafPin: credentials.leafPin,
-                caCertBase64: credentials.caCertBase64,
-                timeout: timeout
-            )
-            guard result.status == 200 else {
-                throw LinkError.httpStatus(result.status, result.body)
-            }
-            return result.json
-        } catch let error as LinkError {
-            if case .httpStatus(let status, let body) = error,
-               status == 401,
-               body.contains("auth/token-expired") || body.contains("auth/invalid") {
-                token = try await ensureAPIToken(forceRefresh: true)
-                let result = try await HTTPSClient.exactGETJSON(
+        guard let credentials else { throw LinkError.notPaired }
+        let origins = exactFetchOrigins()
+        guard let primary = origins.first else { throw LinkError.transport(L10n.t("配对 origin 非法")) }
+        let seq = query["seq"] ?? "-"
+        let prefersRelay = NetworkPathMonitor.shared.prefersRelay
+        var lastError: Error = LinkError.transport(L10n.t("配对 origin 非法"))
+        for (index, origin) in origins.enumerated() {
+            let isPrimary = index == 0
+            let attemptTimeout = isPrimary ? timeout : min(timeout, exactFetchAlternateTimeout)
+            let started = Date()
+            do {
+ // The API token refresh must also target the reachable origin; a stale
+ // LAN origin would otherwise hang the auth before the GET is even sent.
+                var token = try await ensureAPIToken(originOverride: origin)
+                var result = try await Self.exactFetchGET(
                     origin: origin,
                     path: path,
                     query: query,
                     token: token,
-                    leafPin: credentials.leafPin,
-                    caCertBase64: credentials.caCertBase64,
-                    timeout: timeout
+                    credentials: credentials,
+                    timeout: attemptTimeout
                 )
+                if result.status == 401,
+                   result.body.contains("auth/token-expired") || result.body.contains("auth/invalid") {
+                    token = try await ensureAPIToken(forceRefresh: true, originOverride: origin)
+                    result = try await Self.exactFetchGET(
+                        origin: origin,
+                        path: path,
+                        query: query,
+                        token: token,
+                        credentials: credentials,
+                        timeout: attemptTimeout
+                    )
+                }
                 guard result.status == 200 else {
                     throw LinkError.httpStatus(result.status, result.body)
                 }
+                ChangesDebugLog.log("ok path=\(path) seq=\(seq) origin=\(origin.absoluteString) relay=\(prefersRelay ? 1 : 0) status=200 ms=\(Self.millis(since: started))")
                 return result.json
+            } catch {
+                lastError = error
+                let status = Self.httpStatus(of: error).map(String.init) ?? "-"
+                let body = Self.httpBody(of: error) ?? "-"
+                ChangesDebugLog.log("fail path=\(path) seq=\(seq) try=\(index + 1)/\(origins.count) origin=\(origin.absoluteString) relay=\(prefersRelay ? 1 : 0) status=\(status) err=\(Self.describe(error)) ms=\(Self.millis(since: started)) body=\(body.prefix(160))")
+                guard index + 1 < origins.count, Self.shouldTryAlternateExactFetchOrigin(error) else { throw error }
+                ChangesDebugLog.log("retry-alt path=\(path) seq=\(seq) alternate=\(origins[index + 1].absoluteString)")
             }
-            throw error
+        }
+        throw lastError
+    }
+
+    private nonisolated static func exactFetchGET(
+        origin: URL,
+        path: String,
+        query: [String: String],
+        token: String,
+        credentials: PairingCredentials,
+        timeout: TimeInterval
+    ) async throws -> (status: Int, json: JSONValue?, body: String) {
+        try await HTTPSClient.exactGETJSON(
+            origin: origin,
+            path: path,
+            query: query,
+            token: token,
+            leafPin: credentials.leafPin,
+            caCertBase64: credentials.caCertBase64,
+            timeout: timeout
+        )
+    }
+
+    nonisolated static func httpStatus(of error: Error) -> Int? {
+        guard let linkError = error as? LinkError,
+              case let .httpStatus(status, _) = linkError else { return nil }
+        return status
+    }
+
+    nonisolated static func httpBody(of error: Error) -> String? {
+        guard let linkError = error as? LinkError,
+              case let .httpStatus(_, body) = linkError else { return nil }
+        return body
+    }
+
+    nonisolated static func describe(_ error: Error) -> String {
+        "\(type(of: error)): \(String(describing: error))"
+    }
+
+    nonisolated static func millis(since start: Date) -> Int {
+        Int(Date().timeIntervalSince(start) * 1000)
+    }
+
+ /// Whether a failed attempt can be fixed by dialing another origin.
+ /// A Host 404 ("summary released") cannot; a transport/timeout/relay/proxy
+ /// failure can. 404 from the relay proxy itself (`route/not-allowed`, upstream
+ /// connect failure) is a relay-version problem, not the Host dropping the data.
+    nonisolated static func shouldTryAlternateExactFetchOrigin(_ error: Error) -> Bool {
+        guard let linkError = error as? LinkError else { return true }
+        switch linkError {
+        case .httpStatus(let status, let body):
+            switch status {
+            case 401, 403: return true
+            case 404: return body.contains("route/not-allowed") || body.contains("upstream")
+            case 500...599: return true
+            default: return false
+            }
+        case .cancelled, .notPaired: return false
+        default: return true
         }
     }
 

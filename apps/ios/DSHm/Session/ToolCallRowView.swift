@@ -98,6 +98,7 @@ struct FileChangesCard: View {
     var onTap: () -> Void
 
     private var sourceLabel: String {
+        if changes.isLoading { return L10n.t("读取中") }
         switch changes.source {
         case .exactFetch: return "Host"
         case .metaDiffsFallback: return L10n.t("工具聚合")
@@ -117,9 +118,21 @@ struct FileChangesCard: View {
                     .font(Theme.Typography.label)
                     .foregroundStyle(Theme.Palette.textTertiary)
                 Spacer()
-                Text(L10n.f("%lld 个文件 · +%lld -%lld", changes.files.count, changes.added, changes.deleted))
-                    .font(Theme.Typography.label)
-                    .foregroundStyle(Theme.Palette.textTertiary)
+ // task-2: never present the meta.diffs fallback numbers while the
+ // exact Host summary is still loading (first try or backoff retry).
+                if changes.isLoading {
+                    ProgressView()
+                        .controlSize(.mini)
+                        .tint(Theme.Palette.accent)
+                    Text(L10n.t("正在读取精确数据…"))
+                        .font(Theme.Typography.label)
+                        .foregroundStyle(Theme.Palette.textTertiary)
+                } else {
+ // 与桌面端口径一致：标题文件数用 Host 的 total（不是 files 数组长度）。
+                    Text(L10n.f("%lld 个文件 · +%lld -%lld", changes.total ?? changes.files.count, changes.added, changes.deleted))
+                        .font(Theme.Typography.label)
+                        .foregroundStyle(Theme.Palette.textTertiary)
+                }
                 Image(systemName: "chevron.right")
                     .font(.system(size: 9, weight: .semibold))
                     .foregroundStyle(Theme.Palette.textTertiary)

@@ -43,6 +43,10 @@ struct SessionDetailView: View {
  /// 强制回底请求序号：发送消息 / 答完问答时 +1，UIKit 列表据此钉住 offset 0
  /// （读历史时冻结尾部内容，发送后必须立刻看到自己刚发的消息）。
     @State private var scrollToBottomToken = 0
+ /// v0.2.7：过程组显示态覆盖（key = `FlowRowGroup.id`，已用首 step 作稳定 id）。
+ /// 默认态由「是否正在跑」推导：运行中.window（固定高度窗口）/ 已结束.collapsed（一行）；
+ /// 用户点击写入覆盖；这一轮结束自动清掉运行期覆盖（→ 自动折叠）。
+    @State private var processGroupModes: [String: ProcessGroupMode] = [:]
 
     init(address: SessionFollowAddress, subagentContext: SubagentSessionContext? = nil) {
         self.address = address
@@ -173,6 +177,9 @@ struct SessionDetailView: View {
             if running {
                 viewModel.markSendTurnVisible()
             } else {
+ // v0.2.7：这一轮步骤结束 → 运行中的过程组自动折叠成一行。
+ // 只清掉运行期覆盖（.window/.full），保留用户手动展开的历史组（.expanded）。
+                processGroupModes = processGroupModes.filter { $0.value == .expanded }
  // A finished turn is a natural refresh point: child runtimes and
  // the context window may have changed while the parent streamed.
  // The 8 s tick must not be the only source of truth for the beam.
@@ -228,6 +235,8 @@ struct SessionDetailView: View {
             ToolResultDetailView(item: item, sessionId: sessionId, attachments: attachments)
         case .fileChanges(let changes):
             FileChangesSheet(viewModel: viewModel, changes: changes)
+        case .reasoning(let text):
+            ReasoningDetailSheet(text: text)
         case .permission:
             PermissionSheet(
                 permissionsValue: viewModel.permissionsValue,
@@ -713,6 +722,11 @@ struct SessionDetailView: View {
         let groups = viewModel.flowGroups
         items.reserveCapacity(groups.count + 4)
         for group in groups { items.append(.group(group)) }
+        if e2eProcessRunningPreview {
+ // E2E 证据钩子：样本会话里不一定有正在跑的 turn，这里注入一组合成「运行中」步骤，
+ // 用于稳定复现/断言「固定窗口 ⇄ 全高」两态（仅 DEBUG + DSHM_E2E=1）。
+            items.append(.group(.process(e2eProcessPreviewSteps)))
+        }
         if let fileChanges = viewModel.latestTurnFileChanges {
             items.append(.fileChanges(fileChanges))
         }
@@ -751,9 +765,16 @@ struct SessionDetailView: View {
                     attachments: attachments,
                     pendingApprovalCallIds: Set(app.link.pendingApprovals.compactMap(\.callId)),
                     subagentLabels: viewModel.subagentLabels,
-                    isRunning: viewModel.isRunning,
+                    isRunning: viewModel.isRunning || e2eProcessRunningPreview,
                     historyBatchToken: viewModel.historyBatchToken,
                     scrollToBottomToken: scrollToBottomToken,
+                    processGroupModes: processGroupModes,
+                    processGroupWindowHeight: processGroupWindowHeight,
+                    currentTurnStartSeq: currentTurnStartSeq,
+                    onToggleGroupMode: { id, target in
+                        processGroupModes[id] = target
+                    },
+                    onOpenReasoning: { present(.reasoning($0)) },
                     onOpenTool: { present(.tool($0)) },
                     onOpenFileChanges: { present(.fileChanges($0)) },
                     onNearBottomChange: { isNearBottom = $0 },
@@ -769,6 +790,16 @@ struct SessionDetailView: View {
                 .accessibilityIdentifier("session-message-list")
             }
         }
+    }
+
+ /// 运行中过程组固定窗口高度：整屏 1/3（设计稿基线），夹在 280–360pt。
+    private var processGroupWindowHeight: CGFloat {
+        min(360, max(280, UIScreen.main.bounds.height / 3))
+    }
+
+ /// 本轮起点 seq：最后一条用户消息所在行的 seq；没有用户消息时为 Int.min。
+    private var currentTurnStartSeq: Int {
+        viewModel.rows.last(where: { if case .user = $0.content { return true }; return false })?.seq ?? Int.min
     }
 
     private var loadingPlaceholder: some View {
@@ -789,6 +820,62 @@ struct SessionDetailView: View {
             await Task.yield()
             await Task.yield()
             viewModel.markDetailFirstContent()
+        }
+    }
+
+ // MARK: - v0.2.7 E2E 过程组四态预览（仅 DEBUG + E2E）
+
+ /// 运行中两态（固定窗口 / 全高）需要真实的 running turn 才能复现；
+ /// 样本会话不保证有，因此提供合成步骤注入：`DSHM_E2E=1` + `DSHM_E2E_PROCGROUP=running`。
+ /// 只影响 E2E 证据构建，无产品行为。
+    private var e2eProcessRunningPreview: Bool {
+        #if DEBUG
+        guard app.isE2EMode else { return false }
+        return ProcessInfo.processInfo.environment["DSHM_E2E_PROCGROUP"] == "running"
+        #else
+        return false
+        #endif
+    }
+
+    private var e2eProcessPreviewSteps: [ProcessStep] {
+        let specs: [(String, String)] = [
+            ("思考", "先确认 rebuild 流程，再看布局为什么被裁剪"),
+            ("bash", "grep -rn 'rowHeight' apps/ios/DSHm"),
+            ("read", "SessionMessageListView.swift"),
+            ("思考", "锚点只认真实 frame，需要强制重测行高"),
+            ("bash", "xcodebuild build -scheme DSHm"),
+            ("edit", "ProcessGroupView.swift"),
+            ("思考", "展开体不能再用 LazyVStack：cell 里没有视口"),
+            ("bash", "xcodebuild test -only-testing:DSHmTests"),
+            ("思考", "等真机回归后再决定窗口默认高度"),
+            ("read", "ProcessStepRow.swift"),
+            ("grep", "process-group-row"),
+            ("bash", "run-processgroup-e2e.sh"),
+        ]
+        return specs.enumerated().map { index, spec in
+ // 合成步骤的 seq 必须大于任何样本会话的 seq，才能被判定为「本轮运行中」组。
+            let previewSeq = Int.max / 2 + index
+            if spec.0 == "思考" {
+                return ProcessStep(id: "e2e-proc-\(index)", kind: .reasoning(spec.1), seq: previewSeq)
+            }
+            var arguments: [String: JSONValue] = [:]
+            switch spec.0 {
+            case "bash": arguments = ["command": .string(spec.1)]
+            default: arguments = ["file_path": .string(spec.1)]
+            }
+            let item = ToolCallItem(
+                callId: "e2e-call-\(index)",
+                name: spec.0,
+                argumentsRaw: nil,
+                arguments: arguments,
+                result: index == specs.count - 1
+                    ? nil
+                    : ToolResultItem(isError: false, text: "ok", meta: nil, images: []),
+                children: [],
+                turn: 1,
+                step: index
+            )
+            return ProcessStep(id: "e2e-proc-\(index)", kind: .tool(item), seq: previewSeq)
         }
     }
 
@@ -1070,6 +1157,11 @@ struct FlowRowGroupView: View, Equatable {
     var subagentLabels: [String: String] = [:]
  /// True only for the last group while the session runs.
     var isNewestGroupRunning: Bool = false
+ /// v0.2.7：过程组显示态由页面持有，cell 只读不存。
+    var mode: ProcessGroupMode = .collapsed
+    var windowHeight: CGFloat = 300
+    var onToggleMode: (() -> Void)? = nil
+    var onOpenReasoning: ((String) -> Void)? = nil
     var onOpenTool: ((ToolCallItem) -> Void)? = nil
 
  /// 只比较影响渲染的值：流式更新时未变化的组直接跳过 body 重算
@@ -1080,6 +1172,7 @@ struct FlowRowGroupView: View, Equatable {
             && lhs.pendingApprovalCallIds == rhs.pendingApprovalCallIds
             && lhs.subagentLabels == rhs.subagentLabels
             && lhs.isNewestGroupRunning == rhs.isNewestGroupRunning
+            && lhs.mode == rhs.mode
     }
 
     private var axIdentifier: String {
@@ -1104,10 +1197,12 @@ struct FlowRowGroupView: View, Equatable {
                 ProcessGroupView(
                     steps: steps,
                     isRunning: isNewestGroupRunning,
-                    sessionId: sessionId,
-                    attachments: attachments,
                     pendingApprovalCallIds: pendingApprovalCallIds,
-                    onOpenTool: onOpenTool
+                    mode: mode,
+                    windowHeight: windowHeight,
+                    onToggleMode: onToggleMode,
+                    onOpenTool: onOpenTool,
+                    onOpenReasoning: onOpenReasoning
                 )
             }
         }
@@ -1123,6 +1218,8 @@ struct FlowRowGroupView: View, Equatable {
 enum SessionDetailSheet: Identifiable {
     case tool(ToolCallItem)
     case fileChanges(TurnFileChanges)
+ /// v0.2.7：思考全文（原先由过程组 cell 内的.sheet 呈现，cell 重建会丢弹层）。
+    case reasoning(String)
     case permission
  /// v5.4 task-13: half-sheet subagent list of the parent session.
     case subagentList
@@ -1133,6 +1230,7 @@ enum SessionDetailSheet: Identifiable {
         switch self {
         case .tool(let item): return "tool-\(item.id)"
         case .fileChanges(let changes): return "changes-\(changes.seq ?? -1)"
+        case .reasoning(let text): return "reasoning-\(text.count)-\(text.prefix(24))"
         case .permission: return "permission"
         case .subagentList: return "subagent-list"
         case .modelSelection: return "model-selection"
