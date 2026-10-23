@@ -699,6 +699,16 @@ struct SessionDetailView: View {
 
  /// 消息流渲染单元：groups（历史+live）+ 尾部内容（文件变更/流式文本/错误）统一进列表。
     private var messageItems: [SessionMessageItem] {
+        #if DEBUG
+        PerfProbe.shared.measure("messageItems", ["groups": viewModel.flowGroups.count]) {
+            buildMessageItems()
+        }
+        #else
+        buildMessageItems()
+        #endif
+    }
+
+    private func buildMessageItems() -> [SessionMessageItem] {
         var items: [SessionMessageItem] = []
         let groups = viewModel.flowGroups
         items.reserveCapacity(groups.count + 4)
