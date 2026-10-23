@@ -142,6 +142,16 @@ enum DetailMetrics {
     private static var cacheRestoreMs: TimeInterval?
     /// Reserved for the Net/ stream-resume change (P1.5-B keeps it 0).
     private static var resumed = false
+    /// 2026-10-23 full-history autoload metrics:
+    /// - tapAt: the card tap action (before route switch / VM init)
+    /// - shellAt: detail shell on screen (header/composer/skeleton)
+    /// - fill*: the silent background full-history fill (E2E evidence only)
+    private static var tapAt: TimeInterval?
+    private static var tapAtEpochMs: Int64 = -1
+    private static var shellAt: TimeInterval?
+    private static var fillCompletedMs: Double = -1
+    private static var fillPages: Int = -1
+    private static var fillOldestSeq: Int = -1
 
     /// Call first thing in `SessionViewModel.init` (t0). The cache-hit flag is
     /// filled in by `setCacheHit(_:)` once the synchronous restore has run.
@@ -157,6 +167,10 @@ enum DetailMetrics {
         firstWindow = -1
         cacheRestoreMs = nil
         resumed = false
+        shellAt = nil
+        fillCompletedMs = -1
+        fillPages = -1
+        fillOldestSeq = -1
     }
 
     static func setCacheHit(_ hit: Bool) {
@@ -176,10 +190,38 @@ enum DetailMetrics {
         cacheRestoreMs = milliseconds
     }
 
+    /// The card tap action entry (t0 of the user-perceived detail latency). Called
+    /// from the list before the route switch; begin(sessionId:) keeps it.
+    static func beginTap() {
+        guard isEnabled else { return }
+        tapAt = ProcessInfo.processInfo.systemUptime
+        tapAtEpochMs = Int64(Date().timeIntervalSince1970 * 1000)
+    }
+
+    /// The detail shell is on screen (header / composer / message skeleton, content
+    /// not required yet). Idempotent.
+    static func markShellFrame() {
+        guard isEnabled, openedAt != nil, shellAt == nil else { return }
+        shellAt = ProcessInfo.processInfo.systemUptime
+    }
+
     /// Detail's first visible content: title and/or first rows are on screen.
-    static func markFirstFrame() {
+    static func markFirstContent() {
         guard isEnabled, openedAt != nil, firstFrameAt == nil else { return }
         firstFrameAt = ProcessInfo.processInfo.systemUptime
+    }
+
+    /// Backward-compatible alias.
+    static func markFirstFrame() {
+        markFirstContent()
+    }
+
+    /// The silent history fill reached the session's first event.
+    static func markHistoryFillCompleted(milliseconds: Double, pages: Int, oldestSeq: Int) {
+        guard isEnabled, openedAt != nil else { return }
+        if fillCompletedMs < 0 { fillCompletedMs = milliseconds }
+        fillPages = pages
+        fillOldestSeq = oldestSeq
     }
 
     /// First live `session/follow` snapshot applied.
@@ -212,6 +254,51 @@ enum DetailMetrics {
         return "firstFrameMs=\(milliseconds(firstFrameAt));cacheHit=\(cacheHit ? 1 : 0);networkMs=\(milliseconds(networkAt));beginEpochMs=\(beginEpochMs ?? -1);sessionId=\(sessionId ?? "-");window=\(firstWindow);cacheMs=\(cacheRestoreMs.map { String(format: "%.1f", $0) } ?? "-1");fullMs=\(milliseconds(fullAt));resumed=\(resumed ? 1 : 0)"
     }
 
+    /// The 2026-10-23 autoload key group, appended to the legacy detail metrics by
+    /// the view model. Kept separate so the legacy valueString stays byte-stable for
+    /// older bench parsers/tests.
+    static var autoloadValueString: String? {
+        guard isEnabled, let openedAt else { return nil }
+        func secondsString(_ seconds: TimeInterval) -> String {
+            return String(format: "%.1f", seconds * 1000)
+        }
+        let tap: String
+        if let tapAt {
+            tap = secondsString(openedAt - tapAt)
+        } else {
+            tap = "-1"
+        }
+        let shell: String
+        if let shellAt {
+            shell = secondsString(shellAt - openedAt)
+        } else {
+            shell = "-1"
+        }
+        let content: String
+        if let firstFrameAt {
+            content = secondsString(firstFrameAt - openedAt)
+        } else {
+            content = "-1"
+        }
+        let fill: String
+        if fillCompletedMs < 0 {
+            fill = "-1"
+        } else {
+            fill = String(format: "%.1f", fillCompletedMs)
+        }
+        let cacheChunk0: String
+        if let cacheRestoreMs {
+            cacheChunk0 = String(format: "%.1f", cacheRestoreMs)
+        } else {
+            cacheChunk0 = "-1"
+        }
+        return "tapMs=" + tap + ";tapAtEpochMs=" + String(tapAtEpochMs)
+            + ";shellMs=" + shell + ";contentMs=" + content
+            + ";firstContentMs=" + content + ";cacheChunk0Ms=" + cacheChunk0
+            + ";fillMs=" + fill + ";fillPages=" + String(fillPages)
+            + ";fillOldest=" + String(fillOldestSeq)
+    }
+
     /// Clears every mark (unit tests).
     static func reset() {
         openedAt = nil
@@ -224,6 +311,12 @@ enum DetailMetrics {
         firstWindow = -1
         cacheRestoreMs = nil
         resumed = false
+        tapAt = nil
+        tapAtEpochMs = -1
+        shellAt = nil
+        fillCompletedMs = -1
+        fillPages = -1
+        fillOldestSeq = -1
     }
 }
 

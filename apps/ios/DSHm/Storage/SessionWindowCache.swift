@@ -3,34 +3,23 @@ import Foundation
 import UIKit
 #endif
 
-/// P1.5-B: phone-sized `session/follow` first window.
+/// Session detail window policy.
 ///
-/// P1.5-B measure: the detail's first open used to request 40 messages (~0.72MB on
-/// the bench sessions), so a cache miss paid the whole window before *anything*
-/// could paint (App 内首帧 329ms / 跨进程 687ms). The user only sees the newest
-/// few turns first, so the live request now starts with a screen-sized window and
-/// the legacy 40-message window is filled in the background (see
-/// `SessionViewModel`); prewarm writes the same small window, which also makes the
-/// prewarmed cache land sooner.
+/// 2026-10-23 (user decision): the detail no longer has manual "load earlier"
+/// pagination. The first paint is a phone-sized window; the full history is then
+/// pulled automatically in the background by the history filler. The on-disk cache
+/// only keeps the latest 4 screens (fast first paint + a little scroll-up headroom),
+/// never the full history.
 enum SessionWindowPolicy {
-    /// P1.5 plan bounds: 12–20 messages for the first window.
+    /// Phone-sized first window (messages). 12-20 keeps the first paint cheap.
     static let minFirstWindowMessages = 12
     static let maxFirstWindowMessages = 20
-    /// Background fill target: keeps the legacy 40-message history window.
-    static let fillWindowMessages = 40
 
-    // MARK: - turnWindow (task session-history)
+    /// First-paint cache depth: the newest 4 screens are persisted (user decision).
+    static let cachedScreens = 4
 
-    /// Turn minima shared by every window: cover ~8 complete turns *when the
-    /// session's turns are short*, never at the cost of a bigger window.
-    ///
-    /// Host semantics (verified 2026-10-22 in the installed session-controller
-    /// `paginate`): the Host walks backwards from the window end, counts
-    /// append-origin user/assistant messages, and stops at a `turn/start` once
-    /// `count >= minMessages && turns >= minTurns` — **unless `maxMessages` or
-    /// history exhaustion wins first**. `minMessages` must be ≤ `maxMessages`
-    /// (Host-side validation). Consequence: adding a turnWindow never enlarges a
-    /// window; it only stops *earlier* at a turn boundary.
+    /// turnWindow minima shared by the first window request: stop at a turn
+    /// boundary after both minima when the message budget allows it.
     static let turnWindowMinTurns = 8
 
     struct TurnWindow: Equatable {
@@ -45,29 +34,10 @@ enum SessionWindowPolicy {
         }
     }
 
-    /// First window (12–20 messages): keep it phone-sized for the first paint; the
-    /// turn stop only matters for short-turn conversations (in tool-heavy sessions
-    /// `maxMessages` binds first — measured on real logs, see the session-history
-    /// report).
+    /// First window (12-20 messages): the turn stop only matters for short-turn
+    /// conversations; in tool-heavy sessions maxMessages binds first.
     nonisolated static func firstWindowTurnWindow(messages: Int) -> TurnWindow {
         TurnWindow(minMessages: max(1, min(8, messages)), minTurns: turnWindowMinTurns)
-    }
-
-    /// Background fill window (40 messages): stop at a turn start once 32 messages
-    /// and 8 turns are covered, otherwise the 40-message cap wins.
-    nonisolated static func fillWindowTurnWindow(messages: Int) -> TurnWindow {
-        TurnWindow(minMessages: max(1, min(messages - 8, messages)), minTurns: turnWindowMinTurns)
-    }
-
-    /// Older-history page step: 40 user/assistant messages (schema allows 40–60; a
-    /// page is *all* events in the seq range, so 40 messages ≈ 350–400 events /
-    /// 0.8–1.2MB on the measured long sessions — the same order as the legacy
-    /// 40-message fill, just fetched on demand while scrolling up).
-    static let pageWindowMessages = 40
-
-    /// Page turn stop: ≥32 messages + ≥8 turns, otherwise `maxMessages` wins.
-    nonisolated static var pageTurnWindow: TurnWindow {
-        TurnWindow(minMessages: 32, minTurns: turnWindowMinTurns)
     }
 
     /// Screen-height adaptive first window: small phones 12, standard 16,
@@ -79,15 +49,25 @@ enum SessionWindowPolicy {
         return 16
     }
 
-    /// Fill window: never smaller than the first window (a fill must be a superset).
-    nonisolated static func fillMessages(firstWindow: Int) -> Int {
-        max(fillWindowMessages, firstWindow)
+    // MARK: - Background history filler (automatic full-history load)
+
+    /// Filler page size in append-origin messages. Pages are all events in the seq
+    /// range, so on tool-heavy sessions a page is several times larger than its
+    /// message count. LAN gets bigger pages (fewer round trips); relay/cellular gets
+    /// smaller ones (bounded decode/paint cost per batch).
+    static let historyPageMessagesLAN = 160
+    static let historyPageMessagesRelay = 60
+
+    nonisolated static func historyPageMessages(isRelay: Bool) -> Int {
+        isRelay ? historyPageMessagesRelay : historyPageMessagesLAN
     }
 
-    /// Prewarm writes exactly the window the first open asks for, so a warm cache
-    /// is a complete hit (smaller payload = it lands before the user taps).
+    // MARK: - Prewarm (writes the same 4-screen first-paint cache)
+
+    /// Prewarm asks for the full 4-screen cache window so a warm open paints the
+    /// first screen from chunk 0 and has the other 3 screens ready immediately.
     nonisolated static func prewarmMessages(screenHeight: CGFloat) -> Int {
-        firstWindowMessages(screenHeight: screenHeight)
+        firstWindowMessages(screenHeight: screenHeight) * cachedScreens
     }
 
     #if canImport(UIKit)
@@ -100,95 +80,71 @@ enum SessionWindowPolicy {
     @MainActor static var deviceScreenHeight: CGFloat { 800 }
     #endif
 
-    /// First window for this device (used by `SessionViewModel.openStream`).
+    /// First window for this device (used by the SessionViewModel.openStream).
     @MainActor static var deviceFirstWindowMessages: Int {
         firstWindowMessages(screenHeight: deviceScreenHeight)
     }
 
-    /// Prewarm window for this device (used by the workspace list prewarmer).
+    /// Prewarm window for this device (4 screens).
     @MainActor static var devicePrewarmMessages: Int {
         prewarmMessages(screenHeight: deviceScreenHeight)
     }
 }
 
-/// Cached detail window for one session: the last `session/follow` snapshot frame
-/// (raw wire JSON, phone-sized first window plus the background-filled history)
-/// plus the raw event frames that followed it.
+/// First-paint cache for one session: the newest up-to-4 screens of events plus the
+/// metadata the detail header needs (header + projections), so a warm open can paint
+/// the first screen without any network round trip and without re-decoding a huge
+/// payload.
 ///
-/// Like `SessionListCache`, the payload stays as wire JSON: restoring replays the
-/// frames through `SessionJournal` (`SessionStreamFrame.decode` → `apply(snapshot:)`
-/// / `apply(event:)`), which gives sequence ordering and de-duplication for free.
-/// `assistant-stream` deltas are intentionally not cached (ephemeral live text; the
-/// next live snapshot/session stream supersedes them).
+/// The payload is chunked by screen, newest chunk first:
+///   - restore applies chunks[0] as a synthetic snapshot -> first paint rows;
+///   - chunks[1...] are then merged into the front in the background (cheap,
+///     bounded memory).
+///
+/// There is no full-history cache: the history filler always pulls the rest from the
+/// Host (user decision 2026-10-23).
 struct SessionWindowCachePayload: Codable, Equatable {
     var schemaVersion: Int
     var savedAt: Date
-    /// Pairing fingerprint of the Mac that wrote this window; see `CacheIdentity`.
+    /// Pairing fingerprint of the Mac that wrote this window; see CacheIdentity.
     var identity: String
     var sessionId: String
-    /// Raw `{"type":"snapshot", ...}` item value as received on `session/follow`.
-    var snapshot: JSONValue
-    /// Raw `event` objects (the `event` field of an `{"type":"event"}` frame),
-    /// contiguous after `snapshot`.
-    var events: [JSONValue]
-    /// P1.5-B: number of messages the snapshot was requested with (window size
-    /// evidence; caches written before this field decode with nil = legacy 40).
-    var windowMessages: Int?
-    /// P1.5-B: `snapshot.hasMore` (older history exists; the last live window is
-    /// the 40-message background fill, so a warm cache is still complete).
+    /// Newest applied log position when the payload was written.
+    var cursor: Int
+    /// journal.hasMore at save time (Host still has older events beyond the window).
     var hasMore: Bool?
-    /// P1 resume base: channel epoch + applied downstream `sid` when this window
-    /// was last aligned with the live stream. Only meaningful on dsh-m/2; nil on
-    /// the legacy path (which keeps its old behaviour).
-    var p1Epoch: String?
-    var p1Sid: Int64?
+    /// Session header (id/cwd/...). Title itself comes from projections.
+    var header: SessionHeader?
+    /// Full projection values at save time (title / permissions / model selection /
+    /// todos / user questions / subagent catalog ...). Small and needed by the header.
+    var projections: ProjectionValues?
+    /// Newest-first screen chunks. chunks[0] is the newest screen (first paint).
+    var chunks: [[SessionEvent]]
+    /// Evidence: requested first window (messages) at save time.
+    var windowMessages: Int?
 
-    // MARK: - v3 (task session-history): loaded older range
-
-    /// Raw `event` objects **older than** `snapshot`'s first record, ascending by
-    /// seq (the front of the loaded window, filled by `session/page`). A cold open
-    /// replays them so the user's loaded history is still there instead of
-    /// regressing to the newest message window.
-    var olderEvents: [JSONValue]?
-    /// Oldest event seq this payload can restore (= `olderEvents.first` seq, or the
-    /// snapshot's first record when no older range is persisted). Evidence field:
-    /// restoring derives the same value from the replayed records.
-    var oldestSeq: Int?
-    /// `session/page` `hasMore` at save time: true = the Host still has events
-    /// before `oldestSeq` (the user can keep scrolling up). Nil on v2 payloads,
-    /// which are interpreted from the legacy `hasMore` field instead.
-    var hasMoreOlder: Bool?
-    /// v4 (task-6): sticky "the session's first event has already been loaded".
-    /// Once true, a cold open must not show the "load earlier" entry again. Nil on
-    /// v2/v3 payloads: derived as `oldestSeq == 0 || replayed front seq == 0`.
-    var hasReachedOldest: Bool?
+    /// Oldest event seq this payload can restore (nil when empty).
+    var oldestSeq: Int? { chunks.last?.first?.seq }
+    /// Newest event seq this payload contains (nil when empty).
+    var newestSeq: Int? { chunks.first?.last?.seq }
 }
 
-/// One file per session (`window-<stable-hash>.json`) inside the cache directory.
+/// One file per session (window-<stable-hash>.json) inside the cache directory.
 final class SessionWindowCacheStore {
-    /// Very long tool outputs can make a wide snapshot multi-MB; caching that
-    /// would slow the next open instead of speeding it up.
+    /// A 4-screen window on a tool-heavy session can be a couple of MB; beyond this
+    /// the oldest screens are dropped (the filler refetches them; we never let a
+    /// cache write slow down or OOM the next open).
     static let maxPayloadBytes = 4 * 1024 * 1024
 
-    /// Window payload schema.
-    /// - **v3** (task session-history) adds the loaded older range
-    ///   (`olderEvents` / `oldestSeq` / `hasMoreOlder`);
-    /// - **v4** (task-6) adds the sticky `hasReachedOldest` termination flag.
-    ///
-    /// v2/v3 payloads stay readable: v2 means "the legacy 40-message window"
-    /// (`oldestSeq = earliest record`, `hasMoreOlder = legacy hasMore`), v3 lacks
-    /// only the sticky flag (derived from the replayed front seq). The shared
-    /// `CacheSchema.version` is deliberately untouched: the session-list payloads
-    /// have their own schema and must not be invalidated by this change.
-    static let schemaVersion = 4
-    /// Versions `load` accepts (v2 = legacy 40-message window, upgraded in memory).
-    static let readableSchemaVersions: Set<Int> = [2, 3, 4]
-    /// First schema that carries the older-range fields (`olderEvents` etc.).
-    static let olderRangeSchemaVersion = 3
+    /// Window payload schema. Older schemas (raw snapshot + olderEvents envelope)
+    /// are deleted on read: the 2026-10-23 cache is chunked by screen and has no
+    /// full-history range.
+    static let schemaVersion = 5
+    static let readableSchemaVersions: Set<Int> = [5]
 
     struct Loaded {
         var payload: SessionWindowCachePayload
-        /// Older than `CacheSchema.ttl`: shown, but the caller may mark it stale.
+        /// Older than CacheSchema.ttl: shown, but the caller may mark it stale.
         var isStale: Bool
     }
 
@@ -211,13 +167,13 @@ final class SessionWindowCacheStore {
 
     func fileURL(for sessionId: String) -> URL {
         directory.appendingPathComponent(
-            "window-\(CacheIO.stableHash(sessionId)).json",
+            "window-" + CacheIO.stableHash(sessionId) + ".json",
             isDirectory: false
         )
     }
 
-    /// Returns the cached window for `sessionId`, or nil when absent / corrupt /
-    /// wrong schema / past hard retention / **written by a different pairing**.
+    /// Returns the cached window for the session, or nil when absent / corrupt /
+    /// wrong schema / past hard retention / written by a different pairing.
     /// Never throws and never crashes on bad bytes.
     func load(sessionId: String) -> Loaded? {
         let url = fileURL(for: sessionId)
@@ -227,7 +183,6 @@ final class SessionWindowCacheStore {
             }
             return nil
         }
-        // Another Mac's window must never render: delete it and use the network path.
         guard payload.identity == identity() else {
             CacheIO.remove(url, fileManager: fileManager)
             return nil
@@ -245,49 +200,204 @@ final class SessionWindowCacheStore {
         return Loaded(payload: payload, isStale: age > CacheSchema.ttl)
     }
 
+    /// Splits chronological events into up to screens chunks, newest first.
+    ///
+    /// Each chunk covers about messagesPerScreen append-origin messages and starts at
+    /// a message/turn boundary when one can be found in the scanned range (so a
+    /// restored chunk[0] starts at a clean row boundary instead of mid tool block).
+    nonisolated static func screenChunks(
+        events: [SessionEvent],
+        messagesPerScreen: Int,
+        screens: Int
+    ) -> [[SessionEvent]] {
+        guard !events.isEmpty, screens > 0, messagesPerScreen > 0 else { return [] }
+        let sorted = events.sorted { $0.seq < $1.seq }
+        var chunks: [[SessionEvent]] = []
+        var end = sorted.count
+        var remainingScreens = screens
+        while end > 0, remainingScreens > 0 {
+            var messageCount = 0
+            var scan = end - 1
+            var start = end - 1
+            while scan >= 0 {
+                start = scan
+                let type = sorted[scan].type
+                if type == "user/message" || type == "assistant/message" {
+                    messageCount += 1
+                }
+                if messageCount >= messagesPerScreen { break }
+                scan -= 1
+            }
+            // Prefer a clean boundary at/after the scanned start.
+            var boundary = start
+            var probe = start
+            while probe < end {
+                let type = sorted[probe].type
+                if type == "user/message" || type == "turn/start" { boundary = probe; break }
+                probe += 1
+            }
+            if boundary >= end { break }
+            let chunk = Array(sorted[boundary..<end])
+            if !chunk.isEmpty {
+                chunks.append(chunk)
+            }
+            end = boundary
+            remainingScreens -= 1
+        }
+        return chunks
+    }
+
+    /// One pending (or in-flight) background write. Only the newest one is kept:
+    /// a history fill can trigger a save every batch, and re-encoding intermediate
+    /// windows is wasted CPU.
+    private struct SaveWork {
+        /// nil = 后台写入时再读身份（避免主线程 keychain/identity 读取开销）。
+        let identity: String?
+        let sessionId: String
+        let cursor: Int
+        let hasMore: Bool?
+        let header: SessionHeader?
+        let projections: ProjectionValues?
+        let events: [SessionEvent]
+        let windowMessages: Int?
+        let messagesPerScreen: Int
+        let screens: Int
+    }
+
+    /// 测试开关：`saveAsync` 退化为同步写（单测断言「调用返回即落盘」；生产恒为 false）。
+    static var synchronousWritesForTesting = false
+
+    private let saveQueue = DispatchQueue(label: "com.dshm.session-window-cache.save", qos: .utility)
+    private let pendingLock = NSLock()
+    private var pendingWork: SaveWork?
+    private var drainScheduled = false
+
+    /// 后台队列版本（合并写入）：主线程只做参数捕获，分屏/编码/原子写全部在 utility 队列。
+    /// 历史补齐每批都会写缓存，同步做（每批 ~29ms）会直接造成滑动卡顿。
+    @discardableResult
+    func saveAsync(
+        sessionId: String,
+        cursor: Int,
+        hasMore: Bool?,
+        header: SessionHeader?,
+        projections: ProjectionValues?,
+        events: [SessionEvent],
+        windowMessages: Int? = nil,
+        messagesPerScreen: Int = SessionWindowPolicy.maxFirstWindowMessages,
+        screens: Int = SessionWindowPolicy.cachedScreens
+    ) -> Bool {
+        guard !events.isEmpty else { return false }
+        if Self.synchronousWritesForTesting {
+            return save(
+                sessionId: sessionId,
+                cursor: cursor,
+                hasMore: hasMore,
+                header: header,
+                projections: projections,
+                events: events,
+                windowMessages: windowMessages,
+                messagesPerScreen: messagesPerScreen,
+                screens: screens
+            )
+        }
+        let work = SaveWork(
+            identity: nil,
+            sessionId: sessionId,
+            cursor: cursor,
+            hasMore: hasMore,
+            header: header,
+            projections: projections,
+            events: events,
+            windowMessages: windowMessages,
+            messagesPerScreen: messagesPerScreen,
+            screens: screens
+        )
+        pendingLock.lock()
+        pendingWork = work
+        let schedule = !drainScheduled
+        drainScheduled = true
+        pendingLock.unlock()
+        if schedule {
+            saveQueue.async { [weak self] in self?.drainSaves() }
+        }
+        return true
+    }
+
+    private func drainSaves() {
+        while true {
+            pendingLock.lock()
+            guard let work = pendingWork else {
+                drainScheduled = false
+                pendingLock.unlock()
+                return
+            }
+            pendingWork = nil
+            pendingLock.unlock()
+            #if DEBUG
+            PerfProbe.shared.measure("cacheSaveBG", ["events": work.events.count]) {
+                _ = writeNow(work)
+            }
+            #else
+            _ = writeNow(work)
+            #endif
+        }
+    }
+
+    /// Persists the newest screens screens derived from chronological events.
+    /// Oldest screens are dropped when the encoded payload exceeds the byte budget.
     @discardableResult
     func save(
         sessionId: String,
-        snapshot: JSONValue,
-        events: [JSONValue],
+        cursor: Int,
+        hasMore: Bool?,
+        header: SessionHeader?,
+        projections: ProjectionValues?,
+        events: [SessionEvent],
         windowMessages: Int? = nil,
-        hasMore: Bool? = nil,
-        p1Epoch: String? = nil,
-        p1Sid: Int64? = nil,
-        olderEvents: [JSONValue] = [],
-        oldestSeq: Int? = nil,
-        hasMoreOlder: Bool? = nil,
-        hasReachedOldest: Bool? = nil
+        messagesPerScreen: Int = SessionWindowPolicy.maxFirstWindowMessages,
+        screens: Int = SessionWindowPolicy.cachedScreens
     ) -> Bool {
-        guard let identity = identity() else { return false }
+        guard let identity = identity(), !events.isEmpty else { return false }
+        return writeNow(SaveWork(
+            identity: identity,
+            sessionId: sessionId,
+            cursor: cursor,
+            hasMore: hasMore,
+            header: header,
+            projections: projections,
+            events: events,
+            windowMessages: windowMessages,
+            messagesPerScreen: messagesPerScreen,
+            screens: screens
+        ))
+    }
+
+    private func writeNow(_ work: SaveWork) -> Bool {
+        guard let identity = work.identity ?? identity() else { return false }
+        let sessionId = work.sessionId
+        let events = work.events
         var payload = SessionWindowCachePayload(
             schemaVersion: Self.schemaVersion,
             savedAt: now(),
             identity: identity,
             sessionId: sessionId,
-            snapshot: snapshot,
-            events: events,
-            windowMessages: windowMessages,
-            hasMore: hasMore,
-            p1Epoch: p1Epoch,
-            p1Sid: p1Sid,
-            olderEvents: olderEvents.isEmpty ? nil : olderEvents,
-            oldestSeq: oldestSeq,
-            hasMoreOlder: hasMoreOlder,
-            hasReachedOldest: hasReachedOldest
+            cursor: work.cursor,
+            hasMore: work.hasMore,
+            header: work.header,
+            projections: work.projections,
+            chunks: Self.screenChunks(
+                events: events,
+                messagesPerScreen: work.messagesPerScreen,
+                screens: work.screens
+            ),
+            windowMessages: work.windowMessages
         )
+        guard !payload.chunks.isEmpty else { return false }
         guard var data = CacheIO.encode(payload) else { return false }
-        // A long session can accumulate more loaded older history than the cold-start
-        // budget. Persisting *some* of it beats failing the whole write (a cold start
-        // without any window cache is a much worse regression): drop the oldest older
-        // events until the payload fits, and report `hasMoreOlder = true` so
-        // scrolling up refetches the dropped prefix from the Host.
-        while data.count > Self.maxPayloadBytes,
-              let older = payload.olderEvents, !older.isEmpty {
-            let keep = older.count / 2
-            payload.olderEvents = keep > 0 ? Array(older.suffix(keep)) : nil
-            payload.oldestSeq = nil
-            payload.hasMoreOlder = true
+        // Drop the oldest screens until the payload fits. Dropping a screen is safe:
+        // the history filler refetches it from the Host on the next open.
+        while data.count > Self.maxPayloadBytes, payload.chunks.count > 1 {
+            payload.chunks.removeLast()
             guard let encoded = CacheIO.encode(payload) else { return false }
             data = encoded
         }
@@ -299,7 +409,7 @@ final class SessionWindowCacheStore {
     }
 
     func clear(sessionId: String) {
-        CacheIO.remove(fileURL(for: sessionId), fileManager: fileManager)
+        CacheIO.remove(fileURL(for: sessionId))
     }
 
     /// Drops session windows older than the hard retention so the cache directory
@@ -318,7 +428,7 @@ final class SessionWindowCacheStore {
             let modified = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?
                 .contentModificationDate
             guard let modified, modified < cutoff else { continue }
-            CacheIO.remove(url, fileManager: fileManager)
+            CacheIO.remove(url)
         }
     }
 }

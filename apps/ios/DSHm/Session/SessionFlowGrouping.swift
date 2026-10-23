@@ -46,7 +46,10 @@ enum FlowRowGroup: Identifiable, Equatable {
         case .single(let row):
             return row.id
         case .process(let steps):
-            return "process-" + (steps.first?.id ?? "empty")
+            // v0.2.6 滚动修复：组 id 用**最后一条 step**，保证「向历史方向 prepend」
+            // 时既有组的 id 不变（新 step 只会加在组头，尾 step 保持不变），
+            // scrollPosition(id:) 的锚点因此不会在补齐插入时失效。
+            return "process-" + (steps.last?.id ?? "empty")
         }
     }
 }
@@ -54,37 +57,55 @@ enum FlowRowGroup: Identifiable, Equatable {
 /// v5.3 rule: consecutive reasoning + tool-call rows form one folded process
 /// group; everything else stays a normal row.
 enum SessionFlowGrouping {
+    /// 全量分组（首帧 / 测试 oracle / 增量缓存的兜底）。
     static func groups(rows: [FlowRow]) -> [FlowRowGroup] {
+        makeGroups(rows: rows, fromRow: 0).groups
+    }
+
+    /// 从 fromRow 行开始分组，同时返回每个分组对应的行区间——增量缓存只需重算
+    /// 变化的尾部区间（见 FlowGroupCache）。
+    static func makeGroups(rows: [FlowRow], fromRow: Int) -> (groups: [FlowRowGroup], ranges: [Range<Int>]) {
         var groups: [FlowRowGroup] = []
-        var pendingRows: [FlowRow] = []
+        var ranges: [Range<Int>] = []
+        var pendingIndexes: [Int] = []
         var pendingSteps: [ProcessStep] = []
+        var groupStart = max(fromRow, 0)
 
         func flush() {
             guard !pendingSteps.isEmpty else { return }
             if pendingSteps.count >= 2 {
                 groups.append(.process(pendingSteps))
+                ranges.append(groupStart..<(groupStart + pendingSteps.count))
             } else {
-                groups.append(contentsOf: pendingRows.map { FlowRowGroup.single($0) })
+                for index in pendingIndexes {
+                    groups.append(.single(rows[index]))
+                    ranges.append(index..<(index + 1))
+                }
             }
-            pendingRows = []
+            pendingIndexes = []
             pendingSteps = []
         }
 
-        for row in rows {
+        let start = min(max(fromRow, 0), rows.count)
+        for index in start..<rows.count {
+            let row = rows[index]
             switch row.content {
             case .reasoning(let text):
-                pendingRows.append(row)
+                if pendingSteps.isEmpty { groupStart = index }
+                pendingIndexes.append(index)
                 pendingSteps.append(ProcessStep(id: row.id, kind: .reasoning(text)))
             case .tool(let item):
-                pendingRows.append(row)
+                if pendingSteps.isEmpty { groupStart = index }
+                pendingIndexes.append(index)
                 pendingSteps.append(ProcessStep(id: row.id, kind: .tool(item)))
             default:
                 flush()
                 groups.append(.single(row))
+                ranges.append(index..<(index + 1))
             }
         }
         flush()
-        return groups
+        return (groups, ranges)
     }
 
     /// Steps that may be folded: completed tools + reasoning.
@@ -165,5 +186,47 @@ enum SessionFlowGrouping {
         return (known + unknown)
             .map { L10n.f("%@ %lld", L10n.t($0), counts[$0] ?? 0) }
             .joined(separator: " · ")
+    }
+}
+
+/// 渲染分组缓存（会话详情的行 → 分组）。
+///
+/// 视图 body 只读缓存结果，不再每次 O(N) 重算；FlowState 在行变化时按变更类型
+/// 增量刷新：
+/// - tail：只有尾部行变化（live 追加 / 乐观回显重画）——丢掉最后一个分组，从它的
+///   起点重算尾部；
+/// - full：前置历史页 / 原地挂载工具结果 / 全量替换——整表重算（跨页边界相邻
+///   reasoning/tool 行的合并由全量分组保证正确）。
+struct FlowGroupCache {
+    enum Change {
+        case tail
+        case full
+    }
+
+    private(set) var groups: [FlowRowGroup] = []
+    private var ranges: [Range<Int>] = []
+    private var rowCount = 0
+
+    mutating func rebuild(rows: [FlowRow]) {
+        let result = SessionFlowGrouping.makeGroups(rows: rows, fromRow: 0)
+        groups = result.groups
+        ranges = result.ranges
+        rowCount = rows.count
+    }
+
+    mutating func refreshTail(rows: [FlowRow]) {
+        guard rowCount > 0,
+              let lastRange = ranges.last,
+              rows.count >= rowCount,
+              lastRange.lowerBound < rows.count else {
+            rebuild(rows: rows)
+            return
+        }
+        groups.removeLast()
+        ranges.removeLast()
+        let result = SessionFlowGrouping.makeGroups(rows: rows, fromRow: lastRange.lowerBound)
+        groups.append(contentsOf: result.groups)
+        ranges.append(contentsOf: result.ranges)
+        rowCount = rows.count
     }
 }

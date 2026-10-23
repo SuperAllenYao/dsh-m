@@ -71,12 +71,16 @@ extension SessionRowBuilder {
         }
     }
 
+    /// 返回本批「已渲染但还没等到独立 tool/call 事件」的 tool-call block 行
+    /// (callId, rowID)：增量折叠时后续批次出现同 callId 的 tool/call 事件，要把这条
+    /// 重复行删掉，才能与全量重建（预扫描所有 callId）逐行等价。
     static func handleAssistantMessage(
         event: SessionEvent,
         data: JSONValue?,
         callIdsWithEvents: Set<String>,
         appendRow: (FlowContent, SessionEvent, String) -> Void
-    ) {
+    ) -> [(callId: String, rowID: String)] {
+        var deferred: [(callId: String, rowID: String)] = []
         let blocks = data?["message"]?["content"]?.arrayValue ?? []
         for (index, block) in blocks.enumerated() {
             switch block["type"]?.stringValue {
@@ -91,31 +95,27 @@ extension SessionRowBuilder {
             case "tool-call":
                 let callId = block["id"]?.stringValue ?? block["callId"]?.stringValue
                 if let callId, callIdsWithEvents.contains(callId) { continue }
-                let argumentsRaw = block["arguments"]?.stringValue
-                var arguments: [String: JSONValue] = [:]
-                if let argumentsRaw,
-                   let argumentsData = argumentsRaw.data(using: .utf8),
-                   let parsed = try? JSONDecoder().decode(JSONValue.self, from: argumentsData),
-                   let object = parsed.objectValue {
-                    arguments = object
-                } else if let object = block["arguments"]?.objectValue {
-                    arguments = object
-                }
+                // 参数 JSON 延迟解析（ToolCallItem.arguments 首次访问时才解码并缓存）。
+                let argumentsValue = block["arguments"]
                 let item = ToolCallItem(
                     callId: callId,
                     name: block["name"]?.stringValue ?? "tool",
-                    argumentsRaw: argumentsRaw,
-                    arguments: arguments,
+                    argumentsRaw: argumentsValue?.stringValue,
+                    arguments: argumentsValue?.objectValue ?? [:],
                     result: nil,
                     children: [],
                     turn: data?["message"]?["turn"]?.int ?? 0,
                     step: nil
                 )
                 appendRow(.tool(item), event, "tool-block-\(index)")
+                if let callId {
+                    deferred.append((callId, "\(event.seq)-tool-block-\(index)"))
+                }
             default:
                 continue
             }
         }
+        return deferred
     }
 
     /// Attaches a tool result to its already-rendered tool row; an orphan result
@@ -161,19 +161,13 @@ extension SessionRowBuilder {
     }
 
     static func handlePTCDispatchStart(event: SessionEvent, data: JSONValue?, rows: inout [FlowRow]) {
-        let argumentsRaw = data?["arguments"]?.stringValue
-        var arguments: [String: JSONValue] = [:]
-        if let argumentsRaw,
-           let argumentsData = argumentsRaw.data(using: .utf8),
-           let parsed = try? JSONDecoder().decode(JSONValue.self, from: argumentsData),
-           let object = parsed.objectValue {
-            arguments = object
-        }
+        // 参数 JSON 延迟解析（ToolCallItem.arguments 首次访问时才解码并缓存）。
+        let argumentsValue = data?["arguments"]
         let child = ToolCallItem(
             callId: data?["subCallId"]?.stringValue,
             name: data?["name"]?.stringValue ?? "tool",
-            argumentsRaw: argumentsRaw,
-            arguments: arguments,
+            argumentsRaw: argumentsValue?.stringValue,
+            arguments: [:],
             result: nil,
             children: [],
             turn: data?["turn"]?.int ?? 0,
@@ -219,7 +213,16 @@ extension SessionRowBuilder {
     // MARK: - Row attachment helpers
 
     static func attachToolResult(callId: String, result: ToolResultItem, rows: inout [FlowRow]) -> Bool {
-        for rowIndex in rows.indices.reversed() {
+        let upperBound = rows.count
+        return attachToolResult(callId: callId, result: result, rows: &rows, before: upperBound)
+    }
+
+    /// 只在该行之前（更早的 seq）查找调用行：prepend 更早一页补挂孤儿结果时，
+    /// 全量重建能看到的行只有调用行之前的部分。
+    static func attachToolResult(callId: String, result: ToolResultItem, rows: inout [FlowRow], before upperBound: Int) -> Bool {
+        var rowIndex = min(upperBound, rows.count) - 1
+        while rowIndex >= 0 {
+            defer { rowIndex -= 1 }
             if case .tool(var item) = rows[rowIndex].content {
                 if item.callId == callId {
                     item.result = result

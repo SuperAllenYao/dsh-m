@@ -156,6 +156,10 @@ final class LinkService: ObservableObject {
     var eventsHandshakeTask: Task<Void, Never>?
     /// 2026-10-23 冷启动 <1s：共享 HTTPS 连接池预热任务（见 `warmHTTPSPoolIfColdStart`）。
     private var poolWarmupTask: Task<Void, Never>?
+    /// 2026-10-23 T2(B1)：预热任务是否仍在飞——early list 等待它的唯一条件。
+    /// 任务结束（成功或失败）后 `warmHTTPSPoolIfColdStart` 的 `defer` 会把上面
+    /// 的句柄置 nil，所以这里为 false 即「无需等待」，热路径零延迟。
+    var isPoolWarmupInFlight: Bool { poolWarmupTask != nil }
     /// Generation of the legacy `$events` ready handshake (v0.1.1 Bug 1). Stream
     /// callbacks and the timeout task capture it, so a retired stream (the one
     /// abandoned by the one-shot reopen) can neither resume nor fail the
@@ -194,6 +198,17 @@ final class LinkService: ObservableObject {
     /// Short-lived api token (auto-refreshed on expiry/401).
     var apiToken: String?
     var apiTokenExpiresAt: Date?
+    /// 2026-10-23 T2(B2)：api token 的本机 Keychain 持久化（scope 隔离）。
+    /// 冷启动复用未过期 token → 省掉 challenge+verify 2 个 RTT。
+    private let apiTokenStore = APITokenStore.shared
+    /// 持久化 scope：Mac 的 hostId 优先；旧配对凭据没有 hostId（该字段 2026-10-23
+    /// 才引入，Keychain 里的凭据可能更旧）时回退到配对钉住的 leafPin（端点指纹）。
+    /// 两者都缺时才放弃持久化。
+    private var apiTokenScope: String? {
+        APITokenStore.scope(hostId: credentials?.hostId, leafPin: credentials?.leafPin)
+    }
+    /// 主动续期单飞任务（剩余 < 20min 时后台 forceRefresh 一次）。
+    private var apiTokenRenewalTask: Task<Void, Never>?
     /// One in-flight challenge/verify per purpose. **Purpose-scoped on purpose**:
     /// an api token cannot open the WSS mux and a single-use mux token cannot call
     /// unary endpoints, so sharing one in-flight task across purposes handed the
@@ -202,6 +217,9 @@ final class LinkService: ObservableObject {
 
     init() {
         credentials = store.load()
+        // 2026-10-23 T2(B2)：冷启动直接恢复未过期的 api token（若本机 Keychain 有），
+        // 让随后 connect 轮次里的 api token 预取命中快路径（省 2 个 RTT）。
+        restorePersistedAPIToken()
         // task-2 (reconnect < 1s): one listener per app process. A meaningful path
         // change invalidates the live socket immediately instead of waiting for the
         // system TCP timeout; the reconnect then runs on the new path.
@@ -492,6 +510,7 @@ final class LinkService: ObservableObject {
     /// loop. Shared by QR/manual pairing and the M2a pairing-code redeem flow.
     @discardableResult
     func adopt(credentials: PairingCredentials) -> PairingCredentials {
+        let previousScope = apiTokenScope
         do {
             try store.save(credentials)
         } catch {
@@ -503,6 +522,10 @@ final class LinkService: ObservableObject {
         AppSettings.lastOrigin = origin
         apiToken = nil
         apiTokenExpiresAt = nil
+        // 2026-10-23 T2(B2)：重新配对 = 全新凭据语境，旧机器/旧会话的持久化 api token
+        // 一律作废（不允许在 repair 之后仍复用旧 token）。
+        apiTokenStore.clear(scope: previousScope)
+        apiTokenStore.clear(scope: apiTokenScope)
         attempt = 0
         manuallyDisconnected = false
         p1FellBackToLegacy = false
@@ -526,11 +549,81 @@ final class LinkService: ObservableObject {
     /// stale LAN address (cellular / cross-network). Without the override that
     /// request would hang on the unreachable LAN origin and the list would only load
     /// after the mux connect finished — the amplified 10s stale-cache case.
+    ///
+    /// 2026-10-23 T2(B2)：快路径去掉「`originOverride == nil`」限制。token 是插件
+    /// 实例级的（与 origin 覆盖无关），冷启动从 Keychain 恢复的有效 token 在蜂窝
+    /// relay 覆盖下同样可用；否则早列表会白白再付 challenge+verify 2 个 RTT。
     func ensureAPIToken(forceRefresh: Bool = false, originOverride: URL? = nil) async throws -> String {
-        if !forceRefresh, originOverride == nil, let apiToken, let expiry = apiTokenExpiresAt, expiry.timeIntervalSinceNow > 5 {
+        if !forceRefresh, let apiToken, let expiry = apiTokenExpiresAt, expiry.timeIntervalSinceNow > 5 {
+            // 冷启动 early list 走覆盖 origin 时打一行诊断（无 token 明文），下一次
+            // 真机 console 就能区分「token 命中」与「又发生 auth」。
+            if originOverride != nil { linkDebug("api token fast-path hit (early list)") }
             return apiToken
         }
-        return try await authenticateToken(purpose: "api", originOverride: originOverride)
+        do {
+            return try await authenticateToken(purpose: "api", originOverride: originOverride)
+        } catch {
+            // 设备被撤销/凭据失效：本机持久化的 token 一并作废，避免下一次冷启动
+            // 又拿旧 token 撞 401（之后由既有 repair 提示要求重新配对）。
+            if isCredentialRejection(error) {
+                apiToken = nil
+                apiTokenExpiresAt = nil
+                apiTokenStore.clear(scope: apiTokenScope)
+            }
+            throw error
+        }
+    }
+
+    /// 2026-10-23 T2(B2)：冷启动从 Keychain 恢复未过期的 api token。
+    /// 只在内存里没有 token 时执行（断开/恢复场景走同一入口）。
+    private func restorePersistedAPIToken() {
+        guard apiToken == nil, let scope = apiTokenScope,
+              let stored = apiTokenStore.load(scope: scope) else {
+            linkDebug("api token not restored scope=" + Self.apiTokenScopeKind(apiTokenScope))
+            return
+        }
+        apiToken = stored.token
+        apiTokenExpiresAt = stored.expiresAt
+        linkDebug("api token restored scope=" + Self.apiTokenScopeKind(scope))
+    }
+
+    /// 2026-10-23 T2(B2)：认证成功后把 api token 落盘（只存本机 Keychain，不打印 token）。
+    private func persistAPIToken(_ token: String, expiresAt: Date) {
+        guard let scope = apiTokenScope else {
+            linkDebug("api token persist skipped: no scope")
+            return
+        }
+        let saved = apiTokenStore.save(StoredAPIToken(token: token, expiresAt: expiresAt), scope: scope)
+        linkDebug("api token persist " + (saved ? "ok" : "failed") + " scope=" + Self.apiTokenScopeKind(scope))
+    }
+
+    /// 诊断用：scope 类型（host / pin / none），不含任何敏感原值。
+    private static func apiTokenScopeKind(_ scope: String?) -> String {
+        guard let scope else { return "none" }
+        return scope.hasPrefix("pin:") ? "pin" : "host"
+    }
+
+    /// 2026-10-23 T2(B2)：链路就绪/前台恢复时，若 api token 剩余 < 20min，后台
+    /// 静默续期一次——避免 60min TTL 用尽后下一次冷启动又要 2 个 RTT 认证。
+    ///
+    /// 单飞：已有续期任务在飞则跳过；与普通请求共享 `authInFlightByPurpose` 的
+    /// 「api」in-flight challenge；失败静默（401/下次 connected 仍走既有路径）。
+    private func renewAPITokenIfNeededAfterConnect() {
+        guard apiToken != nil,
+              APITokenStore.shouldRenew(
+                  expiresAt: apiTokenExpiresAt,
+                  inFlight: apiTokenRenewalTask != nil
+              ) else { return }
+        apiTokenRenewalTask = Task { [weak self] in
+            defer { self?.apiTokenRenewalTask = nil }
+            guard let self else { return }
+            // 让出冷启动首屏关键路径：列表/首帧通常 1.5s 内落地，续期只是后台保鲜，
+            // 不要和 early session/list 抢同一条 relay 连接（省得把 T2 重新拉长）。
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            guard !Task.isCancelled, self.phase.isConnected else { return }
+            linkDebug("api token renewal (remaining < 20min)")
+            _ = try? await self.ensureAPIToken(forceRefresh: true)
+        }
     }
 
     /// One challenge/verify round trip. Concurrent callers share one in-flight
@@ -601,11 +694,15 @@ final class LinkService: ObservableObject {
         }
         if purpose == "api" {
             apiToken = token
+            let expiresAt: Date
             if let expires = verify.json["expiresAt"]?.intValue {
-                apiTokenExpiresAt = Date(timeIntervalSince1970: TimeInterval(expires) / 1000)
+                expiresAt = Date(timeIntervalSince1970: TimeInterval(expires) / 1000)
             } else {
-                apiTokenExpiresAt = Date().addingTimeInterval(600)
+                expiresAt = Date().addingTimeInterval(600)
             }
+            apiTokenExpiresAt = expiresAt
+            // 2026-10-23 T2(B2)：认证成功后落盘，供下一次冷启动直接复用。
+            persistAPIToken(token, expiresAt: expiresAt)
         }
         return token
     }
@@ -683,6 +780,8 @@ final class LinkService: ObservableObject {
             phase = .unpaired
             return
         }
+        // 2026-10-23 T2(B2)：手动断开后重连时恢复本机持久化的 api token。
+        restorePersistedAPIToken()
         retryTask?.cancel()
         retryTask = nil
         if isConnecting { return }
@@ -734,6 +833,9 @@ final class LinkService: ObservableObject {
                 ReconnectMetrics.markInvalidate(reason: "foreground/pathChanged")
                 teardownTransport()
                 reconnectNow()
+            } else {
+                // 2026-10-23 T2(B2)：前台恢复且链路可复用时按需续期 api token。
+                renewAPITokenIfNeededAfterConnect()
             }
             return
         }
@@ -907,7 +1009,12 @@ final class LinkService: ObservableObject {
         clearPendingWaterfalls()
         apiToken = nil
         apiTokenExpiresAt = nil
+        apiTokenRenewalTask?.cancel()
+        apiTokenRenewalTask = nil
         if clearCredentials {
+            // 2026-10-23 T2(B2)：解绑/repair 时本机持久化的 api token 一并清除，
+            // 不得在重新配对后残留可用凭据。
+            apiTokenStore.clearAll()
             store.clear()
             credentials = nil
             phase = .unpaired
@@ -1126,6 +1233,8 @@ final class LinkService: ObservableObject {
                 ReconnectMetrics.markConnected()
                 ConnectionMetrics.markConnected()
                 connectionMetricsValue = connectionMetricsSummary()
+                // 2026-10-23 T2(B2)：链路就绪后按需后台续期 api token（剩余 < 20min）。
+                renewAPITokenIfNeededAfterConnect()
                 // v0.1.1 C: pre-C pairings still trust only the leaf pin; while
                 // the freshly authenticated link is up, learn the public CA
                 // certificate so future leaf re-issues need no re-pair.
@@ -1198,6 +1307,9 @@ final class LinkService: ObservableObject {
         // remedy; a single rejected (stale/healed) origin must not end the round.
         if !credentialRejections.isEmpty, credentialRejections.count >= dialCandidates.count {
             lastErrorText = credentialRejections.last
+            // 2026-10-23 T2(B2)：凭据被所有候选拒绝 = repair 语义，持久化的 api
+            // token 也一并作废（重新配对时 adopt 会再清一次，双保险）。
+            apiTokenStore.clear(scope: apiTokenScope)
             phase = .needsRepair(credentialRejections.last ?? L10n.t("配对凭据被拒绝，请重新配对"))
             return
         }
@@ -1821,8 +1933,12 @@ final class LinkService: ObservableObject {
     ///
     /// 真机拆解：early `session/list` 在 t0+~100ms 就发出，但连接池是空的 → 首个
     /// 请求（api token 认证）要先付一次 TLS（真机 ~300ms），列表请求再复用同一条
-    /// 连接。这里在启动连接轮次的同时用一次轻量 `/health` 打通 TCP+TLS 并留在池里，
-    /// 认证/列表都直接复用 → 列表侧预期 −200~300ms。
+    /// 连接。这里在启动连接轮次的同时把 TCP+TLS 握手提前做掉并留在池里，认证/列表
+    /// 都直接复用 → 列表侧预期 −200~300ms。
+    ///
+    /// 2026-10-23 T2(A)：预热改为 **TLS-only**（`HTTPSClient.prewarmTLS`）。B1 实测
+    /// 旧的 `GET /health` 预热要额外付 1 个 RTT（整段 ~400–470ms），等待成本抵消了
+    /// 收益；只握手不发送请求可以让预热 ≈ TLS 时长（真机 ~250–300ms）。
     ///
     /// 只在「本次进程还没成功连过」时执行；网络切换/重连不重复预热。选择 origin 的
     /// 规则与拨号序一致：蜂窝/跨网优先 relay 候选，避免预热打到失效 LAN 上。
@@ -1836,20 +1952,31 @@ final class LinkService: ObservableObject {
         ) else { return }
         let leafPin = credentials.leafPin
         let caCertBase64 = credentials.caCertBase64
-        linkDebug("pool warm-up -> " + Self.originLabel(origin))
+        linkDebug("pool warm-up (tls-only) -> " + Self.originLabel(origin))
         poolWarmupTask = Task { [weak self] in
             defer { self?.poolWarmupTask = nil }
-            // A plain GET /health over the shared pool: TLS handshake + one round trip,
-            // connection stays pooled for the auth/list requests that follow.
-            _ = try? await HTTPSClient.json(
+            // 2026-10-23 T2(A)：只做 TCP+TLS 握手（不发 /health），把握手放到连接
+            // 轮次并行进行；随后 auth/list 直接 checkout 这条空闲连接。
+            _ = await HTTPSClient.prewarmTLS(
                 origin: origin,
-                method: "GET",
-                path: "/health",
                 leafPin: leafPin,
                 caCertBase64: caCertBase64,
                 timeout: 3
             )
         }
+    }
+
+    /// 2026-10-23 T2(B1)：冷启动首屏列表前等 HTTPS 池预热就绪，最多 `timeoutMs` 毫秒。
+    ///
+    /// 竞态语义（以下三种情况都**不抛错、不取消预热任务**）：
+    /// - 没有在飞的预热（热路径 / 预热已完成 / 从未预热）：立即返回，零额外延迟；
+    /// - 预热在飞：等它结束；超时按 `timeoutMs` 上限返回，预热继续在后台跑完，
+    ///   后续请求（含已放行的列表请求）仍能复用它建好的连接；
+    /// - 预热失败：任务内部吞掉握手错误后正常结束，这里按「完成」返回，调用方
+    ///   直接走原路径（该付的 TLS 照付，不影响正确性）。
+    func awaitPoolWarmup(timeoutMs: Int) async {
+        guard let task = poolWarmupTask else { return }
+        await PoolWarmupWait.wait(for: task, timeoutMs: timeoutMs)
     }
 
     /// Pure origin choice for the cold-start pool warm-up (unit-tested). Same rule as
@@ -2321,6 +2448,56 @@ extension LinkService {
         pathGeneration: Int
     ) -> Bool {
         roundStartGeneration < pathGeneration
+    }
+}
+
+// MARK: - 2026-10-23 T2(B1)：冷启动预热限时等待
+
+/// 限时等待一个**已经启动**的预热任务结束，供 `LinkService.awaitPoolWarmup` 与单测共用。
+///
+/// 为什么不能直接 `await task.value`：那会一直等到任务结束、拿不到超时上限。
+/// 这里让「任务完成」和「超时」两个一次性唤醒者竞速，先到者唤醒调用方，另一个
+/// 什么都不做——**既不取消也不等待**预热任务：超时后预热继续在后台跑完，后续
+/// 请求仍可复用它建好的连接。
+enum PoolWarmupWait {
+    /// 等 `task` 结束，最多 `timeoutMs` 毫秒；永不抛错。
+    ///
+    /// - `timeoutMs <= 0`：立即返回（不额外等待）；
+    /// - 超时：按上限返回，任务本身继续在后台跑；
+    /// - 任务完成（无论其内部 `/health` 成功还是失败）：立即返回。
+    static func wait(for task: Task<Void, Never>, timeoutMs: Int) async {
+        guard timeoutMs > 0 else { return }
+        // 上限 60s：防止异常入参造成 UInt64 纳秒溢出（生产调用方只用 350ms 量级）。
+        let clampedMs = min(timeoutMs, 60_000)
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            let resumeOnce = ResumeOnce(continuation)
+            Task {
+                await task.value
+                resumeOnce.resume()
+            }
+            Task {
+                try? await Task.sleep(nanoseconds: UInt64(clampedMs) * 1_000_000)
+                resumeOnce.resume()
+            }
+        }
+    }
+
+    /// 两个竞速唤醒者只有第一个真正 resume continuation（double resume 会崩）。
+    private final class ResumeOnce: @unchecked Sendable {
+        private let lock = NSLock()
+        private var continuation: CheckedContinuation<Void, Never>?
+
+        init(_ continuation: CheckedContinuation<Void, Never>) {
+            self.continuation = continuation
+        }
+
+        func resume() {
+            lock.lock()
+            let pending = continuation
+            continuation = nil
+            lock.unlock()
+            pending?.resume()
+        }
     }
 }
 
