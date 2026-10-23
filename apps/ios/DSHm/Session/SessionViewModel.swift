@@ -4,6 +4,43 @@ import Foundation
 import UIKit
 #endif
 
+/// P0 (detail spinner): what a deferred `session/follow` open should do next.
+///
+/// `openStream()` cannot open while the link is down; the old code simply returned
+/// there and recovery relied on `generation` changing. That misses two real paths:
+/// (a) a **silent dsh-m/2 resume**, which keeps the generation on purpose
+/// (`P1ResumePlan.bumpGeneration == false`), and (b) a phase flip that lands before
+/// SwiftUI installs the view's `.onChange`. This policy makes the recovery explicit
+/// and bounded: wait while the link is busy, open exactly once as soon as it is
+/// connected, and surface a retryable error after `deferredStreamOpenTimeout`
+/// instead of spinning forever.
+enum DeferredStreamOpenPolicy {
+    enum Action: Equatable {
+ /// Nothing was deferred (or the stream is already open): do nothing.
+        case idle
+ /// Link not ready yet: keep waiting; the deadline task owns the failure.
+        case wait
+ /// Link is ready and nothing is open: open the stream now (idempotent).
+        case open
+ /// Deadline elapsed with the link still down: surface the retry entry.
+        case fail
+    }
+
+    static func action(
+        phaseIsConnected: Bool,
+        isDeferred: Bool,
+        hasOpenStream: Bool,
+        deadlineElapsed: Bool
+    ) -> Action {
+        guard isDeferred else { return .idle }
+ // A stream that is already open wins over any stale deferral: reopening it
+ // would replace the live handle and drop frames.
+        if hasOpenStream { return .idle }
+        if phaseIsConnected { return .open }
+        return deadlineElapsed ? .fail : .wait
+    }
+}
+
 /// Session detail state: owns the session/follow subscription, applies frames
 /// through SessionJournal and rebuilds render rows (turn grouping).
 @MainActor
@@ -179,6 +216,16 @@ final class SessionViewModel: ObservableObject {
     private var pendingEchoStaleTask: Task<Void, Never>?
     private var liveTextThrottleTask: Task<Void, Never>?
     private var observedGeneration = -1
+ /// P0: `openStream()` ran while the link was down; the phase sink (and the
+ /// view's `.onChange` fallback) re-opens it once the link is ready. A silent
+ /// dsh-m/2 resume deliberately does not bump `generation`, so generation
+ /// alone cannot recover this.
+    private var streamOpenDeferred = false
+ /// Bounded wait for a deferred open: after this the UI shows a retryable
+ /// error instead of an unbounded spinner.
+    private var deferredStreamOpenDeadlineTask: Task<Void, Never>?
+ /// Budget for the deferred open (P0 detail-spinner fix: ≤10 s, then retry UI).
+    static let deferredStreamOpenTimeout: TimeInterval = 10
     private var pendingRebuild = false
  /// Incremental render state (B's FlowState): auto-detects append/prepend/reset
  /// from the journal window so a running turn does not rebuild all rows.
@@ -484,6 +531,11 @@ final class SessionViewModel: ObservableObject {
             .receive(on: RunLoop.main)
             .sink { [weak self] phase in
                 guard let self else { return }
+ // P0 detail-open fallback: a stream deferred while the link was
+ // down must be opened the moment the link is ready. Doing it on
+ // `phase` (not only `generation`) also covers silent dsh-m/2
+ // resumes, which keep the generation on purpose.
+                self.handleLinkPhaseChange(phase)
                 if phase.isConnected {
                     self.maybeFlushQueued()
                     self.resumeHistoryFillAfterReconnect()
@@ -515,6 +567,9 @@ final class SessionViewModel: ObservableObject {
         cachedChunksTask = nil
         firstPaintCacheTask?.cancel()
         firstPaintCacheTask = nil
+ // P0: leaving the screen retires the deferred-open wait; a late phase flip
+ // must not open a stream for a detail that is gone.
+        clearDeferredStreamOpen()
         liveTextThrottleTask?.cancel()
         liveTextThrottleTask = nil
         stream?.cancel()
@@ -544,6 +599,9 @@ final class SessionViewModel: ObservableObject {
  // Allow the filler to restart for the new window: the in-flight page keyed
  // on the old front is cancelled, and the next snapshot/front will re-arm it.
         historyFillState = .idle
+ // An explicit reopen supersedes any pending deferred open; `openStream()`
+ // re-arms the wait when the link is still down.
+        clearDeferredStreamOpen()
         stream?.cancel()
         stream = nil
         openStream()
@@ -564,7 +622,10 @@ final class SessionViewModel: ObservableObject {
     private func openStream() {
         guard let link else { return }
         guard link.phase.isConnected else {
-            dbg("openStream deferred: phase=" + String(describing: link.phase) + " sections=" + String(rows.count))
+            dbg("openStream deferred: phase=" + String(describing: link.phase) + " busy=" + String(link.phase.isBusy) + " sections=" + String(rows.count))
+ // P0: never drop the open silently — arm a phase-driven retry plus a
+ // bounded deadline (see DeferredStreamOpenPolicy).
+            armDeferredStreamOpen()
             isLoading = rows.isEmpty
             streamErrorText = link.phase.isBusy ? nil : "连接未就绪"
             return
@@ -603,10 +664,73 @@ final class SessionViewModel: ObservableObject {
                     self?.isLoading = false
                 }
             )
+ // P0: the open succeeded; retire any pending deferred-open wait.
+            clearDeferredStreamOpen()
         } catch {
+            clearDeferredStreamOpen()
             streamErrorText = NetworkErrorInterpreter.message(for: error)
             isLoading = false
         }
+    }
+
+ // MARK: - P0: deferred stream open (detail spinner)
+
+ /// Phase observer shared by the Combine sink (`attach`) and the view's
+ /// `.onChange(of: app.link.phase)` fallback. Idempotent by construction:
+ /// opening a second stream would replace the live handle and drop frames.
+    func handleLinkPhaseChange(_ phase: LinkService.Phase) {
+        switch DeferredStreamOpenPolicy.action(
+            phaseIsConnected: phase.isConnected,
+            isDeferred: streamOpenDeferred,
+            hasOpenStream: stream != nil,
+            deadlineElapsed: false
+        ) {
+        case .open:
+            dbg("deferred open resumed: phase=" + String(describing: phase) + " sections=" + String(rows.count))
+            openStream()
+        case .idle, .wait, .fail:
+            break
+        }
+    }
+
+    private func armDeferredStreamOpen() {
+        streamOpenDeferred = true
+        guard deferredStreamOpenDeadlineTask == nil else { return }
+        deferredStreamOpenDeadlineTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(Self.deferredStreamOpenTimeout * 1_000_000_000))
+            guard !Task.isCancelled, let self else { return }
+            self.handleDeferredOpenDeadline()
+        }
+    }
+
+ /// Deadline for the deferred open: a link that came up meanwhile still opens
+ /// (and retires the wait); one that did not surfaces a retryable error so the
+ /// detail never sits on an unbounded spinner.
+    private func handleDeferredOpenDeadline() {
+ // This task is the one currently armed: clear the handle so a re-armed
+ // wait (link came up but the open attempt itself failed transiently) can
+ // schedule a fresh deadline instead of believing one is still pending.
+        deferredStreamOpenDeadlineTask = nil
+        if let link, link.phase.isConnected {
+            handleLinkPhaseChange(link.phase)
+            return
+        }
+        guard DeferredStreamOpenPolicy.action(
+            phaseIsConnected: false,
+            isDeferred: streamOpenDeferred,
+            hasOpenStream: stream != nil,
+            deadlineElapsed: true
+        ) == .fail else { return }
+        clearDeferredStreamOpen()
+        isLoading = false
+        streamErrorText = "连接未就绪（已等待 " + String(Int(Self.deferredStreamOpenTimeout)) + " 秒）"
+        dbg("deferred open timed out; surfacing retry entry")
+    }
+
+    private func clearDeferredStreamOpen() {
+        streamOpenDeferred = false
+        deferredStreamOpenDeadlineTask?.cancel()
+        deferredStreamOpenDeadlineTask = nil
     }
 
  // MARK: - Automatic full-history filler (no UI)

@@ -62,7 +62,7 @@ import { mintResumeTicket, MuxRpcChannel, P1_LIMITS, TicketUseGuard, verifyResum
 import { detectListLiteRequest, LIST_LITE_HEADER, trimSessionListResponse } from './list-lite.js';
 
 const PLUGIN_NAME = 'dsh-m-link';
-const PLUGIN_VERSION = '0.2.3';
+const PLUGIN_VERSION = '0.2.5';
 const MUX_PATH = '/api/remote.mux';
 
 /**
@@ -957,6 +957,11 @@ export class LinkServer {
     this.startupError = undefined;
     this.sweepTimer = setInterval(() => this.auth.sweep(), 30_000);
     if (typeof this.sweepTimer.unref === 'function') this.sweepTimer.unref();
+ // LAN addresses change when the Mac joins another Wi-Fi. /health
+ // and the pairing payload refresh on demand; this timer covers idle windows so
+ // mDNS is already correct when the phone comes back.
+    this.endpointRefreshTimer = setInterval(() => this.refreshLanEndpoints(), 30_000);
+    if (typeof this.endpointRefreshTimer.unref === 'function') this.endpointRefreshTimer.unref();
     log('TLS origin listening on https://' + this.config.bindHost + ':' + String(this.config.port));
     log('device-visible endpoints: ' + (this.deviceEndpoints.map((endpoint) => endpoint.url).join(', ') || 'none'));
     log('loopback origin: ' + this.loopbackOrigin);
@@ -1092,6 +1097,9 @@ export class LinkServer {
 
  /** Public liveness document (no device names, no secrets). */
   health(ip) {
+ // root-cause fix: a phone probe is the best moment to refresh the
+ // Mac's current LAN endpoints (cheap getifaddrs; only rebuilds on change).
+    this.refreshLanEndpoints();
     return {
       ok: true,
       plugin: PLUGIN_NAME,
@@ -1184,6 +1192,67 @@ export class LinkServer {
       pair: 'code',
       ...(typeof relay === 'string' ? { relay } : {}),
     };
+  }
+
+ /**
+ * real-device root-cause fix: re-collect the Mac's LAN IPv4 addresses
+ * and rebuild everything derived from them.
+ *
+ * Why: `this.lanIps` used to be captured **once in the constructor** (`:876`).
+ * After a Wi-Fi/subnet change the mDNS A records, `/health.deviceEndpoints`, the
+ * pairing payload and `selectDeviceEndpoints()` kept advertising the *old*
+ * addresses forever. Live evidence on the user's iPhone: the plugin started with
+ * 192.168.5.10 / 172.28.95.194, the Mac now sits on 172.24.116.36, the phone kept
+ * probing dead LAN origins and every authenticated connection since 08:31 went
+ * through the relay (566 relay auths, 0 LAN auths) — the LAN-direct scenario in
+ * the matrix had become unreachable without any user-visible error.
+ *
+ * The leaf certificate is intentionally **not** re-issued here: the iOS client
+ * pins the CA (`CATrust.evaluate` uses `SecPolicyCreateSSL(true, nil)`, hostname
+ * matching replaced by the pinned-CA trust decision), so a new IP works with the
+ * existing leaf. Refreshing on demand (every `/health`, pairing payload, 30s
+ * timer) keeps the cost at one getifaddrs call and rebuilds only on change.
+ *
+ * @returns {boolean} true when the advertised endpoint set changed
+ */
+  refreshLanEndpoints() {
+    let next;
+    try {
+      next = collectLanIps();
+    } catch {
+      return false;
+    }
+    const before = [...this.lanIps].sort().join(',');
+    const after = [...next].sort().join(',');
+    if (before === after) return false;
+    const previous = this.lanIps;
+    try {
+      this.lanIps = next;
+      this.endpoints = buildEndpoints({ config: this.config, certs: this.certs, lanIps: this.lanIps, hostname: this.hostname });
+      this.baseEndpoints = this.endpoints.slice();
+      this.deviceEndpoints = selectDeviceEndpoints(this.endpoints);
+      this.pairing?.setTrust?.({ certs: this.certs, endpoints: this.deviceEndpoints });
+    } catch (error) {
+      this.lanIps = previous;
+      log('endpoints: LAN refresh failed, keeping previous: ' + String(error?.message ?? error));
+      return false;
+    }
+    try {
+      if (this.bonjour !== undefined) {
+        this.bonjour.update({}, { addresses: this.lanIps });
+      } else {
+        this.startBonjour();
+      }
+    } catch (error) {
+      log('bonjour: LAN address refresh failed: ' + String(error?.message ?? error));
+    }
+    try {
+      this.audit?.record('endpoints.refreshed', { previous, current: this.lanIps });
+    } catch {
+ /* audit is best effort */
+    }
+    log('endpoints: LAN addresses changed -> ' + (this.deviceEndpoints.map((endpoint) => endpoint.url).join(', ') || 'none'));
+    return true;
   }
 
  /**
@@ -2880,6 +2949,9 @@ export class LinkServer {
   }
 
   async pairingPayload() {
+ // The QR payload must advertise the Mac's *current* LAN origin: refreshing here
+ // prevents a re-pair (or a second device) from being pinned to stale addresses.
+    this.refreshLanEndpoints();
     const payload = this.pairing.payload();
     const payloadText = this.pairing.payloadText();
     const qr = await this.qr.renderDataUrl(payloadText);
@@ -3332,11 +3404,17 @@ export class LinkServer {
  /* already cleared */
       }
       try {
+        clearInterval(this.endpointRefreshTimer);
+      } catch {
+ /* never set */
+      }
+      try {
         clearTimeout(this.listenRetryTimer);
       } catch {
  /* never set */
       }
       this.sweepTimer = undefined;
+      this.endpointRefreshTimer = undefined;
       try {
         this.adminDisposer?.();
       } catch {

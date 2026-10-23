@@ -79,6 +79,25 @@ final class LinkService: ObservableObject {
         }
         return true
     }
+
+ /// 冷启动 <1s：early/重试的 live `session/list` 可用的**可达 origin**。
+ ///
+ /// `prefersEarlyUnary` 在「持久化 origin 是 LAN + 当前是蜂窝/跨网」时为 false，
+ /// 于是列表只能等 mux 连上后才刷新——真机上这就是「缓存刷新 10s」的放大器。
+ /// 这里不改 `credentials.origin`（连接轮次正在用它逐候选拨号），而是返回一个
+ /// **本次请求的 origin 覆盖**：蜂窝/跨网时取存储候选里的非 LAN（relay）地址。
+ /// 无覆盖需求时返回 nil（走原路径，行为不变）。
+    func earlyListOriginOverride() -> URL? {
+        guard let credentials else { return nil }
+        guard NetworkPathMonitor.shared.prefersRelay,
+              let current = credentials.originURL,
+              PairingOriginSelector.isLANHost(current.host) else { return nil }
+        let candidates = PairingOriginSelector.reconnectCandidates(
+            current: credentials.origin,
+            stored: credentials.originCandidates
+        )
+        return candidates.first { !PairingOriginSelector.isLANHost($0.host) }
+    }
  /// task-2: true when the network path changed after this link became ready —
  /// the live socket is then presumed stale even if `phase` still says
  /// `.connected` (the OS does not report a migrated socket as dead).
@@ -132,6 +151,11 @@ final class LinkService: ObservableObject {
     private var lastRoundFailureClasses: [CandidateFailureClass] = []
     var readyContinuation: CheckedContinuation<Void, Error>?
     var readyTimeoutTask: Task<Void, Never>?
+ /// 冷启动 <1s：`$events` ready 握手已从「在线」判定里解耦，改成
+ /// connected 之后的后台任务（失败则按传输失联重连）。这里保留句柄便于取消。
+    var eventsHandshakeTask: Task<Void, Never>?
+ /// 冷启动 <1s：共享 HTTPS 连接池预热任务（见 `warmHTTPSPoolIfColdStart`）。
+    private var poolWarmupTask: Task<Void, Never>?
  /// Generation of the legacy `$events` ready handshake (v0.1.1 Bug 1). Stream
  /// callbacks and the timeout task capture it, so a retired stream (the one
  /// abandoned by the one-shot reopen) can neither resume nor fail the
@@ -162,6 +186,10 @@ final class LinkService: ObservableObject {
     private var endpointsDirty = true
  /// Observer for `HTTPConnection`'s reused-socket first-byte watchdog.
     private var firstByteTimeoutObserver: NSObjectProtocol?
+ /// 真机根因修复：首字节看门狗不再直接拆传输，先做一次
+ /// 「新连接 /health」存活校验；这里是校验去抖与在飞任务。
+    private var lastFirstByteVerificationAt: Date?
+    private var transportVerificationTask: Task<Void, Never>?
 
  /// Short-lived api token (auto-refreshed on expiry/401).
     var apiToken: String?
@@ -492,17 +520,24 @@ final class LinkService: ObservableObject {
  // MARK: - Auth tokens (ECDSA-P256 challenge/verify)
 
  /// Returns a valid api bearer token, refreshing it when close to expiry.
-    func ensureAPIToken(forceRefresh: Bool = false) async throws -> String {
-        if !forceRefresh, let apiToken, let expiry = apiTokenExpiresAt, expiry.timeIntervalSinceNow > 5 {
+ ///
+ /// `originOverride`: the early `session/list` may be
+ /// issued against the relay origin while the persisted `credentials.origin` is a
+ /// stale LAN address (cellular / cross-network). Without the override that
+ /// request would hang on the unreachable LAN origin and the list would only load
+ /// after the mux connect finished — the amplified 10s stale-cache case.
+    func ensureAPIToken(forceRefresh: Bool = false, originOverride: URL? = nil) async throws -> String {
+        if !forceRefresh, originOverride == nil, let apiToken, let expiry = apiTokenExpiresAt, expiry.timeIntervalSinceNow > 5 {
             return apiToken
         }
-        return try await authenticateToken(purpose: "api")
+        return try await authenticateToken(purpose: "api", originOverride: originOverride)
     }
 
  /// One challenge/verify round trip. Concurrent callers share one in-flight
  /// challenge (the plugin rate-limits challenges).
-    func authenticateToken(purpose: String, timeout: TimeInterval = 15) async throws -> String {
-        if let inFlight = authInFlightByPurpose[purpose] {
+    func authenticateToken(purpose: String, timeout: TimeInterval = 15, originOverride: URL? = nil) async throws -> String {
+        let inFlightKey = originOverride.map { purpose + "@" + $0.absoluteString } ?? purpose
+        if let inFlight = authInFlightByPurpose[inFlightKey] {
             do {
                 return try await inFlight.value
             } catch {
@@ -511,15 +546,15 @@ final class LinkService: ObservableObject {
         }
         let task = Task { [weak self] () throws -> String in
             guard let self else { throw LinkError.notConnected }
-            return try await self.performAuthentication(purpose: purpose, timeout: timeout)
+            return try await self.performAuthentication(purpose: purpose, timeout: timeout, originOverride: originOverride)
         }
-        authInFlightByPurpose[purpose] = task
-        defer { authInFlightByPurpose[purpose] = nil }
+        authInFlightByPurpose[inFlightKey] = task
+        defer { authInFlightByPurpose[inFlightKey] = nil }
         return try await task.value
     }
 
-    private func performAuthentication(purpose: String, timeout: TimeInterval) async throws -> String {
-        guard let credentials, let origin = credentials.originURL else { throw LinkError.notPaired }
+    private func performAuthentication(purpose: String, timeout: TimeInterval, originOverride: URL? = nil) async throws -> String {
+        guard let credentials, let origin = originOverride ?? credentials.originURL else { throw LinkError.notPaired }
         let challenge = try await HTTPSClient.json(
             origin: origin,
             method: "POST",
@@ -796,11 +831,62 @@ final class LinkService: ObservableObject {
 
  /// A pooled unary request hit `HTTPConnection.firstByteTimeout`. Only a request
  /// against the *current* origin says anything about the live mux transport.
+ ///
+ /// real-device root-cause fix: a first-byte timeout on ONE pooled
+ /// request is **not** proof that the whole transport is dead. On 5G/relay the
+ /// shared tunnel carries `session/list` (1.46MB raw / 357KB gzip) and
+ /// `session/page` concurrently; head-of-line blocking routinely pushes a small
+ /// request's first byte past the watchdog while the mux is perfectly alive.
+ /// Real-device evidence (11:53:30): three timeouts within 350ms tore down a live
+ /// transport and started a ~25s reconnect storm ("连接无响应，正在重连…").
+ ///
+ /// New rule: verify the path on a **fresh** connection before invalidating the
+ /// mux. `/health` (pinned TLS, 1.2s) alive → keep the transport (the failed
+ /// request is retried by its caller on a fresh pooled connection). Dead → the
+ /// path really changed (or Mac/relay went away) → reconnect now. Bursts are
+ /// debounced so one stall cannot launch several probes/teardowns.
     private func handleFirstByteTimeout(endpoint: String, host: String?) {
         guard let currentHost = credentials?.originURL?.host, let host, currentHost == host else {
             return
         }
-        noteTransportUnresponsive(source: "unary:" + endpoint)
+        guard phase.isConnected, !manuallyDisconnected, !isConnecting else { return }
+        let now = Date()
+        if let last = lastFirstByteVerificationAt, now.timeIntervalSince(last) < 2.0 {
+            linkDebug("unary firstByte timeout burst (" + endpoint + ") ignored while verifying")
+            return
+        }
+        lastFirstByteVerificationAt = now
+        transportVerificationTask?.cancel()
+        transportVerificationTask = Task { [weak self] in
+            guard let self else { return }
+            let alive = await self.probeCurrentOriginHealth(timeout: 1.2)
+            guard !Task.isCancelled, self.phase.isConnected, !self.isConnecting else { return }
+            if alive {
+                self.linkDebug("unary firstByte timeout (" + endpoint + ") but fresh /health ok; keeping transport")
+                return
+            }
+            self.noteTransportUnresponsive(source: "unary:" + endpoint)
+        }
+    }
+
+ /// Fresh-connection `/health` probe used before invalidating a live transport.
+ /// Deliberately bypasses the HTTP pool: a dead keep-alive socket must not be
+ /// allowed to decide whether the network path is alive.
+    private func probeCurrentOriginHealth(timeout: TimeInterval) async -> Bool {
+        guard let credentials, let origin = credentials.originURL else { return false }
+        do {
+            let response = try await HTTPSClient.json(
+                origin: origin,
+                method: "GET",
+                path: "/health",
+                leafPin: credentials.leafPin,
+                caCertBase64: credentials.caCertBase64,
+                timeout: timeout
+            )
+            return response.status == 200 && response.json["ok"]?.boolValue == true
+        } catch {
+            return false
+        }
     }
 
     func disconnect(clearCredentials: Bool) {
@@ -902,21 +988,53 @@ final class LinkService: ObservableObject {
             local: localNetwork,
             pathChanged: pathChanged
         )
+ // 冷启动 <1s（列表侧）：预热共享 HTTPS 池，让 t0+~100ms 就发出的
+ // early session/list 复用已建好的 TLS，而不是再付一次 ~300ms 握手。
+        warmHTTPSPoolIfColdStart(prefersRelay: prefersRelay, local: localNetwork)
  // 跨网络自愈（用户）：mDNS 拿 Mac **当前** 端点 + 对候选并行打
- // /health，两项都带预算（≤1.5s）。网络刚变时这一步把"按旧顺序串行盲试"
+ // /health，两项都带预算（≤1.2–1.5s）。网络刚变时这一步把"按旧顺序串行盲试"
  // 变成一次并行收敛，第一拨就落在可达地址上。
-        let discovery = await discoverAndProbe(
-            candidates: orderedCandidates,
-            local: localNetwork,
-            credentials: credentials
+ //
+ // 冷启动 <1s（用户人工验收）：跨网（5G）时 relay 是第一且唯一可能
+ // 立即可达的候选，而发现+探测真机实测约 1.58s（connect-metrics 的 candidateMs
+ // 1577–1614ms 就是这一段）。它只用于「首拨失败后换地址」，绝不能挡在第一次
+ // 拨号前：relay-first 路径改为**立刻拨 relay**，发现/探测在后台并发，只有首拨
+ // 失败时才 await 结果重排剩余候选；其它路径（同网段 LAN-first / 单候选）保持
+ // 原行为（它们的预算里含真实选路价值）。
+        let relayFirstFastPath = Self.shouldDialRelayImmediately(
+            prefersRelay: prefersRelay,
+            orderedCandidates: orderedCandidates,
+            local: localNetwork
         )
-        let dialCandidates = Self.dialOrder(
-            discovered: discovery.origins,
-            observations: discovery.observations,
-            fallback: orderedCandidates,
-            local: localNetwork,
-            prefersRelay: prefersRelay
-        )
+        var dialCandidates = orderedCandidates
+        var convergenceConsumed = false
+        var convergenceTask: Task<(origins: [String], observations: [EndpointHealing.ProbeObservation]), Never>?
+        if relayFirstFastPath {
+            convergenceTask = Task { [weak self] in
+                guard let self else { return ([], []) }
+                return await self.discoverAndProbe(
+                    candidates: orderedCandidates,
+                    local: localNetwork,
+                    credentials: credentials
+                )
+            }
+            linkDebug("round: relay-first fast path (dial now, convergence in background)")
+        } else {
+            let discovery = await discoverAndProbe(
+                candidates: orderedCandidates,
+                local: localNetwork,
+                credentials: credentials
+            )
+            dialCandidates = Self.dialOrder(
+                discovered: discovery.origins,
+                observations: discovery.observations,
+                fallback: orderedCandidates,
+                local: localNetwork,
+                prefersRelay: prefersRelay
+            )
+            convergenceConsumed = true
+        }
+        defer { convergenceTask?.cancel() }
         let hasSameSubnetLAN = dialCandidates.contains {
             Self.candidateRole(host: $0.host, local: localNetwork) == .lanSameSubnet
         }
@@ -936,7 +1054,24 @@ final class LinkService: ObservableObject {
         var failures: [String] = []
         var failureClasses: [CandidateFailureClass] = []
         var roundBudgetExhausted = false
-        for (index, origin) in dialCandidates.enumerated() {
+ /// credential rejections are recorded per candidate instead of
+ /// ending the round on the first one. A rejected credential is only fatal
+ /// (`needsRepair`, user must re-pair) when **every** candidate rejects it —
+ /// otherwise a self-healed/stale origin could turn a recoverable round into
+ /// a permanent offline state.
+        var credentialRejections: [String] = []
+        var attemptedOriginKeys = Set<String>()
+        var queue = dialCandidates
+        var queueIndex = 0
+        while queueIndex < queue.count {
+            let origin = queue[queueIndex]
+            queueIndex += 1
+            let originKey = PairingOriginSelector.normalizedOriginString(origin).lowercased()
+            guard attemptedOriginKeys.insert(originKey).inserted else { continue }
+ // Budget semantics keep the original meaning: "index 0" is the first
+ // distinct candidate actually attempted in this round.
+            let attemptIndex = attemptedOriginKeys.count - 1
+            let attemptCount = max(queue.count, dialCandidates.count)
             if Task.isCancelled {
                 isConnecting = false
                 return
@@ -944,8 +1079,8 @@ final class LinkService: ObservableObject {
             let remaining = roundDeadline.timeIntervalSinceNow
             guard let attemptTimeout = Self.attemptBudget(
                 baseTimeout: Self.candidateTimeoutSeconds(
-                    index: index,
-                    count: dialCandidates.count,
+                    index: attemptIndex,
+                    count: attemptCount,
                     pathChanged: pathChanged
                 ),
                 remainingRoundBudget: remaining
@@ -956,7 +1091,7 @@ final class LinkService: ObservableObject {
  // authenticateToken() reads `credentials.origin`, so point it at the
  // origin under test before every attempt.
             setCurrentOrigin(origin, persist: false)
-            if index > 0 {
+            if attemptIndex > 0 {
  // The silent resume window is bounded by one candidate attempt:
  // from the second candidate on, the reconnect becomes visible
  // (phase + banner) and the retained stream table is dropped.
@@ -1005,10 +1140,11 @@ final class LinkService: ObservableObject {
                     milliseconds: (ReconnectMetrics.clock() - candidateStartedAt) * 1000,
                     result: CandidateFailureClass.credentialRejected.rawValue
                 )
-                isConnecting = false
+                credentialRejections.append(reason)
+                failures.append(host + ": " + reason)
                 lastErrorText = reason
-                phase = .needsRepair(reason)
-                return
+                linkDebug("round: credentialRejected " + Self.originLabel(origin) + " " + reason)
+ // Keep walking: only an all-candidates rejection means re-pairing.
             case .fastRejected(let reason, let failureClass):
                 linkDebug("round: fastRejected " + Self.originLabel(origin) + " " + reason)
                 ReconnectMetrics.markCandidateAttempt(
@@ -1036,9 +1172,35 @@ final class LinkService: ObservableObject {
                 failures.append(host + ": " + reason)
                 lastErrorText = reason
             }
+ // Relay-first fast path: the first dial failed, so now pay for the
+ // background convergence exactly once and rebuild the remaining queue in
+ // its preferred order (newly discovered LAN/relay endpoints included).
+            if !convergenceConsumed, let convergenceTask {
+                convergenceConsumed = true
+                let discovery = await convergenceTask.value
+                let reordered = Self.dialOrder(
+                    discovered: discovery.origins,
+                    observations: discovery.observations,
+                    fallback: orderedCandidates,
+                    local: localNetwork,
+                    prefersRelay: prefersRelay
+                )
+                queue = reordered.filter {
+                    !attemptedOriginKeys.contains(PairingOriginSelector.normalizedOriginString($0).lowercased())
+                }
+                queueIndex = 0
+                linkDebug("round: convergence consumed, remaining=[" + queue.map { Self.originLabel($0) }.joined(separator: ",") + "]")
+            }
         }
         isConnecting = false
         guard !Task.isCancelled else { return }
+ // Only when every candidate rejected the credential is re-pairing the only
+ // remedy; a single rejected (stale/healed) origin must not end the round.
+        if !credentialRejections.isEmpty, credentialRejections.count >= dialCandidates.count {
+            lastErrorText = credentialRejections.last
+            phase = .needsRepair(credentialRejections.last ?? L10n.t("配对凭据被拒绝，请重新配对"))
+            return
+        }
         if roundBudgetExhausted {
             ReconnectMetrics.markRoundBudgetExhausted()
             failureClasses.append(.timeout)
@@ -1137,11 +1299,42 @@ final class LinkService: ObservableObject {
         }
         let port = UInt16(origin.port ?? 443)
 
+ // cold start <1s（第二级）：TCP+TLS 建立与 mux token 的
+ // challenge/verify 互不依赖。真机拆解显示 TLS 段 ~300ms、auth 段 ~100ms，
+ // 且原本是「auth 用一条 TLS 连接、WSS 再建一条 TLS」的串行两段。
+ // 这里先把 WSS 的 TLS 连接放到后台并行建立，auth 完成后再发 upgrade，
+ // 把第二段 TLS 从关键路径上消掉（预期 −150~250ms）。
+        let ws = WSSClient(
+            host: host,
+            port: port,
+            path: "/api/remote.mux",
+            headers: [:],
+            leafPin: leafPin,
+            caCertBase64: credentials?.caCertBase64
+        )
+        self.ws = ws
+        let wsPrepare = Task { try await ws.prepareConnection(timeout: timeout) }
+
+ // Cold-start critical path: the unary api token and the mux
+ // token are two independent 2-RTT challenge/verify rounds. Mint them
+ // **concurrently** (purpose-scoped in-flight tasks) instead of serializing
+ // them: on a 5G relay each round trip is ~150–300ms and the list request
+ // waits on the api token, so this removes one full round trip from
+ // "connected → list visible" (part of the <1s cold-start target).
+        let apiTokenPrefetch = Task { [weak self] () -> String? in
+            guard let self else { return nil }
+            return try? await self.ensureAPIToken()
+        }
+
  // Every physical mux connection needs a fresh single-use mux token.
         let muxToken: String
         do {
             muxToken = try await authenticateToken(purpose: "mux", timeout: timeout)
         } catch {
+            apiTokenPrefetch.cancel()
+            wsPrepare.cancel()
+            ws.close()
+            self.ws = nil
             let reason = NetworkErrorInterpreter.message(for: error)
             if isCredentialRejection(error) { return .credentialRejected(reason) }
  // Cross-network: `503 {error:"host/inactive"}` means this origin's
@@ -1152,29 +1345,28 @@ final class LinkService: ObservableObject {
             return .failed(reason)
         }
         ConnectionMetrics.markAuth()
-        if Task.isCancelled { return .failed(L10n.t("已取消")) }
-
- // M2b: mint the unary api token in parallel with the WSS mux handshake.
- // The first screen after `connected` is session/list, which needs the
- // token; overlapping its 2-RTT challenge/verify with the WS upgrade +
- // $events ready removes it from the startup critical path (before M2b
- // the token was only requested when the first unary call ran).
-        let apiTokenPrefetch = Task { [weak self] () -> String? in
-            guard let self else { return nil }
-            return try? await self.ensureAPIToken()
+        if Task.isCancelled {
+            apiTokenPrefetch.cancel()
+            wsPrepare.cancel()
+            ws.close()
+            self.ws = nil
+            return .failed(L10n.t("已取消"))
         }
 
-        let ws = WSSClient(
-            host: host,
-            port: port,
-            path: "/api/remote.mux",
-            headers: ["authorization": "Bearer \(muxToken)"],
-            leafPin: leafPin,
-            caCertBase64: credentials?.caCertBase64
-        )
-        self.ws = ws
         do {
-            try await ws.connect(timeout: timeout)
+            try await wsPrepare.value
+        } catch {
+            apiTokenPrefetch.cancel()
+            self.ws = nil
+            let reason = NetworkErrorInterpreter.message(for: error)
+            if isCredentialRejection(error) { return .credentialRejected(reason) }
+            let failureClass = Self.failureClass(for: error)
+            if failureClass.isFastReject { return .fastRejected(reason, failureClass) }
+            return .failed(reason)
+        }
+        ws.setUpgradeHeaders(["authorization": "Bearer \(muxToken)"])
+        do {
+            try await ws.upgrade(timeout: timeout)
         } catch {
             apiTokenPrefetch.cancel()
             self.ws = nil
@@ -1196,29 +1388,26 @@ final class LinkService: ObservableObject {
             self?.handleTransportLost(error: error)
         }
         self.mux = mux
-        do {
-            try await openEventsAndWaitReady(mux: mux)
-        } catch {
-            apiTokenPrefetch.cancel()
-            let reason = NetworkErrorInterpreter.message(for: error)
-            mux.close()
-            self.mux = nil
-            self.ws = nil
-            if isCredentialRejection(error) { return .credentialRejected(reason) }
-            let failureClass = Self.failureClass(for: error)
-            if failureClass.isFastReject { return .fastRejected(reason, failureClass) }
-            return .failed(reason)
-        }
+ // 冷启动 <1s（用户人工验收）：mux 一旦建立，unary 与 streams 都已可用；
+ // `$events` ready 是连接路径上最后 ~150ms，而列表请求根本不依赖它。
+ // 因此这里立即返回 connected，把 ready 握手放到后台完成：
+ // - 成功：事件流/审批/问题卡正常到达（稍晚 ~150ms，无感）；
+ // - 失败/超时：按「传输失联」处理（teardown + 重连），不会出现「在线但事件
+ // 永不到达」的静默坏状态。
+ // 指标口径：readyMs 现在等于 mux 建立时刻（readyMs≈wsMs），真实握手完成打日志。
         ConnectionMetrics.markReady()
- // Best-effort: a failed prefetch surfaces on the first real unary call
- // (which re-authenticates) instead of failing the connection attempt.
- //
- // v0.1.1 (Bug 1): do **not** await the prefetch here. A slow/flaky
- // challenge+verify pair can burn up to 2 × 15s HTTP timeouts while the
- // link itself is already ready, and awaiting it kept `phase` busy so the
- // UI stayed on 「正在连接 Mac…」. `authenticateToken` shares one in-flight
- // task per purpose, so the first unary call joins the same challenge
- // instead of minting a second token (401 refresh-once path unchanged).
+        eventsHandshakeTask?.cancel()
+        eventsHandshakeTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                try await self.openEventsAndWaitReady(mux: mux, timeout: timeout)
+                self.linkDebug("events ready (background handshake after connected)")
+            } catch {
+                guard !Task.isCancelled, self.mux === mux, self.phase.isConnected else { return }
+                self.linkDebug("events ready failed after connected: " + NetworkErrorInterpreter.message(for: error))
+                self.handleTransportLost(error: LinkError.transport(L10n.t("$events 未就绪，重新连接")))
+            }
+        }
         return .connected(bumpGeneration: true)
     }
 
@@ -1586,6 +1775,11 @@ final class LinkService: ObservableObject {
     func teardownTransport(keepP1Resume: Bool = false) {
         readyTimeoutTask?.cancel()
         readyTimeoutTask = nil
+ // the $events handshake now runs after `connected`; a teardown
+ // (reconnect/disconnect) must retire it so a late ready cannot touch the next
+ // connection's state.
+        eventsHandshakeTask?.cancel()
+        eventsHandshakeTask = nil
         let preservingP1 = keepP1Resume && p1Resume.isRetained
         if !preservingP1 {
             eventsStream?.cancel()
@@ -1621,6 +1815,60 @@ final class LinkService: ObservableObject {
         return resume.isEmpty ? base : base + ";" + resume
     }
 
+ // MARK: - 冷启动 HTTPS 池预热
+
+ /// 冷启动时预热共享 HTTPS 连接池。
+ ///
+ /// 真机拆解：early `session/list` 在 t0+~100ms 就发出，但连接池是空的 → 首个
+ /// 请求（api token 认证）要先付一次 TLS，列表请求再复用同一条
+ /// 连接。这里在启动连接轮次的同时用一次轻量 `/health` 打通 TCP+TLS 并留在池里，
+ /// 认证/列表都直接复用 → 列表侧预期 −200~300ms。
+ ///
+ /// 只在「本次进程还没成功连过」时执行；网络切换/重连不重复预热。选择 origin 的
+ /// 规则与拨号序一致：蜂窝/跨网优先 relay 候选，避免预热打到失效 LAN 上。
+    private func warmHTTPSPoolIfColdStart(prefersRelay: Bool, local: LocalIPv4Network?) {
+        guard lastConnectedAt == nil, poolWarmupTask == nil, let credentials else { return }
+        guard let origin = Self.poolWarmupOrigin(
+            current: credentials.origin,
+            stored: credentials.originCandidates,
+            prefersRelay: prefersRelay,
+            local: local
+        ) else { return }
+        let leafPin = credentials.leafPin
+        let caCertBase64 = credentials.caCertBase64
+        linkDebug("pool warm-up -> " + Self.originLabel(origin))
+        poolWarmupTask = Task { [weak self] in
+            defer { self?.poolWarmupTask = nil }
+ // A plain GET /health over the shared pool: TLS handshake + one round trip,
+ // connection stays pooled for the auth/list requests that follow.
+            _ = try? await HTTPSClient.json(
+                origin: origin,
+                method: "GET",
+                path: "/health",
+                leafPin: leafPin,
+                caCertBase64: caCertBase64,
+                timeout: 3
+            )
+        }
+    }
+
+ /// Pure origin choice for the cold-start pool warm-up (unit-tested). Same rule as
+ /// the dial order: cellular/cross-network warms the relay candidate, LAN paths
+ /// warm the stored current origin.
+    nonisolated static func poolWarmupOrigin(
+        current: String?,
+        stored: [String]?,
+        prefersRelay: Bool,
+        local: LocalIPv4Network?
+    ) -> URL? {
+        let candidates = PairingOriginSelector.reconnectCandidates(current: current, stored: stored)
+        if prefersRelay,
+           let relay = candidates.first(where: { candidateRole(host: $0.host, local: local) == .relay }) {
+            return relay
+        }
+        return candidates.first
+    }
+
  // MARK: - 运行时端点自愈（用户：任何网络都要连得上，且极致快）
 
  /// 一轮连接前的并行发现：mDNS 拿 Mac **当前** 端点 + 对所有候选并行打 `/health`。
@@ -1654,7 +1902,11 @@ final class LinkService: ObservableObject {
             : []
         let (mdns, observations) = await (discovered, probed)
         var origins = mdns.origins
-        if let relay = mdns.relayOrigin { origins.append(relay) }
+ // 根因修复（N-04）：只有「广播的 hostId 与配对 hostId 一致」（或旧
+ // 凭据没有 hostId 时由 matchMacs 的唯一一台规则采纳）才把 mDNS relay 端点写进
+ // 拨号序。hostId 不匹配的发现结果永不使用——那是别的 Mac/DSH 实例的中继。
+        let mdnsHostMatches = credentials.hostId == nil || mdns.hostId == credentials.hostId
+        if let relay = mdns.relayOrigin, mdnsHostMatches { origins.append(relay) }
         let probeSummary = EndpointHealing.rankProbes(observations)
             .map { "\($0.origin)=\($0.result)\( $0.latencyMs)ms" }
             .joined(separator: ",")
@@ -1839,17 +2091,24 @@ extension LinkService {
     }
 
  /// Per-candidate budget inside one round. The last candidate keeps a longer
- /// budget so a slow-but-working relay still connects; the others are bounded at
- /// 2s (1.5s after a path change) because a reachable origin completes
- /// TCP+TLS+auth well under 1s, and a stale LAN address must not burn 4s before
- /// the relay is dialed.
+ /// budget so a slow-but-working relay still connects; the others are bounded so
+ /// a stale LAN address cannot burn time before the relay is dialed.
+ ///
+ /// real-device calibration (iPhone 16 Pro Max on 5G + relay): a
+ /// **healthy** legacy connect measured `candidateMs=1577–1602ms` end-to-end
+ /// (TLS + mux auth + WSS upgrade + `$events` ready), and a degraded-path
+ /// `/auth/challenge` attempt was aborted at 1617ms. The old 1.5s/2s budgets
+ /// therefore cancelled attempts that were about to succeed (two failed rounds
+ /// in the 11:53 cold-start storm: 2.35s connected → 800ms watchdog kill →
+ /// two 1.5s-budget rounds aborted → 28.4s total). Non-last candidates now get
+ /// 3s (2.5s after a path change) so one healthy 5G relay round fits.
     nonisolated static func candidateTimeoutSeconds(
         index: Int,
         count: Int,
         pathChanged: Bool
     ) -> TimeInterval {
         if index >= count - 1 { return 8 }
-        return pathChanged ? 1.5 : 2
+        return pathChanged ? 2.5 : 3
     }
 
  // MARK: Candidate role + path-aware order (cross-network requirement)
@@ -1905,21 +2164,43 @@ extension LinkService {
         return candidates
     }
 
+ /// 冷启动 <1s：跨网（relay-first）时是否跳过"拨号前串行发现+探测"直接拨
+ /// 第一个候选。真机实测这段串行收敛 1577–1614ms（connect-metrics candidateMs），
+ /// 而 relay 拨号本身约 700ms——它是冷启动最大的可消除浪费。
+ ///
+ /// 条件刻意保守：只有 (a) 当前路径判断要求 relay 优先，(b) 至少两个候选（发现才有
+ /// 意义），且 (c) 首候选确实是 relay 时才走快路径。同网段 LAN-first 与单候选保持
+ /// 原行为（后者的发现预算本来就是 0）。
+    nonisolated static func shouldDialRelayImmediately(
+        prefersRelay: Bool,
+        orderedCandidates: [URL],
+        local: LocalIPv4Network?
+    ) -> Bool {
+        guard prefersRelay, orderedCandidates.count > 1 else { return false }
+        return candidateRole(host: orderedCandidates[0].host, local: local) == .relay
+    }
+
  /// Fixed total budget for walking the candidates of one round. This removes the
  /// old 10s+ tail where every serial candidate burned its own timeout.
- /// - single candidate: nothing to switch to, but still capped at 6s (8s dial +
- /// backoff used to be the worst-case tail);
- /// - same-LAN multi-candidate: LAN should answer fast, relay fallback usable -> 3s;
- /// - cross-network multi-candidate (relay first + LAN fallback): 1.5s total.
+ /// - single candidate: nothing to switch to; give it the full 8s candidate
+ /// budget (the old 6s cap could not even cover a slow relay round);
+ /// - same-LAN multi-candidate: LAN should answer fast, relay fallback usable -> 4s;
+ /// - cross-network multi-candidate (relay first + stale LAN fallback): 5s.
+ ///
+ /// real-device calibration: the old cross-network 1.5s round budget is
+ /// shorter than one healthy relay round (`candidateMs≈1.6s`), so whenever the
+ /// `/health` probes all failed the relay attempt was guaranteed to be cancelled
+ /// at 1.5s — the exact mechanism that turned a 800ms stall into a 28.4s
+ /// cold-start storm. 5s covers the relay attempt plus one bounded LAN fallback.
     nonisolated static func roundBudgetSeconds(
         candidateCount: Int,
         hasSameSubnetLAN: Bool,
         hasRelay: Bool
     ) -> TimeInterval {
-        guard candidateCount > 1 else { return 6 }
-        if hasSameSubnetLAN { return 3 }
-        guard hasRelay else { return 3 }
-        return 1.5
+        guard candidateCount > 1 else { return 8 }
+        if hasSameSubnetLAN { return 4 }
+        guard hasRelay else { return 4 }
+        return 5
     }
 
  /// Clamped per-candidate timeout, or nil when the round budget is exhausted
