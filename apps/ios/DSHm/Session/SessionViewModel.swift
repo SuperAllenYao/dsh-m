@@ -101,156 +101,100 @@ final class SessionViewModel: ObservableObject {
  /// M2b-2: the restored window is older than the 24h display TTL (still shown).
     @Published private(set) var cachedWindowIsStale = false
 
- // MARK: - Older history pagination (task session-history: view contract)
+ // MARK: - Automatic full-history load (view contract)
 
- /// The Host still has events older than `oldestLoadedSeq`: the follow snapshot's
- /// `hasMore` on open (a long session starts at `true`), then the last
- /// `session/page` `hasMore`. The view calls `loadOlderIfNeeded()` when the
- /// scroll approaches the top; `false` means the first event is loaded.
-    @Published private(set) var hasMoreOlder: Bool = false
- /// One `session/page` round trip is in flight. Repeated scroll callbacks are
- /// no-ops while this is true (concurrent requests are deduplicated).
-    @Published private(set) var isLoadingOlder: Bool = false
- /// E2E/DEBUG paging diagnostics: the last `session/page` request/response/merge
- /// (task-10 bug2b — "pull shows a spinner but nothing loads" was a silent
- /// no-op). Only written when `DSHM_E2E`/`DSHM_DEBUG_STREAM` is set; the
- /// product path keeps it empty. Read by SessionDetailView's hidden
- /// `e2e-lastpage` accessibility element.
-    @Published private(set) var e2eLastPageDebug: String = ""
- /// Oldest event seq currently loaded (front of the window), read-only view
- /// contract: the detail can anchor/verify the scroll position against it.
+ /// Increments after each merged history batch. The detail view re-anchors the
+ /// scroll position when it changes (bottom-follow or visible-row anchor).
+    @Published private(set) var historyBatchToken: Int = 0
+ /// Cached render groups (folded process groups), rebuilt together with the rows.
+ /// The view body reads this directly and never recomputes O(rows) per render.
+    @Published private(set) var flowGroups: [FlowRowGroup] = []
+ /// E2E-only filler diagnostics (e2e-history-fill). The product path leaves it nil.
+    @Published private(set) var historyFillProbeValue: String?
+
+ /// Internal filler state; there is deliberately no UI for it (user: 无痕).
+    enum HistoryFillState: String {
+        case idle
+        case loading
+        case completed
+        case failed
+        case pausedOffline
+    }
+    private(set) var historyFillState: HistoryFillState = .idle
+    private var historyFillTask: Task<Void, Never>?
+    private var historyFillStartedAt: Date?
+    private var historyFillCompletedAt: Date?
+    private var historyFillPages = 0
+    private var historyFillBytes = 0
+    private var historyFillFailures = 0
+ /// A history/older batch was merged but its rows rebuild has not run yet: the
+ /// view anchors on historyBatchToken, so the token must change *after* the rows
+ /// are on screen.
+    private var pendingHistoryBatch = false
+ /// True between start() and stop(): the filler only runs while the detail lives.
+    private var detailOnScreen = false
+
+ /// Oldest loaded log position (diagnostics/tests only: the view has no entry).
     var oldestLoadedSeq: Int? { journal.oldestSeq }
- /// Sticky "the session's first event has been loaded" (task-6): once true the
- /// detail must hide the "load earlier" entry forever — even if a reconnect /
- /// background-fill snapshot with `hasMore = true` arrives afterwards.
+ /// The session's first event is loaded (filler terminal state).
     var reachedFirstEvent: Bool { journal.hasReachedOldest }
- /// M2b-2: cache read + journal replay + first row rebuild inside `init`, in ms.
-        private(set) var cacheLoadMilliseconds: Double = 0
+
+ /// M2b-2: first-paint cache read+apply cost (ms).
+    private(set) var cacheLoadMilliseconds: Double = 0
     private let windowCache: SessionWindowCacheStore
- /// P1.5-B: phone-sized first `session/follow` window (12–20 messages) and the
- /// legacy 40-message window filled in the background after the first rows paint.
+ /// Phone-sized first session/follow window (12-20 messages).
     private(set) var firstWindowMessages: Int
-    private(set) var fillWindowMessages: Int
- /// Raw wire frames kept for the next cache write: the latest snapshot frame and
- /// the contiguous `event` objects that followed it.
-    private var cachedSnapshotFrame: JSONValue?
-    private var cachedEventFrames: [JSONValue] = []
     private var cacheSaveTask: Task<Void, Never>?
+    private var firstPaintCacheTask: Task<Void, Never>?
+    private var cachedChunksTask: Task<Void, Never>?
+    private(set) var didRestoreFirstPaintCache = false
+ /// Compatibility alias for older tests/E2E (same value).
+    var didRestoreWindowFromCache: Bool { didRestoreFirstPaintCache }
  /// 打开阶段的锚底信号：缓存窗口先上屏、live 快照后到；视图在它为 true 之前
  /// 必须无条件贴底（冷启动/通知深链进入时"停在旧消息"的根因）。
     @Published private(set) var hasLiveSnapshot = false
- /// P1.5-B background fill: the delayed task + the second `session/follow`
- /// stream that requeststhe legacy 40-message window. When its snapshot lands it
- /// replaces the small window and becomes the live stream.
-    private var fillTask: Task<Void, Never>?
-    private var fillStream: RemoteStreamHandle?
- /// Fill attempts for this open (bounded so a failing fill cannot loop).
-    private var fillAttempts = 0
- /// True once the legacy full window (40 messages) is on screen.
-    private var hasFullWindow = false
- /// Bound the persisted tail; when full, later events are no longer appended —
- /// the cached window stays contiguous (and therefore replayable), just older.
-    private static let maxCachedEvents = 200
 
- // MARK: - Older history pagination state (task session-history)
+ // MARK: - Detail state / seams (unchanged by the autoload refactor)
 
- /// Raw `event` objects of the loaded older range (front of the snapshot window,
- /// filled by `session/page`), ascending by seq. Persisted so a cold open replays
- /// the loaded history instead of regressing to the phone-sized window.
-    private var cachedOlderEventFrames: [JSONValue] = []
- /// Serialized size per seq of `cachedOlderEventFrames` (kept incrementally so
- /// the budget check never re-encodes the whole history).
-    private var cachedOlderFrameBytes: [Int: Int] = [:]
-    private var cachedOlderFramesBytes: Int = 0
- /// Older frames were dropped to stay within the cache budget: the persisted
- /// window then reports `hasMoreOlder = true` so the prefix can be refetched.
-    private var cachedOlderFramesTruncated = false
- /// Budget for the raw older range inside the window cache (~1.5MB keeps the
- /// cold-start payload/parse cost near the existing 4MB design cap while still
- /// restoring hundreds of events, not 40 messages).
-    private static let maxCachedOlderBytes = 1_500_000
- /// Unary `session/page` seam (unit tests have no socket). Production leaves nil
- /// and the loader rides `LinkService.unary("session/page", args:)`.
-    var olderPageLoader: (([String: JSONValue]) async throws -> JSONValue)?
-    private var olderPageTask: Task<Void, Never>?
- /// True while `actionErrorText` is the paging failure; a later success clears it
- /// once (other action errors are left alone).
-    private var olderPageErrorShown = false
- /// A pull was dropped because the link was reconnecting (task-10 bug2b); it is
- /// replayed once the link reports connected again.
-    private var olderPageAwaitingReconnect = false
- /// Pages merged by this VM instance — marks the "first page after a push
- /// deep-link reentry" in the E2E diagnostics (a reentry builds a fresh VM).
-    private var olderPageMergedCount = 0
- /// M2b-2c: in-app detail timing (`firstFrameMs=..;cacheHit=1;networkMs=..`),
- /// E2E-gated; surfaced through the hidden `detail-metrics` element.
+ /// E2E-gated in-app detail timing (detail-metrics hidden element).
     @Published private(set) var detailMetricsValue: String?
- /// 体验收尾: E2E in-app send clock (`send-metrics` hidden element).
+ /// E2E in-app send clock (send-metrics hidden element).
     @Published private(set) var sendMetricsValue: String?
- /// True when `init` restored the detail from the on-disk window cache.
-    private(set) var didRestoreWindowFromCache = false
     private var detailViewVisible = false
     private var detailFirstFrameMarked = false
     private var requestedFileChangeSeqs: Set<Int> = []
     private weak var link: LinkService?
- /// M5 test seams: when set, the permission-sheet state machine reads/ writes
- /// through these instead of the attached `LinkService` (unit tests have no
- /// socket). Production leaves both nil.
+ /// M5 test seams (unit tests have no socket).
     var permissionCatalogLoader: (() async throws -> PermissionPresetCatalog)?
     var permissionSwitcher: ((String) async throws -> SessionPermissionUpdate)?
- /// M5: one successful catalog load per detail; failures stay retryable.
     private var permissionCatalogLoaded = false
- /// v0.2.0 model-selection test seams (unit tests have no socket).
+ /// v0.2.0 model-selection test seams.
     var modelCatalogLoader: (() async throws -> ModelCatalog)?
     var modelSelector: ((ModelSelection) async throws -> ModelSelection)?
- /// v0.2.0: one successful model-catalog load per detail; failures retryable.
     private var modelCatalogLoaded = false
- /// Last live selection the cached catalog could not name (refresh trigger for
- /// a desktop-side switch to a model this detail had not loaded yet).
     private var modelCatalogUnknownSelection: ModelSelection?
     private var stream: RemoteStreamHandle?
     private var restartTask: Task<Void, Never>?
     private var rebuildTask: Task<Void, Never>?
- /// One-shot wakeup that rebuilds the rows when a pending echo's "发送中…"
- /// marker expires (see `schedulePendingEchoStaleRefresh`).
     private var pendingEchoStaleTask: Task<Void, Never>?
- /// 流式文本节流任务：assistant-stream 每个增量都写 @Published 会让整页 Markdown
- /// 重解析/重绘 → 真机滚动卡顿/频闪。合并到最多 10Hz。
     private var liveTextThrottleTask: Task<Void, Never>?
     private var observedGeneration = -1
     private var pendingRebuild = false
- /// Last `isRunning` value used for the v5.4 queue flush (turn/end transition).
+ /// Incremental render state (B's FlowState): auto-detects append/prepend/reset
+ /// from the journal window so a running turn does not rebuild all rows.
+    private var renderState = SessionRowBuilder.FlowState()
     private var lastKnownRunning = false
- /// v5.4 task-13: debounced `session/list` refresh after relay/turn activity.
     private var subagentDebounceTask: Task<Void, Never>?
     private var lastSubagentCatalogIds: [String] = []
- /// Projection half of `activeUserQuestions` (`userQuestions.active`).
     private var projectionUserQuestions: [UserQuestionCall] = []
- /// Live half: `$events` `user-questions/request` waterfalls for this session.
- /// Current builds use the legacy/blocking ask_user_question schema, so the
- /// projection stays `{active: [], settled: []}` and this is the only source.
     private var liveUserQuestionWaterfalls: [UserQuestionWaterfall] = []
     private var pendingUserQuestionsCancellable: AnyCancellable?
- /// M2a fix: link-phase observer that flushes prompts queued while offline.
     private var phaseCancellable: AnyCancellable?
- /// Call ids this client already answered (P0-1/P1-1): the journal projection
- /// only refreshes on snapshots and `session/list` can return a stale
- /// `active` list, so answered calls are suppressed until the Host stops
- /// listing them. Ids are never reused, so suppression is permanent for the
- /// lifetime of this view model.
     private var locallyAnsweredCallIds: Set<String> = []
- /// Duplicate/concurrent submit guard (T10): one answer batch per call at a
- /// time; a racing second submit is rejected instead of double-sending.
     private var userQuestionSubmitGate = UserQuestionSubmitGate()
- /// Live waterfall ids dismissed because their turn was aborted (T10). The
- /// Host does not always deliver a `$events` cancel frame for legacy blocking
- /// asks, so aborting clears the card locally and keeps it hidden if the
- /// pending list is republished.
     private var dismissedLiveWaterfallEventIds: Set<String> = []
 
  /// Display text for the v5.5 status-strip context cell.
- /// `12.4k / 200k · 6%` when usage and window are known, `12.4k` with usage
- /// only, `—` when nothing has been reported yet.
     var contextPressureText: String { contextPressure?.displayText ?? "—" }
 
  // MARK: - Model selection (v0.2.0)
@@ -303,22 +247,15 @@ final class SessionViewModel: ObservableObject {
         self.sessionId = address.sessionId
         self.subagentContext = subagentContext
         self.windowCache = windowCache
- // P1.5-B: the first live window is phone-sized; the legacy 40-message
- // window is filled in the background once the first rows are on screen.
-        let firstWindow = SessionWindowPolicy.deviceFirstWindowMessages
-        self.firstWindowMessages = firstWindow
-        self.fillWindowMessages = SessionWindowPolicy.fillMessages(firstWindow: firstWindow)
- // P1.5-B evidence before the first request is even opened; `openStream`
- // overrides it when the actual request differs (cache hit -> wide window).
-        DetailMetrics.setFirstWindow(firstWindow)
- // M2b-2: replay the cached window inside `init` (before the first SwiftUI
- // render) so opening a session shows content immediately; `start()` then
- // subscribes to the live stream and the snapshot replaces this window.
-        restoreCachedWindow()
-        DetailMetrics.setCacheHit(didRestoreWindowFromCache)
-        if didRestoreWindowFromCache {
-            DetailMetrics.markCacheRestored(milliseconds: cacheLoadMilliseconds)
-        }
+ // Phone-sized first window; the full history is filled automatically in the
+ // background (the manual "load earlier" feature is gone).
+        self.firstWindowMessages = SessionWindowPolicy.deviceFirstWindowMessages
+        DetailMetrics.setFirstWindow(self.firstWindowMessages)
+ // The first-paint cache is read/decoded off-main after init: the route switch
+ // and the first render must never wait for disk IO / JSON decoding (user bug:
+ // tapping a session froze ~1s before the detail appeared). The cached chunks
+ // are applied when they arrive; the live follow snapshot supersedes the tail.
+        startFirstPaintCacheRestore()
     }
 
  /// Plain-session shorthand (APNs deep links know only the session id).
@@ -331,155 +268,117 @@ final class SessionViewModel: ObservableObject {
     private static let debugStreamLogging =
         ProcessInfo.processInfo.environment["DSHM_DEBUG_STREAM"] == "1"
 
- /// E2E paging diagnostics (`e2e-lastpage`) are written only in E2E/debug runs;
- /// the product path leaves `e2eLastPageDebug` empty.
-    private static let e2ePageDiagnosticsEnabled =
-        ProcessInfo.processInfo.environment["DSHM_E2E"] == "1"
-        || debugStreamLogging
- /// Unit-test seam: the simulator test runner has no E2E env, so paging tests
- /// flip this on to assert the `e2e-lastpage` diagnostics.
-    static var e2ePageDiagnosticsTestOverride = false
-
     private func dbg(_ message: @autoclosure () -> String) {
         guard Self.debugStreamLogging else { return }
         NSLog("[STREAMDBG] %@", message())
     }
 
- // MARK: - M2b-2 cold-start window cache
+ // MARK: - First-paint cache (newest up-to-4 screens, chunked)
 
- /// Rebuilds the journal from the cached snapshot + following events. A cache that
- /// is corrupt, from another schema, or not contiguous is dropped silently and the
- /// normal loading path takes over.
-    private func restoreCachedWindow() {
-        let started = Date()
-        defer { cacheLoadMilliseconds = Date().timeIntervalSince(started) * 1000 }
-        guard let cached = windowCache.load(sessionId: sessionId) else { dbg("cache miss"); return }
-        do {
-            let frame = try SessionStreamFrame.decode(cached.payload.snapshot)
-            guard case .snapshot(let snapshot) = frame else { return }
-            journal.apply(snapshot: snapshot)
-            dbg("cache restore: snapshotRecords=" + String(snapshot.records.count) + " events=" + String(journal.events.count) + " olderFrames=" + String(cached.payload.olderEvents?.count ?? 0))
- // v3: replay the loaded older range *before* the live tail, so the
- // restored window is [oldestLoadedSeq, cursor] instead of only the
- // newest message window (cold start must not regress to 40 messages).
- //
- // task-7: only a gap-free suffix that is adjacent to the snapshot window
- // may be replayed. A cache written by an older build could carry a
- // non-contiguous prefix; restoring it hides whole turns (turn 1 keeps
- // "running", turns 2–7 vanish) and paging can never repair an interior
- // hole, so the prefix is dropped and the entry is re-armed instead.
-            let olderFrames = cached.payload.olderEvents ?? []
-            var restoredWindowWasRepaired = false
-            if !olderFrames.isEmpty {
-                let decodedOlder = olderFrames.compactMap { try? $0.decode(SessionEvent.self) }
-                let snapshotOldest = snapshot.records.compactMap { $0.event?.seq }.min()
-                let usableOlder = Self.contiguousOlderSuffix(decodedOlder, snapshotOldest: snapshotOldest)
-                if !usableOlder.isEmpty {
-                    journal.prepend(events: usableOlder, hasMoreOlder: true)
-                }
-                if usableOlder.count != decodedOlder.count {
-                    restoredWindowWasRepaired = true
-                }
+ /// Kicks off the off-main cache read. Called from init: it must never block the
+ /// first render, so the disk read + JSON decode + synthetic snapshot build all
+ /// happen away from the main thread.
+    private func startFirstPaintCacheRestore() {
+        guard firstPaintCacheTask == nil else { return }
+        let store = windowCache
+        let targetSessionId = sessionId
+        firstPaintCacheTask = Task { [weak self] in
+            let started = Date()
+            let loaded = await Task.detached(priority: .userInitiated) {
+                store.load(sessionId: targetSessionId)
+            }.value
+            guard let self, !Task.isCancelled else { return }
+            self.cacheLoadMilliseconds = Date().timeIntervalSince(started) * 1000
+            guard let loaded else {
+                self.dbg("first-paint cache miss")
+                return
             }
-            for eventValue in cached.payload.events {
-                let event = try eventValue.decode(SessionEvent.self)
-                if case .gap = journal.apply(event: event) {
- // Cached events are not contiguous with the snapshot: showing a
- // window with holes would be worse than showing nothing.
-                    journal = SessionJournal()
-                    return
-                }
-            }
- // Whole-window continuity gate (task-7): if anything still leaves a hole,
- // keep only the gap-free suffix that ends at the newest event.
-            if !journal.isWindowContiguous {
-                let dropped = journal.trimToContiguousSuffix()
-                if dropped > 0 { restoredWindowWasRepaired = true }
-            }
-            if cached.payload.schemaVersion >= SessionWindowCacheStore.olderRangeSchemaVersion {
-                journal.setHasMoreOlder(cached.payload.hasMoreOlder ?? journal.hasMore)
-            } else {
- // Legacy v2 payload = the old 40-message window: no older range was
- // persisted, so `oldestSeq` is the earliest cached record and
- // `hasMoreOlder` is the old `hasMore` (snapshot hasMore fallback).
-                journal.setHasMoreOlder(cached.payload.hasMore ?? journal.hasMore)
-            }
- // task-6: restore the sticky termination flag. v4 payloads carry it
- // explicitly; older payloads derive it (Lead-agreed rule): a cached front
- // at seq 0 proves the earliest event was loaded.
-            journal.setHasReachedOldest(
-                cached.payload.hasReachedOldest
-                    ?? (cached.payload.oldestSeq == 0 || journal.oldestSeq == 0)
-            )
-            if restoredWindowWasRepaired {
- // The discarded prefix must be pulled again: re-arm the entry for good
- // (this also clears the sticky terminal state — the first event is no
- // longer in the window).
-                journal.markOlderHistoryUnloaded()
-            }
- // task-5: the persisted paging state can be internally inconsistent — a
- // cache written by an older build (stale/empty page path) can carry
- // `hasMoreOlder = false` and even `hasReachedOldest = true` while the
- // restored front is not the session's first event (`oldestSeq > 0`).
- // Taking that at face value hides the "load earlier" entry forever: the
- // user can never scroll back to the missing older turns (real device:
- // oldest=3232 yet hasMoreOlder=false while the session starts at seq 0).
- // A terminal state is only valid when seq 0 is actually loaded, so
- // re-arm pagination whenever the flags disagree with the window.
-            if (journal.oldestSeq ?? 0) > 0, !journal.hasMoreOlder {
-                dbg("cache restore: re-arm paging (cached state said terminal but oldest="
-                    + String(journal.oldestSeq ?? -1) + ")")
-                journal.markOlderHistoryUnloaded()
-            }
-            cachedSnapshotFrame = cached.payload.snapshot
-            cachedEventFrames = cached.payload.events
- // Cache only the raw older frames that actually landed in the repaired
- // window (a dropped hole must not be written back on the next save).
-            let keptSeqs = Set(journal.events.lazy.map(\.seq))
-            cachedOlderEventFrames = Self.mergedEventFrames(olderFrames.filter { frame in
-                guard let seq = Self.eventFrameSeq(frame) else { return false }
-                return keptSeqs.contains(seq)
-            })
-            rebuildCachedOlderFrameBytes()
-            didRestoreWindowFromCache = true
-            isShowingCachedWindow = true
-            cachedWindowIsStale = cached.isStale
-            isLoading = false
-            syncOlderState()
-            rebuildRows()
-            contextPressure = journal.contextPressure
-        } catch {
-            journal = SessionJournal()
-            cachedOlderEventFrames = []
-            cachedOlderFrameBytes = [:]
-            cachedOlderFramesBytes = 0
-            cachedOlderFramesTruncated = false
+            self.applyFirstPaintCache(loaded)
         }
     }
 
- /// Test seam: apply one raw `session/follow` item value (snapshot/event/...).
-    func applyStreamValue(_ value: JSONValue?) {
-        handleItem(value)
+ /// Test seam: wait for the off-main first-paint cache restore (hit or miss).
+    func awaitFirstPaintCacheForTesting() async {
+        await firstPaintCacheTask?.value
     }
 
- /// Test seam: apply one raw item from the background-fill stream (the wide
- /// legacy window that replaces the small first window).
-    func applyFillStreamValue(_ value: JSONValue?) {
-        handleItem(value, isFill: true)
+    private func applyFirstPaintCache(_ loaded: SessionWindowCacheStore.Loaded) {
+        let payload = loaded.payload
+        guard !payload.chunks.isEmpty else { return }
+        didRestoreFirstPaintCache = true
+        isShowingCachedWindow = true
+        cachedWindowIsStale = loaded.isStale
+        DetailMetrics.setCacheHit(true)
+        DetailMetrics.markCacheRestored(milliseconds: cacheLoadMilliseconds)
+        if journal.events.isEmpty {
+            applyCachedSyntheticSnapshot(payload)
+        } else {
+            mergeCachedOlderEvents(payload: payload, olderThan: journal.oldestSeq ?? Int.max)
+        }
+        isLoading = false
+        syncFillDiagnostics()
+        rebuildRows()
+        maybeMarkDetailFirstFrame()
+        cachedChunksTask = Task { [weak self] in
+            guard let self else { return }
+            for chunk in payload.chunks.dropFirst() {
+                if Task.isCancelled { return }
+                let update = self.journal.prepend(events: chunk, hasMoreOlder: true)
+                self.applyJournalUpdate(update)
+                await Task.yield()
+            }
+            self.startHistoryFillIfPossible()
+        }
     }
+
+ /// Applies the newest cached screen as a synthetic snapshot: header/projections
+ /// plus that screen's records. The live follow snapshot replaces the tail later
+ /// and the journal keeps the (contiguous) cached prefix.
+    private func applyCachedSyntheticSnapshot(_ payload: SessionWindowCachePayload) {
+        guard let chunk0 = payload.chunks.first, !chunk0.isEmpty else { return }
+        let records = chunk0.map { SnapshotRecord(type: "event", event: $0, seq: $0.seq) }
+        let header = payload.header ?? SessionHeader(
+            version: nil, id: sessionId, createdAt: nil, cwd: nil, isSeeded: nil, agentPreset: nil
+        )
+        let snapshot = SessionSnapshot(
+            type: "snapshot",
+            header: header,
+            cursor: payload.cursor,
+            records: records,
+            hasMore: payload.hasMore ?? true,
+            projections: payload.projections,
+            assistantStream: nil
+        )
+        let update = journal.apply(snapshot: snapshot)
+        applyJournalUpdate(update)
+        contextPressure = journal.contextPressure
+    }
+
+ /// Merges the cached screens older than the current window front (contiguous
+ /// suffix only) when the live snapshot beat the cache restore.
+    private func mergeCachedOlderEvents(payload: SessionWindowCachePayload, olderThan: Int) {
+        var older = payload.chunks.flatMap { $0 }.filter { $0.seq < olderThan }
+        older.sort { $0.seq < $1.seq }
+        guard let front = journal.oldestSeq, !older.isEmpty else { return }
+        var kept: [SessionEvent] = []
+        var expected = front - 1
+        for event in older.reversed() {
+            guard event.seq == expected else { break }
+            kept.append(event)
+            expected -= 1
+        }
+        guard !kept.isEmpty else { return }
+        let update = journal.prepend(events: Array(kept.reversed()), hasMoreOlder: true)
+        applyJournalUpdate(update)
+    }
+
+ /// Test seam: apply one raw session/follow item value (snapshot/event/...).
+    func applyStreamValue(_ value: JSONValue?) { handleItem(value) }
 
  /// Test seam: sequence numbers currently in the journal window.
     var eventSeqs: [Int] { journal.events.map(\.seq) }
 
- /// P1.5-B test seam: the window is still the small first one and a legacy
- /// 40-message fill is warranted (`hasMore` = older history exists).
-    var needsFullWindowFill: Bool {
-        hasLiveSnapshot && !hasFullWindow && journal.hasMore
-            && fillWindowMessages > firstWindowMessages
-    }
-
- /// Persists the latest snapshot + contiguous event tail, debounced so a running
- /// turn does not write on every frame.
+ /// Debounced window write so a running turn does not write on every frame.
     private func scheduleCacheSave() {
         cacheSaveTask?.cancel()
         cacheSaveTask = Task { [weak self] in
@@ -490,40 +389,57 @@ final class SessionViewModel: ObservableObject {
         }
     }
 
- /// Writes the cache only after a live snapshot exists: a cache restored without a
- /// network round-trip must keep its original `savedAt` (it may be stale).
+ /// Persists the newest up-to-4 screens (chunked first-paint cache). Only after a
+ /// live snapshot: a cache restored without a network round-trip must keep its
+ /// original savedAt (it may be stale).
     func saveWindowCacheNow() {
-        guard hasLiveSnapshot, let snapshot = cachedSnapshotFrame else { return }
- // P1 resume base: record the channel cursor this window is aligned with (nil
- // on the legacy path). Reserved for the Net/ stream-resume change; recording
- // it now keeps the cache evidence complete without changing behaviour.
-        let channel = link?.p1Channel
- // v3: persist the loaded older range too. The recovered oldest seq is
- // `olderEvents.first` (or the snapshot window's first record when the user
- // has not scrolled up yet); if the raw range had to be trimmed the payload
- // keeps `hasMoreOlder = true` so scrolling up refetches the dropped prefix.
-        let restoredOldest = cachedOlderEventFrames.first.flatMap(Self.eventFrameSeq)
-            ?? Self.snapshotOldestSeq(in: snapshot)
+        guard hasLiveSnapshot, !journal.events.isEmpty else { return }
+        let projections = ProjectionValues(
+            asOfSeq: journal.projectionsAsOfSeq,
+            values: journal.projections
+        )
         windowCache.save(
             sessionId: sessionId,
-            snapshot: snapshot,
-            events: cachedEventFrames,
-            windowMessages: hasFullWindow ? fillWindowMessages : firstWindowMessages,
+            cursor: journal.cursor,
             hasMore: journal.hasMore,
-            p1Epoch: channel?.epoch,
-            p1Sid: channel?.lastAppliedSid,
-            olderEvents: cachedOlderEventFrames,
-            oldestSeq: restoredOldest,
-            hasMoreOlder: journal.hasMoreOlder || cachedOlderFramesTruncated,
- // task-6: sticky — a cold open must not show "load earlier" again after
- // the user already reached the session's first event.
-            hasReachedOldest: journal.hasReachedOldest
+            header: journal.header,
+            projections: projections,
+            events: journal.events,
+            windowMessages: firstWindowMessages
         )
     }
 
  // MARK: - M2b-2c detail in-app timing
 
- /// Called from `SessionDetailView.onAppear`: marks the detail's first frame once
+ /// Called from the detail view's onAppear: marks the shell frame (header /
+ /// composer / message skeleton on screen, content not required yet).
+    func markDetailShellFrame() {
+        DetailMetrics.markShellFrame()
+        publishDetailMetricsValue()
+    }
+
+ /// Called from the detail view when the first message content is painted.
+    func markDetailFirstContent() {
+        DetailMetrics.markFirstContent()
+        detailFirstFrameMarked = true
+        publishDetailMetricsValue()
+    }
+
+ /// Publishes the legacy detail metrics plus the autoload key group
+ /// (tapMs / shellMs / contentMs / fillMs / fillPages / fillOldest).
+    private func publishDetailMetricsValue() {
+        guard let base = DetailMetrics.valueString else {
+            detailMetricsValue = nil
+            return
+        }
+        if let extra = DetailMetrics.autoloadValueString {
+            detailMetricsValue = base + ";" + extra
+        } else {
+            detailMetricsValue = base
+        }
+    }
+
+ /// Called from the detail view's onAppear: marks the detail's first content once
  /// the header title and/or the first message rows are available. Idempotent.
     func markDetailViewAppeared() {
         detailViewVisible = true
@@ -532,20 +448,19 @@ final class SessionViewModel: ObservableObject {
 
     private func maybeMarkDetailFirstFrame() {
         guard detailViewVisible, !detailFirstFrameMarked else { return }
- // First visible content = header title and/or the first message rows.
         guard title != nil || !rows.isEmpty else { return }
         detailFirstFrameMarked = true
-        DetailMetrics.markFirstFrame()
-        detailMetricsValue = DetailMetrics.valueString
+        DetailMetrics.markFirstContent()
+        publishDetailMetricsValue()
     }
 
     private func markDetailNetworkApplied() {
         DetailMetrics.markNetworkApplied()
-        detailMetricsValue = DetailMetrics.valueString
+        publishDetailMetricsValue()
     }
 
- /// Called from `SessionDetailView` once the running/turn indicator is on
- /// screen after a send (E2E in-app metric; no product behavior).
+ /// Called from SessionDetailView once the running/turn indicator is on screen
+ /// after a send (E2E in-app metric; no product behavior).
     func markSendTurnVisible() {
         SendMetrics.markTurnVisible()
         sendMetricsValue = SendMetrics.valueString
@@ -555,23 +470,26 @@ final class SessionViewModel: ObservableObject {
 
     func attach(link: LinkService) {
         self.link = link
- // G1 (task-6): merge live `$events` user-question waterfalls into the
- // published cards — on current builds the projection is always empty.
+ // G1 (task-6): merge live $events user-question waterfalls into the published
+ // cards — on current builds the projection is always empty.
         pendingUserQuestionsCancellable = link.$pendingUserQuestions
             .receive(on: RunLoop.main)
             .sink { [weak self] waterfalls in
                 self?.applyPendingUserQuestionWaterfalls(waterfalls)
             }
- // M2a fix: prompts typed while the transport is reconnecting are queued
- // locally; flush the oldest one as soon as the link is connected again.
+ // Prompts typed while the transport is reconnecting are queued locally and
+ // flushed on reconnect; the automatic history filler pauses/resumes with the
+ // link phase as well.
         phaseCancellable = link.$phase
             .receive(on: RunLoop.main)
             .sink { [weak self] phase in
-                guard let self, phase.isConnected else { return }
-                self.maybeFlushQueued()
- // task-10 bug2b: a pull during a reconnect used to be dropped
- // silently; replay it as soon as the link is back.
-                self.retryOlderPageAfterReconnect()
+                guard let self else { return }
+                if phase.isConnected {
+                    self.maybeFlushQueued()
+                    self.resumeHistoryFillAfterReconnect()
+                } else {
+                    self.pauseHistoryFillForOffline()
+                }
             }
     }
 
@@ -581,32 +499,30 @@ final class SessionViewModel: ObservableObject {
  // Restore the live half immediately: the Combine sink only re-fires on
  // changes, and a stop()/start() cycle clears the local cache.
         applyPendingUserQuestionWaterfalls(link.pendingUserQuestionWaterfalls(forSession: sessionId))
+        detailOnScreen = true
         openStream()
+        startHistoryFillIfPossible()
     }
 
     func stop() {
+        detailOnScreen = false
         restartTask?.cancel()
         rebuildTask?.cancel()
         subagentDebounceTask?.cancel()
-        olderPageTask?.cancel()
-        olderPageTask = nil
+        historyFillTask?.cancel()
+        historyFillTask = nil
+        cachedChunksTask?.cancel()
+        cachedChunksTask = nil
+        firstPaintCacheTask?.cancel()
+        firstPaintCacheTask = nil
         liveTextThrottleTask?.cancel()
         liveTextThrottleTask = nil
-        olderPageAwaitingReconnect = false
-        isLoadingOlder = false
-        fillTask?.cancel()
-        fillTask = nil
-        fillStream?.cancel()
-        fillStream = nil
-        fillAttempts = 0
         stream?.cancel()
         stream = nil
- // M2b-2: flush a pending debounced window write before leaving the screen.
+ // Flush a pending debounced window write before leaving the screen.
         cacheSaveTask?.cancel()
         cacheSaveTask = nil
         saveWindowCacheNow()
- // Leaving the screen: drop the live half (the projection half stays in
- // the journal and is restored by the next snapshot).
         liveUserQuestionWaterfalls = []
         rebuildActiveUserQuestions()
     }
@@ -618,18 +534,16 @@ final class SessionViewModel: ObservableObject {
         if generation > 0 {
             reopenStream()
         }
- // M2a fix: prompts queued while offline go out as soon as we are back.
         maybeFlushQueued()
     }
 
     private func reopenStream() {
         restartTask?.cancel()
-        fillTask?.cancel()
-        fillTask = nil
-        fillStream?.cancel()
-        fillStream = nil
-        fillAttempts = 0
-        hasFullWindow = false
+        historyFillTask?.cancel()
+        historyFillTask = nil
+ // Allow the filler to restart for the new window: the in-flight page keyed
+ // on the old front is cancelled, and the next snapshot/front will re-arm it.
+        historyFillState = .idle
         stream?.cancel()
         stream = nil
         openStream()
@@ -641,58 +555,33 @@ final class SessionViewModel: ObservableObject {
     }
 
  /// M4 §4: a background (silent) push asked for fresh data while this detail is
- /// open. Reopens `session/follow` so the snapshot replaces the cached rows —
- /// the same path as the retry button. No-op while offline so a background
- /// push can never paint a connection-error banner over the open session.
+ /// open. Reopens session/follow so the snapshot replaces the cached rows.
     func refreshFromSilentPush() {
         guard let link, link.phase.isConnected else { return }
         reopenStream()
     }
 
- /// P1.5-B: window size for the next `session/follow`.
- /// - First open with nothing on screen: phone-sized first window (fast paint).
- /// - Anything already on screen (cache hit, reconnect, retry): the legacy full
- /// window, so a refresh never shrinks what the user can already see.
-    private func requestedWindowMessages() -> Int {
-        if hasLiveSnapshot || didRestoreWindowFromCache || !rows.isEmpty {
-            return fillWindowMessages
-        }
-        return firstWindowMessages
-    }
-
     private func openStream() {
         guard let link else { return }
         guard link.phase.isConnected else {
-            dbg("openStream deferred: phase=" + String(describing: link.phase) + " busy=" + String(link.phase.isBusy) + " sections=" + String(rows.count))
+            dbg("openStream deferred: phase=" + String(describing: link.phase) + " sections=" + String(rows.count))
             isLoading = rows.isEmpty
             streamErrorText = link.phase.isBusy ? nil : "连接未就绪"
             return
         }
-        let messages = requestedWindowMessages()
-        if !hasLiveSnapshot && !didRestoreWindowFromCache && rows.isEmpty {
- // P1.5-B evidence: what the very first request asked for.
-            DetailMetrics.setFirstWindow(messages)
-        }
+        let messages = firstWindowMessages
         isLoading = rows.isEmpty
         do {
-            let turnWindow = messages >= fillWindowMessages
-                ? SessionWindowPolicy.fillWindowTurnWindow(messages: messages)
-                : SessionWindowPolicy.firstWindowTurnWindow(messages: messages)
+            let turnWindow = SessionWindowPolicy.firstWindowTurnWindow(messages: messages)
             let args: [String: JSONValue] = [
                 "request": .object([
                     "address": address.jsonValue,
                     "assistantStream": .bool(true),
- // P1.5-B: phone-sized window on a cold open; older history is
- // filled in the background (see scheduleBackgroundFillIfNeeded).
                     "maxMessages": .int(Int64(messages)),
- // Task session-history: stop the window at a complete-turn
- // boundary when the message budget allows it (the Host never
- // returns more messages than `maxMessages`, so the first paint
- // cost is unchanged).
                     "turnWindow": turnWindow.jsonValue,
                 ]),
             ]
-            dbg("session/follow send: messages=" + String(messages) + " turnWindow=" + String(describing: turnWindow) + " sections=" + String(rows.count) + " cache=" + String(didRestoreWindowFromCache) + " hasLive=" + String(hasLiveSnapshot))
+            dbg("session/follow send: messages=" + String(messages) + " sections=" + String(rows.count) + " cache=" + String(didRestoreFirstPaintCache) + " hasLive=" + String(hasLiveSnapshot))
             stream = try link.openStream(
                 endpoint: "session/follow",
                 args: args,
@@ -714,547 +603,255 @@ final class SessionViewModel: ObservableObject {
                     self?.isLoading = false
                 }
             )
- // A wide request (cache hit / reconnect) is already the full window; a
- // small first window schedules the background fill after its snapshot.
-            hasFullWindow = messages >= fillWindowMessages
         } catch {
             streamErrorText = NetworkErrorInterpreter.message(for: error)
             isLoading = false
         }
     }
 
- // MARK: - P1.5-B background fill (legacy 40-message window)
+ // MARK: - Automatic full-history filler (no UI)
 
- /// Bound on fill retries per open: a persistent stream error must not loop.
-    private static let maxFillAttempts = 2
+ /// Test seam (unit tests have no socket): replaces the session/page unary.
+    var historyPageLoader: (([String: JSONValue]) async throws -> JSONValue)?
 
- /// After the small first window is on screen, fetch the legacy 40-message window
- /// on a second `session/follow` and promote it to the live stream. Short
- /// sessions (`hasMore == false`) never fill: their first window is complete.
-    private func scheduleBackgroundFillIfNeeded() {
-        guard let link, link.phase.isConnected, stream != nil else { return }
-        guard needsFullWindowFill, fillAttempts < Self.maxFillAttempts else { return }
-        guard fillTask == nil, fillStream == nil else { return }
-        fillTask = Task { [weak self] in
- // Let the first rows settle first: the user already sees content, and
- // this delay keeps the fill from competing with the first paint.
-            try? await Task.sleep(nanoseconds: 600_000_000)
-            guard let self, !Task.isCancelled else { return }
-            self.fillTask = nil
-            self.openFillStream()
-        }
-    }
-
-    private func openFillStream() {
-        guard let link, link.phase.isConnected, stream != nil, needsFullWindowFill else { return }
-        fillAttempts += 1
-        do {
-            fillStream = try link.openStream(
-                endpoint: "session/follow",
-                args: [
-                    "request": .object([
-                        "address": address.jsonValue,
-                        "assistantStream": .bool(true),
-                        "maxMessages": .int(Int64(fillWindowMessages)),
- // Same turn-stop contract as the first window: the fill is
- // the legacy 40-message window, aligned to a turn start when
- // 32 messages + 8 turns are already covered.
-                        "turnWindow": SessionWindowPolicy.fillWindowTurnWindow(
-                            messages: fillWindowMessages
-                        ).jsonValue,
-                    ])
-                ],
-                onItem: { [weak self] value in
-                    self?.handleItem(value, isFill: true)
-                },
-                onEnd: { [weak self] in self?.handleFillStreamFailure() },
-                onError: { [weak self] _ in self?.handleFillStreamFailure() },
-                onClose: { [weak self] _, _ in self?.handleFillStreamFailure() }
-            )
-        } catch {
-            fillStream = nil
-            handleFillStreamFailure()
-        }
-    }
-
- /// The fill stream died before its snapshot: keep the small window live and
- /// retry once (bounded by `maxFillAttempts`).
-    private func handleFillStreamFailure() {
-        fillStream = nil
-        guard needsFullWindowFill else { return }
-        scheduleBackgroundFillIfNeeded()
-    }
-
- /// The fill snapshot replaced the small window: keep consuming that stream as
- /// the live one and drop the small-window stream.
-    private func promoteFillStream() {
-        fillTask?.cancel()
-        fillTask = nil
-        stream?.cancel()
-        stream = fillStream
-        fillStream = nil
-    }
-
- /// Paint the first rows without waiting for the 40ms rebuild debounce. Only the
- /// first snapshot benefits (subsequent frames still coalesce).
-    private func paintFirstRowsImmediately() {
-        guard detailViewVisible, !detailFirstFrameMarked else { return }
-        rebuildTask?.cancel()
-        rebuildTask = nil
-        pendingRebuild = false
-        rebuildRows()
-    }
-
- // MARK: - Older history pagination (unary session/page)
-
- /// `session/page` wire request. Key names and shape are the Host schema exactly
- /// (`spikes/protocol/samples/endpoints.json` → `session/page`, verified
- /// ): `{request:{address, throughSeq, beforeSeq, maxMessages,
- /// turnWindow}}`.
- ///
- /// `throughSeq` is the inclusive log cut taken from the corresponding
- /// `session/follow` opening frame (`snapshot.cursor`); `beforeSeq` is
- /// **exclusive** (Host: `end = min(throughSeq + 1, beforeSeq?? throughSeq + 1)`),
- /// so the next request passes the current oldest loaded seq and walks strictly
- /// backwards. `maxMessages` counts only append-origin user/assistant messages —
- /// a page still contains *all* events of its seq range (tool calls, turn
- /// starts,...), which is what the journal front-merge consumes.
-    nonisolated static func olderPageRequestArgs(
+ /// session/page wire request (same key names the old manual pager used).
+    nonisolated static func historyPageRequestArgs(
         address: SessionFollowAddress,
         throughSeq: Int,
-        beforeSeq: Int
+        beforeSeq: Int,
+        maxMessages: Int
     ) -> [String: JSONValue] {
         [
             "request": .object([
                 "address": address.jsonValue,
                 "throughSeq": .int(Int64(throughSeq)),
                 "beforeSeq": .int(Int64(beforeSeq)),
-                "maxMessages": .int(Int64(SessionWindowPolicy.pageWindowMessages)),
-                "turnWindow": SessionWindowPolicy.pageTurnWindow.jsonValue,
+                "maxMessages": .int(Int64(maxMessages)),
             ]),
         ]
     }
 
- /// View contract: called whenever the scroll approaches the top (may be called
- /// repeatedly and at high frequency). No-op when there is no older history, a
- /// request is already in flight, or no snapshot/cursor exists yet. A pull while
- /// the link is reconnecting is **not** a silent no-op (task-10 bug2b): it
- /// surfaces a visible error and is replayed as soon as the link is back.
-    func loadOlderIfNeeded() {
- // task-6: settle the terminal state before deciding anything, so a stale
- // cache/restore flag can never resurrect the entry after seq 0 is loaded.
-        syncOlderState()
-        if let block = olderPageBlock {
-            noteOlderPageBlocked(block)
+    private var historyPageMessages: Int {
+        SessionWindowPolicy.historyPageMessages(isRelay: NetworkPathMonitor.shared.prefersRelay)
+    }
+
+ /// Starts the automatic fill when the prerequisites are met. Safe to call from
+ /// every trigger (start / cache restore / snapshot / reconnect): idempotent.
+    func startHistoryFillIfPossible() {
+        guard detailOnScreen, historyFillTask == nil else { return }
+        guard historyFillState != .completed, historyFillState != .failed else { return }
+        guard journal.cursor >= 0, journal.oldestSeq != nil, !journal.events.isEmpty else { return }
+        if !journal.hasMoreOlder {
+            markHistoryFillCompleted()
             return
         }
-        isLoadingOlder = true
-        let throughSeq = journal.cursor
-        let beforeSeq = journal.oldestSeq ?? 0
-        olderPageTask = Task { [weak self] in
-            await self?.performOlderPageLoad(throughSeq: throughSeq, beforeSeq: beforeSeq)
-        }
-    }
-
- /// Test seam: runs one page load and awaits it. The view path runs the same
- /// `performOlderPageLoad` from a Task; unit tests drive the state machine
- /// deterministically through this wrapper.
-    func loadOlderPageNowForTesting() async {
-        syncOlderState()
-        if let block = olderPageBlock {
-            noteOlderPageBlocked(block)
+        guard historyPageLoader != nil || (link?.phase.isConnected ?? false) else {
+            pauseHistoryFillForOffline()
             return
         }
-        isLoadingOlder = true
-        await performOlderPageLoad(throughSeq: journal.cursor, beforeSeq: journal.oldestSeq ?? 0)
+        if historyFillStartedAt == nil { historyFillStartedAt = Date() }
+        historyFillState = .loading
+        syncFillDiagnostics()
+        historyFillTask = Task { [weak self] in
+            await self?.runHistoryFillLoop()
+        }
     }
 
- /// Why a pull cannot start a page load (nil = it can). Classified instead of a
- /// bare `canStart` bool so the silent-no-op guard (task-10 bug2b) can surface
- /// a visible reason — and E2E can tell "the gesture never reached us" from
- /// "the load was blocked/rejected".
-    private enum OlderPageBlock: String {
-        case noOlderHistory = "no-more-history"
-        case alreadyLoading = "already-loading"
-        case windowNotReady = "window-not-ready"
-        case notConnected = "not-connected"
+    private enum HistoryPageOutcome {
+        case progress
+        case terminal
+        case retryStalePage
+        case failed
+        case cancelled
     }
 
-    private var olderPageBlock: OlderPageBlock? {
-        guard hasMoreOlder else { return .noOlderHistory }
-        guard !isLoadingOlder else { return .alreadyLoading }
- // Never ask for a page in front of seq 0: reaching the first event is the
- // terminal state (a `beforeSeq=0` request would only return an empty page).
-        guard journal.cursor >= 0, let oldest = journal.oldestSeq, oldest > 0 else { return .windowNotReady }
-        guard olderPageLoader != nil || (link?.phase.isConnected ?? false) else { return .notConnected }
-        return nil
-    }
-
- /// task-10 bug2b: a user pull that cannot start must not be a silent no-op.
- /// Only the reconnect case is a *failure* worth surfacing (it is replayed
- /// automatically); the other blocks are legitimate no-ops (already loading /
- /// nothing older / window not painted yet), but they still leave an E2E trace.
-    private func noteOlderPageBlocked(_ block: OlderPageBlock) {
-        switch block {
-        case .notConnected:
-            olderPageAwaitingReconnect = true
-            if !olderPageErrorShown {
-                actionErrorText = L10n.f("加载更早历史失败：%@", "网络连接中断，恢复后会自动重试")
-                olderPageErrorShown = true
+ /// Pulls pages backwards until the session's first event is loaded. Silent: no
+ /// spinner, no error banner; offline pauses and reconnects resume automatically.
+    private func runHistoryFillLoop() async {
+        defer { historyFillTask = nil }
+        var retriedStalePage = false
+        while !Task.isCancelled {
+            guard detailOnScreen else { return }
+            guard journal.hasMoreOlder else {
+                markHistoryFillCompleted()
+                return
             }
-            publishOlderPageDebug("blocked(not-connected);" + olderPageContext())
-            dbg("older page blocked: not-connected")
-        case .windowNotReady:
-            publishOlderPageDebug("blocked(window-not-ready);" + olderPageContext())
-            dbg("older page blocked: window-not-ready")
-        case .noOlderHistory:
-            publishOlderPageDebug("blocked(no-more-history);" + olderPageContext())
-        case .alreadyLoading:
-            break
-        }
-    }
-
- /// E2E context tying a page attempt to its lifecycle: a push deep-link reentry
- /// opens a **fresh VM** (firstPage=1) that may paint from the on-disk cache
- /// (cacheRestore=1) before the live snapshot (hasLive) lands.
-    private func olderPageContext() -> String {
-        "ctx(firstPage=\(olderPageMergedCount == 0 ? 1 : 0),cacheRestore=\(didRestoreWindowFromCache ? 1 : 0),hasLive=\(hasLiveSnapshot ? 1 : 0),pagesLoaded=\(olderPageMergedCount))"
-    }
-
- /// Replays the pull that was dropped while the link was reconnecting.
-    private func retryOlderPageAfterReconnect() {
-        guard olderPageAwaitingReconnect else { return }
-        olderPageAwaitingReconnect = false
-        guard hasMoreOlder, !isLoadingOlder else { return }
-        dbg("older page: replay pull after reconnect (oldest=" + String(journal.oldestSeq ?? -1) + ")")
-        loadOlderIfNeeded()
-    }
-
- /// Publishes the paging front from the journal. `hasMoreOlder` can never be true
- /// once the first event is loaded; every path that learns about older history
- /// (cache restore, live snapshot, page merge, row rebuild) goes through here so
- /// the view-facing flag cannot drift from the window it describes.
-    private func syncOlderState() {
-        hasMoreOlder = journal.hasMoreOlder
-    }
-
- /// One `session/page` round trip + front merge.
- ///
- /// Failure policy (task-10 bug2b): the current window is left untouched and
- /// `hasMoreOlder` stays true, but a page that cannot be merged is **never a
- /// silent no-op** — the user pulled, saw the spinner and must either see older
- /// rows or a visible, retryable error:
- /// - the page is stale/non-adjacent (the window front moved while the request
- /// was in flight: reconnect snapshot, concurrent prepend) → retry once
- /// against the *fresh* front;
- /// - the retry is rejected too → surface `actionErrorText`;
- /// - an empty page (or Host `hasMore == false`) terminates pagination; the
- /// entry row disappearing is the visible state change.
-    private func performOlderPageLoad(throughSeq: Int, beforeSeq: Int) async {
-        defer { isLoadingOlder = false }
-        let startedAt = Date()
-        var attempt = 0
-        while true {
-            attempt += 1
-            let retrying = attempt > 1
- // The retry re-reads the front: the first request was keyed on the
- // window front at *trigger* time, which may already be stale.
-            let requestThrough = retrying ? journal.cursor : throughSeq
-            let requestBefore = retrying ? (journal.oldestSeq ?? 0) : beforeSeq
-            let oldestBefore = journal.oldestSeq
-            let args = Self.olderPageRequestArgs(
-                address: address,
-                throughSeq: requestThrough,
-                beforeSeq: requestBefore
-            )
-            do {
-                let value: JSONValue
-                if let olderPageLoader {
-                    value = try await olderPageLoader(args)
-                } else if let link {
-                    value = try await link.unary("session/page", args: args)
+            guard journal.cursor >= 0, let oldest = journal.oldestSeq else {
+                try? await Task.sleep(nanoseconds: 100_000_000)
+                continue
+            }
+            guard historyPageLoader != nil || (link?.phase.isConnected ?? false) else {
+                pauseHistoryFillForOffline()
+                return
+            }
+            let outcome = await fetchHistoryPage(beforeSeq: oldest)
+            switch outcome {
+            case .progress:
+                retriedStalePage = false
+                historyFillFailures = 0
+                rebuildNowForHistoryBatch()
+                syncFillDiagnostics()
+                saveWindowCacheNow()
+            case .terminal:
+                markHistoryFillCompleted()
+                return
+            case .retryStalePage:
+                if retriedStalePage {
+                    historyFillFailures += 1
+                    await sleepToBackoffIfNeeded()
                 } else {
-                    throw LinkError.notPaired
+                    retriedStalePage = true
                 }
-                let page = try value.decode(SessionPage.self)
-                let rawFrames = value["records"]?.arrayValue?.compactMap { $0["event"] } ?? []
-                let update = journal.prepend(page: page)
-                applyJournalUpdate(update)
-                let oldestAfter = journal.oldestSeq
-                let merged: Bool = {
-                    guard let before = oldestBefore, let after = oldestAfter else { return false }
-                    return after < before
-                }()
-                if merged, case .olderPrepended(let inserted) = update, !inserted.isEmpty {
-                    let insertedSet = Set(inserted)
-                    let addedFrames = rawFrames.filter { frame in
-                        guard let seq = Self.eventFrameSeq(frame) else { return false }
-                        return insertedSet.contains(seq)
-                    }
-                    appendCachedOlderFrames(addedFrames)
-                    scheduleCacheSave()
-                }
-                syncOlderState()
-                let usedMs = Int(Date().timeIntervalSince(startedAt) * 1000)
-                let debugContext = olderPageContext()
-                let debugLine = Self.olderPageDebugLine(
-                    requestBefore: requestBefore,
-                    requestThrough: requestThrough,
-                    records: page.records.count,
-                    hasMore: page.hasMore,
-                    update: update,
-                    merged: merged,
-                    oldestBefore: oldestBefore,
-                    oldestAfter: oldestAfter,
-                    retried: retrying,
-                    usedMs: usedMs,
-                    context: debugContext
-                )
-                if merged { olderPageMergedCount += 1 }
-                if merged {
-                    olderPageAwaitingReconnect = false
-                    if olderPageErrorShown {
-                        actionErrorText = nil
-                        olderPageErrorShown = false
-                    }
-                    publishOlderPageDebug(debugLine)
-                    dbg("older page: " + debugLine)
+            case .failed:
+                historyFillFailures += 1
+                if historyFillFailures > 5 {
+                    historyFillState = .failed
+                    syncFillDiagnostics()
                     return
                 }
-                if page.records.isEmpty || !journal.hasMoreOlder {
- // Terminal by design: the page carried nothing older (or the
- // Host reached the log start); the entry row goes away.
-                    olderPageAwaitingReconnect = false
-                    publishOlderPageDebug(debugLine)
-                    dbg("older page terminal: " + debugLine)
-                    return
-                }
-                if !retrying {
- // Stale/non-adjacent page: the front moved under us. Retry
- // once with the fresh front instead of dropping the gesture.
-                    dbg("older page rejected, retrying with fresh front: " + debugLine)
-                    continue
-                }
-                let reason = "分页窗口已变化，请重试"
-                actionErrorText = L10n.f("加载更早历史失败：%@", reason)
-                olderPageErrorShown = true
-                publishOlderPageDebug(debugLine + ";error=" + reason)
-                dbg("older page rejected after retry: " + debugLine)
-                return
-            } catch {
-                let message = NetworkErrorInterpreter.message(for: error)
-                actionErrorText = L10n.f("加载更早历史失败：%@", message)
-                olderPageErrorShown = true
-                publishOlderPageDebug(
-                    "req(before=\(requestBefore),through=\(requestThrough));error=" + message + ";" + olderPageContext()
-                )
-                dbg("older page failed: " + message)
+                await sleepToBackoffIfNeeded()
+            case .cancelled:
                 return
             }
         }
     }
 
- /// E2E/DEBUG only: publishes the last paging attempt for the hidden
- /// `e2e-lastpage` element. The product path never writes it.
-    private func publishOlderPageDebug(_ value: String) {
-        guard Self.e2ePageDiagnosticsEnabled || Self.e2ePageDiagnosticsTestOverride else { return }
-        e2eLastPageDebug = value
+    private func sleepToBackoffIfNeeded() async {
+        let exponent = max(0, min(historyFillFailures - 1, 3))
+        let seconds = pow(2.0, Double(exponent))
+        try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
     }
 
- /// `req(before=3232,through=4179);resp(records=263,hasMore=1);prepend(olderPrepended(inserted=2880-3231,count=352),merged=1);oldest=3232->2880;usedMs=812;retry=0`
-    nonisolated private static func olderPageDebugLine(
-        requestBefore: Int,
-        requestThrough: Int,
-        records: Int,
-        hasMore: Bool,
-        update: SessionJournal.Update,
-        merged: Bool,
-        oldestBefore: Int?,
-        oldestAfter: Int?,
-        retried: Bool,
-        usedMs: Int,
-        context: String
-    ) -> String {
-        let before = oldestBefore.map(String.init) ?? "-"
-        let after = oldestAfter.map(String.init) ?? "-"
-        return "req(before=\(requestBefore),through=\(requestThrough))"
-            + ";resp(records=\(records),hasMore=\(hasMore ? 1 : 0))"
-            + ";prepend(\(describeOlderPageUpdate(update)),merged=\(merged ? 1 : 0))"
-            + ";oldest=\(before)->\(after)"
-            + ";usedMs=\(usedMs)"
-            + ";retry=\(retried ? 1 : 0)"
-            + ";" + context
-    }
-
-    nonisolated private static func describeOlderPageUpdate(_ update: SessionJournal.Update) -> String {
-        switch update {
-        case .olderPrepended(let seqs):
-            guard let first = seqs.first, let last = seqs.last else { return "olderPrepended(empty)" }
-            return "olderPrepended(inserted=\(first)-\(last),count=\(seqs.count))"
-        case .snapshotReplaced:
-            return "snapshotReplaced"
-        case .eventsApplied(let seqs):
-            return "eventsApplied(count=\(seqs.count))"
-        case .duplicate(let seq):
-            return "duplicate(\(seq))"
-        case .gap(let expected, let received):
-            return "gap(expected=\(expected),received=\(received))"
-        case .assistantRevisionGap(let expected, let received):
-            return "assistantRevisionGap(expected=\(expected),received=\(received))"
-        case .assistantStreamProgress(let revision):
-            return "assistantStreamProgress(\(revision))"
-        case .ignored:
-            return "ignored"
-        }
-    }
-
- // MARK: - Raw older-range tracking (window cache)
-
- /// Mirrors the journal's snapshot merge for the raw frames kept for the cache:
- /// after `apply(snapshot:)` the loaded older prefix is exactly those previous
- /// raw frames whose seq is still in the journal *and* older than the new
- /// snapshot window.
-    private func refreshCachedOlderFrames(
-        previousSnapshotFrame: JSONValue?,
-        newSnapshotOldest: Int?
-    ) {
-        let previousSnapshotEvents = previousSnapshotFrame?["records"]?.arrayValue?
-            .compactMap { $0["event"] } ?? []
-        let candidates = cachedOlderEventFrames + previousSnapshotEvents + cachedEventFrames
-        let preserved = Set(journal.events.lazy.map(\.seq))
-        var kept: [JSONValue] = []
-        for frame in candidates {
-            guard let seq = Self.eventFrameSeq(frame) else { continue }
-            if let newSnapshotOldest, seq >= newSnapshotOldest { continue }
-            guard preserved.contains(seq) else { continue }
-            kept.append(frame)
-        }
-        cachedOlderEventFrames = Self.mergedEventFrames(kept)
- // task-7: never persist a prefix that is not a gap-free run ending right
- // below the snapshot window. A hole written into the cache comes back as a
- // hole-y cold-start window (whole turns missing / a finished turn shows
- // "running"), and paging can never fill an interior hole.
-        if let newSnapshotOldest {
-            let seqs = cachedOlderEventFrames.compactMap { Self.eventFrameSeq($0) }
-            let contiguous = zip(seqs, seqs.dropFirst()).allSatisfy { $0 + 1 == $1 }
-            let adjacent = seqs.last.map { $0 + 1 == newSnapshotOldest } ?? true
-            if !contiguous || !adjacent {
-                cachedOlderEventFrames = []
-                cachedOlderFramesTruncated = true
+    private func fetchHistoryPage(beforeSeq: Int) async -> HistoryPageOutcome {
+        let args = Self.historyPageRequestArgs(
+            address: address,
+            throughSeq: journal.cursor,
+            beforeSeq: beforeSeq,
+            maxMessages: historyPageMessages
+        )
+        do {
+            let value: JSONValue
+            if let historyPageLoader {
+                value = try await historyPageLoader(args)
+            } else if let link {
+                value = try await link.unary("session/page", args: args)
+            } else {
+                return .failed
             }
-        }
-        rebuildCachedOlderFrameBytes()
-    }
-
- /// Adds newly paged raw frames to the front of the cache range, keeping the
- /// serialized budget. Dropped frames are refetched by scrolling up because the
- /// saved payload then reports `hasMoreOlder = true`.
-    private func appendCachedOlderFrames(_ frames: [JSONValue]) {
-        guard !frames.isEmpty else { return }
-        cachedOlderEventFrames = Self.mergedEventFrames(cachedOlderEventFrames + frames)
-        for frame in frames {
-            guard let seq = Self.eventFrameSeq(frame),
-                  cachedOlderFrameBytes[seq] == nil else { continue }
-            let bytes = Self.serializedBytes(frame)
-            cachedOlderFrameBytes[seq] = bytes
-            cachedOlderFramesBytes += bytes
-        }
- // Re-align the size table with the merged (de-duplicated) frame list.
-        if cachedOlderFrameBytes.count != cachedOlderEventFrames.count {
-            let kept = Set(cachedOlderEventFrames.compactMap { Self.eventFrameSeq($0) })
-            cachedOlderFrameBytes = cachedOlderFrameBytes.filter { kept.contains($0.key) }
-            cachedOlderFramesBytes = cachedOlderFrameBytes.values.reduce(0, +)
-        }
-        var dropped = 0
-        while cachedOlderFramesBytes > Self.maxCachedOlderBytes,
-              let oldest = cachedOlderEventFrames.first,
-              let seq = Self.eventFrameSeq(oldest) {
-            cachedOlderEventFrames.removeFirst()
-            if let bytes = cachedOlderFrameBytes.removeValue(forKey: seq) {
-                cachedOlderFramesBytes -= bytes
+            if Task.isCancelled { return .cancelled }
+            let page = try value.decode(SessionPage.self)
+            let oldestBefore = journal.oldestSeq
+            let update = journal.prepend(page: page)
+            applyJournalUpdate(update)
+            let oldestAfter = journal.oldestSeq
+            let merged: Bool = {
+                guard let before = oldestBefore, let after = oldestAfter else { return false }
+                return after < before
+            }()
+ // Count the page even when it is also the terminal one (a short session
+ // that fits in one page used to report pages=0).
+            if merged {
+                historyFillPages += 1
+                if Self.e2eFillDiagnosticsEnabled || Self.e2eFillDiagnosticsTestOverride {
+                    historyFillBytes += CacheIO.encode(value)?.count ?? 0
+                }
             }
-            dropped += 1
-        }
-        if dropped > 0 {
-            cachedOlderFramesTruncated = true
-        }
-    }
-
-    private func rebuildCachedOlderFrameBytes() {
-        var sizes: [Int: Int] = [:]
-        var total = 0
-        for frame in cachedOlderEventFrames {
-            guard let seq = Self.eventFrameSeq(frame) else { continue }
-            let bytes = Self.serializedBytes(frame)
-            sizes[seq] = bytes
-            total += bytes
-        }
-        cachedOlderFrameBytes = sizes
-        cachedOlderFramesBytes = total
-    }
-
- /// Longest gap-free suffix of a decoded older range that is adjacent to the
- /// snapshot window's first record. Anything else is unusable: restoring a
- /// non-contiguous prefix would render a window with a hole (task-7).
-    static func contiguousOlderSuffix(_ events: [SessionEvent], snapshotOldest: Int?) -> [SessionEvent] {
-        guard let snapshotOldest else { return [] }
-        let older = events.filter { $0.seq < snapshotOldest }.sorted { $0.seq < $1.seq }
-        guard let last = older.last, last.seq + 1 == snapshotOldest else { return [] }
-        var start = older.count - 1
-        while start > 0, older[start].seq == older[start - 1].seq + 1 {
-            start -= 1
-        }
-        return Array(older[start...])
-    }
-
- /// Sorted, seq-de-duplicated raw `event` objects.
-    private static func mergedEventFrames(_ frames: [JSONValue]) -> [JSONValue] {
-        var bySeq: [Int: JSONValue] = [:]
-        for frame in frames {
-            guard let seq = eventFrameSeq(frame), bySeq[seq] == nil else { continue }
-            bySeq[seq] = frame
-        }
-        return bySeq.keys.sorted().compactMap { bySeq[$0] }
-    }
-
- /// `seq` of a raw `event` object (the `event` field of an `{"type":"event"}`
- /// frame / `session/page` record).
-    private static func eventFrameSeq(_ frame: JSONValue) -> Int? {
-        guard let raw = frame["seq"]?.intValue else { return nil }
-        let seq = Int(raw)
-        return seq >= 0 ? seq : nil
-    }
-
- /// Oldest record seq of a raw `{"type":"snapshot",...}` frame.
-    private static func snapshotOldestSeq(in snapshot: JSONValue) -> Int? {
-        guard let records = snapshot["records"]?.arrayValue else { return nil }
-        var oldest: Int?
-        for record in records {
-            guard let eventValue = record["event"],
-                  let seq = eventFrameSeq(eventValue) else { continue }
-            if oldest == nil || seq < oldest! {
-                oldest = seq
+            if page.records.isEmpty || !journal.hasMoreOlder {
+                return .terminal
             }
+            guard merged else { return .retryStalePage }
+            dbg("history page merged: pages=" + String(historyFillPages)
+                + " oldest=" + String(journal.oldestSeq ?? -1)
+                + " rows=" + String(rows.count))
+            return .progress
+        } catch {
+            dbg("history page failed: " + NetworkErrorInterpreter.message(for: error))
+            return .failed
         }
-        return oldest
     }
 
-    private static func serializedBytes(_ value: JSONValue) -> Int {
-        (try? JSONEncoder().encode(value))?.count ?? 0
+    private func markHistoryFillCompleted() {
+        guard historyFillState != .completed else { return }
+        historyFillState = .completed
+        historyFillCompletedAt = Date()
+        if let started = historyFillStartedAt {
+            let milliseconds = Date().timeIntervalSince(started) * 1000
+            DetailMetrics.markHistoryFillCompleted(
+                milliseconds: milliseconds,
+                pages: historyFillPages,
+                oldestSeq: journal.oldestSeq ?? -1
+            )
+        }
+        historyFillTask?.cancel()
+        historyFillTask = nil
+        syncFillDiagnostics()
+        saveWindowCacheNow()
+        publishDetailMetricsValue()
+    }
+
+    private func pauseHistoryFillForOffline() {
+ // From idle too: a cold open while offline must show pausedOffline so the
+ // reconnect resumes it (a plain idle would look like "nothing to load").
+        guard historyFillState == .loading || historyFillState == .idle else { return }
+        historyFillTask?.cancel()
+        historyFillTask = nil
+        historyFillState = .pausedOffline
+        syncFillDiagnostics()
+    }
+
+    private func resumeHistoryFillAfterReconnect() {
+        guard historyFillState == .pausedOffline || historyFillState == .failed else { return }
+        historyFillState = .idle
+        startHistoryFillIfPossible()
+    }
+
+    private static let e2eFillDiagnosticsEnabled =
+        ProcessInfo.processInfo.environment["DSHM_E2E"] == "1"
+        || ProcessInfo.processInfo.environment["DSHM_DEBUG_STREAM"] == "1"
+ /// Unit-test seam: the simulator test runner has no E2E env.
+    static var e2eFillDiagnosticsTestOverride = false
+
+ /// E2E-only filler probe (e2e-history-fill hidden element).
+    private func syncFillDiagnostics() {
+        guard Self.e2eFillDiagnosticsEnabled || Self.e2eFillDiagnosticsTestOverride else { return }
+        let elapsedMs: Int
+        if let started = historyFillStartedAt {
+            elapsedMs = Int(Date().timeIntervalSince(started) * 1000)
+        } else {
+            elapsedMs = -1
+        }
+        let holes = journal.isWindowContiguous ? 0 : 1
+        historyFillProbeValue = "state=" + historyFillState.rawValue
+            + ";pages=" + String(historyFillPages)
+            + ";oldest=" + String(journal.oldestSeq ?? -1)
+            + ";bytes=" + String(historyFillBytes)
+            + ";ms=" + String(elapsedMs)
+            + ";rows=" + String(rows.count)
+            + ";holes=" + String(holes)
+            + ";hasMore=" + (journal.hasMoreOlder ? "1" : "0")
+            + ";failures=" + String(historyFillFailures)
+            + ";gen=" + String(link?.generation ?? -1)
+    }
+
+ /// Test seam: run the filler until it completes / fails / has nothing to do.
+ /// Sets the on-screen gate so unit tests can drive the state machine without a
+ /// real view/link.
+    func runHistoryFillForTesting() async {
+        detailOnScreen = true
+        startHistoryFillIfPossible()
+        await historyFillTask?.value
     }
 
  // MARK: - Frame handling
 
-    private func handleItem(_ value: JSONValue?, isFill: Bool = false) {
+    private func handleItem(_ value: JSONValue?) {
         guard let value else { return }
         lastEventAt = Date()
         do {
             let frame = try SessionStreamFrame.decode(value)
             switch frame {
             case .snapshot(let snapshot):
-                dbg("snapshot: records=" + String(snapshot.records.count) + " cursor=" + String(snapshot.cursor) + " hasMore=" + String(describing: snapshot.hasMore) + " isFill=" + String(isFill))
-                let previousSnapshotFrame = cachedSnapshotFrame
-                let newSnapshotOldest = Self.snapshotOldestSeq(in: value)
+                dbg("snapshot: records=" + String(snapshot.records.count) + " cursor=" + String(snapshot.cursor) + " hasMore=" + String(describing: snapshot.hasMore))
                 let update = journal.apply(snapshot: snapshot)
                 applyJournalUpdate(update)
  // v5.5 §14.5 first frame: seed the context window from the
@@ -1262,49 +859,26 @@ final class SessionViewModel: ObservableObject {
                 contextPressure = journal.contextPressure
                 isLoading = false
                 streamErrorText = nil
- // Task session-history: the snapshot replaces only the newest part
- // of the window; the journal keeps the loaded older prefix. Mirror
- // that in the raw frames kept for the cache write, then adopt the
- // new snapshot frame / reset the live tail (M2b-2).
-                refreshCachedOlderFrames(
-                    previousSnapshotFrame: previousSnapshotFrame,
-                    newSnapshotOldest: newSnapshotOldest
-                )
-                cachedSnapshotFrame = value
-                cachedEventFrames = []
-                syncOlderState()
                 hasLiveSnapshot = true
                 isShowingCachedWindow = false
                 cachedWindowIsStale = false
                 scheduleCacheSave()
-                if isFill {
- // P1.5-B: the legacy 40-message window replaced the small one;
- // this stream becomes the live one from now on.
-                    hasFullWindow = true
-                    promoteFillStream()
-                } else {
  // M2b-2c: live snapshot network cost (detail in-app metric).
-                    markDetailNetworkApplied()
-                    if !hasFullWindow {
- // P1.5-B: paint the first rows immediately (no 40ms debounce);
- // the full window is filled in behind.
-                        paintFirstRowsImmediately()
-                    }
+                markDetailNetworkApplied()
+                if !detailFirstFrameMarked {
+ // First content: paint without the 40ms rebuild debounce.
+                    rebuildNowForHistoryBatch()
                 }
-                if !hasFullWindow {
-                    scheduleBackgroundFillIfNeeded()
-                }
+ // User decision: entering the detail starts the full-history
+ // fill immediately; no user gesture, no visible indicator.
+                startHistoryFillIfPossible()
             case .event(let event):
                 dbg("event: " + event.type + " seq=" + String(event.seq))
                 let update = journal.apply(event: event)
                 applyJournalUpdate(update)
- // M2b-2: cache only events the journal actually appended, so the
- // persisted tail stays contiguous with the cached snapshot (a
- // duplicate/gap frame would make the cache unreplayable).
-                if case .eventsApplied = update,
-                   let rawEvent = value["event"],
-                   cachedEventFrames.count < Self.maxCachedEvents {
-                    cachedEventFrames.append(rawEvent)
+ // Window cache: debounced write of the newest 4 screens (only events
+ // the journal actually appended keep the payload contiguous).
+                if case .eventsApplied = update {
                     scheduleCacheSave()
                 }
  // v5.4 task-13 / v5.5 §14.5: relay, turn and assistant-attempt
@@ -1345,6 +919,7 @@ final class SessionViewModel: ObservableObject {
             if seqs.isEmpty {
                 publishLiveAssistantText()
             } else {
+                pendingHistoryBatch = true
                 pendingRebuild = true
                 scheduleRebuild()
             }
@@ -1377,6 +952,15 @@ final class SessionViewModel: ObservableObject {
         }
     }
 
+ /// Drops a pending debounced rebuild and rebuilds now. Used for the first
+ /// content paint and for history batches (the view anchors on the token).
+    private func rebuildNowForHistoryBatch() {
+        rebuildTask?.cancel()
+        rebuildTask = nil
+        pendingRebuild = false
+        rebuildRows()
+    }
+
     private func scheduleRebuild() {
         guard pendingRebuild else { return }
         guard rebuildTask == nil else { return }
@@ -1398,13 +982,33 @@ final class SessionViewModel: ObservableObject {
         let echoCountBefore = pendingUserEchoes.count
         pendingUserEchoes.reconcile(events: journal.events)
         let retiredEchoes = echoCountBefore - pendingUserEchoes.count
-        flow = SessionRowBuilder.build(
-            events: journal.events,
-            pendingUserEchoes: pendingUserEchoes.echoes,
-            nowMs: Self.epochMilliseconds()
-        )
-        dbg("rebuild: events=" + String(journal.events.count) + " rows=" + String(flow.rows.count) + " hasMoreOlder=" + String(journal.hasMoreOlder) + " oldest=" + String(journal.oldestSeq ?? -1) + " pendingEchoes=" + String(pendingUserEchoes.count) + (retiredEchoes > 0 ? " retired=" + String(retiredEchoes) : "") + (flow.isRunning ? " running" : " idle"))
-        syncOlderState()
+        let events = journal.events
+        let nowMs = Self.epochMilliseconds()
+ // Incremental render: the journal window only changes at the
+ // tail (live events), at the front (history pages) or wholesale (snapshot /
+ // reconnect reset). Auto-detect which one happened so a running session with
+ // the full history loaded does not re-fold thousands of events per frame.
+        if let range = renderState.loadedSeqRange,
+           let first = events.first?.seq,
+           let last = events.last?.seq {
+            if first == range.lowerBound, last == range.upperBound {
+ // Window unchanged (derived refresh only): keep the folded rows.
+            } else if first == range.lowerBound, last > range.upperBound {
+                let appended = events.filter { $0.seq > range.upperBound }
+                renderState.append(events: appended, pendingUserEchoes: pendingUserEchoes.echoes, nowMs: nowMs)
+            } else if last == range.upperBound, first < range.lowerBound {
+                let prepended = events.filter { $0.seq < range.lowerBound }
+                renderState.prepend(events: prepended, pendingUserEchoes: pendingUserEchoes.echoes, nowMs: nowMs)
+            } else {
+                renderState.reset(events: events, pendingUserEchoes: pendingUserEchoes.echoes, nowMs: nowMs)
+            }
+        } else {
+            renderState.reset(events: events, pendingUserEchoes: pendingUserEchoes.echoes, nowMs: nowMs)
+        }
+        flow = renderState.flow
+        flowGroups = renderState.groups
+        dbg("rebuild: events=" + String(events.count) + " rows=" + String(flow.rows.count) + " hasMoreOlder=" + String(journal.hasMoreOlder) + " oldest=" + String(journal.oldestSeq ?? -1) + " pendingEchoes=" + String(pendingUserEchoes.count) + (retiredEchoes > 0 ? " retired=" + String(retiredEchoes) : "") + (flow.isRunning ? " running" : " idle"))
+        syncFillDiagnostics()
         title = journal.title
         permissionsValue = journal.permissionsValue
         todos = journal.todos
@@ -1441,15 +1045,14 @@ final class SessionViewModel: ObservableObject {
         if SessionQueuePolicy.shouldFlush(wasRunning: wasRunning, isRunning: isRunning, queuedCount: queuedPrompts.count) {
             flushNextQueuedPrompt()
         }
- // M2b-2c: if the detail is already on screen (no cache hit -> first rows came
- // from the live snapshot), this is the first visible content.
-        maybeMarkDetailFirstFrame()
- // P1.5-B: the legacy 40-message window is on screen (background fill landed,
- // or the open used the wide window). Evidence only, idempotent.
-        if hasFullWindow {
-            DetailMetrics.markFullWindowApplied()
-            detailMetricsValue = DetailMetrics.valueString
+        if pendingHistoryBatch {
+            pendingHistoryBatch = false
+            historyBatchToken &+= 1
         }
+        syncFillDiagnostics()
+ // M2b-2c: if the detail is already on screen (cache or live snapshot), this
+ // is the first visible content.
+        maybeMarkDetailFirstFrame()
     }
 
  // MARK: - Session-list derived refresh (v5.4 task-13 / v5.5 §14.5)
@@ -1680,11 +1283,14 @@ final class SessionViewModel: ObservableObject {
  /// could briefly report idle between `session/prompt` and `turn/start`
  /// (queue-flush side effects). A pending row only ever needs appending.
     private func repaintPendingUserEchoes() {
-        flow.rows = SessionRowBuilder.appendingPendingEchoes(
+ // Repaint only the optimistic tail rows through the incremental state so
+ // flowGroups stays in sync with flow.rows (the view reads flowGroups).
+        renderState.repaintPendingEchoes(
             pendingUserEchoes.echoes,
-            to: flow.rows,
             nowMs: Self.epochMilliseconds()
         )
+        flow = renderState.flow
+        flowGroups = renderState.groups
     }
 
  /// `mode:"steer"` can legitimately wait minutes for the running turn's next

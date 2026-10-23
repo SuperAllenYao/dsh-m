@@ -665,6 +665,9 @@ final class AppModel: ObservableObject {
     }
 
     private func applyDeepLinkNavigation(_ navigation: PushDeepLinkNavigation) {
+ // t0 for the user-perceived detail latency on the notification
+ // deep-link path (same clock as the list tap).
+        DetailMetrics.beginTap()
         if let context = navigation.context, let parentAddress = navigation.parentAddress {
             subagentRoute = SubagentRoute(context: context, parentAddress: parentAddress)
         } else {
