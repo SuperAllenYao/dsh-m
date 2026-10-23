@@ -575,6 +575,31 @@ final class CacheTests: XCTestCase {
         XCTAssertEqual(renderedUserTexts(viewModel.rows), ["hello"])
     }
 
+    /// 2026-10-23 真机/模拟器回归：热缓存 + 快链路时，off-main 的首屏缓存恢复可能
+    /// 晚于 live `session/follow` 快照到达。恢复侧不得把 `isShowingCachedWindow`
+    /// 再置 true，否则「显示本地缓存，正在同步…」横幅/菊花会永久卡死（没有下一帧
+    /// 快照来清它）。真机手动复现：会话 idle、补齐已完成，横幅 65s 仍在。
+    @MainActor
+    func testLateCacheRestoreDoesNotReArmCacheBannerAfterLiveSnapshot() async throws {
+        let store = windowStore()
+        XCTAssertTrue(store.save(
+            sessionId: "s1", cursor: 3, hasMore: true, header: nil, projections: nil,
+            events: cachedEvents(windowEvents()), windowMessages: 16
+        ))
+        let viewModel = SessionViewModel(address: .session(sessionId: "s1"), windowCache: store)
+        // live 快照先到（缓存恢复还在 off-main 读盘/解码）。
+        viewModel.applyStreamValue(snapshotJSON(cursor: 3, events: windowEvents()))
+        await waitForRowRebuild()
+        XCTAssertTrue(viewModel.hasLiveSnapshot, "live 快照已落地")
+        XCTAssertFalse(viewModel.isShowingCachedWindow, "快照帧后不应再展示缓存横幅")
+
+        await viewModel.awaitFirstPaintCacheForTesting()
+        XCTAssertTrue(viewModel.didRestoreFirstPaintCache, "缓存数据仍要恢复（只是不挂横幅）")
+        XCTAssertFalse(viewModel.isShowingCachedWindow,
+                       "快照之后才完成的缓存恢复不得重新挂「显示本地缓存，正在同步…」")
+        XCTAssertFalse(viewModel.cachedWindowIsStale, "快照之后才完成的缓存恢复不得标记缓存过期")
+    }
+
     @MainActor
     func testFirstPaintCacheMergesOlderChunksInBackground() async throws {
         let store = windowStore()

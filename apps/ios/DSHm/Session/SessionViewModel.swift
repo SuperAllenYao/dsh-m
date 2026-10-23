@@ -353,8 +353,17 @@ final class SessionViewModel: ObservableObject {
         let payload = loaded.payload
         guard !payload.chunks.isEmpty else { return }
         didRestoreFirstPaintCache = true
-        isShowingCachedWindow = true
-        cachedWindowIsStale = loaded.isStale
+        // 2026-10-23 fix(autoload): the cache read/decode runs off-main, so on a hot
+        // cache + fast link the live `session/follow` snapshot can land *before* this
+        // restore finishes. The snapshot frame clears `isShowingCachedWindow`
+        // (see `applyJournalUpdate`), so setting it here afterwards would re-arm the
+        // 「显示本地缓存，正在同步…」banner/spinner with no further snapshot to clear it
+        // (real-device manual repro: still visible after 65s on an idle session).
+        // Only advertise the cached window when no live snapshot has been applied.
+        if !hasLiveSnapshot {
+            isShowingCachedWindow = true
+            cachedWindowIsStale = loaded.isStale
+        }
         DetailMetrics.setCacheHit(true)
         DetailMetrics.markCacheRestored(milliseconds: cacheLoadMilliseconds)
         if journal.events.isEmpty {
