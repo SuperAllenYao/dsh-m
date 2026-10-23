@@ -257,10 +257,23 @@ final class HTTPSClient {
             var decoded = response
             do {
                 decoded.body = try HTTPCompression.gunzip(response.body)
+                return decoded
             } catch {
-                throw LinkError.transport("响应 gzip 解压失败：" + error.localizedDescription)
+ // task-4: a response may declare `content-encoding: gzip`
+ // while the bytes are already plain. That is exactly what the link
+ // plugin's exact-fetch passthrough produces for a Host 404: undici
+ // auto-inflates the upstream body but its response headers still list
+ // `content-encoding: gzip` (PASSTHROUGH_RESPONSE_HEADERS in
+ // packages/dsh-m-link/lib/link-server.js), so the phone sees a gzip
+ // header around plain JSON. Throwing LinkError.transport here hid the
+ // HTTP status from callers: a 404 became a *retryable* transport error
+ // and the file-change card disappeared after the retry budget, instead
+ // of taking the既定 404 terminal branch (FileChangesFetchPolicy).
+ // Fall back to the wire body and keep status/body so the caller can act
+ // on httpStatus (a genuinely corrupt 2xx body still fails later, when it
+ // is decoded as JSON/envelope).
+                return response
             }
-            return decoded
         }
  // Anything else (`identity`, empty) is already the wire body.
         let normalized = encoding.trimmingCharacters(in: .whitespaces).lowercased()

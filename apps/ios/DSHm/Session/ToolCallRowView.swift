@@ -129,7 +129,7 @@ struct FileChangesCard: View {
                         .foregroundStyle(Theme.Palette.textTertiary)
                 } else {
  // 与桌面端口径一致：标题文件数用 Host 的 total（不是 files 数组长度）。
-                    Text(L10n.f("%lld 个文件 · +%lld -%lld", changes.total ?? changes.files.count, changes.added, changes.deleted))
+                    Text(L10n.f("%lld 个文件 · +%lld -%lld", changes.titleFileCount, changes.added, changes.deleted))
                         .font(Theme.Typography.label)
                         .foregroundStyle(Theme.Palette.textTertiary)
                 }

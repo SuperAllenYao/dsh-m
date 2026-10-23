@@ -2070,6 +2070,44 @@ final class SessionViewModel: ObservableObject {
             reasoningEffort: "high"
         )
     }
+
+ // MARK: - task-4 DEBUG-only E2E seam: 跨端「本轮文件变更」口径
+
+ /// E2E seam：注入一份 exact `/api/changes.summary`，让真机/模拟器在不依赖
+ /// 「Host 仍持有该轮 summary」的情况下验证跨端口径——卡片标题用 Host 的
+ /// `total`(50)，sheet 列表用 `files.length`(18)，二者刻意不等。
+ ///
+ /// 三重门（Release 不编译、无产品行为）：
+ /// - DEBUG 编译；
+ /// - `DSHM_E2E=1`（SessionDetailView 只在 `app.isE2EMode` 时调用本方法，
+ /// 方法内再校验一次，避免误触发）；
+ /// - `DSHM_E2E_CHANGES_SUMMARY` = `ChangesSummaryValue` JSON，例如
+ /// `{"files":[{"path":"a.swift"},…],"total":50,"added":123,"deleted":45}`。
+ ///
+ /// 与真实 exact fetch 共用 `TurnFileChanges.exact`，所以 title/added/deleted
+ /// 口径与线上完全一致。
+ /// The injected summary (not the mapped value): the card is read on every
+ /// render, so mapping it lazily lets the seq follow the flow once the Host
+ /// snapshot lands (the seam runs before the snapshot on launch).
+    private var e2eFileChangesSummary: ChangesSummaryValue?
+
+    func installE2EChangesSummaryPreviewIfRequested() {
+        guard ProcessInfo.processInfo.environment["DSHM_E2E"] == "1" else { return }
+        guard let raw = ProcessInfo.processInfo.environment["DSHM_E2E_CHANGES_SUMMARY"] else { return }
+        installE2EChangesSummaryPreview(json: raw)
+    }
+
+ /// Same injection path as installE2EChangesSummaryPreviewIfRequested, without
+ /// the env gate so unit tests can prove the parsed summary drives the card
+ /// (total!= files.count) without a launch environment.
+    func installE2EChangesSummaryPreview(json: String) {
+        guard e2eFileChangesSummary == nil else { return }
+        let raw = json.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !raw.isEmpty,
+              let summary = try? JSONDecoder().decode(ChangesSummaryValue.self, from: Data(raw.utf8)),
+              !summary.files.isEmpty else { return }
+        e2eFileChangesSummary = summary
+    }
     #endif
 
  // MARK: - User questions (task-2 / tech-design §14)
@@ -2274,15 +2312,17 @@ final class SessionViewModel: ObservableObject {
  /// fallback numbers are NOT surfaced as truth — the card/sheet render a loading
  /// state instead (reported illusion: App 18 files +712 −42 vs desktop 50 files).
     var latestTurnFileChanges: TurnFileChanges? {
+        #if DEBUG
+ // E2E seam (installE2EChangesSummaryPreviewIfRequested): a synthetic exact
+ // summary wins so a real device can verify the cross-end title口径 without a
+ // Host that still holds the summary. Mapped lazily so seq follows the flow.
+ // Release builds never compile this.
+        if let summary = e2eFileChangesSummary {
+            return .exact(from: summary, seq: flow.latestFileChangeSeq)
+        }
+        #endif
         if let seq = flow.latestFileChangeSeq, let summary = fileChangeSummaries[seq] {
-            return TurnFileChanges(
-                source: .exactFetch,
-                files: summary.files,
-                added: summary.added ?? summary.files.reduce(0) { $0 + ($1.added ?? 0) },
-                deleted: summary.deleted ?? summary.files.reduce(0) { $0 + ($1.deleted ?? 0) },
-                seq: seq,
-                total: summary.total
-            )
+            return TurnFileChanges.exact(from: summary, seq: seq)
         }
         if let pendingSeq = flow.latestFileChangeSeq, isFileChangeFetchUnsettled(pendingSeq) {
             return TurnFileChanges(

@@ -135,10 +135,16 @@ extension SessionRowBuilder {
     ) -> (content: FlowContent, suffix: String)? {
         let message = data?["message"]
         let content = message?["content"]
+ // Compatibility fallback (task-4): the live event carries meta at the top
+ // level (`data.meta`), which is also the real Host口径 for tool/result diffs
+ // (verified against real session logs: every tool/result with diffs stores
+ // them in data.meta). Some static fixtures / partially restored snapshots
+ // only keep `data.message.meta`, so accept that position as a fallback —
+ // data.meta keeps priority whenever both exist (no real-session口径 change).
         let result = ToolResultItem(
             isError: message?["isError"]?.boolValue ?? false,
             text: MessageContent.text(from: content),
-            meta: data?["meta"],
+            meta: data?["meta"] ?? message?["meta"],
             images: MessageContent.images(from: content)
         )
         let toolCallId = message?["toolCallId"]?.stringValue

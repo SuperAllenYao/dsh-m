@@ -79,7 +79,13 @@ struct FileChangesSheet: View {
                         .buttonStyle(.plain)
                         .accessibilityIdentifier("file-change-row-\(index)")
                     } else {
+ // task-4: fallback（meta.diffs 聚合）行不是可点链接，但 E2E
+ // 要像 exact-fetch 行一样计数/定位，因此同样挂
+ // file-change-row-<i>（fixture 契约 §4 的待补项）。
+ // combine 让整行成为一个 AX 元素，identifier 才稳定可查。
                         row(index: index, file: file, showsChevron: false)
+                            .accessibilityElement(children: .combine)
+                            .accessibilityIdentifier("file-change-row-\(index)")
                     }
                 }
             }

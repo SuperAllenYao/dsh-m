@@ -59,4 +59,22 @@ struct TurnFileChanges: Equatable {
  /// retry). Card/sheet render a loading state instead of the fallback numbers
  /// so the meta.diffs aggregate is never mistaken for the desktop numbers.
     var isLoading: Bool = false
+
+ /// 卡片标题的文件数口径（跨端一致）：Host `total` 优先，缺省才回退客户端
+ /// files 数组长度。桌面端实测「标题用 total、列表用 files.length」，二者可能
+ /// 不等（fixture: total=50 / files=18），所以这里不能直接写 files.count。
+    var titleFileCount: Int { total ?? files.count }
+
+ /// Exact-fetch summary → 卡片/sheet 视图模型。真实取数与 DEBUG E2E seam 共用，
+ /// 保证两者走同一套 total/added/deleted 口径。
+    static func exact(from summary: ChangesSummaryValue, seq: Int?) -> TurnFileChanges {
+        TurnFileChanges(
+            source: .exactFetch,
+            files: summary.files,
+            added: summary.added ?? summary.files.reduce(0) { $0 + ($1.added ?? 0) },
+            deleted: summary.deleted ?? summary.files.reduce(0) { $0 + ($1.deleted ?? 0) },
+            seq: seq,
+            total: summary.total
+        )
+    }
 }

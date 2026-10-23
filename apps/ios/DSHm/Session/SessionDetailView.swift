@@ -77,6 +77,13 @@ struct SessionDetailView: View {
             attachments.attach(link: app.link)
             viewModel.start()
             #if DEBUG
+ // task-4 E2E seam: inject a synthetic exact changes summary
+ // (DSHM_E2E=1 + DSHM_E2E_CHANGES_SUMMARY) so the cross-end title口径
+ // (Host total=50 vs files.length=18) is assertable on a real device.
+ // DEBUG-only; product launches never set these env vars.
+            if app.isE2EMode {
+                viewModel.installE2EChangesSummaryPreviewIfRequested()
+            }
             if let percent = e2eContextPreviewPercent {
                 viewModel.installE2EContextPreview(percent: percent)
             }
