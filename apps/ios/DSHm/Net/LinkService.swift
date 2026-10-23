@@ -198,9 +198,15 @@ final class LinkService: ObservableObject {
     /// Short-lived api token (auto-refreshed on expiry/401).
     var apiToken: String?
     var apiTokenExpiresAt: Date?
-    /// 2026-10-23 T2(B2)：api token 的本机 Keychain 持久化（按 hostId 隔离）。
+    /// 2026-10-23 T2(B2)：api token 的本机 Keychain 持久化（scope 隔离）。
     /// 冷启动复用未过期 token → 省掉 challenge+verify 2 个 RTT。
     private let apiTokenStore = APITokenStore.shared
+    /// 持久化 scope：Mac 的 hostId 优先；旧配对凭据没有 hostId（该字段 2026-10-23
+    /// 才引入，Keychain 里的凭据可能更旧）时回退到配对钉住的 leafPin（端点指纹）。
+    /// 两者都缺时才放弃持久化。
+    private var apiTokenScope: String? {
+        APITokenStore.scope(hostId: credentials?.hostId, leafPin: credentials?.leafPin)
+    }
     /// 主动续期单飞任务（剩余 < 20min 时后台 forceRefresh 一次）。
     private var apiTokenRenewalTask: Task<Void, Never>?
     /// One in-flight challenge/verify per purpose. **Purpose-scoped on purpose**:
@@ -504,7 +510,7 @@ final class LinkService: ObservableObject {
     /// loop. Shared by QR/manual pairing and the M2a pairing-code redeem flow.
     @discardableResult
     func adopt(credentials: PairingCredentials) -> PairingCredentials {
-        let previousHostId = self.credentials?.hostId
+        let previousScope = apiTokenScope
         do {
             try store.save(credentials)
         } catch {
@@ -518,8 +524,8 @@ final class LinkService: ObservableObject {
         apiTokenExpiresAt = nil
         // 2026-10-23 T2(B2)：重新配对 = 全新凭据语境，旧机器/旧会话的持久化 api token
         // 一律作废（不允许在 repair 之后仍复用旧 token）。
-        apiTokenStore.clear(hostId: previousHostId)
-        apiTokenStore.clear(hostId: credentials.hostId)
+        apiTokenStore.clear(scope: previousScope)
+        apiTokenStore.clear(scope: apiTokenScope)
         attempt = 0
         manuallyDisconnected = false
         p1FellBackToLegacy = false
@@ -549,6 +555,9 @@ final class LinkService: ObservableObject {
     /// relay 覆盖下同样可用；否则早列表会白白再付 challenge+verify 2 个 RTT。
     func ensureAPIToken(forceRefresh: Bool = false, originOverride: URL? = nil) async throws -> String {
         if !forceRefresh, let apiToken, let expiry = apiTokenExpiresAt, expiry.timeIntervalSinceNow > 5 {
+            // 冷启动 early list 走覆盖 origin 时打一行诊断（无 token 明文），下一次
+            // 真机 console 就能区分「token 命中」与「又发生 auth」。
+            if originOverride != nil { linkDebug("api token fast-path hit (early list)") }
             return apiToken
         }
         do {
@@ -559,7 +568,7 @@ final class LinkService: ObservableObject {
             if isCredentialRejection(error) {
                 apiToken = nil
                 apiTokenExpiresAt = nil
-                apiTokenStore.clear(hostId: credentials?.hostId)
+                apiTokenStore.clear(scope: apiTokenScope)
             }
             throw error
         }
@@ -568,18 +577,30 @@ final class LinkService: ObservableObject {
     /// 2026-10-23 T2(B2)：冷启动从 Keychain 恢复未过期的 api token。
     /// 只在内存里没有 token 时执行（断开/恢复场景走同一入口）。
     private func restorePersistedAPIToken() {
-        guard apiToken == nil,
-              let credentials,
-              let stored = apiTokenStore.load(hostId: credentials.hostId) else { return }
+        guard apiToken == nil, let scope = apiTokenScope,
+              let stored = apiTokenStore.load(scope: scope) else {
+            linkDebug("api token not restored scope=" + Self.apiTokenScopeKind(apiTokenScope))
+            return
+        }
         apiToken = stored.token
         apiTokenExpiresAt = stored.expiresAt
-        linkDebug("api token restored from keychain")
+        linkDebug("api token restored scope=" + Self.apiTokenScopeKind(scope))
     }
 
     /// 2026-10-23 T2(B2)：认证成功后把 api token 落盘（只存本机 Keychain，不打印 token）。
     private func persistAPIToken(_ token: String, expiresAt: Date) {
-        guard let hostId = credentials?.hostId else { return }
-        _ = apiTokenStore.save(StoredAPIToken(token: token, expiresAt: expiresAt), hostId: hostId)
+        guard let scope = apiTokenScope else {
+            linkDebug("api token persist skipped: no scope")
+            return
+        }
+        let saved = apiTokenStore.save(StoredAPIToken(token: token, expiresAt: expiresAt), scope: scope)
+        linkDebug("api token persist " + (saved ? "ok" : "failed") + " scope=" + Self.apiTokenScopeKind(scope))
+    }
+
+    /// 诊断用：scope 类型（host / pin / none），不含任何敏感原值。
+    private static func apiTokenScopeKind(_ scope: String?) -> String {
+        guard let scope else { return "none" }
+        return scope.hasPrefix("pin:") ? "pin" : "host"
     }
 
     /// 2026-10-23 T2(B2)：链路就绪/前台恢复时，若 api token 剩余 < 20min，后台
@@ -1288,7 +1309,7 @@ final class LinkService: ObservableObject {
             lastErrorText = credentialRejections.last
             // 2026-10-23 T2(B2)：凭据被所有候选拒绝 = repair 语义，持久化的 api
             // token 也一并作废（重新配对时 adopt 会再清一次，双保险）。
-            apiTokenStore.clear(hostId: credentials.hostId)
+            apiTokenStore.clear(scope: apiTokenScope)
             phase = .needsRepair(credentialRejections.last ?? L10n.t("配对凭据被拒绝，请重新配对"))
             return
         }

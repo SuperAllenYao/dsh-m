@@ -44,16 +44,16 @@ final class APITokenStoreTests: XCTestCase {
     // MARK: - 存取往返
 
     func testSaveThenLoadRoundTripsTokenAndExpiry() throws {
-        XCTAssertTrue(store.save(token("tok-1", expiresIn: 1_800), hostId: "mac-A"))
-        let loaded = try XCTUnwrap(store.load(hostId: "mac-A"))
+        XCTAssertTrue(store.save(token("tok-1", expiresIn: 1_800), scope: "mac-A"))
+        let loaded = try XCTUnwrap(store.load(scope: "mac-A"))
         XCTAssertEqual(loaded.token, "tok-1")
         XCTAssertEqual(loaded.expiresAt.timeIntervalSince1970, fixedNow.addingTimeInterval(1_800).timeIntervalSince1970, accuracy: 0.001)
     }
 
     func testSaveOverwritesSameHost() throws {
-        XCTAssertTrue(store.save(token("tok-old", expiresIn: 600), hostId: "mac-A"))
-        XCTAssertTrue(store.save(token("tok-new", expiresIn: 1_800), hostId: "mac-A"))
-        let loaded = try XCTUnwrap(store.load(hostId: "mac-A"))
+        XCTAssertTrue(store.save(token("tok-old", expiresIn: 600), scope: "mac-A"))
+        XCTAssertTrue(store.save(token("tok-new", expiresIn: 1_800), scope: "mac-A"))
+        let loaded = try XCTUnwrap(store.load(scope: "mac-A"))
         XCTAssertEqual(loaded.token, "tok-new")
         XCTAssertEqual(backend.items.count, 1, "same hostId must reuse one Keychain item")
     }
@@ -61,33 +61,51 @@ final class APITokenStoreTests: XCTestCase {
     // MARK: - 过期 / 快路径窗口
 
     func testExpiredTokenIsNotLoaded() {
-        XCTAssertTrue(store.save(token("tok-expired", expiresIn: -1), hostId: "mac-A"))
-        XCTAssertNil(store.load(hostId: "mac-A"), "expired token must never be reused")
+        XCTAssertTrue(store.save(token("tok-expired", expiresIn: -1), scope: "mac-A"))
+        XCTAssertNil(store.load(scope: "mac-A"), "expired token must never be reused")
     }
 
     func testTokenWithinFiveSecondWindowIsNotLoaded() {
-        XCTAssertTrue(store.save(token("tok-nearly", expiresIn: 3), hostId: "mac-A"))
-        XCTAssertNil(store.load(hostId: "mac-A"), "<=5s remaining must match ensureAPIToken's fast-path gate")
-        XCTAssertTrue(store.save(token("tok-fresh", expiresIn: 60), hostId: "mac-A"))
-        XCTAssertNotNil(store.load(hostId: "mac-A"))
+        XCTAssertTrue(store.save(token("tok-nearly", expiresIn: 3), scope: "mac-A"))
+        XCTAssertNil(store.load(scope: "mac-A"), "<=5s remaining must match ensureAPIToken's fast-path gate")
+        XCTAssertTrue(store.save(token("tok-fresh", expiresIn: 60), scope: "mac-A"))
+        XCTAssertNotNil(store.load(scope: "mac-A"))
     }
 
     // MARK: - hostId 隔离
 
     func testHostIdIsolation() throws {
-        XCTAssertTrue(store.save(token("tok-A", expiresIn: 1_800), hostId: "mac-A"))
-        XCTAssertTrue(store.save(token("tok-B", expiresIn: 1_800), hostId: "mac-B"))
-        XCTAssertEqual(try XCTUnwrap(store.load(hostId: "mac-A")).token, "tok-A")
-        XCTAssertEqual(try XCTUnwrap(store.load(hostId: "mac-B")).token, "tok-B")
-        XCTAssertNil(store.load(hostId: "mac-C"), "another Mac must never inherit this token")
-        XCTAssertNil(store.load(hostId: nil))
-        XCTAssertNil(store.load(hostId: ""))
+        XCTAssertTrue(store.save(token("tok-A", expiresIn: 1_800), scope: "mac-A"))
+        XCTAssertTrue(store.save(token("tok-B", expiresIn: 1_800), scope: "mac-B"))
+        XCTAssertEqual(try XCTUnwrap(store.load(scope: "mac-A")).token, "tok-A")
+        XCTAssertEqual(try XCTUnwrap(store.load(scope: "mac-B")).token, "tok-B")
+        XCTAssertNil(store.load(scope: "mac-C"), "another Mac must never inherit this token")
+        XCTAssertNil(store.load(scope: nil))
+        XCTAssertNil(store.load(scope: ""))
     }
 
     func testNilHostIdIsNeverPersisted() {
-        XCTAssertFalse(store.save(token("tok", expiresIn: 1_800), hostId: nil))
-        XCTAssertFalse(store.save(token("tok", expiresIn: 1_800), hostId: ""))
+        XCTAssertFalse(store.save(token("tok", expiresIn: 1_800), scope: nil))
+        XCTAssertFalse(store.save(token("tok", expiresIn: 1_800), scope: ""))
         XCTAssertTrue(backend.items.isEmpty, "no scope -> no persistence")
+    }
+
+    // MARK: - scope 推导（hostId 优先，旧凭据回退端点指纹）
+
+    func testScopePrefersHostIdThenFallsBackToLeafPin() {
+        XCTAssertEqual(APITokenStore.scope(hostId: "mac-A", leafPin: "pin-A"), "host:mac-A")
+        // 真机事故回归：旧配对凭据没有 hostId（hostId 字段 2026-10-23 才引入），
+        // 若只认 hostId，B2 的 token 持久化会完全失效。这里必须回退到 leafPin 指纹。
+        XCTAssertEqual(APITokenStore.scope(hostId: nil, leafPin: "pin-A"), "pin:pin-A")
+        XCTAssertEqual(APITokenStore.scope(hostId: "", leafPin: "pin-A"), "pin:pin-A")
+        // 两者都缺：拒绝持久化（无法安全隔离到某台 Mac）。
+        XCTAssertNil(APITokenStore.scope(hostId: nil, leafPin: nil))
+        XCTAssertNil(APITokenStore.scope(hostId: "", leafPin: ""))
+        // 不同 Mac 的端点指纹不同 -> 不同 scope（不会跨设备复用）。
+        XCTAssertNotEqual(
+            APITokenStore.scope(hostId: nil, leafPin: "pin-A"),
+            APITokenStore.scope(hostId: nil, leafPin: "pin-B")
+        )
     }
 
     func testKeychainAccountIsStableAndDoesNotLeakHostId() {
@@ -103,19 +121,19 @@ final class APITokenStoreTests: XCTestCase {
     // MARK: - 清除
 
     func testClearRemovesOnlyThatHost() {
-        XCTAssertTrue(store.save(token("tok-A", expiresIn: 1_800), hostId: "mac-A"))
-        XCTAssertTrue(store.save(token("tok-B", expiresIn: 1_800), hostId: "mac-B"))
-        store.clear(hostId: "mac-A")
-        XCTAssertNil(store.load(hostId: "mac-A"))
-        XCTAssertNotNil(store.load(hostId: "mac-B"))
+        XCTAssertTrue(store.save(token("tok-A", expiresIn: 1_800), scope: "mac-A"))
+        XCTAssertTrue(store.save(token("tok-B", expiresIn: 1_800), scope: "mac-B"))
+        store.clear(scope: "mac-A")
+        XCTAssertNil(store.load(scope: "mac-A"))
+        XCTAssertNotNil(store.load(scope: "mac-B"))
     }
 
     func testClearAllRemovesEveryHost() {
-        XCTAssertTrue(store.save(token("tok-A", expiresIn: 1_800), hostId: "mac-A"))
-        XCTAssertTrue(store.save(token("tok-B", expiresIn: 1_800), hostId: "mac-B"))
+        XCTAssertTrue(store.save(token("tok-A", expiresIn: 1_800), scope: "mac-A"))
+        XCTAssertTrue(store.save(token("tok-B", expiresIn: 1_800), scope: "mac-B"))
         store.clearAll()
-        XCTAssertNil(store.load(hostId: "mac-A"))
-        XCTAssertNil(store.load(hostId: "mac-B"))
+        XCTAssertNil(store.load(scope: "mac-A"))
+        XCTAssertNil(store.load(scope: "mac-B"))
         XCTAssertTrue(backend.items.isEmpty)
     }
 
@@ -123,14 +141,14 @@ final class APITokenStoreTests: XCTestCase {
 
     func testBackendWriteFailureDegradesToNoPersistence() {
         backend.failWrites = true
-        XCTAssertFalse(store.save(token("tok", expiresIn: 1_800), hostId: "mac-A"))
-        XCTAssertNil(store.load(hostId: "mac-A"))
+        XCTAssertFalse(store.save(token("tok", expiresIn: 1_800), scope: "mac-A"))
+        XCTAssertNil(store.load(scope: "mac-A"))
         XCTAssertTrue(backend.items.isEmpty)
     }
 
     func testCorruptedPayloadIsIgnored() {
         backend.items[APITokenStore.account(for: "mac-A")] = Data("not-json".utf8)
-        XCTAssertNil(store.load(hostId: "mac-A"))
+        XCTAssertNil(store.load(scope: "mac-A"))
     }
 
     // MARK: - 主动续期窗口（纯策略）

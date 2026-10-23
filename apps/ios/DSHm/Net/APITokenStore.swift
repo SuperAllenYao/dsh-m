@@ -24,14 +24,15 @@ protocol APITokenBackend {
 /// 安全约束：
 /// - 只存本机 Keychain（`kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`，与
 ///   `CredentialStore` 的配对凭据同级；不随 iCloud/备份迁移），不上传、不写日志；
-/// - **按 `hostId` 隔离**：Keychain account 由 `sha256(hostId)` 派生，换 Mac /
-///   重新配对不会复用其它设备的 token；hostId 为空的旧凭据拒绝持久化；
-/// - token 明文不出现在系统日志里（调用方只记录「是否命中」）。
+/// - **按 scope 隔离**（`scope(hostId:leafPin:)`）：优先 Mac 的稳定 hostId，旧配对
+///   凭据没有 hostId 时回退到配对钉住的 `leafPin`（端点指纹）。换 Mac / 重新配对
+///   都会得到不同 scope，不会复用其它设备的 token；
+/// - token 明文不出现在系统日志里（调用方只记录「是否命中」/scope 类型）。
 ///
 /// 语义：
-/// - `save` 覆盖同一 hostId 的记录；
+/// - `save` 覆盖同一 scope 的记录；
 /// - `load` 只返回剩余有效期 > 5s 的 token（与 `ensureAPIToken` 快路径门槛一致）；
-/// - `clear(hostId:)` 精确清除；`clearAll()` 在解绑设备时清全部。
+/// - `clear(scope:)` 精确清除；`clearAll()` 在解绑设备时清全部。
 final class APITokenStore {
     static let shared = APITokenStore()
 
@@ -48,33 +49,45 @@ final class APITokenStore {
         self.now = now
     }
 
-    /// Keychain account：sha256(hostId) 派生，避免把 Mac 标识直接写进 Keychain 项。
-    static func account(for hostId: String) -> String {
-        "api-token." + PinFormat.sha256Hex(Data(hostId.utf8))
+    /// Keychain account：sha256(scope) 派生，避免把 Mac 标识直接写进 Keychain 项。
+    static func account(for scope: String) -> String {
+        "api-token." + PinFormat.sha256Hex(Data(scope.utf8))
     }
 
-    /// 保存（同一 hostId 覆盖）。hostId 为空时不持久化（无法安全隔离到某台 Mac）。
+    /// 2026-10-23 T2(B2)：持久化隔离 scope。
+    ///
+    /// 优先 Mac 的稳定 `hostId`；**旧配对凭据没有 hostId**（该字段 2026-10-23 才随
+    /// 跨网自愈加入，而 Keychain 里的配对凭据可能来自更早版本）时回退到「端点指纹」
+    /// ——配对时钉住的 `leafPin`（Mac 插件证书指纹）。两者都缺时拒绝持久化。
+    /// 换 Mac / 重新配对（证书重签）都会得到不同 scope，不会跨设备复用 token。
+    static func scope(hostId: String?, leafPin: String?) -> String? {
+        if let hostId, !hostId.isEmpty { return "host:" + hostId }
+        if let leafPin, !leafPin.isEmpty { return "pin:" + leafPin }
+        return nil
+    }
+
+    /// 保存（同一 scope 覆盖）。scope 为空时不持久化（无法安全隔离到某台 Mac）。
     @discardableResult
-    func save(_ token: StoredAPIToken, hostId: String?) -> Bool {
-        guard let hostId, !hostId.isEmpty else { return false }
+    func save(_ token: StoredAPIToken, scope: String?) -> Bool {
+        guard let scope, !scope.isEmpty else { return false }
         let payload = Payload(token: token.token, expiresAtMs: Self.milliseconds(token.expiresAt))
         guard let data = try? JSONEncoder().encode(payload) else { return false }
-        return backend.write(data, account: Self.account(for: hostId))
+        return backend.write(data, account: Self.account(for: scope))
     }
 
     /// 只返回仍可用的 token；过期/损坏/hostId 缺失都返回 nil。
-    func load(hostId: String?) -> StoredAPIToken? {
-        guard let hostId, !hostId.isEmpty else { return nil }
-        guard let data = backend.read(account: Self.account(for: hostId)),
+    func load(scope: String?) -> StoredAPIToken? {
+        guard let scope, !scope.isEmpty else { return nil }
+        guard let data = backend.read(account: Self.account(for: scope)),
               let payload = try? JSONDecoder().decode(Payload.self, from: data) else { return nil }
         let expiresAt = Date(timeIntervalSince1970: TimeInterval(payload.expiresAtMs) / 1000)
         guard expiresAt.timeIntervalSince(now()) > Self.minimumRemaining else { return nil }
         return StoredAPIToken(token: payload.token, expiresAt: expiresAt)
     }
 
-    func clear(hostId: String?) {
-        guard let hostId, !hostId.isEmpty else { return }
-        backend.delete(account: Self.account(for: hostId))
+    func clear(scope: String?) {
+        guard let scope, !scope.isEmpty else { return }
+        backend.delete(account: Self.account(for: scope))
     }
 
     func clearAll() {
