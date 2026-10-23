@@ -166,66 +166,315 @@ enum SessionRowBuilder {
         return event.data?["source"]?["rpcId"]?.stringValue
     }
 
-    // MARK: - Build
+    // MARK: - Build (full rebuild entry point)
 
     /// Flattens the event log into one continuous row stream.
     ///
     /// Turn boundaries only feed two derived values:
-    /// - `isRunning`: the newest turn of the loaded window started but has not ended
-    ///   (a window that starts mid-turn has no `turn/start`, so turn-scoped rows
-    ///   after the last `turn/end` keep the indicator truthful — and an ended
-    ///   session can never claim "运行中" any more);
-    /// - `latestFileChangeSeq` / `latestFileChanges`: the newest turn's file changes.
+    /// - isRunning: the newest turn of the loaded window started but has not ended
+    ///   (a window that starts mid-turn has no turn/start, so turn-scoped rows
+    ///   after the last turn/end keep the indicator truthful — and an ended
+    ///   session can never claim 运行中 any more);
+    /// - latestFileChangeSeq / latestFileChanges: the newest turn's file changes.
+    ///
+    /// 全量重建入口（冷恢复 / journal snapshot 替换 / 测试 oracle）。live 尾部与
+    /// history 前置走 FlowState 的增量接口；两者共用同一折叠核心，因此增量结果
+    /// 与全量重建结果逐行等价（见 RowBuilderBenchTests）。
     static func build(
         events: [SessionEvent],
         pendingUserEchoes: [PendingUserEcho] = [],
-        nowMs: Int64 = Int64(Date().timeIntervalSince1970 * 1000)
+        nowMs: Int64 = currentEpochMs()
     ) -> SessionFlow {
-        let sorted = events.sorted { $0.seq < $1.seq }
-        var callIdsWithEvents = Set<String>()
-        for event in sorted {
-            if event.type == "tool/call", let id = event.data?["callId"]?.stringValue {
-                callIdsWithEvents.insert(id)
+        var state = FlowState()
+        state.replaceAll(events: events, pendingUserEchoes: pendingUserEchoes, nowMs: nowMs, computeGroups: false)
+        return state.flow
+    }
+
+    static func currentEpochMs() -> Int64 {
+        Int64(Date().timeIntervalSince1970 * 1000)
+    }
+
+    // MARK: - Incremental flow state
+
+    /// 增量渲染状态：视图模型持有一个实例，避免每批事件都全量重建。
+    ///
+    /// - reset：全量替换（冷恢复 / journal snapshot 替换 / 重连 gap）；
+    /// - append：live 尾部——只折叠 seq 大于已加载最大 seq 的事件；
+    /// - prepend：更早一页（可一次多页）——只折叠 seq 小于已加载最小 seq 的事件，
+    ///   行直接前置；跨页边界相邻的 reasoning/tool 行由分组缓存重新合并；
+    /// - repaintPendingEchoes：只重画尾部乐观回显行，不重扫事件日志。
+    ///
+    /// flow / groups 是发布给视图的快照：flow.rows 含尾部乐观回显行，
+    /// groups 是同一批行的渲染分组缓存（视图 body 直接读，不再每次 O(N) 重算）。
+    struct FlowState {
+        private(set) var flow = SessionFlow()
+        private(set) var groups: [FlowRowGroup] = []
+
+        /// 已折叠的行：前 baseRowCount 行来自事件，其后是乐观回显行（重画时整段替换）。
+        private var rows: [FlowRow] = []
+        private var baseRowCount = 0
+        private var fold = FoldState()
+        private var groupCache = FlowGroupCache()
+
+        init() {}
+
+        /// 全量替换（冷恢复 / journal snapshot 替换 / generation 重置）。
+        mutating func reset(
+            events: [SessionEvent],
+            pendingUserEchoes: [PendingUserEcho] = [],
+            nowMs: Int64 = SessionRowBuilder.currentEpochMs()
+        ) {
+            replaceAll(events: events, pendingUserEchoes: pendingUserEchoes, nowMs: nowMs, computeGroups: true)
+        }
+
+        /// 追加 live 尾部事件；已加载过的 seq 会被丢弃（幂等）。
+        mutating func append(
+            events: [SessionEvent],
+            pendingUserEchoes: [PendingUserEcho] = [],
+            nowMs: Int64 = SessionRowBuilder.currentEpochMs()
+        ) {
+            let batch = orderedAppendBatch(events)
+            stripPendingEchoRows()
+            var change: FlowGroupCache.Change = .tail
+            if !batch.isEmpty {
+                let removedDeferredRows = SessionRowBuilder.foldBatch(batch, mode: .append, state: &fold, rows: &rows)
+                let resolvedOrphanRows = SessionRowBuilder.resolveOrphanResults(state: &fold, rows: &rows)
+                if removedDeferredRows || resolvedOrphanRows || SessionRowBuilder.touchesExistingRows(batch) {
+                    change = .full
+                }
             }
-            if event.type == "tool/ptc-dispatch-start", let id = event.data?["subCallId"]?.stringValue {
-                callIdsWithEvents.insert(id)
+            baseRowCount = rows.count
+            applyPendingEchoes(pendingUserEchoes, nowMs: nowMs)
+            publish(computeGroups: true, change: change)
+        }
+
+        /// 前置更早的一页/一批事件；已加载过的 seq 会被丢弃（幂等）。
+        mutating func prepend(
+            events: [SessionEvent],
+            pendingUserEchoes: [PendingUserEcho] = [],
+            nowMs: Int64 = SessionRowBuilder.currentEpochMs()
+        ) {
+            let batch = orderedPrependBatch(events)
+            stripPendingEchoRows()
+            if !batch.isEmpty {
+                var segment: [FlowRow] = []
+                _ = SessionRowBuilder.foldBatch(batch, mode: .prepend, state: &fold, rows: &segment)
+                rows.insert(contentsOf: segment, at: 0)
+                SessionRowBuilder.resolveOrphanResults(state: &fold, rows: &rows)
+            }
+            baseRowCount = rows.count
+            applyPendingEchoes(pendingUserEchoes, nowMs: nowMs)
+            publish(computeGroups: true, change: .full)
+        }
+
+        /// 只重画乐观回显行（发送 / 失败 / 超时），不重扫事件日志。
+        mutating func repaintPendingEchoes(
+            _ echoes: [PendingUserEcho],
+            nowMs: Int64 = SessionRowBuilder.currentEpochMs()
+        ) {
+            stripPendingEchoRows()
+            baseRowCount = rows.count
+            applyPendingEchoes(echoes, nowMs: nowMs)
+            publish(computeGroups: true, change: .tail)
+        }
+
+        /// 已折叠事件的 seq 范围（nil 表示还没有事件）。filler 的 cursor 仍由 VM 维护，
+        /// 这里只读兜底。
+        var loadedSeqRange: ClosedRange<Int>? {
+            guard let min = fold.loadedMinSeq, let max = fold.loadedMaxSeq else { return nil }
+            return min...max
+        }
+
+        // MARK: internals
+
+        fileprivate mutating func replaceAll(
+            events: [SessionEvent],
+            pendingUserEchoes: [PendingUserEcho],
+            nowMs: Int64,
+            computeGroups: Bool
+        ) {
+            let sorted = events.sorted { $0.seq < $1.seq }
+            rows = []
+            baseRowCount = 0
+            fold = FoldState()
+            if !sorted.isEmpty {
+                _ = SessionRowBuilder.foldBatch(sorted, mode: .replace, state: &fold, rows: &rows)
+                SessionRowBuilder.resolveOrphanResults(state: &fold, rows: &rows)
+            }
+            baseRowCount = rows.count
+            applyPendingEchoes(pendingUserEchoes, nowMs: nowMs)
+            publish(computeGroups: computeGroups, change: .full)
+        }
+
+        private mutating func stripPendingEchoRows() {
+            if rows.count > baseRowCount {
+                rows.removeSubrange(baseRowCount...)
             }
         }
 
-        var rows: [FlowRow] = []
-        // 最新一轮是否仍在运行（只影响「运行中」指示，不再有 turn 区块）。
-        var running = false
-        var lastEndedTurn = 0
+        private mutating func applyPendingEchoes(_ echoes: [PendingUserEcho], nowMs: Int64) {
+            guard !echoes.isEmpty else { return }
+            var echoRows: [FlowRow] = []
+            SessionRowBuilder.appendPendingUserEchoes(echoes, to: &echoRows, nowMs: nowMs, startingAfter: fold.maxRowSeq)
+            rows.append(contentsOf: echoRows)
+        }
+
+        private mutating func publish(computeGroups: Bool, change: FlowGroupCache.Change) {
+            let derived = SessionRowBuilder.replay(fold)
+            let aggregateStart = fold.newestTurnStarted ? min(fold.newestTurnRowStart, rows.count) : 0
+            flow = SessionFlow(
+                rows: rows,
+                isRunning: derived.isRunning,
+                latestFileChangeSeq: derived.latestFileChangeSeq,
+                latestFileChanges: SessionRowBuilder.aggregateFileChanges(rows: rows, from: aggregateStart)
+            )
+            guard computeGroups else { return }
+            switch change {
+            case .tail:
+                groupCache.refreshTail(rows: rows)
+            case .full:
+                groupCache.rebuild(rows: rows)
+            }
+            groups = groupCache.groups
+        }
+
+        private func orderedAppendBatch(_ events: [SessionEvent]) -> [SessionEvent] {
+            guard !events.isEmpty else { return [] }
+            let lowerBound = fold.loadedMaxSeq.map { $0 &+ 1 } ?? Int.min
+            let sorted = events.count > 1 ? events.sorted { $0.seq < $1.seq } : events
+            var result: [SessionEvent] = []
+            result.reserveCapacity(sorted.count)
+            var lastSeq = Int.min
+            for event in sorted where event.seq >= lowerBound && event.seq > lastSeq {
+                result.append(event)
+                lastSeq = event.seq
+            }
+            return result
+        }
+
+        private func orderedPrependBatch(_ events: [SessionEvent]) -> [SessionEvent] {
+            guard !events.isEmpty else { return [] }
+            let upperBound = fold.loadedMinSeq.map { $0 &- 1 } ?? Int.max
+            let sorted = events.count > 1 ? events.sorted { $0.seq < $1.seq } : events
+            var result: [SessionEvent] = []
+            result.reserveCapacity(sorted.count)
+            var lastSeq = Int.min
+            for event in sorted where event.seq <= upperBound && event.seq > lastSeq {
+                result.append(event)
+                lastSeq = event.seq
+            }
+            return result
+        }
+    }
+
+    // MARK: - Fold core (shared by build and FlowState)
+
+    private struct FoldState {
+        /// 有独立 tool/call 或 ptc-dispatch-start 事件的 callId：assistant/message
+        /// 里同 id 的 tool-call block 不再重复成行。
+        var callIdsWithEvents: Set<String> = []
+        /// 已渲染但尚未等到 tool/call 的 assistant tool-call block 行（callId -> rowID）。
+        /// 后续批次出现同 callId 时删除该行，保持与全量重建等价。
+        var deferredBlockRowIDs: [String: String] = [:]
+        /// 只保留 turn 状态的紧凑轨迹：全量重建与增量折叠共用同一 isRunning /
+        /// latestFileChangeSeq 推导，O(事件数) 但常数极小（16B/条）。
+        var turnTrace: [TurnTraceEntry] = []
         var newestTurnStarted = false
         var newestTurnRowStart = 0
-        var latestFileChangeSeq: Int?
+        var maxRowSeq = 0
+        var loadedMinSeq: Int?
+        var loadedMaxSeq: Int?
+        /// 已渲染但还没等到调用行的孤儿 tool/result 行。更早的一页 prepend 后可能
+        /// 补上调用行：那时把结果挂载到调用行并删掉孤儿行，才能与全量重建
+        /// （按 seq 顺序处理，结果总能找到更早的调用行）逐行等价。
+        var orphanResultRows: [OrphanResultRow] = []
+    }
+
+    private struct OrphanResultRow {
+        var rowID: String
+        var callId: String
+        var result: ToolResultItem
+    }
+
+    private enum FoldMode {
+        case replace
+        case append
+        case prepend
+    }
+
+    private struct TurnTraceEntry {
+        enum Kind: UInt8 {
+            case turnStart
+            case turnEnd
+            case workspace
+            case row
+        }
+
+        var seq: Int
+        var kind: Kind
+        var turn: Int
+    }
+
+    /// - Returns: 是否删除了已渲染的行（跨批次补上的 tool/call 让之前的 block 行退场）。
+    ///   调用方据此决定分组缓存能否只重算尾部（删中间行必须全量重算）。
+    private static func foldBatch(
+        _ batch: [SessionEvent],
+        mode: FoldMode,
+        state: inout FoldState,
+        rows: inout [FlowRow]
+    ) -> Bool {
+        var removedExistingRows = false
+        var batchCallIds = Set<String>()
+        for event in batch {
+            if event.type == "tool/call", let id = event.data?["callId"]?.stringValue {
+                batchCallIds.insert(id)
+            } else if event.type == "tool/ptc-dispatch-start", let id = event.data?["subCallId"]?.stringValue {
+                batchCallIds.insert(id)
+            }
+        }
+        switch mode {
+        case .replace:
+            state.callIdsWithEvents = batchCallIds
+            state.deferredBlockRowIDs = [:]
+            state.orphanResultRows = []
+        case .append, .prepend:
+            let unresolved = batchCallIds.subtracting(state.callIdsWithEvents)
+            state.callIdsWithEvents.formUnion(batchCallIds)
+            if !unresolved.isEmpty,
+               removeDeferredBlocks(for: unresolved, state: &state, rows: &rows) {
+                removedExistingRows = true
+            }
+        }
+
+        var traceEntries: [TurnTraceEntry] = []
+        traceEntries.reserveCapacity(batch.count)
+        var batchTurnStartRow: Int?
+        var batchMaxRowSeq = 0
 
         func appendRow(_ content: FlowContent, event: SessionEvent, suffix: String) {
             rows.append(FlowRow(id: "\(event.seq)-\(suffix)", seq: event.seq, content: content))
+            if event.seq > batchMaxRowSeq { batchMaxRowSeq = event.seq }
         }
 
-        for event in sorted {
-            // workspace/changes carries only {turn}; its seq is the key for the
-            // exact-fetch summary/diff routes (§3.9). Only the newest turn's card
-            // survives the turn-UI removal, so keep the last one.
+        for event in batch {
+            // workspace/changes 只带 turn 字段，其 seq 是精确取数 summary/diff 的 key。
+            // 只保留最新一轮的那条：新的 turn/start 让上一条让位（见 replay）。
             if event.type == "workspace/changes" {
-                latestFileChangeSeq = event.seq
+                traceEntries.append(TurnTraceEntry(seq: event.seq, kind: .workspace, turn: 0))
                 continue
             }
             guard !hiddenEventTypes.contains(event.type) else { continue }
             let data = event.data
             switch event.type {
             case "turn/start":
-                running = true
-                newestTurnStarted = true
-                newestTurnRowStart = rows.count
-                // 新一轮开始时上一轮的文件变更让位。
-                latestFileChangeSeq = nil
+                traceEntries.append(TurnTraceEntry(seq: event.seq, kind: .turnStart, turn: 0))
+                batchTurnStartRow = rows.count
             case "turn/end":
-                running = false
-                if let turn = data?["turn"]?.int, turn > lastEndedTurn {
-                    lastEndedTurn = turn
-                }
+                traceEntries.append(TurnTraceEntry(
+                    seq: event.seq,
+                    kind: .turnEnd,
+                    turn: data?["turn"]?.int ?? 0
+                ))
                 if data?["reason"]?["kind"]?.stringValue == "error",
                    let error = data?["reason"]?["error"] {
                     let message = error["message"]?.stringValue ?? "未知错误"
@@ -235,23 +484,40 @@ enum SessionRowBuilder {
             default:
                 // 窗口可能从一轮中间开始（其 turn/start 在窗口外）：最后一条
                 // turn/end 之后又出现带 turn 的行事件，等价于新一轮已开始。
-                if !running, let turn = data?["turn"]?.int, turn > lastEndedTurn {
-                    running = true
+                if let turn = data?["turn"]?.int {
+                    traceEntries.append(TurnTraceEntry(seq: event.seq, kind: .row, turn: turn))
                 }
                 switch event.type {
                 case "user/message":
                     handleUserMessage(event: event, data: data, appendRow: appendRow)
                 case "assistant/message":
-                    handleAssistantMessage(event: event, data: data, callIdsWithEvents: callIdsWithEvents, appendRow: appendRow)
+                    let deferred = handleAssistantMessage(
+                        event: event,
+                        data: data,
+                        callIdsWithEvents: state.callIdsWithEvents,
+                        appendRow: appendRow
+                    )
+                    for block in deferred {
+                        state.deferredBlockRowIDs[block.callId] = block.rowID
+                    }
                 case "tool/call":
                     let item = toolCall(from: data, event: event)
                     appendRow(.tool(item), event: event, suffix: "tool-\(item.callId ?? "seq-\(event.seq)")")
                 case "tool/result":
                     // Orphan results are appended here (not inside the handler) so the
-                    // handler's inout `rows` access never overlaps the closure's
+                    // handler's inout rows access never overlaps the closure's
                     // mutation of the same array (Swift exclusivity abort).
                     if let orphan = handleToolResult(event: event, data: data, rows: &rows) {
                         appendRow(orphan.content, event: event, suffix: orphan.suffix)
+                        if case .tool(let item) = orphan.content,
+                           let callId = item.callId,
+                           let result = item.result {
+                            state.orphanResultRows.append(OrphanResultRow(
+                                rowID: "\(event.seq)-\(orphan.suffix)",
+                                callId: callId,
+                                result: result
+                            ))
+                        }
                     }
                 case "tool/ptc-dispatch-start":
                     handlePTCDispatchStart(event: event, data: data, rows: &rows)
@@ -316,21 +582,129 @@ enum SessionRowBuilder {
             }
         }
 
-        // Optimistic echo: painted last, so a prompt the user just sent stays at
-        // the end of the flow until its durable user/message retires it.
-        rows = appendingPendingEchoes(pendingUserEchoes, to: rows, nowMs: nowMs)
+        let insertedCount: Int
+        switch mode {
+        case .prepend:
+            insertedCount = rows.count
+        default:
+            insertedCount = 0
+        }
+        switch mode {
+        case .replace:
+            state.turnTrace = traceEntries
+            state.newestTurnStarted = batchTurnStartRow != nil
+            state.newestTurnRowStart = batchTurnStartRow ?? 0
+            state.maxRowSeq = batchMaxRowSeq
+            state.loadedMinSeq = batch.first?.seq
+            state.loadedMaxSeq = batch.last?.seq
+            return removedExistingRows
+        case .append:
+            state.turnTrace.append(contentsOf: traceEntries)
+            if let rowStart = batchTurnStartRow {
+                state.newestTurnStarted = true
+                state.newestTurnRowStart = rowStart
+            }
+            if batchMaxRowSeq > state.maxRowSeq { state.maxRowSeq = batchMaxRowSeq }
+            if let last = batch.last?.seq {
+                state.loadedMaxSeq = max(state.loadedMaxSeq ?? Int.min, last)
+            }
+        case .prepend:
+            state.turnTrace.insert(contentsOf: traceEntries, at: 0)
+            if let rowStart = batchTurnStartRow {
+                if state.newestTurnStarted {
+                    state.newestTurnRowStart += insertedCount
+                } else {
+                    state.newestTurnStarted = true
+                    state.newestTurnRowStart = rowStart
+                }
+            } else {
+                state.newestTurnRowStart += insertedCount
+            }
+            if batchMaxRowSeq > state.maxRowSeq { state.maxRowSeq = batchMaxRowSeq }
+            if let first = batch.first?.seq {
+                state.loadedMinSeq = min(state.loadedMinSeq ?? Int.max, first)
+            }
+        }
+        return removedExistingRows
+    }
 
-        // 最新一轮的文件变更：精确取数 seq（上面）+ 该轮工具结果 meta.diffs 的
-        // 客户端聚合回退（baseline §3.5/§6）。窗口从一轮中间开始时没有 turn/start，
-        // 聚合窗口退化为整窗。
-        let aggregateStart = newestTurnStarted ? min(newestTurnRowStart, rows.count) : 0
-        let latestFileChanges = aggregateFileChanges(rows: Array(rows[aggregateStart...]))
-        return SessionFlow(
-            rows: rows,
-            isRunning: running,
-            latestFileChangeSeq: latestFileChangeSeq,
-            latestFileChanges: latestFileChanges
-        )
+    @discardableResult
+    private static func removeDeferredBlocks(
+        for callIds: Set<String>,
+        state: inout FoldState,
+        rows: inout [FlowRow]
+    ) -> Bool {
+        var removable = Set<String>()
+        for callId in callIds {
+            if let rowID = state.deferredBlockRowIDs.removeValue(forKey: callId) {
+                removable.insert(rowID)
+            }
+        }
+        guard !removable.isEmpty else { return false }
+        rows.removeAll { removable.contains($0.id) }
+        return true
+    }
+
+    /// prepend 更早的一页之后：把新补上的调用行与之前的孤儿 tool/result 行合并
+    /// （结果挂到调用行上、删除孤儿行），行序与全量重建保持一致。
+    @discardableResult
+    private static func resolveOrphanResults(state: inout FoldState, rows: inout [FlowRow]) -> Bool {
+        guard !state.orphanResultRows.isEmpty else { return false }
+        var remaining: [OrphanResultRow] = []
+        var removable = Set<String>()
+        for orphan in state.orphanResultRows {
+            guard let index = rows.firstIndex(where: { $0.id == orphan.rowID }) else { continue }
+            if attachToolResult(callId: orphan.callId, result: orphan.result, rows: &rows, before: index) {
+                removable.insert(orphan.rowID)
+            } else {
+                remaining.append(orphan)
+            }
+        }
+        guard !removable.isEmpty else {
+            state.orphanResultRows = remaining
+            return false
+        }
+        rows.removeAll { removable.contains($0.id) }
+        state.orphanResultRows = remaining
+        return true
+    }
+
+    /// 这批事件里有会「原地修改已有行」的类型：工具结果挂载 / 审批结论 / 后台任务结算。
+    /// 分组缓存遇到这种批次要走全量重算（行的分组结构不变，但组内内容变了）。
+    private static func touchesExistingRows(_ batch: [SessionEvent]) -> Bool {
+        for event in batch {
+            switch event.type {
+            case "tool/result", "approval/decided", "job/settled", "tool/ptc-dispatch", "tool/ptc-dispatch-start":
+                return true
+            default:
+                continue
+            }
+        }
+        return false
+    }
+
+    /// 由紧凑 turn 轨迹重放派生值（与全量折叠同一套规则）。
+    private static func replay(_ state: FoldState) -> (isRunning: Bool, latestFileChangeSeq: Int?) {
+        var isRunning = false
+        var lastEndedTurn = 0
+        var lastTurnStartSeq = Int.min
+        var lastWorkspaceSeq: Int?
+        for entry in state.turnTrace {
+            switch entry.kind {
+            case .turnStart:
+                isRunning = true
+                lastTurnStartSeq = entry.seq
+            case .turnEnd:
+                isRunning = false
+                if entry.turn > lastEndedTurn { lastEndedTurn = entry.turn }
+            case .workspace:
+                lastWorkspaceSeq = entry.seq
+            case .row:
+                if !isRunning, entry.turn > lastEndedTurn { isRunning = true }
+            }
+        }
+        let latestFileChangeSeq = lastWorkspaceSeq.flatMap { $0 > lastTurnStartSeq ? $0 : nil }
+        return (isRunning, latestFileChangeSeq)
     }
 
     /// Repaint only the optimistic tail rows (idempotent): the view model calls
@@ -354,10 +728,11 @@ enum SessionRowBuilder {
     private static func appendPendingUserEchoes(
         _ echoes: [PendingUserEcho],
         to rows: inout [FlowRow],
-        nowMs: Int64
+        nowMs: Int64,
+        startingAfter seqBase: Int? = nil
     ) {
         guard !echoes.isEmpty else { return }
-        var seq = rows.map(\.seq).max() ?? 0
+        var seq = seqBase ?? (rows.map(\.seq).max() ?? 0)
         for echo in echoes {
             seq += 1
             rows.append(FlowRow(
@@ -385,21 +760,15 @@ enum SessionRowBuilder {
     // MARK: - Parsing helpers
 
     static func toolCall(from data: JSONValue?, event: SessionEvent) -> ToolCallItem {
-        let argumentsRaw = data?["arguments"]?.stringValue
-        var arguments: [String: JSONValue] = [:]
-        if let argumentsRaw,
-           let argumentsData = argumentsRaw.data(using: .utf8),
-           let parsed = try? JSONDecoder().decode(JSONValue.self, from: argumentsData),
-           let object = parsed.objectValue {
-            arguments = object
-        } else if let object = data?["arguments"]?.objectValue {
-            arguments = object
-        }
+        // 参数 JSON 解析推迟到真正要显示时（ToolCallItem.arguments 懒解析 + 缓存）：
+        // 构建/滚动不再为「不可见的工具行」解码 arguments 字符串。
+        let argumentsValue = data?["arguments"]
+        let argumentsRaw = argumentsValue?.stringValue
         return ToolCallItem(
             callId: data?["callId"]?.stringValue,
             name: data?["name"]?.stringValue ?? "tool",
             argumentsRaw: argumentsRaw,
-            arguments: arguments,
+            arguments: argumentsValue?.objectValue ?? [:],
             result: nil,
             children: [],
             turn: data?["turn"]?.int ?? 0,
@@ -408,6 +777,12 @@ enum SessionRowBuilder {
     }
 
     static func aggregateFileChanges(rows: [FlowRow]) -> FileChangeSummary? {
+        aggregateFileChanges(rows: rows, from: 0)
+    }
+
+    /// 只聚合 rows[from...]（最新一轮）——「窗口从一轮中间开始」时退化为整窗。
+    /// 增量回路每批只需要重算最新一轮的尾部窗口，避免全量重扫。
+    static func aggregateFileChanges(rows: [FlowRow], from startIndex: Int) -> FileChangeSummary? {
         var files = Set<String>()
         var additions = 0
         var deletions = 0
@@ -416,8 +791,8 @@ enum SessionRowBuilder {
                 for diff in diffs {
                     guard let path = diff["path"]?.stringValue else { continue }
                     files.insert(path)
-                    let oldLines = diff["oldText"]?.stringValue?.components(separatedBy: "\n").count ?? 0
-                    let newLines = diff["newText"]?.stringValue?.components(separatedBy: "\n").count ?? 0
+                    let oldLines = lineCount(diff["oldText"]?.stringValue)
+                    let newLines = lineCount(diff["newText"]?.stringValue)
                     if newLines > oldLines { additions += newLines - oldLines }
                     if oldLines > newLines { deletions += oldLines - newLines }
                 }
@@ -430,11 +805,22 @@ enum SessionRowBuilder {
             }
             for child in item.children { walk(child) }
         }
-        for row in rows {
-            if case .tool(let item) = row.content { walk(item) }
+        var index = min(max(startIndex, 0), rows.count)
+        while index < rows.count {
+            if case .tool(let item) = rows[index].content { walk(item) }
+            index += 1
         }
         guard !files.isEmpty else { return nil }
         return FileChangeSummary(files: files.sorted(), additions: additions, deletions: deletions)
+    }
+
+    /// 等价于 components(separatedBy: "\n").count，但不分配切分数组。
+    private static func lineCount(_ text: String?) -> Int {
+        guard let text else { return 0 }
+        guard !text.isEmpty else { return 1 }
+        var count = 1
+        for byte in text.utf8 where byte == 0x0A { count += 1 }
+        return count
     }
 
     static func findToolCall(in rows: [FlowRow], callId: String?) -> ToolCallItem? {

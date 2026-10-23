@@ -40,11 +40,7 @@ struct SessionDetailView: View {
     /// 会让距离阈值瞬间判成"不在底部"，跟随就此停住，页面卡在会话中间
     /// （用户 2026-10-22 报障：点通知进入停在 turn 8，实际已到 turn 9）。
     @State private var userHasScrolled = false
-    /// 问题三 + 问题一：向上加载更早历史时的视觉锚点（旧的首条 section id）。
-    /// 前置插入会让可见内容整体下移，加载完成后用它把旧视口重新钉回顶部。
-    @State private var pendingPrependAnchorID: String?
-    /// 触发前置加载时的 log front（同一 turn 内分页也靠它判断「真的合并了新页」）。
-    @State private var pendingPrependOldestSeq: Int?    /// E2E-only：真实滚动几何快照（真机空白屏定位用，产品路径不渲染）。
+    /// E2E-only：真实滚动几何快照（真机空白屏定位用，产品路径不渲染）。
     @State private var e2eScrollDebug = "offset=-;size=-;viewport=-"
     /// 兜底重锚次数：内容已就绪、用户没滚过却离底很远时自动拉回底部（最多 3 次）。
     @State private var bottomRecoveryAttempts = 0
@@ -153,15 +149,20 @@ struct SessionDetailView: View {
             viewModel.stop()
         }
         .onAppear {
+            // 壳优先：header/返回/输入框/消息区骨架这一帧就上屏（幂等）。
+            viewModel.markDetailShellFrame()
             // M2b-2c: detail in-app first-frame mark (idempotent).
             viewModel.markDetailViewAppeared()
+            // 内容已在首帧前就绪（缓存命中窗口）时，onChange 不会触发，这里补标一次。
+            if !viewModel.rows.isEmpty {
+                markFirstContentAfterLayout()
+            }
         }
         .overlay(alignment: .topLeading) {
             VStack(spacing: 0) {
                 detailMetricsElement
                 sendMetricsElement
-                e2ePagingDebugElement
-                e2eLastPageDebugElement
+                e2eHistoryFillElement
                 e2eLinkDebugElement
             }
         }
@@ -178,25 +179,6 @@ struct SessionDetailView: View {
                 // The 8 s tick must not be the only source of truth for the beam.
                 refreshDerivedState()
             }
-        }
-        // E2E paging self-test (env-gated, DEBUG): 自动向上翻页到最早事件，用来在真机上
-        // 验证 turn 分组/终止条件，无需手势。DSHM_E2E_PAGING=1 时启动。
-        .task(id: viewModel.hasLiveSnapshot) {
-            guard app.isE2EMode,
-                  ProcessInfo.processInfo.environment["DSHM_E2E_PAGING"] == "1",
-                  viewModel.hasLiveSnapshot,
-                  viewModel.hasMoreOlder else { return }
-            for _ in 0..<40 {
-                guard viewModel.hasMoreOlder else { break }
-                viewModel.loadOlderIfNeeded()
-                var spins = 0
-                while viewModel.isLoadingOlder, spins < 100 {
-                    try? await Task.sleep(nanoseconds: 100_000_000)
-                    spins += 1
-                }
-                try? await Task.sleep(nanoseconds: 150_000_000)
-            }
-            NSLog("[STREAMDBG] paging self-test done: hasMoreOlder=%@ oldest=%@", String(viewModel.hasMoreOlder), String(viewModel.oldestLoadedSeq ?? -1))
         }
         .onChange(of: scenePhase) { _, phase in
             // A background gap can leave the last poll stale; refresh once when
@@ -526,49 +508,26 @@ struct SessionDetailView: View {
         }
     }
 
-    // MARK: - E2E paging state (session-history E2E, task-11)
+    // MARK: - E2E autoload state (全量历史自动补齐, 2026-10-23)
 
-    /// Invisible state element read by the session-history XCUITests: a pull that
-    /// "refreshes but loads nothing" used to be a silent no-op, so tests need the
-    /// real paging front / has-more / loading / error values after every gesture.
-    /// Format: `oldest=<n|->;hasMore=0|1;loading=0|1;error=<text|->`.
+    /// 隐藏元素 `e2e-history-fill`：后台自动补齐的诊断值（VM 只在 E2E/DEBUG 时写入，
+    /// 产品路径为 nil → 不渲染）。前缀由 VM 固定为 state/pages/oldest/ms/rows/failures，
+    /// 这里只在末尾追加滚动几何 key（不影响前缀顺序）。
     @ViewBuilder
-    private var e2ePagingDebugElement: some View {
-        if app.isE2EMode {
-            let oldest = viewModel.oldestLoadedSeq.map(String.init) ?? "-"
-            let error = (viewModel.actionErrorText?.isEmpty == false) ? (viewModel.actionErrorText ?? "-") : "-"
-            let value = "oldest=" + oldest
-                + ";hasMore=" + (viewModel.hasMoreOlder ? "1" : "0")
-                + ";loading=" + (viewModel.isLoadingOlder ? "1" : "0")
-                + ";error=" + error
-                + ";rows=" + String(viewModel.rows.count)
+    private var e2eHistoryFillElement: some View {
+        if app.isE2EMode, let probe = viewModel.historyFillProbeValue {
+            let value = probe
                 + ";scrolled=" + (userHasScrolled ? "1" : "0")
                 + ";nearBottom=" + (isNearBottom ? "1" : "0")
+                + ";prepend=" + scrollAnchorState.lastPrependHandling
+                + ";visible=" + String(scrollAnchorState.visibleRowIDs.count)
                 + ";" + e2eScrollDebug
-            Text("e2e-paging")
+            Text("e2e-history-fill")
                 .font(.system(size: 1))
                 .frame(width: 2, height: 2)
                 .opacity(0.02)
                 .allowsHitTesting(false)
-                .accessibilityIdentifier("e2e-paging")
-                .accessibilityLabel(value)
-                .accessibilityValue(value)
-        }
-    }
-
-    /// Last `session/page` round trip (request/response/merge classification),
-    /// written by the view model only in E2E/debug runs. Read by the
-    /// session-history UI tests to tell "gesture never started" from "page dropped".
-    @ViewBuilder
-    private var e2eLastPageDebugElement: some View {
-        let value = viewModel.e2eLastPageDebug
-        if app.isE2EMode, !value.isEmpty {
-            Text("e2e-lastpage")
-                .font(.system(size: 1))
-                .frame(width: 2, height: 2)
-                .opacity(0.02)
-                .allowsHitTesting(false)
-                .accessibilityIdentifier("e2e-lastpage")
+                .accessibilityIdentifier("e2e-history-fill")
                 .accessibilityLabel(value)
                 .accessibilityValue(value)
         }
@@ -733,23 +692,34 @@ struct SessionDetailView: View {
 
     /// 平铺流的渲染分组：连续 reasoning/tool 行折成一个过程组，其余一行一组。
     /// 与桌面端一致：分组是行级的，不按 turn 分块。
+    /// 2026-10-23 性能：分组结果由 SessionViewModel 缓存并随 rows 一起发布，
+    /// body 直接读，不再每次渲染 O(rows) 重算（全量历史后 rows 可达 3000+）。
     private var flowGroups: [FlowRowGroup] {
-        SessionFlowGrouping.groups(rows: viewModel.rows)
+        viewModel.flowGroups
+    }
+
+    /// 详情壳首帧的消息区占位：只在「还没有任何行、live 快照也没到」时出现。
+    /// 静态无动画、无菊花——不是后台补齐进度提示，只是壳先出的骨架。
+    private var messageSkeleton: some View {
+        VStack(alignment: .leading, spacing: Theme.Spacing.s) {
+            ForEach(0..<5, id: \.self) { index in
+                RoundedRectangle(cornerRadius: Theme.Radius.lg, style: .continuous)
+                    .fill(Theme.Palette.surface)
+                    .frame(maxWidth: index == 2 ? 220 : .infinity)
+                    .frame(height: index == 1 ? 64 : 40)
+                    .opacity(0.6)
+            }
+        }
+        .padding(.top, Theme.Spacing.s)
+        .allowsHitTesting(false)
+        .accessibilityIdentifier("session-skeleton")
     }
 
     private var messageList: some View {
-        ScrollViewReader { proxy in
+        let pendingCallIds = Set(app.link.pendingApprovals.compactMap(\.callId))
+        return ScrollViewReader { proxy in
             ScrollView {
-                // 顶部锚点必须放在 LazyVStack **外部**：LazyVStack 内的 section id
-                // 在距离远/未实体化时 scrollTo 会按估算位置落点甚至不动，
-                // 导致「更早页已合并但用户看不到」（2026-10-22 真机回归 A5）。
-                Color.clear
-                    .frame(height: 0)
-                    .id(Self.topAnchorID)
                 LazyVStack(alignment: .leading, spacing: Theme.Spacing.s) {
-                    if viewModel.hasMoreOlder || viewModel.isLoadingOlder {
-                        loadOlderRow
-                    }
                     if viewModel.isLoading {
                         HStack(spacing: Theme.Spacing.xs) {
                             ProgressView().tint(Theme.Palette.accent)
@@ -760,12 +730,16 @@ struct SessionDetailView: View {
                         .frame(maxWidth: .infinity)
                         .padding(.top, Theme.Spacing.xxl)
                     } else if viewModel.rows.isEmpty, viewModel.streamErrorText == nil {
-                        EmptyStateView(
-                            icon: "text.bubble",
-                            title: "还没有消息",
-                            message: "在下方输入框发一条消息开始这个会话。"
-                        )
-                        .accessibilityIdentifier("session-empty")
+                        if viewModel.hasLiveSnapshot {
+                            EmptyStateView(
+                                icon: "text.bubble",
+                                title: "还没有消息",
+                                message: "在下方输入框发一条消息开始这个会话。"
+                            )
+                            .accessibilityIdentifier("session-empty")
+                        } else {
+                            messageSkeleton
+                        }
                     }
 
                     // 2026-10-23 用户拍板：删除 turn UI，与 DSH 桌面端一致——
@@ -776,7 +750,7 @@ struct SessionDetailView: View {
                             group: group,
                             sessionId: sessionId,
                             attachments: attachments,
-                            pendingApprovalCallIds: Set(app.link.pendingApprovals.compactMap(\.callId)),
+                            pendingApprovalCallIds: pendingCallIds,
                             subagentLabels: viewModel.subagentLabels,
                             isNewestGroupRunning: viewModel.isRunning && index == flowGroups.count - 1,
                             onOpenTool: { present(.tool($0)) }
@@ -811,6 +785,8 @@ struct SessionDetailView: View {
                 }
                 .padding(.horizontal, Theme.Spacing.pageInset)
                 .padding(.vertical, Theme.Spacing.s)
+                // 自动补齐视口锚定（HistoryViewportAnchor）需要把每个流分组登记成滚动目标。
+                .scrollTargetLayout()
                 // 问题三关键修复：锚点必须放在 LazyVStack 外面。
                 // 放里面时 LazyVStack 尚未实体化该行，scrollTo(bottom) 会按估算布局滚到
                 // 非法位置；等内容上屏后视图停在 content 之外 → 整屏空白
@@ -856,12 +832,25 @@ struct SessionDetailView: View {
             ))
             // 用户手动滚动后不再强制贴底（上滑读历史时新内容不得把视图拉回底部）。
             .modifier(UserScrollObserver { userHasScrolled = true })
-            // 问题一对接：滑到接近顶部自动加载更早历史（问题一的分页状态机由 SessionViewModel 提供）。
-            .modifier(NearTopObserver(onPullAtTop: triggerLoadOlder))
-            .onChange(of: viewModel.isLoadingOlder) { _, loading in
-                if !loading { restorePrependAnchor(proxy: proxy) }
+            // 自动补齐阅读锚定：iOS 18+ 采集「当前可见的流分组 id」（写非观察容器，滚动不重绘）。
+            .modifier(HistoryViewportAnchor(state: scrollAnchorState))
+            // 首屏消息内容上屏（布局提交后标记，用于 tap→firstContent 口径；幂等）。
+            .onChange(of: viewModel.rows.isEmpty) { _, isEmpty in
+                guard !isEmpty else { return }
+                markFirstContentAfterLayout()
             }
-            .onChange(of: viewModel.rows) { _ in
+            // 后台自动补齐合并了一批更早历史 → 视口稳定（不含任何补齐提示）。
+            .onChange(of: viewModel.historyBatchToken) { _, _ in
+                handleHistoryPrepend(proxy: proxy)
+            }
+            .onChange(of: viewModel.rows) { oldRows, newRows in
+                // 后台自动补齐只在列表最前面插入更早历史：尾部 id 不变、首行 id 变了。
+                // 这类变化由 historyBatchToken 的处理器统一做视口稳定，绝不能进入贴底
+                // 跟随，否则正在上滑读历史的用户会被拽回底部（用户拍板禁止）。
+                let prependOnly = newRows.count > oldRows.count
+                    && oldRows.first?.id != newRows.first?.id
+                    && oldRows.last?.id == newRows.last?.id
+                if prependOnly { return }
                 // Keep the newest activity visible; LazyVStack off-screen rows are
                 // not in the accessibility tree, so this also keeps the live tool
                 // row reachable for UI automation.
@@ -885,9 +874,6 @@ struct SessionDetailView: View {
 
     // MARK: - 问题三：滚动锚定（首帧锚底 / 粘底 / 布局突变重锚）
 
-    /// 内容绝对顶部（LazyVStack 外）：每次成功前置加载更早页后把视口移到这里，
-    /// 让用户立刻看到刚加载的内容。详见 `restorePrependAnchor`。
-    private static let topAnchorID = "session-top-anchor"
     private static let bottomAnchorID = "bottom"
 
     /// 底部锚点：滚动目标 + iOS 17 上"是否接近底部"的退化探测点。
@@ -963,79 +949,78 @@ struct SessionDetailView: View {
         }
     }
 
-    /// 顶部"加载更早"兜底入口：自动触发失败时可手动重试；加载中显示菊花。
-    private var loadOlderRow: some View {
-        HStack(spacing: Theme.Spacing.xs) {
-            Spacer(minLength: 0)
-            if viewModel.isLoadingOlder {
-                ProgressView().tint(Theme.Palette.accent)
-                Text("正在加载更早的消息…")
-                    .font(Theme.Typography.caption)
-                    .foregroundStyle(Theme.Palette.textTertiary)
-            } else {
-                Button {
-                    viewModel.loadOlderIfNeeded()
-                } label: {
-                    Text("加载更早的消息")
-                        .font(Theme.Typography.caption)
-                        .foregroundStyle(Theme.Palette.textSecondary)
-                }
-                .buttonStyle(.plain)
-            }
-            Spacer(minLength: 0)
-        }
-        .padding(.vertical, Theme.Spacing.xs)
-        .accessibilityIdentifier("session-load-older")
-        // iOS 17 退化触发点：这一行被实体化说明用户已滑到顶部附近。
-        .modifier(TopRowTrigger(onAppear: triggerLoadOlder))
-    }
+    // MARK: - 后台自动补齐（全量历史）视口稳定
 
-    /// 滑近顶部自动加载更早历史；到底/并发由 ViewModel 的 loadOlderIfNeeded 去重。
-    private func triggerLoadOlder() {
-        guard viewModel.hasMoreOlder, !viewModel.isLoadingOlder else { return }
-        if pendingPrependAnchorID == nil {
-            pendingPrependAnchorID = viewModel.rows.first?.id
-            // 分页在同一个 turn 内也能前进：锚点 id 不变时不能只靠它判断
-            // 「是否真的合并了新页」，log 的 oldest seq 才是可靠信号。
-            pendingPrependOldestSeq = viewModel.oldestLoadedSeq
-        }
-        viewModel.loadOlderIfNeeded()
-    }
-
-    /// 前置插入完成后定位视口。
+    /// 后台自动补齐合并了一批「更早历史」（只在列表最前面插入，尾部 id 不变）。
     ///
-    /// 2026-10-22 真机回归（用户）：下拉触发了刷新、页也加载了，但视口被钉回**旧**首条，
-    /// 新加载的更早内容全在视口上方，用户反复下拉只会不断加载、却"看不到刷出更早的消息"。
-    /// 因此：本次确实合并了新页 → 把视口移到**新窗口顶部**（让用户立刻看到加载结果）；
-    /// 没合并（失败/被拒/无新页）→ 仍钉回旧锚点，保持阅读位置不乱跳。
-    private func restorePrependAnchor(proxy: ScrollViewProxy) {
-        guard let anchor = pendingPrependAnchorID else { return }
-        let oldestBefore = pendingPrependOldestSeq
+    /// 用户拍板：补齐完全无痕（无按钮/文案/进度/菊花），且视口不得被拽走——
+    /// - 用户贴底（或打开后还没手动滚动过）→ 无动画把视口保持/贴回底部，内容不跳；
+    /// - 用户已上滑读历史 → 用「当前视口最上方可见行」把阅读位置钉回原处，
+    ///   **绝不**滚回底部；没有可用锚点（iOS 17 / 尚未采集）时宁可不滚动，也不拽底。
+    private func handleHistoryPrepend(proxy: ScrollViewProxy) {
+        scrollAnchorState.prependEpoch += 1
+        let epoch = scrollAnchorState.prependEpoch
+        if !userHasScrolled || isNearBottom {
+            scrollAnchorState.lastPrependHandling = "pin"
+            pinToBottomAfterPrepend(proxy: proxy, epoch: epoch)
+            return
+        }
+        guard let anchorID = firstVisibleRowID() else {
+            // iOS 17 无可见性 API / 尚未采集到可见行：宁可不滚动，也绝不拽回底部。
+            scrollAnchorState.lastPrependHandling = "skip-no-anchor"
+            return
+        }
+        scrollAnchorState.lastPrependHandling = "anchor:" + anchorID
+        restoreReadingAnchor(proxy: proxy, anchorID: anchorID, epoch: epoch)
+    }
+
+    /// 首屏内容帧标记：等一次布局提交（yield 两拍）再标记，尽量贴近"内容真的可见"的时刻。
+    /// 幂等由 VM 保证（detailFirstFrameMarked）。
+    private func markFirstContentAfterLayout() {
         Task { @MainActor in
-            // 更早页合并后 rows 重建有 ~40ms debounce，isLoadingOlder=false 时
-            // sections/oldest 往往还是旧值。等「log front 真正前进」再决定落点，
-            // 否则会把视口钉回旧锚点、新加载的更早内容永远留在视口上方（真机回归）。
-            // 同一 turn 内的分页不改变 sections.first.id，所以必须看 oldest seq。
-            // 上限 500ms：没有新页（失败/被拒/无更多）则保持阅读位置。
-            for _ in 0..<50 {
-                await Task.yield()
-                if let before = oldestBefore, viewModel.oldestLoadedSeq != before {
-                    pendingPrependAnchorID = nil
-                    pendingPrependOldestSeq = nil
-                    // 等布局把新 rows 落定（LazyVStack 会按可见锚点修正一次），
-                    // 再滚到 LazyVStack 外的真实 top anchor；重复两次抵消布局修正。
-                    for _ in 0..<3 {
-                        await Task.yield()
-                        proxy.scrollTo(Self.topAnchorID, anchor: .top)
-                        try? await Task.sleep(nanoseconds: 80_000_000)
-                    }
-                    return
-                }
-                try? await Task.sleep(nanoseconds: 10_000_000)
-            }
-            pendingPrependAnchorID = nil
-            pendingPrependOldestSeq = nil
-            proxy.scrollTo(anchor, anchor: .top)
+            await Task.yield()
+            await Task.yield()
+            viewModel.markDetailFirstContent()
+        }
+    }
+
+    /// 当前视口内最上方（文档顺序最靠前）的可见行 id；prepend 后用它锚定阅读位置。
+    private func firstVisibleRowID() -> String? {
+        let visible = scrollAnchorState.visibleRowIDs
+        guard !visible.isEmpty else { return nil }
+        for group in flowGroups where visible.contains(group.id) {
+            return group.id
+        }
+        return nil
+    }
+
+    /// 贴底保持：补齐只从顶部插入，末尾内容的位置语义不变，单拍无动画对齐底部。
+    private func pinToBottomAfterPrepend(proxy: ScrollViewProxy, epoch: Int) {
+        isNearBottom = true
+        // 自动补齐每批都要贴底，不做首屏加固多拍（多拍 = 每批 3 次滚动 → 闪动）。
+        scrollAnchorState.hardeningRemaining = 0
+        scrollToBottom(proxy: proxy)
+        let generation = scrollAnchorState.generation
+        Task { @MainActor in
+            // LazyVStack 前置插入后高度估算会再收敛一次；120ms 后补一拍校正。
+            try? await Task.sleep(nanoseconds: 120_000_000)
+            guard epoch == scrollAnchorState.prependEpoch,
+                  generation == scrollAnchorState.generation,
+                  isNearBottom else { return }
+            proxy.scrollTo(Self.bottomAnchorID, anchor: .bottom)
+        }
+    }
+
+    /// 阅读位置锚定：把 prepend 前视口最上方的行重新对齐回视口顶部（无动画、不贴底）。
+    private func restoreReadingAnchor(proxy: ScrollViewProxy, anchorID: String, epoch: Int) {
+        Task { @MainActor in
+            await Task.yield()
+            guard epoch == scrollAnchorState.prependEpoch, !isNearBottom else { return }
+            proxy.scrollTo(anchorID, anchor: .top)
+            // 前置内容落定后再对齐一次；若新批次已到（新锚点由新批次负责）则放弃。
+            try? await Task.sleep(nanoseconds: 80_000_000)
+            guard epoch == scrollAnchorState.prependEpoch, !isNearBottom else { return }
+            proxy.scrollTo(anchorID, anchor: .top)
         }
     }
 
@@ -1385,6 +1370,30 @@ enum SessionDetailSheet: Identifiable {
     }
 }
 
+/// 自动补齐阅读锚定（iOS 18+）：把「当前视口内可见的流分组 id」写入非观察容器。
+/// 只写普通 class 属性、不写 @State——滚动时逐帧写状态会让整个详情页重绘
+/// （2026-10-23 真机反馈的滚动卡顿/频闪根因）。iOS 17 无此 API：不采集，
+/// prepend 时宁可不滚动也不拽回底部（见 handleHistoryPrepend）。
+private struct HistoryViewportAnchor: ViewModifier {
+    let state: ScrollAnchorState
+    /// 阈值取小值：让「刚在顶部露出一点」的行也进入集合，锚点更贴近真实视口顶部。
+    private static let threshold: Double = 0.05
+
+    func body(content: Content) -> some View {
+        if #available(iOS 18.0, *) {
+            content.onScrollTargetVisibilityChange(
+                idType: String.self,
+                threshold: Self.threshold
+            ) { ids in
+                // 该 API 回调是 [ID]（可见顺序不定）；存成集合，锚定时再按文档顺序取最靠前的行。
+                state.visibleRowIDs = Set(ids)
+            }
+        } else {
+            content
+        }
+    }
+}
+
 /// 用户手动滚动的判定：iOS 18 用滚动阶段（`.interacting` 一定是手指拖动，
 /// `.decelerating` 只会出现在手势之后）；iOS 17 用 simultaneousGesture 兜底。
 /// 自动跟随是**无动画**的程序化滚动，不会进入 interacting/decelerating，
@@ -1433,135 +1442,18 @@ private struct StickToBottomObserver: ViewModifier {
     }
 }
 
-/// 问题一/问题三：**每次下拉手势**到达顶部时加载一页更早历史。
-///
-/// 旧实现只在"是否贴顶"这个 Bool 翻转时触发。但前置加载完成后锚点恢复会把视口
-/// 留在顶部附近，Bool 一直是 true、不再翻转，于是后面几次下拉完全不触发，
-/// 用户只能去点按钮（2026-10-22 报障）。修正后改为：
-/// - 用 ScrollGeometry 持续跟踪"是否在顶部附近"；
-/// - 用户每一次滚动手势结束（interacting/decelerating → idle）时，只要还在顶部附近
-///   就触发一次加载 —— 天然做到"一次下拉加载一页"，不会无节制连发。
-///
-/// 2026-10-22 二次反馈："加载更早的消息"出现后稍微一滑就自动加载，极易误触。
-/// 因此把触发所需的滑动距离整体放大 2 倍（120 → 240），并额外要求**本次手势
-/// 实际向上拉动的距离**也 ≥ 240pt：只认"用户真的把内容拉上去一屏"，
-/// 贴顶状态下的小幅抖动不再触发。程序化跟随是瞬时无动画滚动，不产生
-/// interacting/decelerating，因此不会自我触发。
-/// 常量集中在 `Trigger`，真机微调手感只改这一处。
-/// iOS 17 由顶部加载行是否实体化兜底（TopRowTrigger）。
-/// 「下拉加载更早」的触发判定，抽成纯逻辑以便单测（真机手势仍需 UITest 覆盖）。
-///
-/// 关键口径：量的是 **contentOffset 的下降量**（内容被向上拉动的距离），不是手指位移。
-/// 已经贴顶时继续下拉会进入 rubber-band，offset 变负、松手又弹回 0 ——
-/// 所以必须在滚动过程中累计**峰值**，不能在手势结束时用起止 offset 相减
-/// （2026-10-22 真机回归：贴顶下拉永远算成 0，加载彻底失效）。
-struct NearTopPullTracker: Equatable {
-    /// 触发条件（集中调参处；真机调手感只改这一处）。
-    enum Trigger {
-        /// 视口距顶部多少 pt 以内算"已到达顶部附近"。
-        static let nearTopThreshold: CGFloat = 240
-        /// 本次手势实际向上拉动的距离下限（相对原 120 放大 2 倍）。
-        static let minimumPullDistance: CGFloat = 240
-    }
-
-    /// 最近一次 ScrollGeometry 提交的 contentOffset.y。
-    private(set) var offsetY: CGFloat = 0
-    /// 当前视口是否在顶部附近（用于手势结束时的判定）。
-    private(set) var isNearTop = true
-    /// 本次用户手势开始时的 contentOffset.y（nil = 当前没有进行中的手势）。
-    private var startOffsetY: CGFloat?
-    /// 本次手势过程中累计的最大向上拉动距离（含 rubber-band 峰值）。
-    private(set) var maxPullDistance: CGFloat = 0
-
-    /// 本次手势是否已经触发过（阈值一过立即触发一次，避免同一手势重复请求）。
-    private(set) var didTriggerThisGesture = false
-
-    /// 每次 ScrollGeometry 变化都调用；返回 true 表示**本次手势首次越过阈值**，
-    /// 调用方应立即加载一页（用户要求：越过距离立即刷新，不等回弹到顶）。
-    @discardableResult
-    mutating func updateOffset(_ y: CGFloat) -> Bool {
-        if let start = startOffsetY {
-            maxPullDistance = max(maxPullDistance, start - y)
-        }
-        offsetY = y
-        isNearTop = y <= Trigger.nearTopThreshold
-        guard startOffsetY != nil,
-              !didTriggerThisGesture,
-              isNearTop,
-              maxPullDistance >= Trigger.minimumPullDistance else { return false }
-        didTriggerThisGesture = true
-        return true
-    }
-
-    /// 用户手势开始（ScrollPhase 进入 .interacting）。
-    mutating func gestureBegan() {
-        startOffsetY = offsetY
-        maxPullDistance = 0
-        didTriggerThisGesture = false
-    }
-
-    /// 用户手势结束（.interacting/.decelerating → .idle）：回弹前没越过阈值时再兜底判一次。
-    mutating func gestureEnded() -> Bool {
-        let triggered = !didTriggerThisGesture && isNearTop && maxPullDistance >= Trigger.minimumPullDistance
-        resetGesture()
-        return triggered
-    }
-
-    /// 手势未以"用户驱动"方式结束（或需要显式清理）时调用，避免陈旧峰值串到下一次手势。
-    mutating func resetGesture() {
-        startOffsetY = nil
-        maxPullDistance = 0
-        didTriggerThisGesture = false
-    }
-}
-
-/// 高频滚动状态的「非观察」容器。
-///
-/// 2026-10-23 真机反馈：上下滚动卡顿 + 频闪。根因是滚动相关的值状态每帧写入
-/// `@State` → 整个会话详情页每帧重新求值（消息列表极重）。这些状态只被手势闭包
-/// 读取、从不参与 body 布局，因此放进普通 class + `@StateObject`，写入不触发重绘。
-private final class NearTopPullTrackerBox: ObservableObject {
-    var tracker = NearTopPullTracker()
-}
-
 /// 贴底重锚的代号与首屏加固次数（同上：高频写入，不参与渲染）。
 private final class ScrollAnchorState: ObservableObject {
     var generation = 0
     var hardeningRemaining = 0
-}
-
-private struct NearTopObserver: ViewModifier {
-    let onPullAtTop: () -> Void
-    @StateObject private var trackerBox = NearTopPullTrackerBox()
-
-    func body(content: Content) -> some View {
-        if #available(iOS 18.0, *) {
-            content
-                .onScrollGeometryChange(for: CGFloat.self) { geometry in
-                    geometry.contentOffset.y
-                } action: { _, y in
-                    // 越过阈值的那一刻立即触发（不必等手势结束/回弹）。
-                    if trackerBox.tracker.updateOffset(y) { onPullAtTop() }
-                }
-                .onScrollPhaseChange { previousPhase, phase in
-                    switch phase {
-                    case .interacting:
-                        if previousPhase != .interacting { trackerBox.tracker.gestureBegan() }
-                    case .idle:
-                        let wasUserDriven = previousPhase == .interacting || previousPhase == .decelerating
-                        if wasUserDriven {
-                            if trackerBox.tracker.gestureEnded() { onPullAtTop() }
-                        } else {
-                            trackerBox.tracker.resetGesture()
-                        }
-                    default:
-                        break
-                    }
-                }
-        } else {
-            content
-        }
-    }
+    /// iOS 18+：当前视口内可见的流分组 id 集合（iOS 18 的可见性回调写入）。
+    /// 后台自动补齐 prepend 后用它把「正在读的那一行」锚回视口顶部，绝不拽回底部。
+    /// 写普通 class 而不是 @State：滚动时不触发整页重绘。
+    var visibleRowIDs: Set<String> = []
+    /// 自动补齐批次代号：每前置一批 +1，旧批次的延迟校正自动作废。
+    var prependEpoch = 0
+    /// E2E 诊断：最近一批历史补齐的视口处理结果（pin / anchor:<id> / skip-no-anchor）。
+    var lastPrependHandling = "-"
 }
 
 /// 真机空白屏兜底 + E2E 滚动几何埋点。
@@ -1617,19 +1509,6 @@ private struct ScrollBoundsWatch: ViewModifier {
                 }
         } else {
             content
-        }
-    }
-}
-
-/// iOS 17 退化：顶部加载行进入视图树即视为"用户已接近顶部"。
-private struct TopRowTrigger: ViewModifier {
-    let onAppear: () -> Void
-
-    func body(content: Content) -> some View {
-        if #available(iOS 18.0, *) {
-            content
-        } else {
-            content.onAppear(perform: onAppear)
         }
     }
 }

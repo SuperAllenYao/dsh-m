@@ -126,14 +126,35 @@ final class SessionWindowPrewarmer {
                     // snapshot (evidence + the detail knows the window is complete
                     // when `hasMore=false`). The opener asks for the same
                     // `SessionWindowPolicy.devicePrewarmMessages` window.
-                    attempt.saved = self.cacheStore.save(
-                        sessionId: candidate.sessionId,
-                        snapshot: snapshot,
-                        events: [],
-                        windowMessages: SessionWindowPolicy.devicePrewarmMessages,
-                        hasMore: snapshot["hasMore"]?.boolValue
-                    )
-                    finish()
+                    // 2026-10-23: the cache now stores the newest 4 screens as
+                    // chunks. Decode the snapshot off-main (1-2MB on long sessions),
+                    // then persist chunk 0..3 so the first open paints from chunk 0.
+                    let store = self.cacheStore
+                    let sessionId = candidate.sessionId
+                    let windowMessages = SessionWindowPolicy.devicePrewarmMessages
+                    Task {
+                        // Decode (1-2MB snapshot) and the payload encode/disk write
+                        // both stay off the main actor: the list must not jank while
+                        // the prewarm runs behind it.
+                        let didSave = await Task.detached(priority: .utility) {
+                            guard case .snapshot(let parsed)? = try? SessionStreamFrame.decode(snapshot) else {
+                                return false
+                            }
+                            return store.save(
+                                sessionId: sessionId,
+                                cursor: parsed.cursor,
+                                hasMore: parsed.hasMore,
+                                header: parsed.header,
+                                projections: parsed.projections,
+                                events: parsed.records.compactMap { $0.event },
+                                windowMessages: windowMessages,
+                                messagesPerScreen: SessionWindowPolicy.maxFirstWindowMessages,
+                                screens: SessionWindowPolicy.cachedScreens
+                            )
+                        }.value
+                        attempt.saved = didSave
+                        finish()
+                    }
                 },
                 {
                     finish()

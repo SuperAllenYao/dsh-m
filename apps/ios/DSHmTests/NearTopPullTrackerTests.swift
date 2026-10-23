@@ -1,113 +1,120 @@
 import XCTest
 @testable import DSHm
 
-/// 「下拉加载更早」触发判定的单测（纯逻辑）。
-///
-/// 两次真机回归都锁定在这里：
-/// 1) 2026-10-22 第一次：用「手势起止 offset 差」算位移，贴顶 rubber-band 回弹后
-///    恒为 0 → 永不触发。修正为手势过程中累计 **峰值**。
-/// 2) 2026-10-22 第二次（用户反馈）：必须**越过距离立即触发**，不能等回弹到顶。
-///    修正为 updateOffset 内即时判定，一次手势只触发一次。
-final class NearTopPullTrackerTests: XCTestCase {
+/// 2026-10-23 全量历史自动补齐：in-app 计时门禁（detail-metrics 新增 autoload key 组）。
+/// - legacy 串（firstFrameMs/cacheHit/networkMs/beginEpochMs/sessionId/window/cacheMs/fullMs/resumed）
+///   必须保持字节稳定（旧 bench parser / 旧 E2E 兼容）；
+/// - autoload 组（tapMs/tapAtEpochMs/shellMs/contentMs/firstContentMs/cacheChunk0Ms/
+///   fillMs/fillPages/fillOldest）由 ; 拼在 legacy 之后。
+final class AutoloadMetricsTests: XCTestCase {
 
-    /// 贴顶下拉：峰值一旦越过 240pt 就在拖动过程中立即返回 true（不等松手/回弹）。
-    func testPullAtTopTriggersImmediatelyDuringDrag() {
-        var tracker = NearTopPullTracker()
-        XCTAssertTrue(tracker.isNearTop)
-        tracker.gestureBegan()
-        XCTAssertFalse(tracker.updateOffset(-120), "未到阈值不触发")
-        XCTAssertTrue(tracker.updateOffset(-380), "越过阈值的那一帧应立即触发")
-        // 继续拖/回弹都不再重复触发
-        XCTAssertFalse(tracker.updateOffset(-420))
-        XCTAssertFalse(tracker.updateOffset(0))
-        XCTAssertFalse(tracker.gestureEnded(), "同一次手势不重复触发")
+    private func fields(_ value: String) -> [String: String] {
+        var result: [String: String] = [:]
+        for part in value.split(separator: ";") {
+            let pair = part.split(separator: "=", maxSplits: 1)
+            guard pair.count == 2 else { continue }
+            result[String(pair[0])] = String(pair[1])
+        }
+        return result
     }
 
-    /// 贴顶轻搓（峰值 < 240pt）不触发——用户要求「放大 2 倍」的意图。
-    func testSmallWiggleAtTopDoesNotTrigger() {
-        var tracker = NearTopPullTracker()
-        tracker.gestureBegan()
-        XCTAssertFalse(tracker.updateOffset(-30))
-        XCTAssertFalse(tracker.updateOffset(-80))
-        XCTAssertFalse(tracker.updateOffset(0))
-        XCTAssertFalse(tracker.gestureEnded())
+    private func number(_ fields: [String: String], _ key: String) -> Double? {
+        fields[key].flatMap(Double.init)
     }
 
-    /// 中段一路拉到顶部：在「到达顶部附近且峰值越阈值」的那一帧立即触发。
-    func testPullFromMidListToTopTriggersWhenReachingTop() {
-        var tracker = NearTopPullTracker()
-        tracker.updateOffset(1200)
-        tracker.gestureBegan()
-        XCTAssertFalse(tracker.updateOffset(900))
-        XCTAssertFalse(tracker.updateOffset(400), "还没到顶部附近，不触发")
-        XCTAssertTrue(tracker.updateOffset(0), "到达顶部立即触发")
-        XCTAssertFalse(tracker.gestureEnded())
+    // MARK: - legacy 段
+
+    @MainActor
+    func testLegacyDetailMetricsStringStaysByteStable() throws {
+        defer { DetailMetrics.forceEnabledForTesting = nil; DetailMetrics.reset() }
+        DetailMetrics.forceEnabledForTesting = true
+        DetailMetrics.reset()
+        DetailMetrics.begin(sessionId: "s1")
+        let value = try XCTUnwrap(DetailMetrics.valueString)
+        let pattern = #"^firstFrameMs=-1;cacheHit=0;networkMs=-1;beginEpochMs=\d+;sessionId=s1;window=-1;cacheMs=-1;fullMs=-1;resumed=0$"#
+        XCTAssertNotNil(
+            value.range(of: pattern, options: .regularExpression),
+            "legacy detail-metrics 串必须保持旧格式（旧 E2E parser 依赖）: \(value)"
+        )
     }
 
-    /// 拉了很长距离但松手时没有到达顶部附近 → 不触发（避免半路误加载）。
-    func testPullEndingAwayFromTopDoesNotTrigger() {
-        var tracker = NearTopPullTracker()
-        tracker.updateOffset(3000)
-        tracker.gestureBegan()
-        XCTAssertFalse(tracker.updateOffset(2500))
-        XCTAssertFalse(tracker.updateOffset(2400))
-        XCTAssertFalse(tracker.isNearTop)
-        XCTAssertFalse(tracker.gestureEnded())
+    // MARK: - autoload 段
+
+    @MainActor
+    func testAutoloadMetricsExposeTapToFillSegments() throws {
+        defer { DetailMetrics.forceEnabledForTesting = nil; DetailMetrics.reset() }
+        DetailMetrics.forceEnabledForTesting = true
+        DetailMetrics.reset()
+        DetailMetrics.beginTap()
+        DetailMetrics.begin(sessionId: "s1")
+        DetailMetrics.setFirstWindow(16)
+        DetailMetrics.markShellFrame()
+        DetailMetrics.markFirstContent()
+        DetailMetrics.markNetworkApplied()
+        DetailMetrics.markCacheRestored(milliseconds: 12.5)
+        DetailMetrics.markHistoryFillCompleted(milliseconds: 2345.6, pages: 3, oldestSeq: 0)
+        let autoload = try XCTUnwrap(DetailMetrics.autoloadValueString)
+        let f = fields(autoload)
+        XCTAssertEqual(Set(f.keys).sorted(), [
+            "cacheChunk0Ms", "contentMs", "fillMs", "fillOldest", "fillPages",
+            "firstContentMs", "shellMs", "tapAtEpochMs", "tapMs",
+        ])
+        XCTAssertGreaterThanOrEqual(try XCTUnwrap(number(f, "tapMs")), 0, "tap 是 VM init 之前的第一笔 in-app 时间")
+        XCTAssertGreaterThanOrEqual(try XCTUnwrap(number(f, "tapAtEpochMs")), 1_700_000_000_000)
+        XCTAssertGreaterThanOrEqual(try XCTUnwrap(number(f, "shellMs")), 0)
+        XCTAssertEqual(try XCTUnwrap(number(f, "firstContentMs")), try XCTUnwrap(number(f, "contentMs")))
+        XCTAssertEqual(try XCTUnwrap(number(f, "cacheChunk0Ms")), 12.5)
+        XCTAssertEqual(try XCTUnwrap(number(f, "fillMs")), 2345.6)
+        XCTAssertEqual(try XCTUnwrap(number(f, "fillPages")), 3)
+        XCTAssertEqual(try XCTUnwrap(number(f, "fillOldest")), 0)
     }
 
-    /// 程序化滚动（贴底跟随/锚点恢复）不经过手势：不得触发加载。
-    func testProgrammaticScrollWithoutGestureDoesNotTrigger() {
-        var tracker = NearTopPullTracker()
-        XCTAssertFalse(tracker.updateOffset(1800))
-        XCTAssertFalse(tracker.updateOffset(600))
-        XCTAssertFalse(tracker.updateOffset(0))
-        XCTAssertFalse(tracker.gestureEnded(), "没有 gestureBegan 的滚动不能算用户下拉")
+    @MainActor
+    func testCacheRestoredMarksLegacyCacheKeys() throws {
+        defer { DetailMetrics.forceEnabledForTesting = nil; DetailMetrics.reset() }
+        DetailMetrics.forceEnabledForTesting = true
+        DetailMetrics.reset()
+        DetailMetrics.begin(sessionId: "s1")
+        DetailMetrics.setFirstWindow(16)
+        DetailMetrics.markCacheRestored(milliseconds: 21.0)
+        let legacy = try XCTUnwrap(DetailMetrics.valueString)
+        XCTAssertTrue(legacy.contains("cacheHit=0"), "cacheHit 由 setCacheHit 单独写入")
+        XCTAssertTrue(legacy.contains("window=16"))
+        XCTAssertTrue(legacy.contains("cacheMs=21.0"))
     }
 
-    /// 连续多次下拉：每次手势都能独立触发（回归 §4.2「连续下拉每次有效」）。
-    func testConsecutiveGesturesEachTrigger() {
-        var tracker = NearTopPullTracker()
+    // MARK: - VM 拼接
 
-        tracker.gestureBegan()
-        XCTAssertTrue(tracker.updateOffset(-300))
-        XCTAssertFalse(tracker.gestureEnded())
-
-        tracker.gestureBegan()
-        XCTAssertFalse(tracker.updateOffset(-20), "第二次轻搓不触发")
-        XCTAssertFalse(tracker.gestureEnded())
-
-        tracker.gestureBegan()
-        XCTAssertTrue(tracker.updateOffset(-260), "第三次仍应触发")
-        XCTAssertFalse(tracker.gestureEnded())
+    private func snapshotJSON() -> JSONValue {
+        TestJSON.value("""
+        {"type":"snapshot","header":{"version":4,"id":"s1"},"cursor":3,
+         "records":[
+           {"type":"event","event":{"type":"user/message","seq":1,"data":{"content":[{"type":"text","text":"hello"}],"source":{"kind":"user"}}}},
+           {"type":"event","event":{"type":"assistant/message","seq":2,"data":{"message":{"content":[{"type":"text","text":"world"}]}}}}
+         ],
+         "hasMore":false,
+         "projections":{"asOfSeq":2,"values":{}},"assistantStream":{"revision":0}}
+        """)
     }
 
-    /// 阈值边界：offset == 240 算顶部附近，241 不算。
-    func testNearTopThresholdBoundary() {
-        var tracker = NearTopPullTracker()
-        tracker.updateOffset(240)
-        XCTAssertTrue(tracker.isNearTop)
-        tracker.updateOffset(241)
-        XCTAssertFalse(tracker.isNearTop)
-    }
-
-    /// 峰值在回弹前累计：先在拖动中越过阈值 → 立即触发；回弹不影响结论。
-    func testPeakIsAccumulatedBeforeBounce() {
-        var tracker = NearTopPullTracker()
-        tracker.gestureBegan()
-        XCTAssertFalse(tracker.updateOffset(-100))
-        XCTAssertEqual(tracker.maxPullDistance, 100)
-        XCTAssertTrue(tracker.updateOffset(-260), "峰值越过阈值立即触发")
-        tracker.updateOffset(-90)
-        tracker.updateOffset(0)
-        XCTAssertFalse(tracker.gestureEnded())
-    }
-
-    /// 慢拖但峰值不够（快速轻弹）不触发。
-    func testShortFlickDoesNotTrigger() {
-        var tracker = NearTopPullTracker()
-        tracker.gestureBegan()
-        XCTAssertFalse(tracker.updateOffset(-90))
-        XCTAssertFalse(tracker.updateOffset(-140))
-        XCTAssertFalse(tracker.gestureEnded())
+    @MainActor
+    func testViewModelDetailMetricsValueAppendsAutoloadGroup() async throws {
+        DetailMetrics.forceEnabledForTesting = true
+        DetailMetrics.reset()
+        let store = SessionWindowCacheStore(
+            directory: FileManager.default.temporaryDirectory
+                .appendingPathComponent("AutoMetrics-\(UUID().uuidString)", isDirectory: true),
+            identity: { "autoload-tests" }
+        )
+        let viewModel = SessionViewModel(address: .session(sessionId: "s1"), windowCache: store)
+        viewModel.applyStreamValue(snapshotJSON())
+        try? await Task.sleep(nanoseconds: 150_000_000)
+        viewModel.markDetailViewAppeared()
+        let value = try XCTUnwrap(viewModel.detailMetricsValue)
+        let f = fields(value)
+        XCTAssertNotNil(f["firstFrameMs"], "legacy 段保留")
+        XCTAssertNotNil(f["tapMs"], "autoload 段追加")
+        XCTAssertNotNil(f["fillMs"])
+        XCTAssertEqual(f["fillOldest"], "-1", "补齐未跑时 fillOldest=-1")
     }
 }

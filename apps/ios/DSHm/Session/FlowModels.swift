@@ -39,20 +39,90 @@ struct ToolResultItem: Equatable {
     var images: [ImageRef]
 }
 
+/// 工具参数的惰性解析持有者。
+///
+/// 行构建只保留原始 JSON 字符串（argumentsRaw，线上本来就是这个形态）；参数只在
+/// 真正要显示摘要（summary）或参数面板时才解码一次并缓存——全量/增量构建不再为
+/// 不可见的工具行付出 JSONDecoder 成本。同一 ToolCallItem 的拷贝共享同一个 box，
+/// 解析结果也随之共享（主线程 / MainActor 使用，与视图读取同一线程）。
+final class ToolArgumentsBox {
+    private var parsed: [String: JSONValue]?
+    private let raw: String?
+    private let fallback: [String: JSONValue]
+
+    init(raw: String?, fallback: [String: JSONValue]) {
+        self.raw = raw
+        self.fallback = fallback
+    }
+
+    var value: [String: JSONValue] {
+        if let parsed { return parsed }
+        let resolved = resolve()
+        parsed = resolved
+        return resolved
+    }
+
+    private func resolve() -> [String: JSONValue] {
+        if let raw, !raw.isEmpty, let data = raw.data(using: .utf8),
+           let decoded = try? JSONDecoder().decode(JSONValue.self, from: data),
+           let object = decoded.objectValue {
+            return object
+        }
+        return fallback
+    }
+}
+
 struct ToolCallItem: Identifiable, Equatable {
     var callId: String?
     var name: String
     var argumentsRaw: String?
-    var arguments: [String: JSONValue]
+    private var argumentsBox: ToolArgumentsBox
     var result: ToolResultItem?
     var children: [ToolCallItem]
     var turn: Int
     var step: Int?
 
+    /// 惰性解析后的参数（首次访问时解码 argumentsRaw 并缓存）。
+    var arguments: [String: JSONValue] { argumentsBox.value }
+
+    init(
+        callId: String?,
+        name: String,
+        argumentsRaw: String?,
+        arguments: [String: JSONValue] = [:],
+        result: ToolResultItem?,
+        children: [ToolCallItem],
+        turn: Int,
+        step: Int?
+    ) {
+        self.callId = callId
+        self.name = name
+        self.argumentsRaw = argumentsRaw
+        self.argumentsBox = ToolArgumentsBox(raw: argumentsRaw, fallback: arguments)
+        self.result = result
+        self.children = children
+        self.turn = turn
+        self.step = step
+    }
+
     var id: String { callId ?? "call-\(name)-\(turn)-\(step ?? 0)" }
 
     var isRunning: Bool { result == nil }
     var isError: Bool { result?.isError == true }
+
+    /// raw 相同即参数相同（解析是纯函数）：视图 diff 不该触发 JSON 解码。
+    /// 只有 raw 缺失（本地构造 / 参数本来就是对象）时才比较解析后的值。
+    static func == (lhs: ToolCallItem, rhs: ToolCallItem) -> Bool {
+        guard lhs.callId == rhs.callId,
+              lhs.name == rhs.name,
+              lhs.argumentsRaw == rhs.argumentsRaw,
+              lhs.result == rhs.result,
+              lhs.children == rhs.children,
+              lhs.turn == rhs.turn,
+              lhs.step == rhs.step else { return false }
+        if lhs.argumentsRaw != nil || rhs.argumentsRaw != nil { return true }
+        return lhs.arguments == rhs.arguments
+    }
 
     /// One-line argument summary per tool (v5.1 compact row spec):
     /// bash=command first line; read/edit/write/read_image=file basename;

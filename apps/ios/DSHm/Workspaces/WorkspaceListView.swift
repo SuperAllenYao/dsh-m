@@ -332,6 +332,10 @@ struct WorkspaceListView: View {
                         pendingApprovals: viewModel.pendingApprovalCount(sessionId: session.sessionId, link: app.link),
                         isConnected: app.link.phase.isConnected
                     ) {
+                        // 2026-10-23: t0 for the user-perceived detail latency (tap ->
+                        // first content). The route switch must stay synchronous and
+                        // cheap; the detail's own work happens after this mark.
+                        DetailMetrics.beginTap()
                         app.openSession(session.followAddress)
                     }
                     .accessibilityIdentifier("session-card-\(cardIndex)")
