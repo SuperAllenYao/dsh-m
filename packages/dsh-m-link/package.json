@@ -1,6 +1,6 @@
 {
   "name": "dsh-m-link",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "private": true,
   "description": "DSH-m link host plugin (M1): self-hosted TLS origin + transparent bridge to the DSH loopback Remote API, with P-256 device authentication, persistent device registry, revocation, audit log, QR pairing and APNs notifications.",
   "type": "module",
