@@ -46,7 +46,10 @@ enum FlowRowGroup: Identifiable, Equatable {
         case .single(let row):
             return row.id
         case .process(let steps):
-            return "process-" + (steps.first?.id ?? "empty")
+ // v0.2.6 滚动修复：组 id 用**最后一条 step**，保证「向历史方向 prepend」
+ // 时既有组的 id 不变（新 step 只会加在组头，尾 step 保持不变），
+ // scrollPosition(id:) 的锚点因此不会在补齐插入时失效。
+            return "process-" + (steps.last?.id ?? "empty")
         }
     }
 }
