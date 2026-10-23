@@ -47,7 +47,8 @@ final class SessionMessageListCoordinatorTests: XCTestCase {
 
     // MARK: - fixtures
 
-    /// 用 .process 组造行：组 id = "process-<尾 step id>"，插入/删除都能被 diffable 正确识别。
+    /// 用 .process 组造行：组 id = "process-<首 step id>"（v0.2.7 起对流式追加稳定），
+    /// 插入/删除都能被 diffable 正确识别。
     private func items(count: Int, prefix: Int = 0) -> [SessionMessageItem] {
         (0..<count).map { index in
             let stepID = "step-\(prefix + index)"

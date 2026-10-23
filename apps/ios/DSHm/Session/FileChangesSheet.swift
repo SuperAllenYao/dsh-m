@@ -6,38 +6,66 @@ struct FileChangesSheet: View {
     @ObservedObject var viewModel: SessionViewModel
     var changes: TurnFileChanges
 
+    /// Live value: while the exact summary is still loading (or was just retried),
+    /// the sheet follows the view model instead of the value captured at tap time.
+    private var effectiveChanges: TurnFileChanges {
+        viewModel.latestTurnFileChanges ?? changes
+    }
+
     var body: some View {
         NavigationStack {
             VStack(spacing: 0) {
                 SheetHeader(title: L10n.t("本轮文件变更"))
                 Rectangle().fill(Theme.Palette.border).frame(height: 1)
-                fileList
+                if effectiveChanges.isLoading {
+                    loadingView
+                } else {
+                    fileList
+                }
             }
             // The sheet draws its own unified header; the navigation bar stays
             // available for the pushed file-diff pages.
             .toolbar(.hidden, for: .navigationBar)
+            // task-2: opening the sheet is an explicit ask for the exact numbers;
+            // re-arm a previously failed fetch instead of pinning the fallback.
+            .onAppear { viewModel.retryFileChangesExactFetchIfNeeded() }
         }
+    }
+
+    /// task-2: exact numbers still loading — show a neutral loading state instead
+    /// of the meta.diffs fallback (which reads like the desktop numbers but is not).
+    private var loadingView: some View {
+        VStack(spacing: Theme.Spacing.s) {
+            ProgressView()
+                .tint(Theme.Palette.accent)
+            Text(L10n.t("正在读取精确数据…"))
+                .font(Theme.Typography.caption)
+                .foregroundStyle(Theme.Palette.textTertiary)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding(Theme.Spacing.pageInset)
+        .accessibilityIdentifier("file-changes-loading")
     }
 
     private var fileList: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: Theme.Spacing.s) {
                 HStack(spacing: Theme.Spacing.xs) {
-                    Text(changes.source == .exactFetch ? L10n.t("来源：Host /api/changes.summary") : L10n.t("来源：tool/result.meta.diffs 兜底"))
+                    Text(effectiveChanges.source == .exactFetch ? L10n.t("来源：Host /api/changes.summary") : L10n.t("来源：tool/result.meta.diffs 兜底"))
                         .font(Theme.Typography.label)
                         .foregroundStyle(Theme.Palette.textTertiary)
                     Spacer()
-                    Text("+\(changes.added) -\(changes.deleted)")
+                    Text("+\(effectiveChanges.added) -\(effectiveChanges.deleted)")
                         .font(Theme.Typography.label)
                         .foregroundStyle(Theme.Palette.textTertiary)
                 }
 
-                if changes.source == .metaDiffsFallback {
+                if effectiveChanges.source == .metaDiffsFallback {
                     InlineErrorView(message: L10n.t("Host 已释放该轮变更详情（404 或连接未就绪），以下文件来自工具结果 meta.diffs 聚合。"))
                 }
 
-                ForEach(Array(changes.files.enumerated()), id: \.offset) { index, file in
-                    if changes.source == .exactFetch, let seq = changes.seq {
+                ForEach(Array(effectiveChanges.files.enumerated()), id: \.offset) { index, file in
+                    if effectiveChanges.source == .exactFetch, let seq = effectiveChanges.seq {
                         NavigationLink {
                             FileDiffLoaderView(
                                 viewModel: viewModel,

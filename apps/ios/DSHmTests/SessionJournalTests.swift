@@ -401,3 +401,149 @@ final class SessionJournalTests: XCTestCase {
         XCTAssertEqual(journal.events.map(\.seq), Array(8...20))
     }
 }
+
+// MARK: - task-2: exact file-change fetch (cross-end consistency, handoff §2.4)
+
+/// 404 (Host released the per-turn summary) is the only terminal failure; the relay
+/// proxy answers its own 404 for non-allowlisted routes, which must stay retryable.
+final class FileChangesFetchPolicyTests: XCTestCase {
+    private func kind(_ error: Error) -> FileChangesFetchPolicy.FailureKind {
+        FileChangesFetchPolicy.failureKind(for: error)
+    }
+
+    func testHostReleased404IsTerminal() {
+        XCTAssertEqual(kind(LinkError.httpStatus(404, "not found")), .hostReleased)
+        XCTAssertEqual(
+            FileChangesFetchPolicy.decision(afterFailure: .hostReleased, retriesMade: 0),
+            .giveUp,
+            "a real 404 must not be retried — the Host no longer holds the summary"
+        )
+    }
+
+    func testRelayRouteNotAllowed404IsTransient() {
+        // packages/dsh-m-link/lib/link-server.js:1618-1623 — the relay/proxy answers
+        // 404 JSON for a route its version does not allowlist.
+        let body = "{\"ok\":false,\"error\":\"route/not-allowed\",\"message\":\"GET exact-fetch route is not allowlisted by dsh-m-link\"}"
+        XCTAssertEqual(kind(LinkError.httpStatus(404, body)), .transient)
+        XCTAssertEqual(
+            FileChangesFetchPolicy.decision(afterFailure: .transient, retriesMade: 0),
+            .retry(delay: 1)
+        )
+    }
+
+    func testRelayUpstream404IsTransient() {
+        let body = "{\"ok\":false,\"error\":\"upstream-unreachable\",\"message\":\"fetch failed\"}"
+        XCTAssertEqual(kind(LinkError.httpStatus(404, body)), .transient)
+    }
+
+    func testOtherFailuresAreTransient() {
+        XCTAssertEqual(kind(LinkError.httpStatus(401, "auth/required")), .transient)
+        XCTAssertEqual(kind(LinkError.httpStatus(502, "upstream-connect-failed")), .transient)
+        XCTAssertEqual(kind(LinkError.transport("Connection refused")), .transient)
+        XCTAssertEqual(kind(LinkError.timeout("changes.summary")), .transient)
+        XCTAssertEqual(kind(LinkError.notConnected), .transient)
+    }
+
+    func testBackoffIsOneTwoFourSecondsThenGiveUp() {
+        XCTAssertEqual(FileChangesFetchPolicy.maxRetries, 3)
+        XCTAssertEqual(FileChangesFetchPolicy.decision(afterFailure: .transient, retriesMade: 0), .retry(delay: 1))
+        XCTAssertEqual(FileChangesFetchPolicy.decision(afterFailure: .transient, retriesMade: 1), .retry(delay: 2))
+        XCTAssertEqual(FileChangesFetchPolicy.decision(afterFailure: .transient, retriesMade: 2), .retry(delay: 4))
+        XCTAssertEqual(FileChangesFetchPolicy.decision(afterFailure: .transient, retriesMade: 3), .giveUp)
+    }
+}
+
+/// Loading/retry/terminal transitions that keep the fallback off the card while the
+/// exact summary is still being fetched.
+final class FileChangesFetchStateTests: XCTestCase {
+    func testLoadingStaysOnThroughBackoffAndClearsAtGiveUp() {
+        var state = FileChangesFetchState()
+        let failure = LinkError.transport("Connection refused")
+        state.begin(seq: 7)
+        XCTAssertTrue(state.isLoading(7), "card/sheet must show loading during the first attempt")
+        XCTAssertEqual(state.failed(seq: 7, error: failure), .scheduledRetry(delay: 1))
+        XCTAssertTrue(state.isLoading(7), "backoff is still loading — no fallback numbers yet")
+        XCTAssertEqual(state.failed(seq: 7, error: failure), .scheduledRetry(delay: 2))
+        XCTAssertEqual(state.failed(seq: 7, error: failure), .scheduledRetry(delay: 4))
+        XCTAssertEqual(state.failed(seq: 7, error: failure), .failedTransiently)
+        XCTAssertFalse(state.isLoading(7), "fallback may show only after the retries are exhausted")
+        XCTAssertFalse(state.isTerminal(7), "a network failure must not pin the fallback permanently")
+    }
+
+    func test404ClearsLoadingAndPinsTerminal() {
+        var state = FileChangesFetchState()
+        state.begin(seq: 8)
+        XCTAssertEqual(state.failed(seq: 8, error: LinkError.httpStatus(404, "not found")), .failedPermanently)
+        XCTAssertFalse(state.isLoading(8))
+        XCTAssertTrue(state.isTerminal(8))
+    }
+
+    func testSuccessClearsLoadingAndAttempts() {
+        var state = FileChangesFetchState()
+        state.begin(seq: 9)
+        _ = state.failed(seq: 9, error: LinkError.transport("boom"))
+        state.succeeded(seq: 9)
+        XCTAssertFalse(state.isLoading(9))
+        XCTAssertEqual(state.retriesMade(9), 0)
+        XCTAssertFalse(state.isTerminal(9))
+    }
+
+    func testResetClearsLoadingRetriesAndTerminal() {
+        var state = FileChangesFetchState()
+        state.begin(seq: 10)
+        _ = state.failed(seq: 10, error: LinkError.transport("boom"))
+        state.begin(seq: 11)
+        _ = state.failed(seq: 11, error: LinkError.httpStatus(404, "not found"))
+        state.reset()
+        XCTAssertTrue(state.loadingSeqs.isEmpty)
+        XCTAssertTrue(state.attempts.isEmpty)
+        XCTAssertTrue(state.terminalSeqs.isEmpty)
+    }
+}
+
+/// task-2: exact-fetch origin selection mirrors the cold-start list override — on a
+/// cellular/cross-network path the persisted LAN origin is unreachable, so the relay
+/// candidate is used (this is the fallback root cause, handoff §2.3).
+final class LinkServiceExactFetchOriginTests: XCTestCase {
+    private let lan = URL(string: "https://192.168.1.10:3466")!
+    private let relay = URL(string: "https://121.41.112.232:30000")!
+
+    func testCellularUsesRelayOverrideAndSkipsLanAlternate() {
+        let origins = LinkService.exactFetchOriginCandidates(
+            persisted: lan,
+            stored: [lan.absoluteString, relay.absoluteString],
+            relayOverride: relay,
+            prefersRelay: true
+        )
+        XCTAssertEqual(origins, [relay], "5G/cross-network must not route back to the stale LAN origin")
+    }
+
+    func testSameLanPathKeepsPersistedOriginThenRelayAlternate() {
+        let origins = LinkService.exactFetchOriginCandidates(
+            persisted: lan,
+            stored: [lan.absoluteString, relay.absoluteString],
+            relayOverride: nil,
+            prefersRelay: false
+        )
+        XCTAssertEqual(origins, [lan, relay])
+    }
+
+    func testCellularWithoutRelayCandidateStillUsesPersistedOrigin() {
+        let origins = LinkService.exactFetchOriginCandidates(
+            persisted: lan,
+            stored: nil,
+            relayOverride: nil,
+            prefersRelay: true
+        )
+        XCTAssertEqual(origins, [lan])
+    }
+
+    func testNoPersistedOriginYieldsEmpty() {
+        XCTAssertTrue(LinkService.exactFetchOriginCandidates(
+            persisted: nil,
+            stored: [relay.absoluteString],
+            relayOverride: nil,
+            prefersRelay: false
+        ).isEmpty)
+    }
+}

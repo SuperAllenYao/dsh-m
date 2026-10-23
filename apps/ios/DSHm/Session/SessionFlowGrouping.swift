@@ -9,6 +9,9 @@ struct ProcessStep: Identifiable, Equatable {
 
     var id: String
     var kind: Kind
+    /// 该步骤对应事件 seq（v0.2.7：用于判定过程组是否属于「本轮」，
+    /// 避免刚发消息、新步骤未到时上一轮的组闪成运行中窗口）。
+    var seq: Int = 0
 
     var tool: ToolCallItem? {
         if case .tool(let item) = kind { return item }
@@ -41,15 +44,65 @@ enum FlowRowGroup: Identifiable, Equatable {
     case single(FlowRow)
     case process([ProcessStep])
 
+    /// 组内第一条步骤的事件 seq（.single 取行 seq）。
+    var firstSeq: Int {
+        switch self {
+        case .single(let row): return row.seq
+        case .process(let steps): return steps.first?.seq ?? Int.min
+        }
+    }
+
     var id: String {
         switch self {
         case .single(let row):
             return row.id
         case .process(let steps):
-            // v0.2.6 滚动修复：组 id 用**最后一条 step**，保证「向历史方向 prepend」
-            // 时既有组的 id 不变（新 step 只会加在组头，尾 step 保持不变），
-            // scrollPosition(id:) 的锚点因此不会在补齐插入时失效。
-            return "process-" + (steps.last?.id ?? "empty")
+            // v0.2.7：组 id 改用**首 step**。
+            // v0.2.6 用尾 step 的动机是历史补齐时 id 不变，但代价是**流式追加**
+            // （新 step 加在组尾）每一步都换 id：diffable 把它当「删旧行 + 插新行」，
+            // 行高重测、展开态随 cell 重建丢失——即用户报障的过程组渲染错乱。
+            // 反转列表下历史补齐是数据尾部追加、既有内容坐标不变，锚点不依赖 id 复用，
+            // 因此这里选「流式身份稳定」优先（真机滚动门禁见 apps/ios/scripts）。
+            return "process-" + (steps.first?.id ?? "empty")
+        }
+    }
+}
+
+/// 过程组显示态（v0.2.7，对齐 DSH 桌面端「内联工作步骤」）：
+/// - `window`：运行中默认 —— 固定高度窗口内滚动、自动跟随最新步骤；
+/// - `full`：运行中点图标 —— 取消高度限制，全部步骤内联撑开；
+/// - `collapsed`：这一轮步骤结束 —— 自动折叠成一行摘要；
+/// - `expanded`：点折叠行 —— 展开该轮全部历史步骤。
+enum ProcessGroupMode: String, Equatable {
+    case window
+    case full
+    case collapsed
+    case expanded
+}
+
+/// 过程组显示态解析（默认态由「是否正在跑」推导，用户点击产生覆盖）。
+/// 阶段切换时自动丢弃不适用的覆盖，保证「结束即折叠」不被运行期覆盖卡住。
+enum ProcessGroupModeResolver {
+    static func resolve(isRunning: Bool, override: ProcessGroupMode?) -> ProcessGroupMode {
+        let fallback: ProcessGroupMode = isRunning ? .window : .collapsed
+        guard let override else { return fallback }
+        switch (isRunning, override) {
+        case (true, .collapsed), (true, .expanded):
+            return fallback
+        case (false, .window), (false, .full):
+            return fallback
+        default:
+            return override
+        }
+    }
+
+    /// 同一个控件点击后的目标态：运行中 window⇄full；已结束 collapsed⇄expanded。
+    static func toggled(_ current: ProcessGroupMode) -> ProcessGroupMode {
+        switch current {
+        case .window: return .full
+        case .full: return .window
+        case .collapsed: return .expanded
+        case .expanded: return .collapsed
         }
     }
 }
@@ -93,11 +146,11 @@ enum SessionFlowGrouping {
             case .reasoning(let text):
                 if pendingSteps.isEmpty { groupStart = index }
                 pendingIndexes.append(index)
-                pendingSteps.append(ProcessStep(id: row.id, kind: .reasoning(text)))
+                pendingSteps.append(ProcessStep(id: row.id, kind: .reasoning(text), seq: row.seq))
             case .tool(let item):
                 if pendingSteps.isEmpty { groupStart = index }
                 pendingIndexes.append(index)
-                pendingSteps.append(ProcessStep(id: row.id, kind: .tool(item)))
+                pendingSteps.append(ProcessStep(id: row.id, kind: .tool(item), seq: row.seq))
             default:
                 flush()
                 groups.append(.single(row))

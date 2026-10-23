@@ -23,6 +23,12 @@ enum SessionMessageItem: Equatable {
     }
 }
 
+/// 过程组行高取证开关：真机 DEBUG 构建下设 `DSHM_PROCDBG=1` 时，
+/// 每次行重测后打印可见过程组的行高与 hosting 内容高度（默认关闭，零开销）。
+enum ProcessGroupDebug {
+    static let enabled = ProcessInfo.processInfo.environment["DSHM_PROCDBG"] == "1"
+}
+
 /// 布局回调型 UITableView：每次布局完成（屏幕提交前）通知协调器做「锚点行位置保持」。
 final class AnchoredTableView: UITableView {
     var onLayoutPass: (() -> Void)?
@@ -70,6 +76,15 @@ struct SessionMessageListView: UIViewRepresentable {
     let historyBatchToken: Int
     /// 递增即请求「强制回到底部」（发送消息 / 答完问答时由上层 +1）。
     let scrollToBottomToken: Int
+    /// v0.2.7：过程组显示态覆盖（key = `FlowRowGroup.id`）；默认态由 isRunning + 是否最新组推导。
+    var processGroupModes: [String: ProcessGroupMode] = [:]
+    /// 运行中固定窗口高度（页面按会话可视高度 1/3 传入）。
+    var processGroupWindowHeight: CGFloat = 300
+    /// 本轮起点 seq（最后一条用户消息）。只有本轮内的组才可能是「运行中」组。
+    var currentTurnStartSeq: Int = Int.min
+    /// 点击过程组 header：回调目标态（页面写入覆盖）。
+    var onToggleGroupMode: ((String, ProcessGroupMode) -> Void)? = nil
+    var onOpenReasoning: ((String) -> Void)? = nil
     let onOpenTool: (ToolCallItem) -> Void
     let onOpenFileChanges: (TurnFileChanges) -> Void
     let onNearBottomChange: (Bool) -> Void
@@ -131,6 +146,10 @@ struct SessionMessageListView: UIViewRepresentable {
                 Group {
                     switch item {
                     case .group(let group):
+                        let mode = ProcessGroupModeResolver.resolve(
+                            isRunning: isNewest,
+                            override: parent.processGroupModes[group.id]
+                        )
                         FlowRowGroupView(
                             group: group,
                             sessionId: parent.sessionId,
@@ -138,6 +157,12 @@ struct SessionMessageListView: UIViewRepresentable {
                             pendingApprovalCallIds: parent.pendingApprovalCallIds,
                             subagentLabels: parent.subagentLabels,
                             isNewestGroupRunning: isNewest,
+                            mode: mode,
+                            windowHeight: parent.processGroupWindowHeight,
+                            onToggleMode: {
+                                parent.onToggleGroupMode?(group.id, ProcessGroupModeResolver.toggled(mode))
+                            },
+                            onOpenReasoning: parent.onOpenReasoning,
                             onOpenTool: parent.onOpenTool
                         )
                     case .fileChanges(let changes):
@@ -187,6 +212,10 @@ struct SessionMessageListView: UIViewRepresentable {
         private var lastScrollToBottomToken: Int = 0
         /// 上一次布局时的视口高度：键盘/内联行/输入框增高会改变它，读历史时需要补偿。
         private var lastViewportHeight: CGFloat = 0
+        /// v0.2.7：上一次应用时的过程组显示态覆盖，用于把「点击/阶段切换」转成行重测。
+        private var lastGroupModes: [String: ProcessGroupMode] = [:]
+        /// 上一次应用时的 running 标记：true→false 时最新组要从窗口态切到折叠态。
+        private var lastRunningFlag = false
 
         init(_ parent: SessionMessageListView) {
             self.parent = parent
@@ -199,6 +228,8 @@ struct SessionMessageListView: UIViewRepresentable {
             tableView.register(MessageCell.self, forCellReuseIdentifier: MessageCell.reuseID)
             lastScrollToBottomToken = parent.scrollToBottomToken
             lastViewportHeight = tableView.bounds.height
+            lastRunningFlag = parent.isRunning
+            lastGroupModes = parent.processGroupModes
             let dataSource = UITableViewDiffableDataSource<String, String>(tableView: tableView) { [weak self] tableView, indexPath, itemID in
                 guard let self,
                       let cell = tableView.dequeueReusableCell(withIdentifier: MessageCell.reuseID, for: indexPath) as? MessageCell,
@@ -281,12 +312,31 @@ struct SessionMessageListView: UIViewRepresentable {
             return lastItems.first { $0.id == id }
         }
 
+        #if DEBUG
+        /// DSHM_PROCDBG=1 取证：行高（UIKit 自撑高结果）vs hosting 内容实际高度。
+        /// 二者不一致即为「内容溢出旧行高」的直接证据。
+        private func logProcessRowHeights(_ tableView: UITableView, reason: String) {
+            guard ProcessGroupDebug.enabled else { return }
+            var parts: [String] = []
+            for indexPath in tableView.indexPathsForVisibleRows ?? [] {
+                guard let id = dataSource?.itemIdentifier(for: indexPath), id.hasPrefix("process-") else { continue }
+                let rowHeight = tableView.rectForRow(at: indexPath).height
+                let hosting = tableView.cellForRow(at: indexPath)?.contentView.subviews.first?.bounds.height ?? -1
+                parts.append("\(id.suffix(8)) row=\(Int(rowHeight)) hosting=\(Int(hosting))")
+            }
+            guard !parts.isEmpty else { return }
+            print("[procdbg] \(reason) " + parts.joined(separator: " | "))
+        }
+        #endif
+
         private func isNewest(_ item: SessionMessageItem) -> Bool {
             guard parent.isRunning else { return false }
-            if case .group(let group) = item {
-                return group.id == parent.items.last(where: { if case .group = $0 { return true }; return false })?.id
-            }
-            return false
+            guard case .group(let group) = item else { return false }
+            // v0.2.7：必须是**本轮**（最后一条用户消息之后）的最后一个过程组。
+            // 只看「最后一个组」会让刚发消息时的上一轮组闪成运行中窗口；
+            // 只看「本轮」会让同一轮里更早的组也当成运行中（它们已经结束了）。
+            guard group.firstSeq > parent.currentTurnStartSeq else { return false }
+            return group.id == parent.items.last(where: { if case .group = $0 { return true }; return false })?.id
         }
 
         // MARK: - apply
@@ -309,6 +359,22 @@ struct SessionMessageListView: UIViewRepresentable {
                 if let old = previous[item.id], old != item { changedIDs.append(item.id) }
             }
             for item in lastItems { previousIDs.insert(item.id) }
+            // v0.2.7：显示态（window/full/collapsed/expanded）不参与 FlowRowGroup 等价，
+            // 单独比对后并入 changedIDs，走同一条「reconfigure + 重测行高」路径。
+            if parent.processGroupModes != lastGroupModes {
+                for id in parent.processGroupModes.keys where newIDs.contains(id) {
+                    if !changedIDs.contains(id) { changedIDs.append(id) }
+                }
+                lastGroupModes = parent.processGroupModes
+            }
+            // 阶段切换（running true→false）：最新组要从「运行中窗口」自动切到「折叠一行」。
+            if parent.isRunning != lastRunningFlag {
+                lastRunningFlag = parent.isRunning
+                if let lastGroupID = items.last(where: { if case .group = $0 { return true }; return false })?.id,
+                   !changedIDs.contains(lastGroupID) {
+                    changedIDs.append(lastGroupID)
+                }
+            }
             let insertedIDs = newIDs.subtracting(previousIDs)
             // 数据开头新增 = 视觉底部新内容；数据末尾新增 = 视觉顶部历史补齐。
             let tailAppend = !insertedIDs.isEmpty
@@ -372,6 +438,18 @@ struct SessionMessageListView: UIViewRepresentable {
             let diffMs = (CACurrentMediaTime() - applyStart) * 1000
             #endif
             tableView.layoutIfNeeded()
+            // v0.2.7：UIHostingConfiguration 自撑高行在 reconfigure 后不会自动重测高度，
+            // 内容变高（展开/折叠、流式步骤增长）会沿用旧行高 → 内容溢出/裁剪/重叠。
+            // 有变化行时做一次可见行重测（performBatchUpdates(nil) 会失效自撑高缓存）。
+            if !changedIDs.isEmpty {
+                UIView.performWithoutAnimation {
+                    tableView.performBatchUpdates(nil) { _ in }
+                }
+                tableView.layoutIfNeeded()
+                #if DEBUG
+                logProcessRowHeights(tableView, reason: "changed=\(changedIDs.count)")
+                #endif
+            }
             #if DEBUG
             let applyMs = (CACurrentMediaTime() - applyStart) * 1000
             PerfProbe.shared.record("apply", ms: applyMs, [

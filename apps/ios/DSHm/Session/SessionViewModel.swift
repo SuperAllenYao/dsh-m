@@ -42,6 +42,111 @@ enum DeferredStreamOpenPolicy {
     }
 }
 
+/// Retry policy for the exact `/api/changes.summary` fetch (task-2: cross-end
+/// file-change consistency, handoff §2.4).
+///
+/// The protocol says the Host keeps one turn's file summary in process memory and
+/// drops it on a restart / session release, so **404 is the only terminal failure**.
+/// Everything else — timeout / TLS / relay 5xx / the relay proxy's own 404
+/// `route/not-allowed` (packages/dsh-m-link/lib/link-server.js:1618-1623) — is
+/// retried with a 1 s → 2 s → 4 s backoff so a network handover or relay hiccup
+/// does not pin the meta.diffs aggregate for the rest of the session.
+enum FileChangesFetchPolicy {
+    /// Reply bodies the relay proxy uses when the failure is on the relay side, not
+    /// the Host releasing the summary. A bare 404 without these is the Host's.
+    static let relayFailureMarkers = [
+        "route/not-allowed",
+        "upstream-connect-failed",
+        "upstream-unreachable",
+    ]
+
+    enum FailureKind: Equatable {
+        /// Host really dropped the summary: stop; the fallback is all we have.
+        case hostReleased
+        /// Network / relay / auth / decoding fault: retry with backoff.
+        case transient
+    }
+
+    enum Decision: Equatable {
+        case retry(delay: TimeInterval)
+        case giveUp
+    }
+
+    /// 1 s → 2 s → 4 s (three retries after the first attempt).
+    static let backoff: [TimeInterval] = [1, 2, 4]
+    static var maxRetries: Int { backoff.count }
+
+    static func failureKind(for error: Error) -> FailureKind {
+        guard let linkError = error as? LinkError,
+              case let .httpStatus(status, body) = linkError,
+              status == 404 else { return .transient }
+        if relayFailureMarkers.contains(where: { body.contains($0) }) { return .transient }
+        return .hostReleased
+    }
+
+    static func decision(afterFailure kind: FailureKind, retriesMade: Int) -> Decision {
+        guard kind == .transient else { return .giveUp }
+        guard retriesMade < maxRetries else { return .giveUp }
+        return .retry(delay: backoff[max(0, retriesMade)])
+    }
+}
+
+/// Bookkeeping for the newest turn's exact summary fetch: which seq is loading,
+/// how many retries were made, and which seqs are 404-terminal. Value type so the
+/// transitions are unit-tested. `loadingSeqs` is what keeps the card/sheet from
+/// presenting the fallback numbers while the exact ones are still being fetched
+/// (the reported 18-vs-50-file mismatch, handoff §2.1).
+struct FileChangesFetchState: Equatable {
+    enum Outcome: Equatable {
+        case scheduledRetry(delay: TimeInterval)
+        case failedPermanently
+        case failedTransiently
+    }
+
+    private(set) var loadingSeqs: Set<Int> = []
+    private(set) var attempts: [Int: Int] = [:]
+    private(set) var terminalSeqs: Set<Int> = []
+
+    mutating func begin(seq: Int) {
+        loadingSeqs.insert(seq)
+        if attempts[seq] == nil { attempts[seq] = 0 }
+    }
+
+    mutating func succeeded(seq: Int) {
+        loadingSeqs.remove(seq)
+        attempts[seq] = nil
+    }
+
+    mutating func failed(seq: Int, error: Error) -> Outcome {
+        let kind = FileChangesFetchPolicy.failureKind(for: error)
+        let retriesMade = attempts[seq] ?? 0
+        switch FileChangesFetchPolicy.decision(afterFailure: kind, retriesMade: retriesMade) {
+        case .giveUp:
+            loadingSeqs.remove(seq)
+            attempts[seq] = nil
+            if kind == .hostReleased { terminalSeqs.insert(seq) }
+            return kind == .hostReleased ? .failedPermanently : .failedTransiently
+        case .retry(let delay):
+            attempts[seq] = retriesMade + 1
+            return .scheduledRetry(delay: delay)
+        }
+    }
+
+    mutating func reset() {
+        loadingSeqs.removeAll()
+        attempts.removeAll()
+        terminalSeqs.removeAll()
+    }
+
+    func isLoading(_ seq: Int?) -> Bool {
+        guard let seq else { return false }
+        return loadingSeqs.contains(seq)
+    }
+
+    func isTerminal(_ seq: Int) -> Bool { terminalSeqs.contains(seq) }
+    func retriesMade(_ seq: Int) -> Int { attempts[seq] ?? 0 }
+}
+
 /// Session detail state: owns the session/follow subscription, applies frames
 /// through SessionJournal and rebuilds render rows (turn grouping).
 @MainActor
@@ -129,7 +234,12 @@ final class SessionViewModel: ObservableObject {
     @Published var draft: String = ""
     /// Exact-fetch (protocol §3.9) summaries keyed by workspace/changes seq.
     @Published private(set) var fileChangeSummaries: [Int: ChangesSummaryValue] = [:]
-    @Published private(set) var fileChangeUnavailableSeqs: Set<Int> = []
+    /// task-2: loading/retry/404-terminal bookkeeping of the exact fetch. While
+    /// `loadingSeqs` contains the newest seq the card/sheet show a loading state
+    /// instead of the meta.diffs fallback numbers.
+    @Published private(set) var fileChangeFetch = FileChangesFetchState()
+    /// Seqs the Host really released (404 only). Computed view of the fetch state.
+    var fileChangeUnavailableSeqs: Set<Int> { fileChangeFetch.terminalSeqs }
 
     private(set) var journal = SessionJournal()
     /// M2b-2: the detail was first painted from the on-disk window cache. The live
@@ -225,6 +335,16 @@ final class SessionViewModel: ObservableObject {
     private var detailViewVisible = false
     private var detailFirstFrameMarked = false
     private var requestedFileChangeSeqs: Set<Int> = []
+    /// task-2: retry timers and stale-completion guards per changes seq.
+    private var fileChangeRetryTasks: [Int: Task<Void, Never>] = [:]
+    private var fileChangeFetchTokens: [Int: Int] = [:]
+    private var fileChangeFetchTokenValue = 0
+    /// task-2: lifecycle reset triggers (network path / foreground / reconnect).
+    private var lastFileChangeNetworkGeneration = NetworkPathMonitor.shared.changeGeneration
+    private var lastFileChangeLinkConnected = false
+    #if canImport(UIKit)
+    private var fileChangeForegroundObserver: NSObjectProtocol?
+    #endif
     private weak var link: LinkService?
     /// M5 test seams (unit tests have no socket).
     var permissionCatalogLoader: (() async throws -> PermissionPresetCatalog)?
@@ -622,6 +742,12 @@ final class SessionViewModel: ObservableObject {
     func start() {
         guard let link else { return }
         observedGeneration = link.generation
+        // task-2: (re)entering the detail re-arms the exact file-change fetch; a
+        // 404/transient failure from a previous visit must not pin the fallback.
+        lastFileChangeLinkConnected = link.phase.isConnected
+        lastFileChangeNetworkGeneration = NetworkPathMonitor.shared.changeGeneration
+        installFileChangeForegroundObserver()
+        resetFileChangesExactFetch(reason: "detail-open")
         // Restore the live half immediately: the Combine sink only re-fires on
         // changes, and a stop()/start() cycle clears the local cache.
         applyPendingUserQuestionWaterfalls(link.pendingUserQuestionWaterfalls(forSession: sessionId))
@@ -655,6 +781,10 @@ final class SessionViewModel: ObservableObject {
         saveWindowCacheNow()
         liveUserQuestionWaterfalls = []
         rebuildActiveUserQuestions()
+        // task-2: no background retries for a detail that is gone; the next
+        // start() resets the bookkeeping and re-fetches.
+        cancelFileChangeFetchTasks()
+        removeFileChangeForegroundObserver()
     }
 
     /// Called when the link generation changed (reconnect): rebuild from snapshot.
@@ -665,6 +795,7 @@ final class SessionViewModel: ObservableObject {
             reopenStream()
         }
         maybeFlushQueued()
+        resetFileChangesExactFetch(reason: "generation-change")
     }
 
     private func reopenStream() {
@@ -755,6 +886,12 @@ final class SessionViewModel: ObservableObject {
     /// `.onChange(of: app.link.phase)` fallback. Idempotent by construction:
     /// opening a second stream would replace the live handle and drop frames.
     func handleLinkPhaseChange(_ phase: LinkService.Phase) {
+        // task-2: a reconnect (phase flips back to connected) re-arms the exact
+        // file-change fetch; the fallback must not survive a transport recovery.
+        if phase.isConnected, !lastFileChangeLinkConnected {
+            resetFileChangesExactFetch(reason: "reconnect")
+        }
+        lastFileChangeLinkConnected = phase.isConnected
         switch DeferredStreamOpenPolicy.action(
             phaseIsConnected: phase.isConnected,
             isDeferred: streamOpenDeferred,
@@ -1244,6 +1381,9 @@ final class SessionViewModel: ObservableObject {
     }
 
     private func applyJournalUpdate(_ update: SessionJournal.Update) {
+        // task-2: a network-path change (Wi-Fi ⇄ cellular) invalidates the exact
+        // fetch that failed on the old path; reset + refetch on the new one.
+        checkFileChangeNetworkGeneration()
         switch update {
         case .snapshotReplaced:
             scrollDbg("journal snapshotReplaced")
@@ -2129,6 +2269,10 @@ final class SessionViewModel: ObservableObject {
 
     /// 最新一轮合并后的文件变更视图：Host 仍保留时用精确取数，否则退回
     /// 客户端 meta.diffs 聚合。turn UI 删除后只在流末尾保留「最近一轮」卡片。
+    ///
+    /// task-2: while the exact fetch is still loading (first try or backoff) the
+    /// fallback numbers are NOT surfaced as truth — the card/sheet render a loading
+    /// state instead (reported illusion: App 18 files +712 −42 vs desktop 50 files).
     var latestTurnFileChanges: TurnFileChanges? {
         if let seq = flow.latestFileChangeSeq, let summary = fileChangeSummaries[seq] {
             return TurnFileChanges(
@@ -2136,7 +2280,18 @@ final class SessionViewModel: ObservableObject {
                 files: summary.files,
                 added: summary.added ?? summary.files.reduce(0) { $0 + ($1.added ?? 0) },
                 deleted: summary.deleted ?? summary.files.reduce(0) { $0 + ($1.deleted ?? 0) },
-                seq: seq
+                seq: seq,
+                total: summary.total
+            )
+        }
+        if let pendingSeq = flow.latestFileChangeSeq, isFileChangeFetchUnsettled(pendingSeq) {
+            return TurnFileChanges(
+                source: .metaDiffsFallback,
+                files: [],
+                added: 0,
+                deleted: 0,
+                seq: pendingSeq,
+                isLoading: true
             )
         }
         guard let fallback = flow.latestFileChanges else { return nil }
@@ -2149,22 +2304,163 @@ final class SessionViewModel: ObservableObject {
         )
     }
 
+    /// True while the newest turn's exact summary is in flight (card/sheet loading).
+    var fileChangesExactFetchPending: Bool {
+        guard let seq = flow.latestFileChangeSeq else { return false }
+        return isFileChangeFetchUnsettled(seq)
+    }
+
+    /// No summary yet, not a terminal 404, and the fetch is in flight or about to be
+    /// requested → show loading instead of the fallback numbers (avoids the flash of
+    /// the aggregate口径 before the first request starts).
+    private func isFileChangeFetchUnsettled(_ seq: Int) -> Bool {
+        if fileChangeFetch.isLoading(seq) { return true }
+        return !fileChangeFetch.isTerminal(seq) && !requestedFileChangeSeqs.contains(seq)
+    }
+
     /// Requests the exact-fetch summary of the newest turn's workspace/changes
-    /// event; 404 (host restarted / session released) marks it for fallback.
+    /// event. Only a real 404 is terminal; everything else retries 1/2/4 s and is
+    /// re-armed by every lifecycle reset (network / foreground / reconnect / reopen).
     private func requestFileChangeSummariesIfNeeded() {
-        guard let link, let seq = flow.latestFileChangeSeq else { return }
-        if fileChangeSummaries[seq] != nil || fileChangeUnavailableSeqs.contains(seq) { return }
-        if requestedFileChangeSeqs.contains(seq) { return }
+        guard let seq = flow.latestFileChangeSeq else { return }
+        guard fileChangeSummaries[seq] == nil else { return }
+        guard !fileChangeFetch.isTerminal(seq) else { return }
+        guard !requestedFileChangeSeqs.contains(seq) else { return }
         requestedFileChangeSeqs.insert(seq)
+        ChangesDebugLog.log("request seq=\(seq) networkGen=\(NetworkPathMonitor.shared.changeGeneration) prefersRelay=\(NetworkPathMonitor.shared.prefersRelay ? 1 : 0) fallbackFiles=\(flow.latestFileChanges?.files.count ?? -1)")
+        beginFileChangeSummaryFetch(seq: seq)
+    }
+
+    /// One attempt for `seq`; retries are scheduled by `scheduleFileChangeSummaryRetry`
+    /// after `FileChangesFetchPolicy.decision`.
+    private func beginFileChangeSummaryFetch(seq: Int) {
+        guard let link else { return }
+        fileChangeFetch.begin(seq: seq)
+        let token = makeFileChangeFetchToken(seq: seq)
+        let started = Date()
         Task { [weak self] in
             guard let self else { return }
             do {
                 let summary = try await link.changesSummary(sessionId: self.sessionId, seq: seq)
+                guard self.isCurrentFileChangeFetch(seq: seq, token: token), !Task.isCancelled else { return }
+                self.fileChangeFetch.succeeded(seq: seq)
                 self.fileChangeSummaries[seq] = summary
+                let added = summary.added ?? summary.files.reduce(0) { $0 + ($1.added ?? 0) }
+                let deleted = summary.deleted ?? summary.files.reduce(0) { $0 + ($1.deleted ?? 0) }
+                ChangesDebugLog.log("summary ok seq=\(seq) files=\(summary.files.count) added=\(added) deleted=\(deleted) ms=\(Self.millisSince(started))")
             } catch {
-                self.fileChangeUnavailableSeqs.insert(seq)
+                guard self.isCurrentFileChangeFetch(seq: seq, token: token), !Task.isCancelled else { return }
+                let retriesMade = self.fileChangeFetch.retriesMade(seq)
+                let kind = FileChangesFetchPolicy.failureKind(for: error)
+                let outcome = self.fileChangeFetch.failed(seq: seq, error: error)
+                let fallback = self.flow.latestFileChanges
+                let origin = link.credentials?.originURL?.absoluteString ?? "-"
+                ChangesDebugLog.log("summary fail seq=\(seq) retriesMade=\(retriesMade) kind=\(kind) outcome=\(outcome) status=\(LinkService.httpStatus(of: error).map(String.init) ?? "-") err=\(Self.describeChangesError(error)) origin=\(origin) relay=\(NetworkPathMonitor.shared.prefersRelay ? 1 : 0) ms=\(Self.millisSince(started)) fallbackFiles=\(fallback?.files.count ?? -1) fallbackAdded=\(fallback?.additions ?? -1) fallbackDeleted=\(fallback?.deletions ?? -1)")
+                switch outcome {
+                case .scheduledRetry(let delay):
+                    self.scheduleFileChangeSummaryRetry(seq: seq, delay: delay, token: token)
+                case .failedPermanently, .failedTransiently:
+                    break
+                }
             }
         }
+    }
+
+    private func scheduleFileChangeSummaryRetry(seq: Int, delay: TimeInterval, token: Int) {
+        fileChangeRetryTasks[seq]?.cancel()
+        ChangesDebugLog.log("summary retry seq=\(seq) delayMs=\(Int(delay * 1000))")
+        fileChangeRetryTasks[seq] = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            guard !Task.isCancelled, let self else { return }
+            guard self.isCurrentFileChangeFetch(seq: seq, token: token) else { return }
+            self.fileChangeRetryTasks[seq] = nil
+            self.beginFileChangeSummaryFetch(seq: seq)
+        }
+    }
+
+    private func makeFileChangeFetchToken(seq: Int) -> Int {
+        fileChangeFetchTokenValue += 1
+        fileChangeFetchTokens[seq] = fileChangeFetchTokenValue
+        return fileChangeFetchTokenValue
+    }
+
+    private func isCurrentFileChangeFetch(seq: Int, token: Int) -> Bool {
+        fileChangeFetchTokens[seq] == token
+    }
+
+    /// Cancels timers + in-flight bookkeeping and re-arms the request. Called on
+    /// network path change / foreground / reconnect (phase or generation) / detail
+    /// (re)open / sheet open. Only a fresh 404 can pin the fallback again.
+    /// - Parameter reason: included in the DSHM_CHANGESDBG=1 diagnostics.
+    private func resetFileChangesExactFetch(reason: String) {
+        let hadState = !requestedFileChangeSeqs.isEmpty
+            || !fileChangeFetch.loadingSeqs.isEmpty
+            || !fileChangeFetch.attempts.isEmpty
+            || !fileChangeFetch.terminalSeqs.isEmpty
+        for task in fileChangeRetryTasks.values { task.cancel() }
+        fileChangeRetryTasks.removeAll()
+        fileChangeFetchTokens.removeAll()
+        fileChangeFetch.reset()
+        requestedFileChangeSeqs.removeAll()
+        if hadState {
+            ChangesDebugLog.log("reset reason=\(reason) networkGen=\(NetworkPathMonitor.shared.changeGeneration) prefersRelay=\(NetworkPathMonitor.shared.prefersRelay ? 1 : 0)")
+        }
+        requestFileChangeSummariesIfNeeded()
+    }
+
+    /// Public hook for `FileChangesSheet.onAppear`: opening the detail sheet is an
+    /// explicit request for the exact numbers, so re-arm a previously failed fetch
+    /// instead of leaving the fallback pinned.
+    func retryFileChangesExactFetchIfNeeded() {
+        guard let seq = flow.latestFileChangeSeq else { return }
+        guard fileChangeSummaries[seq] == nil else { return }
+        guard !fileChangeFetch.isLoading(seq) else { return }
+        resetFileChangesExactFetch(reason: "sheet-open")
+    }
+
+    private func checkFileChangeNetworkGeneration() {
+        let generation = NetworkPathMonitor.shared.changeGeneration
+        guard generation != lastFileChangeNetworkGeneration else { return }
+        lastFileChangeNetworkGeneration = generation
+        resetFileChangesExactFetch(reason: "network-path-change")
+    }
+
+    private static func millisSince(_ start: Date) -> Int {
+        Int(Date().timeIntervalSince(start) * 1000)
+    }
+
+    private static func describeChangesError(_ error: Error) -> String {
+        if let linkError = error as? LinkError {
+            return "LinkError(\(String(describing: linkError)))"
+        }
+        return "\(type(of: error)): \(String(describing: error))"
+    }
+
+    #if canImport(UIKit)
+    private func installFileChangeForegroundObserver() {
+        guard fileChangeForegroundObserver == nil else { return }
+        fileChangeForegroundObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.willEnterForegroundNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.resetFileChangesExactFetch(reason: "foreground")
+            }
+        }
+    }
+
+    private func removeFileChangeForegroundObserver() {
+        if let observer = fileChangeForegroundObserver {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        fileChangeForegroundObserver = nil
+    }
+    #endif
+
+    private func cancelFileChangeFetchTasks() {
+        for task in fileChangeRetryTasks.values { task.cancel() }
+        fileChangeRetryTasks.removeAll()
     }
 
     /// Loads `/api/changes.diff` for one file in a turn's change set.
