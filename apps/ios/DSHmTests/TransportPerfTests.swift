@@ -580,4 +580,73 @@ final class TransportPerfTests: XCTestCase {
         XCTAssertTrue(String(data: oneShot, encoding: .utf8)!.contains("Connection: close\r\n"))
         XCTAssertTrue(String(data: keepAlive, encoding: .utf8)!.contains("Host: 127.0.0.1:4443\r\n"))
     }
+
+    // MARK: - 2026-10-23 T2(A): TLS-only prewarm
+
+    /// 预热只建 TCP+TLS、不发请求；随后 unary 直接复用这条连接（服务端只接受 1 条）。
+    func testPrewarmTLSBuildsOnePooledConnectionWithoutSendingRequest() async throws {
+        try await runServer(handler: { _ in
+            TestResponse(body: Data(#"{"ok":true}"#.utf8))
+        }) { server in
+            let pool = makePool()
+            let warmed = await HTTPSClient.prewarmTLS(
+                origin: URL(string: "https://127.0.0.1:\(server.port)")!,
+                leafPin: nil,
+                timeout: 5,
+                pool: pool,
+                parameters: NWParameters.tcp
+            )
+            XCTAssertTrue(warmed, "loopback TLS-less transport must reach ready")
+            XCTAssertEqual(pool.idleCount(for: key(server)), 1, "prewarmed connection must be idle in the pool")
+            XCTAssertEqual(server.requests.count, 0, "TLS-only prewarm must not send an HTTP request")
+
+            // 后续 unary 直接 checkout 预热的连接：服务端 TCP 连接数仍为 1。
+            let response = try await makeClient(server, pool: pool).perform(post(), timeout: 5)
+            XCTAssertEqual(response.status, 200)
+            XCTAssertEqual(server.connectionsAccepted, 1, "the list request must reuse the prewarmed connection")
+            XCTAssertEqual(server.requests.count, 1)
+            XCTAssertEqual(pool.idleCount(for: key(server)), 1, "the connection must return to the pool")
+        }
+    }
+
+    /// 池里已有空闲连接时，重复预热不得再建一条。
+    func testPrewarmTLSSkipsWhenPoolAlreadyHasIdleConnection() async throws {
+        try await runServer(handler: { _ in
+            TestResponse(body: Data(#"{"ok":true}"#.utf8))
+        }) { server in
+            let pool = makePool()
+            let origin = URL(string: "https://127.0.0.1:\(server.port)")!
+            let first = await HTTPSClient.prewarmTLS(
+                origin: origin, leafPin: nil, timeout: 5, pool: pool, parameters: NWParameters.tcp
+            )
+            let second = await HTTPSClient.prewarmTLS(
+                origin: origin, leafPin: nil, timeout: 5, pool: pool, parameters: NWParameters.tcp
+            )
+            XCTAssertTrue(first)
+            XCTAssertTrue(second)
+            XCTAssertEqual(server.requests.count, 0)
+            _ = try await makeClient(server, pool: pool).perform(post(), timeout: 5)
+            XCTAssertEqual(server.connectionsAccepted, 1, "second prewarm must not open another connection")
+        }
+    }
+
+    /// 预热失败（origin 不可达）必须快速返回 false、不抛错、不污染连接池。
+    func testPrewarmTLSFailsCleanlyWhenOriginUnreachable() async {
+        let pool = makePool()
+        let started = Date()
+        let warmed = await HTTPSClient.prewarmTLS(
+            origin: URL(string: "https://127.0.0.1:1")!,
+            leafPin: nil,
+            timeout: 2,
+            pool: pool,
+            parameters: NWParameters.tcp
+        )
+        XCTAssertFalse(warmed)
+        XCTAssertLessThan(Date().timeIntervalSince(started), 3, "prewarm failure must not hang")
+        XCTAssertEqual(
+            pool.idleCount(for: HTTPConnectionKey(host: "127.0.0.1", port: 1, pin: nil)),
+            0,
+            "a failed prewarm must never leave a pooled connection behind"
+        )
+    }
 }
