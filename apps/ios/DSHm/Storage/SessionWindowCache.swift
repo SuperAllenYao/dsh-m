@@ -264,6 +264,9 @@ final class SessionWindowCacheStore {
         let screens: Int
     }
 
+    /// 测试开关：`saveAsync` 退化为同步写（单测断言「调用返回即落盘」；生产恒为 false）。
+    static var synchronousWritesForTesting = false
+
     private let saveQueue = DispatchQueue(label: "com.dshm.session-window-cache.save", qos: .utility)
     private let pendingLock = NSLock()
     private var pendingWork: SaveWork?
@@ -284,6 +287,19 @@ final class SessionWindowCacheStore {
         screens: Int = SessionWindowPolicy.cachedScreens
     ) -> Bool {
         guard !events.isEmpty else { return false }
+        if Self.synchronousWritesForTesting {
+            return save(
+                sessionId: sessionId,
+                cursor: cursor,
+                hasMore: hasMore,
+                header: header,
+                projections: projections,
+                events: events,
+                windowMessages: windowMessages,
+                messagesPerScreen: messagesPerScreen,
+                screens: screens
+            )
+        }
         let work = SaveWork(
             identity: nil,
             sessionId: sessionId,

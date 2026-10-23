@@ -469,7 +469,19 @@ final class SessionViewModel: ObservableObject {
     }
 
     /// Test seam: apply one raw session/follow item value (snapshot/event/...).
-    func applyStreamValue(_ value: JSONValue?) { handleItem(value) }
+    /// 测试 seam：**同步**应用一帧。生产路径走后台解码流水线（handleItem），
+    /// 但单测需要在一次调用内看到效果，因此这里保持同步解码 + 同步处理。
+    func applyStreamValue(_ value: JSONValue?) {
+        guard let value else { return }
+        lastEventAt = Date()
+        do {
+            processFrame(try SessionStreamFrame.decode(value))
+        } catch {
+            let detail = FrameDecodeFailure.describe(error, frame: value)
+            dbg("frame decode failed: " + detail)
+            streamErrorText = "帧解析失败: " + detail
+        }
+    }
 
     /// Test seam: sequence numbers currently in the journal window.
     var eventSeqs: [Int] { journal.events.map(\.seq) }
@@ -499,17 +511,14 @@ final class SessionViewModel: ObservableObject {
             "events": journal.events.count,
             "cursor": journal.cursor,
         ]) {
-            windowCache.saveAsync(
-                sessionId: sessionId,
-                cursor: journal.cursor,
-                hasMore: journal.hasMore,
-                header: journal.header,
-                projections: projections,
-                events: journal.events,
-                windowMessages: firstWindowMessages
-            )
+            writeWindowCache(projections: projections)
         }
         #else
+        writeWindowCache(projections: projections)
+        #endif
+    }
+
+    private func writeWindowCache(projections: ProjectionValues) {
         windowCache.saveAsync(
             sessionId: sessionId,
             cursor: journal.cursor,
@@ -519,7 +528,6 @@ final class SessionViewModel: ObservableObject {
             events: journal.events,
             windowMessages: firstWindowMessages
         )
-        #endif
     }
 
     // MARK: - M2b-2c detail in-app timing

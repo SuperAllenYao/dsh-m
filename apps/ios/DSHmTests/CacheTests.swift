@@ -8,6 +8,8 @@ final class CacheTests: XCTestCase {
     private var cacheDirectory: URL!
 
     override func setUpWithError() throws {
+        // 窗口缓存生产路径是后台合并写；单测断言「调用返回即落盘」，这里显式切同步。
+        SessionWindowCacheStore.synchronousWritesForTesting = true
         root = FileManager.default.temporaryDirectory
             .appendingPathComponent("DSHmCacheTests-\(UUID().uuidString)", isDirectory: true)
         cacheDirectory = root.appendingPathComponent("cache", isDirectory: true)
@@ -15,6 +17,7 @@ final class CacheTests: XCTestCase {
     }
 
     override func tearDownWithError() throws {
+        SessionWindowCacheStore.synchronousWritesForTesting = false
         if let root {
             try? FileManager.default.removeItem(at: root)
         }
