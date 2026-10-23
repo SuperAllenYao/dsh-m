@@ -98,6 +98,32 @@ final class WorkspaceViewModel: ObservableObject {
     private var listCacheSaveTask: Task<Void, Never>?
     private var didExposeCachedSessions = false
 
+ // MARK: - 冷启动 <1s（用户人工验收）
+
+ /// 缓存刷新指示器延迟出现：低于阈值的刷新（正常 <1s）用户完全看不到；
+ /// 只有真正变慢（如桌面端重启后首次启动）才显示「本地缓存 · 正在刷新…」。
+    @Published private(set) var showCacheRefreshBanner = false
+    private var cacheBannerDelayTask: Task<Void, Never>?
+ /// 阈值：低于它完成的刷新不显示指示器（需求「连接 + 缓存刷新 <1s」，
+ /// 1s 内完成的刷新不该闪一下文案）。
+    static let cacheRefreshBannerDelayMs: Int = 800
+ /// 缓存仍是首帧时对 live `session/list` 的有界重试节奏（ms）。真机现场：
+ /// 桌面端重启后 App 首次启动，连接重试持续 13s，而 live 列表只在「连上」后
+ /// 才重试一次 → 用户看到 10s+ 的「正在刷新」。有界重试让列表在 1s 内自愈。
+    static let staleListRetryDelaysMs: [Int] = [400, 800, 1600, 3200, 5_000]
+    private var staleListRetryTask: Task<Void, Never>?
+ /// 最近一次 live list 请求的开始时间：用于（a）冷启动耗时埋点，（b）重试循环在
+ /// 请求挂起 >1.2s 时允许**并行重发**（更高 requestID 胜出），避免 20s unary
+ /// 超时把「缓存刷新」拖到 10s+。
+    private var lastListRequestStartedAt: Date?
+
+ /// DEBUG 冷启动埋点：连接/列表各阶段耗时用。
+    private func coldStartDebug(_ message: String) {
+        #if DEBUG
+        NSLog("[COLDSTART] %@", message)
+        #endif
+    }
+
  // MARK: - M2b-2b cold-start (compact first frame / in-app timing / prewarm)
 
  /// E2E-gated in-app metrics (`cacheMs=..;firstFrameMs=..;networkMs=..`) surfaced
@@ -352,6 +378,7 @@ final class WorkspaceViewModel: ObservableObject {
  /// Entering the list: keep the workspace stream open and load session metadata.
     func start() {
         guard let link else { return }
+        coldStartDebug("start phase=\(link.phase) cached=\(loadedFromCache) sessionsLoaded=\(sessionsLoaded) networkApplied=\(networkApplied)")
         observedGeneration = link.generation
  // The cached list was applied in `init`; SwiftUI's `.onChange` only observes
  // changes made after it appears, so re-publish once to feed the deep-link
@@ -369,6 +396,10 @@ final class WorkspaceViewModel: ObservableObject {
  // is a stale LAN address (it would hang for the full timeout instead of
  // letting the connect loop dial the relay first).
         startEarlySnapshotDuringBringup()
+ // if the first frame is still the cached one, keep retrying the
+ // live list on a bounded schedule instead of waiting for the next phase flip
+ // .
+        armStaleListRetry()
         guard link.phase.isConnected else {
  // Show the list chrome + connection banner instead of a forever spinner;
  // handleConnectionChange() starts the stream once the link is ready.
@@ -399,6 +430,11 @@ final class WorkspaceViewModel: ObservableObject {
         workspaceStream = nil
         loadTask?.cancel()
         loadTask = nil
+ // leaving the list retires the stale-list retry loop and the
+ // delayed cache-refresh indicator (a late callback must not touch a view
+ // that is gone).
+        cancelStaleListRetry()
+        clearCacheRefreshBanner()
         if let resumeObserver {
             NotificationCenter.default.removeObserver(resumeObserver)
             self.resumeObserver = nil
@@ -565,6 +601,17 @@ final class WorkspaceViewModel: ObservableObject {
  /// (P0-4/P0-5): those either land (and paint the list early) or are superseded
  /// by the `.connected` reload, so a transient failure is not user-actionable.
     private func loadSessions(silent: Bool = false) {
+ // 冷启动 <1s：不要取消一个刚发出（<1.2s）的 in-flight 请求。
+ // 真机上 connected/generation 触发的 reload 会把快完成的 early 请求 cancel，
+ // 然后重发一整轮（TLS+auth+240KB）——抖动路径上叠加成 10s 级刷新。让它在飞，
+ // 由 requestID 保证「最新者胜出」；真正挂起时由 stale-list 重试循环 supersede。
+        if isRefreshing, let startedAt = lastListRequestStartedAt {
+            let inFlightMs = Date().timeIntervalSince(startedAt) * 1000
+            if inFlightMs < 1_200 {
+                coldStartDebug("loadSessions skipped: in-flight request \(Int(inFlightMs))ms (not cancelling)")
+                return
+            }
+        }
         loadTask?.cancel()
         loadTask = Task { [weak self] in
             await self?.loadSessionsNow(silent: silent)
@@ -578,11 +625,16 @@ final class WorkspaceViewModel: ObservableObject {
  // overwriting a newer snapshot.
         sessionListRequestID += 1
         let requestID = sessionListRequestID
+        lastListRequestStartedAt = Date()
+        let originOverride = link.earlyListOriginOverride()
+        coldStartDebug("list request #\(requestID) silent=\(silent) override=\(originOverride?.absoluteString ?? "-") cached=\(loadedFromCache)")
         isRefreshing = true
+        armCacheRefreshBannerDelay()
         defer {
             if requestID == sessionListRequestID {
                 isRefreshing = false
                 loadTask = nil
+                clearCacheRefreshBanner()
             }
         }
         do {
@@ -591,11 +643,20 @@ final class WorkspaceViewModel: ObservableObject {
  // fields only). The plugin strips the hint before forwarding, so the
  // upstream DSH request is unchanged; old App builds send no signal
  // and keep the byte-identical full response.
-            let value = try await link.unary("session/list", args: SessionListLite.requestArgs(), timeout: 20)
+            let value = try await link.unary(
+                "session/list",
+                args: SessionListLite.requestArgs(),
+                timeout: 20,
+                originOverride: originOverride
+            )
             guard !Task.isCancelled, requestID == sessionListRequestID else { return }
+            let elapsedMs = lastListRequestStartedAt.map { Date().timeIntervalSince($0) * 1000 } ?? -1
+            coldStartDebug("list applied #\(requestID) elapsedMs=\(Int(elapsedMs))")
             try applySessionListResponse(value)
         } catch {
             guard !Task.isCancelled, requestID == sessionListRequestID else { return }
+            let elapsedMs = lastListRequestStartedAt.map { Date().timeIntervalSince($0) * 1000 } ?? -1
+            coldStartDebug("list failed #\(requestID) elapsedMs=\(Int(elapsedMs)) err=\(NetworkErrorInterpreter.message(for: error))")
             if !silent, !link.phase.isBusy {
                 errorText = NetworkErrorInterpreter.message(for: error)
             }
@@ -613,6 +674,9 @@ final class WorkspaceViewModel: ObservableObject {
         lastNetworkListAppliedAt = Date()
         loadedFromCache = false
         cacheIsStale = false
+ // Live list landed: retire the slow-refresh indicator and the stale retries.
+        clearCacheRefreshBanner()
+        cancelStaleListRetry()
  // The live snapshot is complete: the deferred raw cache restore is moot.
         needsDeferredRawRestore = false
         scheduleListCacheSave()
@@ -657,14 +721,91 @@ final class WorkspaceViewModel: ObservableObject {
  /// changes (connecting -> reconnecting) do not stack requests.
     private func startEarlySnapshotDuringBringup() {
         guard let link, !link.manuallyDisconnected else { return }
+ // 冷启动 <1s：即使 `prefersEarlyUnary` 因「持久化 origin 是失效
+ // LAN」为 false，只要有可达的 relay origin 覆盖，early list 仍然值得立刻发。
+        let originOverride = link.earlyListOriginOverride()
         guard Self.shouldStartEarlySnapshot(
-            prefersEarlyUnary: link.prefersEarlyUnary,
+            prefersEarlyUnary: link.prefersEarlyUnary || originOverride != nil,
             hasCredentials: link.credentials != nil,
             isConnected: link.phase.isConnected
-        ) else { return }
+        ) else {
+            coldStartDebug("early-list skipped gate prefersEarlyUnary=\(link.prefersEarlyUnary) override=\(originOverride?.absoluteString ?? "-")")
+            return
+        }
         if let last = lastEarlySnapshotAt, Date().timeIntervalSince(last) < 1.5 { return }
         lastEarlySnapshotAt = Date()
+        coldStartDebug("early-list sent gate prefersEarlyUnary=\(link.prefersEarlyUnary) override=\(originOverride?.absoluteString ?? "-")")
         loadSessions(silent: true)
+    }
+
+ // MARK: - 冷启动 <1s：缓存刷新指示器 + stale 列表有界重试
+
+ /// 纯策略：刷新耗时是否已达到显示指示器的阈值（默认 800ms）。
+    nonisolated static func shouldShowCacheRefreshBanner(
+        elapsedMs: Double,
+        thresholdMs: Double = 800
+    ) -> Bool {
+        elapsedMs >= thresholdMs
+    }
+
+ /// `isRefreshing` 置真时调用：只有「缓存首帧 + 尚无 live 列表」才需要指示器，
+ /// 且延迟到阈值后才真正显示（<1s 的刷新用户看不到任何「缓存刷新」文案）。
+    private func armCacheRefreshBannerDelay() {
+        guard loadedFromCache, !networkApplied else {
+            clearCacheRefreshBanner()
+            return
+        }
+        if showCacheRefreshBanner { return }
+        cacheBannerDelayTask?.cancel()
+        let threshold = Self.cacheRefreshBannerDelayMs
+        cacheBannerDelayTask = Task { [weak self] in
+            let startedAt = Date()
+            try? await Task.sleep(nanoseconds: UInt64(threshold) * 1_000_000)
+            guard !Task.isCancelled, let self else { return }
+            guard self.isRefreshing, self.loadedFromCache, !self.networkApplied else { return }
+            let elapsed = Date().timeIntervalSince(startedAt) * 1000
+            guard Self.shouldShowCacheRefreshBanner(elapsedMs: elapsed, thresholdMs: Double(threshold)) else { return }
+            self.showCacheRefreshBanner = true
+        }
+    }
+
+    private func clearCacheRefreshBanner() {
+        cacheBannerDelayTask?.cancel()
+        cacheBannerDelayTask = nil
+        if showCacheRefreshBanner { showCacheRefreshBanner = false }
+    }
+
+ /// 首帧仍来自缓存时，对 live `session/list` 做有界重试。用户的真机现场是
+ /// 「桌面端重启后首次启动」：连接轮次重试了约 13s，而 live 列表请求只在连上后才
+ /// 重发一次，于是「正在刷新」持续 10s+。这里在 bring-up 窗口内每 0.4–5s 重试一次
+ /// （串行、不打断在飞请求），live 列表一落地即停止。
+    private func armStaleListRetry() {
+        staleListRetryTask?.cancel()
+        guard loadedFromCache, !networkApplied, link?.credentials != nil else { return }
+        staleListRetryTask = Task { [weak self] in
+            for delayMs in Self.staleListRetryDelaysMs {
+                try? await Task.sleep(nanoseconds: UInt64(delayMs) * 1_000_000)
+                guard !Task.isCancelled, let self else { return }
+                if self.networkApplied || !self.loadedFromCache { return }
+                guard self.link?.credentials != nil else { return }
+ // A request already in flight is normally left alone; if it has been
+ // hanging for >1.2s (first launch after a desktop restart), issue a
+ // newer request in parallel — its higher request id wins and the
+ // stale one is discarded, so the banner cannot sit for its 20s timeout.
+                if self.isRefreshing {
+                    let inFlightMs = self.lastListRequestStartedAt.map { Date().timeIntervalSince($0) * 1000 } ?? .infinity
+                    guard inFlightMs > 1_200 else { continue }
+                    self.coldStartDebug("stale-retry supersede inFlightMs=\(Int(inFlightMs))")
+                }
+                await self.loadSessionsNow(silent: true)
+                if self.networkApplied { return }
+            }
+        }
+    }
+
+    private func cancelStaleListRetry() {
+        staleListRetryTask?.cancel()
+        staleListRetryTask = nil
     }
 
  /// Arms the reused-mux first-byte probe described by `reuseBaselineTimeoutMs`.

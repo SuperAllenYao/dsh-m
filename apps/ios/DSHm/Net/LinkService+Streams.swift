@@ -257,7 +257,15 @@ extension LinkService {
  /// `auth/invalid` the token is refreshed once and the call retried (the
  /// protocol has no automatic retry contract, but token refresh is
  /// transport-level auth, not a business mutation).
-    func unary(_ endpoint: String, args: [String: JSONValue] = [:], timeout: TimeInterval = 20) async throws -> JSONValue {
+ /// `originOverride`: the early list refresh may target
+ /// the relay origin while the persisted `credentials.origin` is a stale LAN
+ /// address (cellular / cross-network). See `earlyListOriginOverride()`.
+    func unary(
+        _ endpoint: String,
+        args: [String: JSONValue] = [:],
+        timeout: TimeInterval = 20,
+        originOverride: URL? = nil
+    ) async throws -> JSONValue {
         if let p1 = p1Channel, p1.isReady {
             do {
                 let result = try await p1.unary(endpoint: endpoint, args: args, timeout: timeout)
@@ -269,8 +277,8 @@ extension LinkService {
             }
         }
         guard let credentials else { throw LinkError.notPaired }
-        guard let origin = credentials.originURL else { throw LinkError.transport(L10n.t("配对 origin 非法")) }
-        var token = try await ensureAPIToken()
+        guard let origin = originOverride ?? credentials.originURL else { throw LinkError.transport(L10n.t("配对 origin 非法")) }
+        var token = try await ensureAPIToken(originOverride: originOverride)
         do {
             return try await HTTPSClient.unaryJSON(
                 origin: origin,
@@ -285,7 +293,7 @@ extension LinkService {
             if case .httpStatus(let status, let body) = error,
                status == 401,
                body.contains("auth/token-expired") || body.contains("auth/invalid") {
-                token = try await ensureAPIToken(forceRefresh: true)
+                token = try await ensureAPIToken(forceRefresh: true, originOverride: originOverride)
                 return try await HTTPSClient.unaryJSON(
                     origin: origin,
                     endpoint: endpoint,
