@@ -1,5 +1,8 @@
 import SwiftUI
 import UIKit
+#if DEBUG
+import QuartzCore
+#endif
 
 /// 消息流的一行（groups 之后的尾部内容也作为可滚动行参与同一列表）。
 enum SessionMessageItem: Equatable {
@@ -51,6 +54,8 @@ struct SessionMessageListView: UIViewRepresentable {
     let subagentLabels: [String: String]
     let isRunning: Bool
     let historyBatchToken: Int
+    /// 递增即请求「强制回到底部」（发送消息 / 答完问答时由上层 +1）。
+    let scrollToBottomToken: Int
     let onOpenTool: (ToolCallItem) -> Void
     let onOpenFileChanges: (TurnFileChanges) -> Void
     let onNearBottomChange: (Bool) -> Void
@@ -159,6 +164,10 @@ struct SessionMessageListView: UIViewRepresentable {
         private var isAdjustingOffset = false
         /// 静止阅读时的冻结锚点（最上方可见行 + 屏幕位置）；每次布局后保持它不动。
         private var desiredAnchor: (rowID: String, screenY: CGFloat)?
+        /// 已处理到的「强制回底」请求序号（发送消息 / 答完问答）。
+        private var lastScrollToBottomToken: Int = 0
+        /// 上一次布局时的视口高度：键盘/内联行/输入框增高会改变它，读历史时需要补偿。
+        private var lastViewportHeight: CGFloat = 0
 
         init(_ parent: SessionMessageListView) {
             self.parent = parent
@@ -169,6 +178,8 @@ struct SessionMessageListView: UIViewRepresentable {
             tableView.onLayoutPass = { [weak self] in self?.stabilizeAfterLayout() }
             tableView.delegate = self
             tableView.register(MessageCell.self, forCellReuseIdentifier: MessageCell.reuseID)
+            lastScrollToBottomToken = parent.scrollToBottomToken
+            lastViewportHeight = tableView.bounds.height
             let dataSource = UITableViewDiffableDataSource<String, String>(tableView: tableView) { [weak self] tableView, indexPath, itemID in
                 guard let self,
                       let cell = tableView.dequeueReusableCell(withIdentifier: MessageCell.reuseID, for: indexPath) as? MessageCell,
@@ -182,13 +193,69 @@ struct SessionMessageListView: UIViewRepresentable {
                 return cell
             }
             self.dataSource = dataSource
+            #if DEBUG
+            ScrollJitterProbe.shared?.attach(table: tableView)
+            installProbeObservers(tableView)
+            #endif
         }
 
         func detach() {
             #if DEBUG
+            offsetObservation?.invalidate()
+            offsetObservation = nil
+            sizeObservation?.invalidate()
+            sizeObservation = nil
+            if let tableView { ScrollJitterProbe.shared?.detachTable(tableView) }
             ScrollJitterProbe.shared?.stop()
             #endif
         }
+
+        #if DEBUG
+        private var offsetObservation: NSKeyValueObservation?
+        private var sizeObservation: NSKeyValueObservation?
+
+        /// 取证：谁在「用户没滚动、代码也没主动调 offset」时改了 contentOffset/contentSize？
+        /// KVO 回调同步发生在变更点，callStackSymbols 直接给出调用来源。
+        private func installProbeObservers(_ tableView: UITableView) {
+            guard ScrollJitterProbe.shared != nil else { return }
+            offsetObservation = tableView.observe(\.contentOffset, options: [.old, .new]) { [weak self] table, change in
+                guard let self, self.didInitialBottom,
+                      !self.userIsScrolling, !self.isAdjustingOffset,
+                      !table.isTracking, !table.isDecelerating else { return }
+                guard let old = change.oldValue, let new = change.newValue else { return }
+                let delta = new.y - old.y
+                guard abs(delta) > 1.0 else { return }
+                ScrollJitterProbe.shared?.event("offsetKVO", [
+                    "delta": Double(delta),
+                    "off": Double(new.y),
+                    "ch": Double(table.contentSize.height),
+                    "stack": Coordinator.compactStack(),
+                ])
+            }
+            sizeObservation = tableView.observe(\.contentSize, options: [.old, .new]) { [weak self] table, change in
+                guard let self, self.didInitialBottom,
+                      !self.userIsScrolling, !self.isAdjustingOffset,
+                      !table.isTracking, !table.isDecelerating else { return }
+                guard let old = change.oldValue, let new = change.newValue else { return }
+                let delta = new.height - old.height
+                guard abs(delta) > 2.0 else { return }
+                ScrollJitterProbe.shared?.event("sizeKVO", [
+                    "delta": Double(delta),
+                    "ch": Double(new.height),
+                    "off": Double(table.contentOffset.y),
+                    "stack": Coordinator.compactStack(),
+                ])
+            }
+        }
+
+        static func compactStack(_ limit: Int = 18) -> String {
+            Thread.callStackSymbols.prefix(limit).compactMap { line -> String? in
+                let parts = line.split(separator: " ", omittingEmptySubsequences: true)
+                guard parts.count >= 4 else { return nil }
+                return String(parts[1]) + "!" + String(parts[3])
+            }.joined(separator: ";")
+        }
+        #endif
 
         private func item(for id: String) -> SessionMessageItem? {
             if let group = groupLookup[id] { return .group(group) }
@@ -243,15 +310,28 @@ struct SessionMessageListView: UIViewRepresentable {
             }
             #endif
 
+            // 「强制回底」请求（发送消息 / 答完问答）：放弃冻结的尾部内容，直接回到底部。
+            let wantsBottom = parent.scrollToBottomToken != lastScrollToBottomToken
+            if wantsBottom {
+                lastScrollToBottomToken = parent.scrollToBottomToken
+                frozenItems = nil
+            }
+            // 贴底语义：用户停在近底部（offset ≤140；反转列表 0 = 视觉底部）时，
+            // 尾部新增（自己发的消息 / 流式内容）必须直接出现在底部，不能做锚点补偿。
+            let wasNearBottom = isNearBottom && tableView.contentOffset.y <= 140
+
             // 用户正在读历史（不在近底部）时，非历史补齐的变化（新流式行/文本增长）先冻结。
-            if didInitialBottom, !isNearBottom, !historyAppend {
+            if didInitialBottom, !isNearBottom, !historyAppend, !wantsBottom {
                 frozenItems = items
                 return
             }
             frozenItems = nil
 
             let lastDataIDs = lastItems.reversed().map(\.id)
-            if ids == lastDataIDs && changedIDs.isEmpty { return }
+            if ids == lastDataIDs && changedIDs.isEmpty {
+                if wantsBottom { forceBottom(tableView) }
+                return
+            }
 
             groupLookup = newGroupLookup
             lastItems = items
@@ -265,8 +345,27 @@ struct SessionMessageListView: UIViewRepresentable {
             snapshot.appendSections(["main"])
             snapshot.appendItems(ids, toSection: "main")
             if !changedIDs.isEmpty { snapshot.reconfigureItems(changedIDs) }
+            #if DEBUG
+            let applyStart = CACurrentMediaTime()
+            #endif
             dataSource.apply(snapshot, animatingDifferences: false)
+            #if DEBUG
+            let diffMs = (CACurrentMediaTime() - applyStart) * 1000
+            #endif
             tableView.layoutIfNeeded()
+            #if DEBUG
+            let applyMs = (CACurrentMediaTime() - applyStart) * 1000
+            if applyMs > 8 {
+                ScrollJitterProbe.shared?.event("applyDur", [
+                    "diffMs": diffMs,
+                    "totalMs": applyMs,
+                    "inserted": insertedIDs.count,
+                    "changed": changedIDs.count,
+                    "history": historyAppend ? 1 : 0,
+                    "tail": tailAppend ? 1 : 0,
+                ])
+            }
+            #endif
             var preCorrectionDelta: CGFloat = 0
             #if DEBUG
             if let before = anchorBefore,
@@ -278,7 +377,11 @@ struct SessionMessageListView: UIViewRepresentable {
             // 布局期锚定兜底修正：锚点行是已实体化/可见行，位置是真实布局结果；
             // 若布局后它偏离了原屏幕位置（如 UIKit 因 contentSize/估算变化调整过 offset），
             // 在屏幕提交前按真实差值修正 contentOffset（不依赖任何高度估算）。
-            if let before = anchorBeforeSnapshot,
+            // 例外：贴底/强制回底时新内容在视觉底部，锚点补偿会把 offset 推离底部（新消息落在屏外），
+            // 此时直接钉住 offset 0。
+            if wantsBottom || (tailAppend && wasNearBottom) {
+                forceBottom(tableView)
+            } else if let before = anchorBeforeSnapshot,
                !isAdjustingOffset,
                let indexPath = dataSource.indexPath(for: before.rowID) {
                 let rect = tableView.rectForRow(at: indexPath)
@@ -294,7 +397,8 @@ struct SessionMessageListView: UIViewRepresentable {
                 }
             }
             #if DEBUG
-            if let before = anchorBeforeSnapshot,
+            if !(wantsBottom || (tailAppend && wasNearBottom)),
+               let before = anchorBeforeSnapshot,
                let indexPath = dataSource.indexPath(for: before.rowID) {
                 let rect = tableView.rectForRow(at: indexPath)
                 let delta = (rect.minY - tableView.contentOffset.y) - before.screenY
@@ -321,6 +425,19 @@ struct SessionMessageListView: UIViewRepresentable {
             updateNearBottom(tableView: tableView)
         }
 
+        /// 强制回到底部（反转列表：offset 0 = 视觉底部）。
+        private func forceBottom(_ tableView: UITableView) {
+            frozenItems = nil
+            isAdjustingOffset = true
+            tableView.setContentOffset(.zero, animated: false)
+            isAdjustingOffset = false
+            if !isNearBottom {
+                isNearBottom = true
+                parent.onNearBottomChange(true)
+            }
+            freezeAnchorFromCurrentViewport(tableView)
+        }
+
         private struct Anchor {
             let rowID: String
             let screenY: CGFloat
@@ -335,8 +452,20 @@ struct SessionMessageListView: UIViewRepresentable {
 
         /// 每次布局后把冻结锚点行放回原屏幕位置（真实 frame，不依赖估算）。
         func stabilizeAfterLayout() {
-            guard let tableView, didInitialBottom,
-                  !userIsScrolling, !isAdjustingOffset,
+            guard let tableView, didInitialBottom else { return }
+            // 视口高度变化（键盘弹出/收起、内联提示行、输入框多行增高）：
+            // 读历史时保持可见内容不动；贴底时不动 offset（底部本就随视口移动）。
+            let height = tableView.bounds.height
+            if height > 1 {
+                let previous = lastViewportHeight
+                lastViewportHeight = height
+                if previous > 1, abs(height - previous) > 0.5,
+                   !isNearBottom, !userIsScrolling, !isAdjustingOffset,
+                   let anchor = desiredAnchor {
+                    desiredAnchor = (anchor.rowID, anchor.screenY - (previous - height))
+                }
+            }
+            guard !userIsScrolling, !isAdjustingOffset,
                   let desired = desiredAnchor,
                   let indexPath = dataSource?.indexPath(for: desired.rowID) else { return }
             let rect = tableView.rectForRow(at: indexPath)

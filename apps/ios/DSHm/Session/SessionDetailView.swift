@@ -40,6 +40,9 @@ struct SessionDetailView: View {
     /// 会让距离阈值瞬间判成"不在底部"，跟随就此停住，页面卡在会话中间
     /// （用户 2026-10-22 报障：点通知进入停在 turn 8，实际已到 turn 9）。
     @State private var userHasScrolled = false
+    /// 强制回底请求序号：发送消息 / 答完问答时 +1，UIKit 列表据此钉住 offset 0
+    /// （读历史时冻结尾部内容，发送后必须立刻看到自己刚发的消息）。
+    @State private var scrollToBottomToken = 0
 
     init(address: SessionFollowAddress, subagentContext: SubagentSessionContext? = nil) {
         self.address = address
@@ -363,7 +366,11 @@ struct SessionDetailView: View {
             queued: viewModel.queuedPrompts,
             isReadOnly: viewModel.isReadOnlySubagent,
             readOnlyReason: viewModel.subagentReadOnlyReason,
-            onSend: { viewModel.submitDraft() },
+            onSend: {
+                viewModel.submitDraft()
+                // 发送后强制回到底部：读历史时也立即看到自己刚发的消息（§6.2 回归点）。
+                scrollToBottomToken += 1
+            },
             onAbort: {
                 // T10: the pending live question belongs to the turn being
                 // aborted; drop the card immediately instead of waiting for the
@@ -736,6 +743,7 @@ struct SessionDetailView: View {
                     subagentLabels: viewModel.subagentLabels,
                     isRunning: viewModel.isRunning,
                     historyBatchToken: viewModel.historyBatchToken,
+                    scrollToBottomToken: scrollToBottomToken,
                     onOpenTool: { present(.tool($0)) },
                     onOpenFileChanges: { present(.fileChanges($0)) },
                     onNearBottomChange: { isNearBottom = $0 },
@@ -873,6 +881,8 @@ struct SessionDetailView: View {
         submittingQuestionCallId = nil
         questionErrorCallId = nil
         questionErrorText = nil
+        // 答完问答后会话继续产出内容：贴底时强制回底；读历史时尊重用户位置。
+        if isNearBottom { scrollToBottomToken += 1 }
         withAnimation(Theme.Motion.standard) {
             answeredQuestionCallId = callId
             switch outcome {

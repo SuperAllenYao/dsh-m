@@ -51,8 +51,21 @@ final class ScrollJitterProbe {
     private var fileHandle: FileHandle?
     private var stopped = false
     private var frameIndex: Int = 0
+    /// 列表视图弱引用：每帧实时读取 contentOffset/contentSize/bounds（缓存几何只做兜底），
+    /// 避免「布局内部调整」期间读到过期快照造成假跳变。
+    private weak var observedTable: UITableView?
 
     private init() {}
+
+    func attach(table: UITableView) {
+        observedTable = table
+        event("tableAttach", ["table": String(describing: ObjectIdentifier(table))])
+    }
+
+    func detachTable(_ table: UITableView) {
+        if observedTable === table { observedTable = nil }
+        event("tableDetach", ["table": String(describing: ObjectIdentifier(table))])
+    }
 
     // MARK: - lifecycle
 
@@ -154,6 +167,7 @@ final class ScrollJitterProbe {
         frameIndex += 1
         // 每帧按 view 现读 row id（cell 复用安全），并清理已释放的 view。
         var ys: [String: Double] = [:]
+        var hs: [String: Double] = [:]
         var alive: [WeakView] = []
         alive.reserveCapacity(registeredViews.count)
         for ref in registeredViews {
@@ -164,25 +178,110 @@ final class ScrollJitterProbe {
                   !identified.jitterRowID.isEmpty else { continue }
             let rect = view.convert(view.bounds, to: nil)
             ys[identified.jitterRowID] = Double(rect.minY)
+            hs[identified.jitterRowID] = Double(abs(rect.height))
         }
         registeredViews = alive
         registeredIDs = Set(alive.compactMap { $0.view.map(ObjectIdentifier.init) })
+        // 权威来源：UITableView.visibleCells（真正参与渲染的 cell）。
+        // 复用池里的 parked cell 仍在 window 层级里（window != nil），但不是用户可见行；
+        // 拿它的 frame 当「可见行位移」会产生幽灵跳变（实测同帧出现行序颠倒/重叠）。
+        if let table = observedTable, !table.visibleCells.isEmpty {
+            var visibleYs: [String: Double] = [:]
+            var visibleHs: [String: Double] = [:]
+            for cell in table.visibleCells {
+                guard let identified = cell as? JitterProbeIdentifiable,
+                      !identified.jitterRowID.isEmpty else { continue }
+                let rect = cell.convert(cell.bounds, to: nil)
+                visibleYs[identified.jitterRowID] = Double(rect.minY)
+                visibleHs[identified.jitterRowID] = Double(abs(rect.height))
+            }
+            if !visibleYs.isEmpty {
+                ys = visibleYs
+                hs = visibleHs
+            }
+        }
         guard !ys.isEmpty else { return }
+        var off = geometry.offset
+        var contentH = geometry.contentH
+        var viewportH = geometry.viewportH
+        if let table = observedTable {
+            off = Double(table.contentOffset.y)
+            contentH = Double(table.contentSize.height)
+            viewportH = Double(table.bounds.height)
+        }
         let payload: [String: Any] = [
             "type": "frame",
             "t": Date().timeIntervalSince1970,
             "i": frameIndex,
-            "off": geometry.offset,
-            "ch": geometry.contentH,
-            "vh": geometry.viewportH,
+            "off": off,
+            "ch": contentH,
+            "vh": viewportH,
             "phase": phase,
             "anim": animating ? 1 : 0,
             "anchor": anchorRowID ?? "-",
             "ys": ys,
+            "hs": hs,
         ]
         guard let data = try? JSONSerialization.data(withJSONObject: payload),
               let line = String(data: data, encoding: .utf8) else { return }
         append(line)
+
+        // 判定「本帧的位移是否真正上屏」：同一 runloop 内 CA 提交后复核行位置。
+        // 若提交时已回正（stillShifted≈0），说明探针抓到的只是布局中间态，用户看不到。
+        if phase == "idle", let previous = lastFrameRows {
+            var maxShift = 0.0
+            var maxRow = ""
+            for (key, value) in ys {
+                if let old = previous[key] {
+                    let delta = abs(value - old)
+                    if delta > maxShift { maxShift = delta; maxRow = key }
+                }
+            }
+            if maxShift > 4.0 {
+                scheduleCommitCheck(rows: ys, maxShift: maxShift, row: maxRow)
+            }
+        }
+        lastFrameRows = ys
+    }
+
+    // MARK: - commit check
+
+    private var lastFrameRows: [String: Double]?
+
+    private func scheduleCommitCheck(rows: [String: Double], maxShift: Double, row: String) {
+        CATransaction.begin()
+        CATransaction.setCompletionBlock { [weak self] in
+            guard let self else { return }
+            var post: [String: Double] = [:]
+            if let table = self.observedTable, !table.visibleCells.isEmpty {
+                for cell in table.visibleCells {
+                    guard let identified = cell as? JitterProbeIdentifiable,
+                          !identified.jitterRowID.isEmpty else { continue }
+                    post[identified.jitterRowID] = Double(cell.convert(cell.bounds, to: nil).minY)
+                }
+            }
+            if post.isEmpty {
+                for ref in self.registeredViews {
+                    guard let view = ref.view, view.window != nil,
+                          let identified = view as? JitterProbeIdentifiable,
+                          !identified.jitterRowID.isEmpty else { continue }
+                    post[identified.jitterRowID] = Double(view.convert(view.bounds, to: nil).minY)
+                }
+            }
+            var still = 0.0
+            for (key, value) in rows {
+                if let now = post[key] { still = max(still, abs(now - value)) }
+            }
+            let table = self.observedTable
+            self.event("commitCheck", [
+                "maxShift": maxShift,
+                "row": row,
+                "stillShifted": still,
+                "ch": Double(table?.contentSize.height ?? 0),
+                "off": Double(table?.contentOffset.y ?? 0),
+            ])
+        }
+        CATransaction.commit()
     }
 
     // MARK: - file IO
