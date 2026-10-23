@@ -141,29 +141,32 @@ struct ProcessGroupView: View {
 
     // MARK: - 步骤列表
 
-    /// 运行中：固定高度窗口内滚动。
+    /// 运行中：固定高度窗口，**只展示最近 N 步**（N = 窗口高度 / 28pt 行高）。
     ///
-    /// v0.2.7 真机复核：scrollTo(last) / scrollPosition 在自撑高 cell 里会被夹断一行
-    /// （首帧滚动早于行高重测，落不到位）。这里沿用外层消息列表已验证的「反转滚动」方案：
-    /// ScrollView 与内容各自翻转一次 → offset 0 = 视觉底部，窗口初次出现就停在最新一步；
-    /// 新步骤追加到数据头部（reversed 后 index 0）时继续贴底，不依赖任何滚动时序。
-    /// 用户上滑（offset 增大）仍可回看更早步骤。
+    /// v0.2.7 真机回归（用户报障「屏幕根本没办法上下滑动」）：
+    /// 之前这里放了一个嵌套 ScrollView，它嵌在「自撑高 UIHostingConfiguration cell +
+    /// 反转（scaleY(-1)）列表」里会抢走纵向 pan 手势，导致整页消息列表滑不动。
+    /// 现在窗口**不做嵌套滚动**：只渲染最近 N 步、底部对齐、新步骤到达时整体上移
+    /// （animation 过渡），手势全部留给外层消息列表；要看全部步骤点右上「全高」图标。
     private var stepsWindow: some View {
-        ScrollView(.vertical, showsIndicators: true) {
-            VStack(spacing: 0) {
-                ForEach(Array(foldable.reversed())) { step in
-                    hairline(inset: 34)
-                    stepRow(step)
-                        .scaleEffect(x: 1, y: -1)
-                        .accessibilityElement(children: .contain)
-                        .accessibilityIdentifier("process-step-row")
-                }
+        VStack(spacing: 0) {
+            ForEach(windowSteps) { step in
+                hairline(inset: 34)
+                stepRow(step)
+                    .accessibilityElement(children: .contain)
+                    .accessibilityIdentifier("process-step-row")
             }
         }
-        .scaleEffect(x: 1, y: -1)
-        .frame(height: windowHeight)
-        .scrollBounceBehavior(.basedOnSize)
+        .frame(height: windowHeight, alignment: .bottom)
+        .clipped()
+        .animation(Theme.Motion.quick, value: foldable.count)
         .accessibilityIdentifier("process-steps-window")
+    }
+
+    /// 固定窗口内展示的「最近 N 步」（尾部切片，随新步骤上移）。
+    private var windowSteps: [ProcessStep] {
+        let capacity = max(1, Int(windowHeight / 29))
+        return Array(foldable.suffix(capacity))
     }
 
     /// 全量内联（运行中「全高」/ 已结束「展开历史」）：同步 VStack。
