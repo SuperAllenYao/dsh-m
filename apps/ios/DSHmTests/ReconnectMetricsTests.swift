@@ -365,7 +365,36 @@ final class ReconnectPolicyTests: XCTestCase {
         ))
     }
 
-    func testAttemptBudgetNeverExceedsTheRoundBudget() {        XCTAssertNil(LinkService.attemptBudget(baseTimeout: 8, remainingRoundBudget: 0))
+    /// 2026-10-23 冷启动 <1s（列表侧）：连接池预热必须选「当前网络可达」的 origin，
+    /// 蜂窝/跨网时优先 relay 候选，避免把 ~3s 预热预算打到失效 LAN 上。
+    func testPoolWarmupOriginSelection() {
+        let relay = "https://121.41.112.232:30000"
+        let lan = "https://192.168.5.10:3466"
+        XCTAssertEqual(
+            LinkService.poolWarmupOrigin(
+                current: lan,
+                stored: [lan, relay],
+                prefersRelay: true,
+                local: nil
+            )?.absoluteString,
+            relay,
+            "cellular: warm the relay, never the stale LAN"
+        )
+        XCTAssertEqual(
+            LinkService.poolWarmupOrigin(
+                current: lan,
+                stored: [lan, relay],
+                prefersRelay: false,
+                local: nil
+            )?.absoluteString,
+            lan,
+            "LAN path: warm the stored current origin first"
+        )
+        XCTAssertNil(LinkService.poolWarmupOrigin(current: nil, stored: [], prefersRelay: true, local: nil))
+    }
+
+    func testAttemptBudgetNeverExceedsTheRoundBudget() {
+        XCTAssertNil(LinkService.attemptBudget(baseTimeout: 8, remainingRoundBudget: 0))
         XCTAssertNil(
             LinkService.attemptBudget(baseTimeout: 8, remainingRoundBudget: 0.05),
             "no point dialing with 50ms of the round budget left"
