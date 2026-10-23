@@ -1001,34 +1001,36 @@ struct SessionDetailView: View {
         return nil
     }
 
-    /// 贴底保持：补齐只从顶部插入，末尾内容的位置语义不变，单拍无动画对齐底部。
+    /// 贴底保持：补齐结果一次性出现在列表最前面后，把视口无动画对齐底部。
+    ///
+    /// 2026-10-23 真机回归：冷启动直达会话入口（通知/深链）+ 热缓存 + 13.2MB 会话时，
+    /// 原先「每批 history page 都从顶部插入并 rebuild」会让 LazyVStack 反复丢内容
+    /// （整页空白 ↔ 内容闪回 1–5s）。VM 侧已改为补齐期间不发布 rows、完成时一次性发布
+    /// （`prependRenderDeferred`），所以这里只需在**这一次**发布后把视口对齐：
+    /// 先滚真实末行（贴底时必然已实体化，frame 精确，不用估算的 bottomSentinel），
+    /// 再在布局收敛后（120ms/400ms）补拍对齐，避免一次性大插入后停在内容之外。
+    /// 只有一次多拍，不会产生逐批滚动闪动。
     private func pinToBottomAfterPrepend(proxy: ScrollViewProxy, epoch: Int) {
         isNearBottom = true
-        // 自动补齐每批都要贴底，不做首屏加固多拍（多拍 = 每批 3 次滚动 → 闪动）。
-        scrollAnchorState.hardeningRemaining = 0
         scrollAnchorState.generation += 1
         let generation = scrollAnchorState.generation
         let lastRow = viewModel.rows.last?.id
-        Task { @MainActor in
-            await Task.yield()
-            guard generation == scrollAnchorState.generation else { return }
-            // 2026-10-23 真机回归（热缓存打开 13.2MB 大会话：补齐期间内容区全黑 3.5s，
-            // 几何一直「贴底 + 尺寸正常」，但 AX 只有 3 行 → 末段行未实体化）：
-            // 这是本文件 `scrollToBottom` 注释里记录过的已知问题——只滚 LazyVStack 外的
-            // bottomSentinel 时 offset 已贴底、末段行却没实体化，渲染出整屏空白。
-            // 补齐每批 prepend 后先滚真实末行强制实体化末段，再对齐 sentinel（顺序不能反，
-            // 与 scrollToBottom 的 pass>=1 修复一致）；两次滚动同一拍提交，不引入多拍闪动。
-            if let lastRow {
-                proxy.scrollTo(lastRow, anchor: .top)
-                guard generation == scrollAnchorState.generation else { return }
+        let passes: [(delayMs: UInt64, target: String)] = [
+            (0, lastRow ?? Self.bottomAnchorID),
+            (120, lastRow ?? Self.bottomAnchorID),
+            (400, Self.bottomAnchorID),
+        ]
+        for pass in passes {
+            Task { @MainActor in
+                if pass.delayMs > 0 {
+                    try? await Task.sleep(nanoseconds: pass.delayMs * 1_000_000)
+                }
+                await Task.yield()
+                guard epoch == scrollAnchorState.prependEpoch,
+                      generation == scrollAnchorState.generation,
+                      isNearBottom else { return }
+                proxy.scrollTo(pass.target, anchor: .bottom)
             }
-            proxy.scrollTo(Self.bottomAnchorID, anchor: .bottom)
-            // LazyVStack 前置插入后高度估算会再收敛一次；120ms 后补一拍校正。
-            try? await Task.sleep(nanoseconds: 120_000_000)
-            guard epoch == scrollAnchorState.prependEpoch,
-                  generation == scrollAnchorState.generation,
-                  isNearBottom else { return }
-            proxy.scrollTo(Self.bottomAnchorID, anchor: .bottom)
         }
     }
 
