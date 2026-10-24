@@ -149,8 +149,14 @@ struct WorkspaceListView: View {
 
     private var header: some View {
         VStack(alignment: .leading, spacing: Theme.Spacing.m) {
-            HStack {
+            HStack(spacing: Theme.Spacing.xs) {
                 BrandMark()
+ // app version (marketing + build) right of the DSH·m wordmark.
+                Text(appVersionText)
+                    .font(Theme.Typography.label)
+                    .foregroundStyle(Theme.Palette.textTertiary)
+                    .lineLimit(1)
+                    .accessibilityIdentifier("app-version")
                 Spacer()
                 ConnectionStatusPill(phase: app.link.phase, detail: app.link.credentials?.originURL?.host)
                 Menu {
@@ -186,7 +192,7 @@ struct WorkspaceListView: View {
             }
             .padding(.top, Theme.Spacing.xs)
 
-            ScreenTitle(title: "工作区", subtitle: subtitle)
+            ScreenTitle(title: "工作区", subtitle: subtitle, subtitleInline: true)
                 .accessibilityIdentifier("workspace-title")
         }
         .padding(.bottom, Theme.Spacing.m)
@@ -210,6 +216,14 @@ struct WorkspaceListView: View {
         if viewModel.showCacheRefreshBanner { return L10n.f("%@ · 本地缓存", summary) }
         if viewModel.cacheIsStale { return L10n.f("%@ · 缓存已过期", summary) }
         return summary
+    }
+
+ /// App version shown next to the wordmark: marketing version + build number,
+ /// e.g. `v2.8.0 (8)` (from `MARKETING_VERSION` / `CURRENT_PROJECT_VERSION`).
+    private var appVersionText: String {
+        let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.1.0"
+        let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "1"
+        return "v\(version) (\(build))"
     }
 
  /// M2b-2: cache-first paint indicator (a fresh network list hides it). The
@@ -300,27 +314,39 @@ struct WorkspaceListView: View {
                     viewModel.toggleCollapsed(group.path)
                 }
             } label: {
-                HStack(spacing: Theme.Spacing.xs) {
-                    Image(systemName: "folder")
-                        .font(.system(size: 13, weight: .regular))
-                        .foregroundStyle(Theme.Palette.textTertiary)
-                    Text(group.displayName)
-                        .font(Theme.Typography.bodyMedium)
-                        .foregroundStyle(Theme.Palette.textSecondary)
-                    Text(group.path)
-                        .font(Theme.Typography.label)
-                        .foregroundStyle(Theme.Palette.textTertiary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
+                HStack(alignment: .center, spacing: Theme.Spacing.xs) {
+ // open-folder glyph + accent color when expanded
+ // (SF Symbols has no open-folder symbol; see WorkspaceFolderIcon).
+                    WorkspaceFolderIcon(expanded: !collapsed)
+ // name enlarged to 16pt and path moved onto its own
+ // second line instead of sharing the name's line.
+                    VStack(alignment: .leading, spacing: Theme.Spacing.xxs) {
+                        Text(group.displayName)
+                            .font(Theme.Typography.workspaceName)
+                            .foregroundStyle(Theme.Palette.textSecondary)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                            .accessibilityIdentifier("workspace-name-\(index)")
+                        Text(group.path)
+                            .font(Theme.Typography.label)
+                            .foregroundStyle(Theme.Palette.textTertiary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                            .accessibilityIdentifier("workspace-path-\(index)")
+                    }
                     Spacer(minLength: Theme.Spacing.xs)
                     if collapsed {
                         Text(L10n.f("%lld 个会话", group.sessions.count))
                             .font(Theme.Typography.label)
                             .foregroundStyle(Theme.Palette.textTertiary)
                     }
-                    Image(systemName: collapsed ? "chevron.right" : "chevron.down")
+ // Same chevron symbol rotating (no glyph swap), synced with
+ // the folder's open/close morph.
+                    Image(systemName: "chevron.down")
                         .font(.system(size: 10, weight: .semibold))
                         .foregroundStyle(Theme.Palette.textTertiary)
+                        .rotationEffect(.degrees(collapsed ? -90 : 0))
+                        .animation(Theme.Motion.folder, value: collapsed)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .contentShape(Rectangle())

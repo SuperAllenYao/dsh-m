@@ -367,7 +367,9 @@ final class SessionViewModel: ObservableObject {
  /// E2E-only filler diagnostics (e2e-history-fill). The product path leaves it nil.
     @Published private(set) var historyFillProbeValue: String?
 
- /// Internal filler state; there is deliberately no UI for it (user: 无痕).
+ /// Internal filler state. The only UI coupled to it is the 2pt top progress
+ /// bar in `SessionDetailView.messageList` (handoff r4 §2.1 / §6.3-8); the
+ /// filler itself stays silent (user: 无痕), and completed/failed/idle show nothing.
     enum HistoryFillState: String {
         case idle
         case loading
@@ -375,7 +377,9 @@ final class SessionViewModel: ObservableObject {
         case failed
         case pausedOffline
     }
-    private(set) var historyFillState: HistoryFillState = .idle
+ /// Observable so the detail view can render the top 2pt fill progress bar
+ /// (handoff r4 §6.3-8). All writes happen on the MainActor (class is @MainActor).
+    @Published private(set) var historyFillState: HistoryFillState = .idle
     private var historyFillTask: Task<Void, Never>?
     private var historyFillStartedAt: Date?
     private var historyFillCompletedAt: Date?
@@ -443,6 +447,11 @@ final class SessionViewModel: ObservableObject {
 
  /// M2b-2: first-paint cache read+apply cost (ms).
     private(set) var cacheLoadMilliseconds: Double = 0
+    #if DEBUG
+ /// Test seam: rows rebuilds since init. The 300-message cache restore must
+ /// rebuild exactly once (no per-chunk rebuild/scroll flash).
+    private(set) var rebuildRowsCountForTesting = 0
+    #endif
     private let windowCache: SessionWindowCacheStore
  /// Phone-sized first session/follow window (12-20 messages).
     private(set) var firstWindowMessages: Int
@@ -605,7 +614,7 @@ final class SessionViewModel: ObservableObject {
         NSLog("[SCROLLDBG] %@", message())
     }
 
- // MARK: - First-paint cache (newest up-to-4 screens, chunked)
+ // MARK: - First-paint cache (newest up-to-300 messages, chunked)
 
  /// Kicks off the off-main cache read. Called from init: it must never block the
  /// first render, so the disk read + JSON decode + synthetic snapshot build all
@@ -668,22 +677,33 @@ final class SessionViewModel: ObservableObject {
         #endif
         isLoading = false
         syncFillDiagnostics()
+ // （缓存深度 300 条）：整个缓存窗口在上面用一次 journal update 合并
+ // 完；journal update 会排一个 40ms 防抖 rebuild，这里取消它，让恢复只 rebuild
+ // rows 一次。 真机闪回的根因正是逐 chunk prepend：每块都重建 rows 并
+ // 触发滚底，表现为「内容出现后 1–2 秒内整页快速闪两次 + 视口上跳再回底」
+ // （热缓存每次打开必现）。现在缓存一次性上屏，更早历史交给后台补齐引擎
+ // （HistoryFiller），内容一致且没有中途插入抖动。
+        rebuildTask?.cancel()
+        rebuildTask = nil
+        pendingRebuild = false
         rebuildRows()
         maybeMarkDetailFirstFrame()
- // 真机闪回修复：只应用 chunk0（最新一屏，用于首帧秒开）。
- // 其余缓存屏不再逐块 prepend 进可见列表——每块都会重建 rows 并触发一次滚底，
- // 真机上表现为「内容出现后 1–2 秒内整页快速闪两次 + 视口上跳再回底」
- // （热缓存每次打开必现，与会话大小无关）。更早的历史交给后台补齐引擎
- // （HistoryFiller）从 Host 拉，用户看到的内容一致，但不再有中途插入抖动。
         startHistoryFillIfPossible()
     }
 
- /// Applies the newest cached screen as a synthetic snapshot: header/projections
- /// plus that screen's records. The live follow snapshot replaces the tail later
- /// and the journal keeps the (contiguous) cached prefix.
+ /// Applies the whole cached window (newest 300 messages) as ONE synthetic
+ /// snapshot: header/projections plus the contiguous cached records. The live
+ /// follow snapshot replaces the tail later and the journal keeps the (contiguous)
+ /// cached prefix — one journal update, one rows rebuild.
     private func applyCachedSyntheticSnapshot(_ payload: SessionWindowCachePayload) {
-        guard let chunk0 = payload.chunks.first, !chunk0.isEmpty else { return }
-        let records = chunk0.map { SnapshotRecord(type: "event", event: $0, seq: $0.seq) }
+ // chunks are newest-first and each chunk is seq-ascending: flatten to one
+ // chronological list. Keep only the newest gap-free run (defensive: a corrupt
+ // or mixed payload must never punch a hole into the journal — a hole hides
+ // whole turns and cannot be repaired by paging).
+        let cached = payload.chunks.reversed().flatMap { $0 }.sorted { $0.seq < $1.seq }
+        let records = SessionJournal.contiguousSuffix(of: cached)
+            .map { SnapshotRecord(type: "event", event: $0, seq: $0.seq) }
+        guard !records.isEmpty else { return }
         let header = payload.header ?? SessionHeader(
             version: nil, id: sessionId, createdAt: nil, cwd: nil, isSeeded: nil, agentPreset: nil
         )
@@ -701,21 +721,18 @@ final class SessionViewModel: ObservableObject {
         contextPressure = journal.contextPressure
     }
 
- /// Merges the cached screens older than the current window front (contiguous
- /// suffix only) when the live snapshot beat the cache restore.
+ /// Merges the cached window older than the current journal front in ONE prepend
+ /// (contiguous suffix only) when the live snapshot beat the cache restore.
     private func mergeCachedOlderEvents(payload: SessionWindowCachePayload, olderThan: Int) {
-        var older = payload.chunks.flatMap { $0 }.filter { $0.seq < olderThan }
-        older.sort { $0.seq < $1.seq }
+        let cached = payload.chunks.reversed().flatMap { $0 }.sorted { $0.seq < $1.seq }
+        let older = cached.filter { $0.seq < olderThan }
         guard let front = journal.oldestSeq, !older.isEmpty else { return }
-        var kept: [SessionEvent] = []
-        var expected = front - 1
-        for event in older.reversed() {
-            guard event.seq == expected else { break }
-            kept.append(event)
-            expected -= 1
-        }
-        guard !kept.isEmpty else { return }
-        let update = journal.prepend(events: Array(kept.reversed()), hasMoreOlder: true)
+ // Only a gap-free suffix that touches the current front can be merged; a
+ // stale payload that does not reach front-1 is rejected and refetched by the
+ // filler (no hidden holes).
+        let kept = SessionJournal.contiguousSuffix(of: older).filter { $0.seq < front }
+        guard kept.last?.seq == front - 1 else { return }
+        let update = journal.prepend(events: kept, hasMoreOlder: true)
         applyJournalUpdate(update)
     }
 
@@ -748,9 +765,9 @@ final class SessionViewModel: ObservableObject {
         }
     }
 
- /// Persists the newest up-to-4 screens (chunked first-paint cache). Only after a
- /// live snapshot: a cache restored without a network round-trip must keep its
- /// original savedAt (it may be stale).
+ /// Persists the newest up-to-300-message window (chunked first-paint cache).
+ /// Only after a live snapshot: a cache restored without a network round-trip
+ /// must keep its original savedAt (it may be stale).
     func saveWindowCacheNow() {
         guard hasLiveSnapshot, !journal.events.isEmpty else { return }
         let projections = ProjectionValues(
@@ -770,6 +787,8 @@ final class SessionViewModel: ObservableObject {
     }
 
     private func writeWindowCache(projections: ProjectionValues) {
+ // Cache depth: the newest 300 messages, split into ~20-message (one screen)
+ // chunks. Older history is never persisted.
         windowCache.saveAsync(
             sessionId: sessionId,
             cursor: journal.cursor,
@@ -777,7 +796,9 @@ final class SessionViewModel: ObservableObject {
             header: journal.header,
             projections: projections,
             events: journal.events,
-            windowMessages: firstWindowMessages
+            windowMessages: firstWindowMessages,
+            messagesPerScreen: SessionWindowPolicy.cachedChunkMessages,
+            screens: SessionWindowPolicy.cachedScreens
         )
     }
 
@@ -1795,6 +1816,7 @@ final class SessionViewModel: ObservableObject {
 
     private func rebuildRows() {
         #if DEBUG
+        rebuildRowsCountForTesting += 1
         PerfProbe.shared.measure("rebuildRows", ["events": journal.events.count]) {
             rebuildRowsImpl()
         }

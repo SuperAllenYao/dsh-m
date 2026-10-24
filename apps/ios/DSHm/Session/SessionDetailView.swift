@@ -830,6 +830,20 @@ struct SessionDetailView: View {
                 .accessibilityIdentifier("session-message-list")
             }
         }
+ // §2.1 / §6.3-8：后台自动补齐历史进行中 → 顶部 2pt 细进度条。
+ // overlay 不参与布局（不撑高、不挤压消息），也不拦截点击；
+ // 只在.loading 时显示，completed / failed / idle 均不显示。
+        .overlay(alignment: .top) {
+            if viewModel.historyFillState == .loading {
+                ProgressView()
+                    .progressViewStyle(.linear)
+                    .tint(Theme.Palette.accent)
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 2)
+                    .allowsHitTesting(false)
+                    .accessibilityIdentifier("session-history-fill-progress")
+            }
+        }
     }
 
  /// 运行中过程组固定窗口高度：整屏 1/3（设计稿基线），夹在 280–360pt。
