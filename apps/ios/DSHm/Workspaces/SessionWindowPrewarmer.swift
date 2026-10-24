@@ -68,7 +68,17 @@ final class SessionWindowPrewarmer {
             for candidate in candidates {
                 guard !Task.isCancelled else { return }
  // Already fresh on disk (kept within the display TTL): nothing to do.
-                if let cached = self.cacheStore.load(sessionId: candidate.sessionId), !cached.isStale {
+ // r7 immediate-swipe freeze: this loop inherits the
+ // MainActor, and `load` reads + JSON-decodes the window cache
+ // (up to 1-2MB per session). Checking 8-10 candidates serially on
+ // the main thread froze the list for seconds right after launch.
+ // Same off-main rule as the snapshot decode below.
+                let store = self.cacheStore
+                let sessionId = candidate.sessionId
+                let cached = await Task.detached(priority: .utility) {
+                    store.load(sessionId: sessionId)
+                }.value
+                if let cached, !cached.isStale {
                     if StartupMetrics.isEnabled {
                         NSLog("[DSHM-PERF] prewarm skip-fresh %@", candidate.sessionId)
                     }

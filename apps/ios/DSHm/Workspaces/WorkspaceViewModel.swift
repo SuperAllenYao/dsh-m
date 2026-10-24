@@ -258,17 +258,25 @@ final class WorkspaceViewModel: ObservableObject {
         deferredRawRestoreTask = Task { [weak self] in
             let loaded = await Task.detached(priority: .utility) { store.load() }.value
             guard let self, !Task.isCancelled, let loaded else { return }
-            self.applyDeferredRawCache(loaded)
+            guard let raw = loaded.payload.sessionList else { return }
+ // r7 immediate-swipe freeze: the raw snapshot (~1MB, a
+ // JSONEncoder+JSONDecoder double conversion) used to be decoded right
+ // here on the MainActor. A user swiping right after cold start hit that
+ // window and the whole list froze. Decode off the main thread (same fix
+ // as the network path, ce023fe); the MainActor only assigns + rebuilds.
+            guard let value = try? await Self.decodeSessionListOffMain(raw) else { return }
+            guard !Task.isCancelled else { return }
+            self.applyDecodedDeferredRawCache(raw, value)
         }
     }
 
-    private func applyDeferredRawCache(_ cached: SessionListCacheStore.Loaded) {
+ /// Applies an already-decoded raw cache snapshot on the MainActor (assignments
+ /// + in-memory group rebuild only; no JSON decoding here).
+    private func applyDecodedDeferredRawCache(_ raw: JSONValue, _ value: SessionListValue) {
         deferredRawRestoreTask = nil
  // A live network snapshot already landed with fresher data: keep it.
         guard !sessionsLoaded else { return }
-        guard let list = cached.payload.sessionList,
-              let value = try? list.decode(SessionListValue.self) else { return }
-        lastSessionListJSON = list
+        lastSessionListJSON = raw
         sessionsLoaded = true
         allSessions = value.items
         var byId: [String: SessionListItem] = [:]
