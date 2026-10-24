@@ -495,6 +495,10 @@ struct SessionMessageListView: View {
                 guard !frame.isNull else { return }
                 metrics.viewportFrame = frame
             }
+ // 自绘滚动条（系统指示条被翻转错位；对标 UIKit 外观，语义贴底=最新）。
+            .overlay(alignment: .trailing) {
+                InvertedScrollIndicator(metrics: metrics)
+            }
  // 骨架屏（无内容拉取中）：挂在 scale 外层不被翻转。
             .overlay {
                 if displayedItems.isEmpty {
@@ -654,6 +658,9 @@ struct SessionMessageListView: View {
     private func handleScrollFactsChange(old: ScrollFacts, new: ScrollFacts) {
         metrics.facts = new
         traceGestureOffsetIfNeeded(offset: new.offset)
+        if isUserInteractingNow() {
+            metrics.lastActiveAt = CACurrentMediaTime()
+        }
         trackIdleBottomStability()
     }
 
@@ -1042,9 +1049,12 @@ struct ScrollFacts: Equatable {
     var distanceFromBottom: CGFloat
  /// 过滚量（offset 超过最大 offset 的部分）。
     var overscroll: CGFloat
+ /// 最大合法 offset（自绘滚动条的分母；内容不足一屏时 0）。
+    var maxOffset: CGFloat
 
     init(geometry: ScrollGeometry) {
         let insets = geometry.contentInsets
+        let maxOffset = geometry.contentSize.height + insets.bottom - geometry.containerSize.height
         self.contentHeight = geometry.contentSize.height
         self.offset = max(0, geometry.contentOffset.y + insets.top)
         self.viewportHeight = geometry.containerSize.height
@@ -1053,14 +1063,16 @@ struct ScrollFacts: Equatable {
         self.distanceFromBottom = self.offset
  // inverted 过滚 = 布局顶越界（= 视觉底部下拉 rubber band）。
         self.overscroll = max(0, -(geometry.contentOffset.y + insets.top))
+        self.maxOffset = max(0, maxOffset)
     }
 
-    init(contentHeight: CGFloat, offset: CGFloat, viewportHeight: CGFloat, distanceFromBottom: CGFloat, overscroll: CGFloat) {
+    init(contentHeight: CGFloat, offset: CGFloat, viewportHeight: CGFloat, distanceFromBottom: CGFloat, overscroll: CGFloat, maxOffset: CGFloat = 0) {
         self.contentHeight = contentHeight
         self.offset = offset
         self.viewportHeight = viewportHeight
         self.distanceFromBottom = distanceFromBottom
         self.overscroll = overscroll
+        self.maxOffset = maxOffset
     }
 }
 
@@ -1196,10 +1208,83 @@ enum ScrollFollowPolicy {
     }
 }
 
+/// 自绘滚动条几何（纯函数，可单测）。inverted 语义：进度 0 = 最新 = 视觉底部。
+enum ScrollIndicatorGeometry {
+ /// 滑块长度比例 = 视口/内容；下限保证可抓握（对标 UIKit 最小指示块）。
+    static func thumbLength(track: CGFloat, contentHeight: CGFloat, viewportHeight: CGFloat, minimum: CGFloat = 20) -> CGFloat {
+        guard contentHeight > 1, track > 0 else { return 0 }
+        return min(track, max(minimum, viewportHeight / contentHeight * track))
+    }
+
+ /// 滑块顶边 y（track 顶为 0）：inverted 下 offset=0（最新）→ y = track-len（底部）。
+ /// 过滚端（rubber band）贴边并压缩（对标 UIKit 行为）。
+    static func thumbY(track: CGFloat, contentHeight: CGFloat, viewportHeight: CGFloat,
+                       offset: CGFloat, maxOffset: CGFloat, minimum: CGFloat = 20) -> CGFloat {
+        let len = thumbLength(track: track, contentHeight: contentHeight, viewportHeight: viewportHeight, minimum: minimum)
+        guard len > 0 else { return 0 }
+        let span = track - len
+        guard maxOffset > 1 else { return span }   // 内容不足一屏：贴底部（最新）
+        let progress = min(1, max(0, offset / maxOffset))
+        return (1 - progress) * span
+    }
+
+ /// rubber band 压缩系数（0...1，越大压得越短）：视觉底下拉（offset<0 侧）/
+ /// 视觉顶下拉（offset>maxOffset 侧）都把滑块压向对应边缘。
+    static func rubberBandCompression(overscroll: CGFloat) -> CGFloat {
+        guard overscroll > 0 else { return 0 }
+        return min(0.5, overscroll / 400)
+    }
+}
+
+/// 自绘滚动条（r7-inverted）：翻转使系统指示条错位（左缘+反向），
+/// 在 scale 外层自绘，外观对标 UIKit 系统指示条：3pt 胶囊、右缘 2.5pt、
+/// primary 30%（自适配深浅色）、最小 20pt；手势/惯性期间显示，停稳后淡出。
+/// TimelineView 轮询 metrics（引用类型）——重绘隔离在指示条自身，不触发列表 body。
+private struct InvertedScrollIndicator: View {
+    let metrics: ScrollMetrics
+
+    private static let width: CGFloat = 3
+    private static let trailingInset: CGFloat = 2.5
+    private static let fadeAfter: TimeInterval = 0.45
+
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 0.05)) { _ in
+            GeometryReader { geo in
+                let f = metrics.facts
+                let track = geo.size.height
+                if f.maxOffset > 1, track > 40, f.contentHeight > 1 {
+                    let base = ScrollIndicatorGeometry.thumbLength(track: track, contentHeight: f.contentHeight, viewportHeight: f.viewportHeight)
+                    let y = ScrollIndicatorGeometry.thumbY(track: track, contentHeight: f.contentHeight, viewportHeight: f.viewportHeight, offset: f.offset, maxOffset: f.maxOffset)
+                    let compression = max(
+                        ScrollIndicatorGeometry.rubberBandCompression(overscroll: f.overscroll),
+                        ScrollIndicatorGeometry.rubberBandCompression(overscroll: f.offset - f.maxOffset)
+                    )
+                    let now = CACurrentMediaTime()
+                    let visible = metrics.isDragging
+                        || now < metrics.interactingUntil
+                        || now < metrics.lastActiveAt + Self.fadeAfter
+ // rubber band：滑块向对应边缘压短（简化：保持顶边，缩短长度）。
+                    let len = max(8, base * (1 - compression))
+                    Capsule()
+                        .fill(Color.primary.opacity(0.3))
+                        .frame(width: Self.width, height: len)
+                        .offset(x: -Self.trailingInset, y: y)
+                        .opacity(visible ? 1 : 0)
+                        .animation(.easeOut(duration: 0.25), value: visible)
+                }
+            }
+        }
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
+    }
+}
+
 /// 滚动几何/校正状态（引用类型：不触发 SwiftUI body 重算，每帧滚动零成本）。
 private final class ScrollMetrics {
  /// 官方几何观察的最新事实。
-    var facts = ScrollFacts(contentHeight: 0, offset: 0, viewportHeight: 0, distanceFromBottom: .greatestFiniteMagnitude, overscroll: 0)
+    var facts = ScrollFacts(contentHeight: 0, offset: 0, viewportHeight: 0, distanceFromBottom: .greatestFiniteMagnitude, overscroll: 0, maxOffset: 0)
+ /// 最近一次用户手势活跃时刻（自绘滚动条淡出计时用）。
+    var lastActiveAt: CFTimeInterval = 0
  /// LazyVStack 内容高度（preference 值，仅诊断）。
     var contentHeight: CGFloat = 0
     var viewportHeight: CGFloat = 0
