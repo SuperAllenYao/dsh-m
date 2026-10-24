@@ -369,6 +369,7 @@ struct WorkspaceListView: View {
                         DetailMetrics.beginTap()
                         app.openSession(session.followAddress)
                     }
+                    .equatable()
                     .accessibilityIdentifier("session-card-\(cardIndex)")
                     .onAppear {
  // M2b-2b: the first list card on screen marks the in-app first
@@ -443,11 +444,21 @@ struct WorkspaceListView: View {
 }
 
 /// One session card (v5 02): title / lastPromptAt / running dot + text / approval badge.
-struct SessionCardView: View {
+struct SessionCardView: View, Equatable {
     var session: SessionListItem
     var pendingApprovals: Int
     var isConnected: Bool
     var onTap: () -> Void
+
+ /// cold-launch freeze: the workspace list re-renders several times
+ /// while the cached list, the live `session/list` snapshot and the
+ /// `workspace/follow` baseline arrive. `.equatable()` skips the card body when
+ /// its visible inputs did not change (the tap closure is intentionally ignored).
+    static func == (lhs: SessionCardView, rhs: SessionCardView) -> Bool {
+        lhs.session == rhs.session
+            && lhs.pendingApprovals == rhs.pendingApprovals
+            && lhs.isConnected == rhs.isConnected
+    }
 
  /// v5.4 status: waiting-for-answer > in-progress > not-started > idle; offline
  /// overrides while the link is down. Approval counts come from the live

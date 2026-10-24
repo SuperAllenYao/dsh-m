@@ -148,7 +148,11 @@ final class AppModel: ObservableObject {
  /// visible); the child detail then replaces the parent in the route.
     @Published private(set) var backSnapshot: UIImage?
     @Published var language: AppLanguage {
-        didSet { UserDefaults.standard.set(language.storageKey, forKey: "appLanguage") }
+        didSet {
+            UserDefaults.standard.set(language.storageKey, forKey: "appLanguage")
+ // the localization cache is language-keyed; rebuild it.
+            L10n.invalidateCache()
+        }
     }
 
     let link: LinkService
