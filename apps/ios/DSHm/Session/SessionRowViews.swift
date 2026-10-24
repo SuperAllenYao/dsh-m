@@ -120,7 +120,6 @@ struct RelayCardView: View {
  /// `subagentCatalog` label for the sender child session (falls back to id prefix).
     var agentLabel: String? = nil
     @State private var isExpanded = false
-    @Environment(\.userToggleReporter) private var userToggleReporter
 
     private var senderLabel: String {
         if let agentLabel, !agentLabel.isEmpty { return agentLabel }
@@ -131,8 +130,7 @@ struct RelayCardView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: Theme.Spacing.xs) {
             Button {
-                userToggleReporter?()
-                isExpanded.toggle()
+                withAnimation(.easeInOut(duration: 0.15)) { isExpanded.toggle() }
             } label: {
                 HStack(spacing: 6) {
                     Image(systemName: "person.2")
@@ -222,13 +220,11 @@ struct NoticeCardView: View {
 struct ReasoningRowView: View {
     var text: String
     @State private var expanded = false
-    @Environment(\.userToggleReporter) private var userToggleReporter
 
     var body: some View {
         VStack(alignment: .leading, spacing: Theme.Spacing.xs) {
             Button {
-                userToggleReporter?()
-                expanded.toggle()
+                withAnimation(.easeInOut(duration: 0.15)) { expanded.toggle() }
             } label: {
                 HStack(spacing: Theme.Spacing.xs) {
                     Image(systemName: "sparkles")
