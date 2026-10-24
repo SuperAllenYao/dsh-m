@@ -28,6 +28,9 @@ struct MessageListSignature: Equatable {
     var liveText: String?
     var running: Bool
     var newestGroupStepCount: Int
+    /// 尾部非 group 行（文件变更卡/错误行）的内容指纹：它们在流式过程中会原地更新，
+    /// 但 id 不变；不纳入签名会导致卡片状态（如 404 回退文案）不刷新。
+    var tailSignature: String
 }
 
 /// 纯逻辑：列表更新策略（可单测，不依赖 UI）。
@@ -150,8 +153,24 @@ struct SessionMessageListView: View {
             lastID: items.last?.id,
             liveText: liveTextValue,
             running: isRunning,
-            newestGroupStepCount: newestStepCount
+            newestGroupStepCount: newestStepCount,
+            tailSignature: tailSignature
         )
+    }
+
+    private var tailSignature: String {
+        var parts: [String] = []
+        for item in items.reversed() {
+            switch item {
+            case .group: break
+            case .liveText(let text): parts.append("lt:\(text.count)")
+            case .streamError(let message): parts.append("se:\(message)")
+            case .actionError(let message): parts.append("ae:\(message)")
+            case .fileChanges(let changes):
+                parts.append("fc:\(changes.source)|\(changes.isLoading)|\(changes.titleFileCount)|\(changes.files.count)|\(changes.added)|\(changes.deleted)")
+            }
+        }
+        return parts.joined(separator: "#")
     }
 
     private var liveTextValue: String? {
