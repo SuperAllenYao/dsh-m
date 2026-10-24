@@ -664,9 +664,21 @@ final class WorkspaceViewModel: ObservableObject {
                 originOverride: originOverride
             )
             guard !Task.isCancelled, requestID == sessionListRequestID else { return }
+ // cold-launch freeze (user report + Time Profiler): a cold start
+ // fires an early pre-connect request and a post-connect reload. Both used
+ // to decode + rebuild the list on the MainActor (JSONValue.decode is a
+ // JSONEncoder+JSONDecoder double conversion — seconds on large lists), so
+ // the whole UI froze for 3.5-5.5s right after launch. Skip an identical
+ // second snapshot, and decode off-main.
+            if networkApplied, lastSessionListJSON == value {
+                coldStartDebug("list duplicate #\(requestID) skipped")
+                return
+            }
+            let list = try await Self.decodeSessionListOffMain(value)
+            guard !Task.isCancelled, requestID == sessionListRequestID else { return }
             let elapsedMs = lastListRequestStartedAt.map { Date().timeIntervalSince($0) * 1000 } ?? -1
             coldStartDebug("list applied #\(requestID) elapsedMs=\(Int(elapsedMs))")
-            try applySessionListResponse(value)
+            applyDecodedSessionListResponse(value, list: list)
         } catch {
             guard !Task.isCancelled, requestID == sessionListRequestID else { return }
             let elapsedMs = lastListRequestStartedAt.map { Date().timeIntervalSince($0) * 1000 } ?? -1
@@ -681,6 +693,20 @@ final class WorkspaceViewModel: ObservableObject {
  /// Keeps the raw wire JSON so the next cache write replays the exact same path.
     func applySessionListResponse(_ value: JSONValue) throws {
         let list = try value.decode(SessionListValue.self)
+        applyDecodedSessionListResponse(value, list: list)
+    }
+
+ /// Off-main decode of a `session/list` payload.
+ /// `JSONValue.decode` encodes to JSON and decodes again; running it on the
+ /// MainActor froze the whole list page for seconds on cold start.
+    nonisolated static func decodeSessionListOffMain(_ value: JSONValue) async throws -> SessionListValue {
+        try await Task.detached(priority: .userInitiated) {
+            try value.decode(SessionListValue.self)
+        }.value
+    }
+
+ /// Applies an already-decoded `session/list` snapshot on the MainActor.
+    private func applyDecodedSessionListResponse(_ value: JSONValue, list: SessionListValue) {
         lastSessionListJSON = value
         applySessions(list.items)
         errorText = nil
