@@ -8,15 +8,27 @@ import UIKit
 /// the detail no longer has manual "load earlier"
 /// pagination. The first paint is a phone-sized window; the full history is then
 /// pulled automatically in the background by the history filler. The on-disk cache
-/// only keeps the latest 4 screens (fast first paint + a little scroll-up headroom),
+/// keeps the newest 300 messages (fast first paint + deep scroll-up headroom),
 /// never the full history.
 enum SessionWindowPolicy {
- /// Phone-sized first window (messages). 12-20 keeps the first paint cheap.
+ /// Phone-sized first window (messages). 12-20 keeps the first paint cheap; the
+ /// network first window must stay small (relay payload), the cache restores
+ /// depth from disk instead.
     static let minFirstWindowMessages = 12
     static let maxFirstWindowMessages = 20
 
- /// First-paint cache depth: the newest 4 screens are persisted.
-    static let cachedScreens = 4
+ /// First-paint cache depth: the newest 300 messages are persisted per session
+ /// .
+    static let cachedMessages = 300
+
+ /// Cache chunk size in messages: one phone screen. Keeps the existing
+ /// newest-first chunk format and bounds each payload chunk's decode/apply cost.
+    static let cachedChunkMessages = maxFirstWindowMessages
+
+ /// Number of screen-sized chunks the 300-message cache is split into (15).
+    static var cachedScreens: Int {
+        (cachedMessages + cachedChunkMessages - 1) / cachedChunkMessages
+    }
 
  /// turnWindow minima shared by the first window request: stop at a turn
  /// boundary after both minima when the message budget allows it.
@@ -62,12 +74,14 @@ enum SessionWindowPolicy {
         isRelay ? historyPageMessagesRelay : historyPageMessagesLAN
     }
 
- // MARK: - Prewarm (writes the same 4-screen first-paint cache)
+ // MARK: - Prewarm (writes the same 300-message first-paint cache)
 
- /// Prewarm asks for the full 4-screen cache window so a warm open paints the
- /// first screen from chunk 0 and has the other 3 screens ready immediately.
+ /// Prewarm asks for the full cache window (300 messages) so a warm open paints
+ /// the first screen immediately and restores the deep window without any extra
+ /// round trip. Cache depth no longer depends on the first window size (12-20),
+ /// so the screen height is accepted for call-site compatibility only.
     nonisolated static func prewarmMessages(screenHeight: CGFloat) -> Int {
-        firstWindowMessages(screenHeight: screenHeight) * cachedScreens
+        cachedMessages
     }
 
     #if canImport(UIKit)
@@ -85,21 +99,24 @@ enum SessionWindowPolicy {
         firstWindowMessages(screenHeight: deviceScreenHeight)
     }
 
- /// Prewarm window for this device (4 screens).
+ /// Prewarm window for this device (the full 300-message cache depth).
     @MainActor static var devicePrewarmMessages: Int {
         prewarmMessages(screenHeight: deviceScreenHeight)
     }
 }
 
-/// First-paint cache for one session: the newest up-to-4 screens of events plus the
-/// metadata the detail header needs (header + projections), so a warm open can paint
-/// the first screen without any network round trip and without re-decoding a huge
-/// payload.
+/// First-paint cache for one session: the newest up-to-300 messages of events plus
+/// the metadata the detail header needs (header + projections), so a warm open can
+/// paint the first screen without any network round trip and restore a deep window
+/// (no "loading earlier messages" jump when scrolling up).
 ///
-/// The payload is chunked by screen, newest chunk first:
-/// - restore applies chunks[0] as a synthetic snapshot -> first paint rows;
-/// - chunks[1...] are then merged into the front in the background (cheap,
-/// bounded memory).
+/// The payload is chunked by screen (~20 messages), newest chunk first:
+/// - on a cold journal the whole cache is flattened into one chronological,
+/// gap-free prefix and applied as a single synthetic snapshot -> one rows
+/// rebuild (: applying the cache chunk-by-chunk caused a visible
+/// flash / viewport jump on real devices);
+/// - when the live snapshot lands first, the cached prefix is merged into the
+/// journal front with a single prepend.
 ///
 /// There is no full-history cache: the history filler always pulls the rest from the
 /// Host.
@@ -118,7 +135,8 @@ struct SessionWindowCachePayload: Codable, Equatable {
  /// Full projection values at save time (title / permissions / model selection /
  /// todos / user questions / subagent catalog...). Small and needed by the header.
     var projections: ProjectionValues?
- /// Newest-first screen chunks. chunks[0] is the newest screen (first paint).
+ /// Newest-first screen chunks (~20 messages each): flattened this is the newest
+ /// 300 messages of the session. chunks[0] is the newest screen (first paint).
     var chunks: [[SessionEvent]]
  /// Evidence: requested first window (messages) at save time.
     var windowMessages: Int?
@@ -131,16 +149,17 @@ struct SessionWindowCachePayload: Codable, Equatable {
 
 /// One file per session (window-<stable-hash>.json) inside the cache directory.
 final class SessionWindowCacheStore {
- /// A 4-screen window on a tool-heavy session can be a couple of MB; beyond this
- /// the oldest screens are dropped (the filler refetches them; we never let a
- /// cache write slow down or OOM the next open).
+ /// A 300-message window on a tool-heavy session can be several MB; beyond this
+ /// byte budget the oldest chunks are dropped (the filler refetches them; we never
+ /// let a cache write slow down or OOM the next open). This is also the per-session
+ /// disk cap on top of the retention prune below.
     static let maxPayloadBytes = 4 * 1024 * 1024
 
- /// Window payload schema. Older schemas (raw snapshot + olderEvents envelope)
- /// are deleted on read: the cache is chunked by screen and has no
- /// full-history range.
-    static let schemaVersion = 5
-    static let readableSchemaVersions: Set<Int> = [5]
+ /// Window payload schema. Older schemas (raw snapshot + olderEvents envelope, or
+ /// the 4-screen v5 cache) are deleted on read: v6 keeps the newest 300 messages
+ /// chunked by screen.
+    static let schemaVersion = 6
+    static let readableSchemaVersions: Set<Int> = [6]
 
     struct Loaded {
         var payload: SessionWindowCachePayload
@@ -343,8 +362,9 @@ final class SessionWindowCacheStore {
         }
     }
 
- /// Persists the newest screens screens derived from chronological events.
- /// Oldest screens are dropped when the encoded payload exceeds the byte budget.
+ /// Persists the newest screen chunks (up to 300 messages) derived from
+ /// chronological events. Oldest chunks are dropped when the encoded payload
+ /// exceeds the byte budget.
     @discardableResult
     func save(
         sessionId: String,

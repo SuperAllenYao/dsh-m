@@ -136,6 +136,8 @@ enum Theme {
         static let display = Font.system(size: 26, weight: .bold)
  /// Card / screen section title — 15/650 (semibold is the closest system weight).
         static let cardTitle = Font.system(size: 15, weight: .semibold)
+ /// Workspace group name in the list header — 16/600.
+        static let workspaceName = Font.system(size: 16, weight: .semibold)
         static let title = Font.system(size: 20, weight: .semibold)
         static let headline = Font.system(size: 15, weight: .semibold)
  /// Body — 14/1.5.
@@ -163,6 +165,9 @@ enum Theme {
  /// v5.5 §14.3 subagent capsule: one linear turn per 1.2s, forever.
  /// Reduce Motion renders the ring statically instead (SubagentCapsuleButton).
         static let ringRotation = Animation.linear(duration: 1.2).repeatForever(autoreverses: false)
+ /// Workspace folder glyph morph: the front cover swings open/closed and
+ /// the tint cross-fades (single icon, both directions;).
+        static let folder = Animation.timingCurve(0.2, 0.8, 0.2, 1, duration: 0.24)
     }
 }
 
