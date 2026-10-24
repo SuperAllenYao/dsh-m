@@ -392,6 +392,29 @@ final class SessionViewModel: ObservableObject {
     /// never reached its first event until reopened.
     private static let historyFillTransientRetryLimit = 30
 
+    /// Consecutive empty `session/page` replies while the Host still claims older
+    /// history. Bounded by `historyFillEmptyPageRetryLimit` so a Host that keeps
+    /// answering `records: []` cannot spin the filler forever.
+    private var historyFillEmptyPages = 0
+    /// Watchdog bookkeeping (2026-10-24 real-device "上滑看不到历史"): the fill can
+    /// end up failed/idle after a transient failure or after `reopenStream()`
+    /// cancelled the task and reset the state; nothing re-starts it afterwards.
+    private var lastHistoryFillWatchdogAt: Date?
+    private var historyFillWatchdogTask: Task<Void, Never>?
+    private var historyFillWatchdogRestarts = 0
+    /// Last successful page merge (probe: real-device logs can tell "still
+    /// progressing" from "stalled after N pages").
+    private var historyFillLastProgressAt: Date?
+    /// Test seam: watchdog cooldown in seconds (production 10s; unit tests set 0
+    /// to drive deterministic recovery without wall-clock waits).
+    var historyFillWatchdogCooldown: TimeInterval = 10
+    /// Test seam: scales the filler's retry sleeps (production 1.0; unit tests set
+    /// 0 so the 1/2/4s backoff sequences run instantly).
+    var historyFillBackoffScale: Double = 1
+    /// Empty pages (with 1/2/4s backoff) after which the fill is treated as done.
+    private static let historyFillEmptyPageRetryLimit = 3
+    private var historyFillForegroundObserver: NSObjectProtocol?
+
     // MARK: - DEBUG-only 自动化取证钩子（生产 env 不设置 → 零行为）
     //
     // `DSHM_FILL_PACE_MS`：把补齐每页之间的间隔拉长，好让自动化真机场景能跨多个
@@ -855,6 +878,7 @@ final class SessionViewModel: ObservableObject {
         lastFileChangeLinkConnected = link.phase.isConnected
         lastFileChangeNetworkGeneration = NetworkPathMonitor.shared.changeGeneration
         installFileChangeForegroundObserver()
+        installHistoryFillForegroundObserver()
         resetFileChangesExactFetch(reason: "detail-open")
         // Restore the live half immediately: the Combine sink only re-fires on
         // changes, and a stop()/start() cycle clears the local cache.
@@ -862,6 +886,7 @@ final class SessionViewModel: ObservableObject {
         detailOnScreen = true
         openStream()
         startHistoryFillIfPossible()
+        checkHistoryFillWatchdog()
     }
 
     func stop() {
@@ -893,6 +918,10 @@ final class SessionViewModel: ObservableObject {
         // start() resets the bookkeeping and re-fetches.
         cancelFileChangeFetchTasks()
         removeFileChangeForegroundObserver()
+        removeHistoryFillForegroundObserver()
+        historyFillWatchdogTask?.cancel()
+        historyFillWatchdogTask = nil
+        lastHistoryFillWatchdogAt = nil
     }
 
     /// Called when the link generation changed (reconnect): rebuild from snapshot.
@@ -904,6 +933,7 @@ final class SessionViewModel: ObservableObject {
         }
         maybeFlushQueued()
         resetFileChangesExactFetch(reason: "generation-change")
+        checkHistoryFillWatchdog()
     }
 
     private func reopenStream() {
@@ -913,6 +943,9 @@ final class SessionViewModel: ObservableObject {
         // Allow the filler to restart for the new window: the in-flight page keyed
         // on the old front is cancelled, and the next snapshot/front will re-arm it.
         historyFillState = .idle
+        // A reopen is itself a recovery attempt: keep the watchdog from beating the
+        // snapshot restart, but still self-heal if that snapshot never arrives.
+        lastHistoryFillWatchdogAt = Date()
         pendingHistoryBatch = false
         // An explicit reopen supersedes any pending deferred open; `openStream()`
         // re-arms the wait when the link is still down.
@@ -920,6 +953,7 @@ final class SessionViewModel: ObservableObject {
         stream?.cancel()
         stream = nil
         openStream()
+        checkHistoryFillWatchdog()
     }
 
     func retry() {
@@ -1011,6 +1045,11 @@ final class SessionViewModel: ObservableObject {
             openStream()
         case .idle, .wait, .fail:
             break
+        }
+        if phase.isConnected {
+            // Self-heal entry: a reconnect must also revive a fill stuck in
+            // failed/loading-with-no-task, not only the pausedOffline case.
+            checkHistoryFillWatchdog()
         }
     }
 
@@ -1113,6 +1152,9 @@ final class SessionViewModel: ObservableObject {
         case progress
         case terminal
         case retryStalePage
+        /// Host answered an empty page while it still claims older history: retry
+        /// with 1/2/4s backoff (bounded) before treating the fill as complete.
+        case retryEmptyPage
         /// Transport/link failure: retry with capped backoff instead of failing the
         /// whole fill (the requirement is unconditional full history).
         case retryTransient
@@ -1123,7 +1165,13 @@ final class SessionViewModel: ObservableObject {
     /// Pulls pages backwards until the session's first event is loaded. Silent: no
     /// spinner, no error banner; offline pauses and reconnects resume automatically.
     private func runHistoryFillLoop() async {
-        defer { historyFillTask = nil }
+        defer {
+            historyFillTask = nil
+            // 2026-10-24 真机：任务结束后若仍处于停滞态（failed / idle 被 reopen
+            // 重置 / loading 但无 task），这里排一次冷却后的 watchdog 重试；不在
+            // defer 内联重启，避免失败路径热循环。
+            armHistoryFillWatchdogIfStalled()
+        }
         var retriedStalePage = false
         while !Task.isCancelled {
             guard detailOnScreen else { return }
@@ -1145,6 +1193,8 @@ final class SessionViewModel: ObservableObject {
                 retriedStalePage = false
                 historyFillFailures = 0
                 historyFillTransientRetries = 0
+                historyFillEmptyPages = 0
+                historyFillLastProgressAt = Date()
                 // v0.2.6 滚动修复：逐批发布（不再延迟）。视口稳定性由视图侧的
                 // scrollPosition(id:anchor:) 锚定保证，插入本身不改变可见内容。
                 rebuildNowForHistoryBatch()
@@ -1159,6 +1209,15 @@ final class SessionViewModel: ObservableObject {
             case .terminal:
                 markHistoryFillCompleted()
                 return
+            case .retryEmptyPage:
+                // Host 瞬时回空页不应把补齐钉死在 completed：按 1/2/4s 退避重试，
+                // 连续空页有上限（3 次）后仍空才认为到底。
+                historyFillEmptyPages += 1
+                if historyFillEmptyPages > Self.historyFillEmptyPageRetryLimit {
+                    markHistoryFillCompleted()
+                    return
+                }
+                await sleepEmptyPageBackoff()
             case .retryStalePage:
                 if retriedStalePage {
                     historyFillFailures += 1
@@ -1174,7 +1233,9 @@ final class SessionViewModel: ObservableObject {
                 }
                 historyFillTransientRetries += 1
                 if historyFillTransientRetries > Self.historyFillTransientRetryLimit {
-                    historyFillState = .failed
+                    // 2026-10-24 真机：旧的 .failed 终态无人重试，补齐永久停住。
+                    // 预算耗尽后退回 idle，交给 watchdog 冷却后开新周期。
+                    historyFillState = .idle
                     syncFillDiagnostics()
                     return
                 }
@@ -1195,8 +1256,7 @@ final class SessionViewModel: ObservableObject {
 
     private func sleepToBackoffIfNeeded() async {
         let exponent = max(0, min(historyFillFailures - 1, 3))
-        let seconds = pow(2.0, Double(exponent))
-        try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+        await sleepHistoryFill(seconds: pow(2.0, Double(exponent)))
     }
 
     /// Backoff for transient transport failures: 1s, 2s, then 4s cap (never 8s):
@@ -1204,8 +1264,22 @@ final class SessionViewModel: ObservableObject {
     /// long stretches; the retry budget bounds the total.
     private func sleepTransientBackoff() async {
         let exponent = max(0, min(historyFillTransientRetries - 1, 2))
-        let seconds = min(pow(2.0, Double(exponent)), 4.0)
-        try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+        await sleepHistoryFill(seconds: min(pow(2.0, Double(exponent)), 4.0))
+    }
+
+    /// 1s → 2s → 4s for empty `session/page` replies (bounded by
+    /// `historyFillEmptyPageRetryLimit`).
+    private func sleepEmptyPageBackoff() async {
+        let exponent = max(0, min(historyFillEmptyPages - 1, 2))
+        await sleepHistoryFill(seconds: min(pow(2.0, Double(exponent)), 4.0))
+    }
+
+    /// All filler backoff sleeps go through here so unit tests can collapse them
+    /// (`historyFillBackoffScale == 0`) and drive multi-round sequences instantly.
+    private func sleepHistoryFill(seconds: Double) async {
+        let scaled = max(0, seconds * historyFillBackoffScale)
+        guard scaled > 0 else { return }
+        try? await Task.sleep(nanoseconds: UInt64(scaled * 1_000_000_000))
     }
 
     private func fetchHistoryPage(beforeSeq: Int) async -> HistoryPageOutcome {
@@ -1250,6 +1324,14 @@ final class SessionViewModel: ObservableObject {
         } catch {
             dbg("history page decode failed: " + String(describing: error))
             return .failed
+        }
+        // 真机 2026-10-24：Host 偶发回空页（瞬时）时，旧代码直接 terminal →
+        // completed，补齐永久停在 hasMoreOlder=1。空页绝不能进 journal.prepend
+        //（它会把空页当「到底」并把 hasMoreOlder 置 false），交给退避重试；
+        // 连续空页有上限，仍空才 completed。
+        if page.records.isEmpty, journal.hasMoreOlder {
+            dbg("history page empty while hasMoreOlder; retrying")
+            return .retryEmptyPage
         }
         let oldestBefore = journal.oldestSeq
         #if DEBUG
@@ -1300,6 +1382,8 @@ final class SessionViewModel: ObservableObject {
         }
         historyFillTask?.cancel()
         historyFillTask = nil
+        historyFillWatchdogTask?.cancel()
+        historyFillWatchdogTask = nil
         syncFillDiagnostics()
         saveWindowCacheNow()
         publishDetailMetricsValue()
@@ -1311,6 +1395,10 @@ final class SessionViewModel: ObservableObject {
         guard historyFillState == .loading || historyFillState == .idle else { return }
         historyFillTask?.cancel()
         historyFillTask = nil
+        // Offline: the reconnect path resumes; a watchdog timer would only re-check
+        // a transport that is known to be down.
+        historyFillWatchdogTask?.cancel()
+        historyFillWatchdogTask = nil
         historyFillState = .pausedOffline
         syncFillDiagnostics()
     }
@@ -1337,6 +1425,12 @@ final class SessionViewModel: ObservableObject {
             elapsedMs = -1
         }
         let holes = journal.isWindowContiguous ? 0 : 1
+        let lastProgressMilliseconds: Int
+        if let start = historyFillStartedAt, let progress = historyFillLastProgressAt {
+            lastProgressMilliseconds = Int(progress.timeIntervalSince(start) * 1000)
+        } else {
+            lastProgressMilliseconds = -1
+        }
         historyFillProbeValue = "state=" + historyFillState.rawValue
             + ";pages=" + String(historyFillPages)
             + ";oldest=" + String(journal.oldestSeq ?? -1)
@@ -1348,6 +1442,125 @@ final class SessionViewModel: ObservableObject {
             + ";failures=" + String(historyFillFailures)
             + ";retries=" + String(historyFillTransientRetries)
             + ";gen=" + String(link?.generation ?? -1)
+            + ";lastProgressAt=" + String(lastProgressMilliseconds)
+            + ";watchdogRestarts=" + String(historyFillWatchdogRestarts)
+    }
+
+    // MARK: - History filler watchdog (self-heal)
+
+    /// Whether a transport can serve a history page right now. The unit-test
+    /// loader stands in for the link, mirroring the guards in
+    /// `startHistoryFillIfPossible`.
+    private func historyFillTransportAvailable() -> Bool {
+        historyPageLoader != nil || (link?.phase.isConnected ?? false)
+    }
+
+    /// 2026-10-24 真机 gap：补齐在以下「没人再启动」的状态下会永久停住：
+    ///   - `.failed`：旧的失败终态，只有 reconnect 会清；
+    ///   - `.loading` 但 `historyFillTask == nil`：任务被 cancel（reopenStream /
+    ///     推送重开流）后没有后续 snapshot 调用 start；
+    ///   - `.pausedOffline` 但链路已经恢复；
+    ///   - `.idle` 但补齐开始过且无 task：reopenStream 的 cancel + idle 竞态会留下
+    ///     这个组合，之后没有任何调用方再启动 filler。
+    private func isHistoryFillStalled() -> Bool {
+        switch historyFillState {
+        case .failed, .pausedOffline:
+            return true
+        case .loading:
+            return historyFillTask == nil
+        case .idle:
+            return historyFillTask == nil && historyFillStartedAt != nil
+        case .completed:
+            return false
+        }
+    }
+
+    /// Watchdog entry: restart a stalled fill after a cooldown. Called from every
+    /// state funnel that already exists (snapshot/event rebuild, detail start, link
+    /// phase / generation change, foreground) so a cancelled or failed fill always
+    /// gets a second chance without requiring the user to scroll.
+    private func checkHistoryFillWatchdog() {
+        guard detailOnScreen,
+              journal.hasMoreOlder,
+              historyFillTransportAvailable(),
+              isHistoryFillStalled() else { return }
+        let now = Date()
+        if let last = lastHistoryFillWatchdogAt,
+           now.timeIntervalSince(last) < historyFillWatchdogCooldown {
+            armHistoryFillWatchdogRetry(
+                after: historyFillWatchdogCooldown - now.timeIntervalSince(last)
+            )
+            return
+        }
+        restartHistoryFillFromWatchdog()
+    }
+
+    private func restartHistoryFillFromWatchdog() {
+        historyFillWatchdogTask?.cancel()
+        historyFillWatchdogTask = nil
+        lastHistoryFillWatchdogAt = Date()
+        historyFillWatchdogRestarts += 1
+        // Fresh cycle: the previous budget is what got us here; keeping it would
+        // make the restarted fill fail again immediately.
+        historyFillFailures = 0
+        historyFillEmptyPages = 0
+        historyFillTransientRetries = 0
+        historyFillState = .idle
+        syncFillDiagnostics()
+        dbg("history fill watchdog restart: pages=" + String(historyFillPages)
+            + " oldest=" + String(journal.oldestSeq ?? -1)
+            + " restarts=" + String(historyFillWatchdogRestarts))
+        startHistoryFillIfPossible()
+    }
+
+    /// Arm a one-shot watchdog re-check. Kept separate from
+    /// `checkHistoryFillWatchdog()` so the fill loop's `defer` never restarts
+    /// inline (a hot failure loop would otherwise spin before the cooldown).
+    private func armHistoryFillWatchdogRetry(after seconds: TimeInterval) {
+        guard detailOnScreen, historyFillWatchdogTask == nil else { return }
+        let delay = max(0, seconds)
+        historyFillWatchdogTask = Task { [weak self] in
+            if delay > 0 {
+                try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            }
+            guard let self, !Task.isCancelled else { return }
+            self.historyFillWatchdogTask = nil
+            self.checkHistoryFillWatchdog()
+        }
+    }
+
+    /// Called when the fill task ends: schedules (never runs inline) the watchdog
+    /// so the common "fill finished its last page" path cannot spin.
+    private func armHistoryFillWatchdogIfStalled() {
+        guard detailOnScreen,
+              journal.hasMoreOlder,
+              historyFillTransportAvailable(),
+              isHistoryFillStalled() else { return }
+        armHistoryFillWatchdogRetry(after: historyFillWatchdogCooldown)
+    }
+
+    /// 前台恢复是补齐自愈的重要入口：OS 挂起期间链路/任务可能被系统打断，
+    /// 回前台时补一次检查（冷却约束下最多一次重启）。
+    private func installHistoryFillForegroundObserver() {
+        #if canImport(UIKit)
+        guard historyFillForegroundObserver == nil else { return }
+        historyFillForegroundObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.willEnterForegroundNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.checkHistoryFillWatchdog()
+            }
+        }
+        #endif
+    }
+
+    private func removeHistoryFillForegroundObserver() {
+        if let observer = historyFillForegroundObserver {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        historyFillForegroundObserver = nil
     }
 
     /// Test seam: run the filler until it completes / fails / has nothing to do.
@@ -1356,6 +1569,13 @@ final class SessionViewModel: ObservableObject {
     func runHistoryFillForTesting() async {
         detailOnScreen = true
         startHistoryFillIfPossible()
+        await historyFillTask?.value
+    }
+
+    /// Test seam: run the watchdog self-heal check and await a restart it triggers.
+    func runHistoryFillWatchdogForTesting() async {
+        detailOnScreen = true
+        checkHistoryFillWatchdog()
         await historyFillTask?.value
     }
 
@@ -1519,6 +1739,8 @@ final class SessionViewModel: ObservableObject {
             // snapshot (session/page hole patching is M2, protocol §4.3).
             reopenStream()
         }
+        // 事件应用后也检查一次（debounced rebuild 可能被推迟，自愈不该等它）。
+        checkHistoryFillWatchdog()
     }
 
     /// 流式文本最多 10Hz 发布；`flush` 用于 turn 结束/重建，立即同步到最新文本。
@@ -1667,6 +1889,9 @@ final class SessionViewModel: ObservableObject {
             historyBatchToken &+= 1
         }
         syncFillDiagnostics()
+        // 自愈入口：每次 derived 发布（snapshot / 事件 / 历史批）都检查一次，
+        // 冷却约束保证不会演变成高频重启。
+        checkHistoryFillWatchdog()
         // M2b-2c: if the detail is already on screen (cache or live snapshot), this
         // is the first visible content.
         maybeMarkDetailFirstFrame()

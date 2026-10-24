@@ -83,6 +83,8 @@ final class SessionPaginationTests: XCTestCase {
                 identity: { "autoload-tests" }
             )
         )
+        // 单测把 filler 的退避 sleep 折叠为 0：失败/空页的多轮 1/2/4s 序列即时跑完。
+        viewModel.historyFillBackoffScale = 0
         let firstWindow = Array(host.events.suffix(firstWindowMessages))
         let cursor = firstWindow.last?.seq ?? 0
         viewModel.applyStreamValue(snapshotJSON(events: firstWindow, cursor: cursor, hasMore: hasMore))
@@ -181,9 +183,76 @@ final class SessionPaginationTests: XCTestCase {
             return .object(["records": .array([]), "hasMore": .bool(true)])
         }
         await viewModel.runHistoryFillForTesting()
-        XCTAssertEqual(calls, 1, "空页必须终止，不能无限请求")
+        XCTAssertEqual(calls, 4, "空页按 1/2/4s 退避最多重试 3 次后终止，不能无限请求")
         XCTAssertEqual(viewModel.historyFillState, .completed)
         XCTAssertEqual(viewModel.oldestLoadedSeq, fixtureEventCount - 4, "空页没有前进")
+        let callsAtCompletion = calls
+        await viewModel.runHistoryFillForTesting()
+        XCTAssertEqual(calls, callsAtCompletion, "completed 后空页不得再请求")
+    }
+
+    @MainActor
+    func testHistoryFillRetriesEmptyPageWithBackoffThenSucceeds() async throws {
+        // 2026-10-24 真机：Host 瞬时回空页时旧代码直接 completed，补齐永久停在
+        // hasMoreOlder=1。新语义：1/2/4s 退避重试，拿到真页后继续补到 seq0。
+        let host = FakeHost(eventCount: fixtureEventCount)
+        let viewModel = makeViewModel(host: host, firstWindowMessages: 4)
+        var calls = 0
+        viewModel.historyPageLoader = { args in
+            calls += 1
+            if calls == 1 {
+                return .object(["records": .array([]), "hasMore": .bool(true)])
+            }
+            return .object(try host.page(args: args))
+        }
+        await viewModel.runHistoryFillForTesting()
+        XCTAssertEqual(calls, 2, "空页退避后必须重试，并在第二页成功")
+        XCTAssertEqual(viewModel.historyFillState, .completed)
+        XCTAssertEqual(viewModel.oldestLoadedSeq, 0, "重试成功后必须补到会话第一条")
+        XCTAssertEqual(Set(viewModel.eventSeqs).count, viewModel.eventSeqs.count, "不得重复")
+    }
+
+    @MainActor
+    func testHistoryFillWatchdogRestartsAfterTerminalFailure() async throws {
+        // .failed 是确定性失败（loader 直接 throw）的终态；真机上它没有任何重试
+        // 入口。watchdog 冷却后必须把 failed 置 idle 并重启，链路恢复即可补完。
+        let host = FakeHost(eventCount: fixtureEventCount)
+        let viewModel = makeViewModel(host: host, firstWindowMessages: 4)
+        var calls = 0
+        viewModel.historyPageLoader = { _ in
+            calls += 1
+            throw NSError(domain: "test", code: 7)
+        }
+        await viewModel.runHistoryFillForTesting()
+        XCTAssertEqual(viewModel.historyFillState, .failed, "连续确定性失败进入 failed")
+        XCTAssertGreaterThan(calls, 0)
+
+        // 链路恢复（loader 可用）+ 冷却时间到 -> watchdog 自动重启并补完。
+        viewModel.historyPageLoader = loader(host: host)
+        viewModel.historyFillWatchdogCooldown = 0
+        await viewModel.runHistoryFillWatchdogForTesting()
+        XCTAssertEqual(viewModel.historyFillState, .completed)
+        XCTAssertEqual(viewModel.oldestLoadedSeq, 0, "watchdog 恢复后必须补完")
+        let fields = probe(viewModel)
+        XCTAssertNotNil(fields["watchdogRestarts"], "probe 必须带 watchdogRestarts（真机取证字段）")
+        XCTAssertNotEqual(fields["watchdogRestarts"], "0", "watchdog 至少重启过一次")
+        XCTAssertNotNil(fields["lastProgressAt"], "probe 必须带 lastProgressAt（真机取证字段）")
+    }
+
+    @MainActor
+    func testHistoryFillWatchdogDoesNotRestartAfterCompletion() async throws {
+        let host = FakeHost(eventCount: fixtureEventCount)
+        let viewModel = makeViewModel(host: host, firstWindowMessages: 4)
+        var calls = 0
+        viewModel.historyPageLoader = loader(host: host) { _ in calls += 1 }
+        await viewModel.runHistoryFillForTesting()
+        XCTAssertEqual(viewModel.historyFillState, .completed)
+        let callsAtCompletion = calls
+
+        viewModel.historyFillWatchdogCooldown = 0
+        await viewModel.runHistoryFillWatchdogForTesting()
+        XCTAssertEqual(calls, callsAtCompletion, "completed 后 watchdog 不得重启补齐")
+        XCTAssertEqual(viewModel.historyFillState, .completed)
     }
 
     @MainActor
