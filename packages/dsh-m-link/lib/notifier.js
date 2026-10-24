@@ -217,7 +217,7 @@ export class Notifier {
     this.queue = Promise.resolve();
   }
 
-  notify(device, { kind, title, body, threadId, data, category }) {
+  notify(device, { kind, title, body, threadId, data, category, collapseId }) {
     const delivery = this.apns.mode === 'ready' ? 'push' : this.apns.mode;
     this.audit.record('notify.' + kind, {
       deviceId: device.deviceId,
@@ -237,6 +237,7 @@ export class Notifier {
         threadId,
         data,
         category,
+        collapseId,
       }))
       .then((result) => {
         if (result.ok === false) this.log('APNs send failed (' + kind + '): ' + String(result.error));

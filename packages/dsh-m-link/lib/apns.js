@@ -291,7 +291,7 @@ export class ApnsProvider {
    * `silent: true` sends a background (content-available) push; `category`
    * attaches an iOS notification category (only meaningful for alert pushes).
    */
-  async send({ deviceToken, environment, topic, title, body, threadId, data, category, silent }) {
+  async send({ deviceToken, environment, topic, title, body, threadId, data, category, silent, collapseId }) {
     if (typeof deviceToken !== 'string' || deviceToken.length === 0) {
       return { ok: false, error: 'apns/device-token-missing' };
     }
@@ -330,6 +330,11 @@ export class ApnsProvider {
           authorization: 'bearer ' + jwt,
           'apns-topic': apnsTopic,
           ...buildApnsHeaders({ silent }),
+          // 同一事件重复投递时让 iOS 折叠成一条，而不是叠出多张横幅
+          // （真机报障：一次 turn-end 因为设备重复注册收到 8 条通知）。
+          ...(typeof collapseId === 'string' && collapseId.length > 0
+            ? { 'apns-collapse-id': collapseId.slice(0, 64) }
+            : {}),
           'content-type': 'application/json',
           'content-length': Buffer.byteLength(payload),
         });
