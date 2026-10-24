@@ -380,6 +380,19 @@ final class SessionViewModel: ObservableObject {
  /// Observable so the detail view can render the top 2pt fill progress bar
  /// (handoff r4 §6.3-8). All writes happen on the MainActor (class is @MainActor).
     @Published private(set) var historyFillState: HistoryFillState = .idle
+ /// Deterministic progress of the full-history filler (design r2, approved
+ /// ). `nil` while hidden: no older history, reveal delay, or after
+ /// the completion fade. `SessionDetailView` renders the top 2pt bar from it.
+    @Published private(set) var historyFillProgress: HistoryFillProgress?
+    private var fillProgressTracker = HistoryFillProgressTracker()
+    private var fillProgressRevealTask: Task<Void, Never>?
+    private var fillProgressHideTask: Task<Void, Never>?
+    private var fillProgressRevealed = false
+    private var fillProgressRevealedAt: Date?
+    private var fillProgressSawCacheRestore = false
+ /// The off-main first-paint cache read finished (hit or miss): the progress
+ /// origin may be armed once the first-screen window is known.
+    private var firstPaintCacheFinished = false
     private var historyFillTask: Task<Void, Never>?
     private var historyFillStartedAt: Date?
     private var historyFillCompletedAt: Date?
@@ -629,6 +642,7 @@ final class SessionViewModel: ObservableObject {
                 store.load(sessionId: targetSessionId)
             }.value
             guard let self, !Task.isCancelled else { return }
+            self.firstPaintCacheFinished = true
             self.cacheLoadMilliseconds = Date().timeIntervalSince(started) * 1000
             guard let loaded else {
                 self.dbg("first-paint cache miss")
@@ -940,6 +954,7 @@ final class SessionViewModel: ObservableObject {
         cancelFileChangeFetchTasks()
         removeFileChangeForegroundObserver()
         removeHistoryFillForegroundObserver()
+        stopHistoryFillProgress()
         historyFillWatchdogTask?.cancel()
         historyFillWatchdogTask = nil
         lastHistoryFillWatchdogAt = nil
@@ -1212,6 +1227,7 @@ final class SessionViewModel: ObservableObject {
             switch outcome {
             case .progress:
                 retriedStalePage = false
+                fillProgressTracker.notePageLoaded()
                 historyFillFailures = 0
                 historyFillTransientRetries = 0
                 historyFillEmptyPages = 0
@@ -1438,6 +1454,9 @@ final class SessionViewModel: ObservableObject {
 
  /// E2E-only filler probe (e2e-history-fill hidden element).
     private func syncFillDiagnostics() {
+ // First: deterministic 2pt bar state (design r2). Must run for every user
+ // independent of the E2E-only diagnostics gate below.
+        refreshHistoryFillProgress()
         guard Self.e2eFillDiagnosticsEnabled || Self.e2eFillDiagnosticsTestOverride else { return }
         let elapsedMs: Int
         if let started = historyFillStartedAt {
@@ -1465,6 +1484,119 @@ final class SessionViewModel: ObservableObject {
             + ";gen=" + String(link?.generation ?? -1)
             + ";lastProgressAt=" + String(lastProgressMilliseconds)
             + ";watchdogRestarts=" + String(historyFillWatchdogRestarts)
+    }
+
+ // MARK: - History fill progress (design: r2)
+
+ /// DEBUG kill switch (design §10): `DSHM_FILL_PROGRESS=0` restores the old
+ /// behaviour (no bar at all), so a visual regression can be isolated cheaply.
+    private static let historyFillProgressEnabled: Bool = {
+        #if DEBUG
+        if ProcessInfo.processInfo.environment["DSHM_FILL_PROGRESS"] == "0" { return false }
+        #endif
+        return true
+    }()
+ /// Reveal delay: sessions that finish quickly must not flash a 0→100 bar.
+    private static let historyFillProgressRevealDelay: TimeInterval = 0.3
+ /// Completion linger (200 ms at 100% + 250 ms fade) before the view is removed.
+    private static let historyFillProgressCompletionLinger: TimeInterval = 0.6
+ /// A bar that completed almost immediately after appearing gets a quick fade.
+    private static let historyFillProgressMinVisible: TimeInterval = 0.3
+
+ /// Single refresh point; driven by `syncFillDiagnostics()`, which already runs
+ /// after cache restore / snapshot / each merged history batch / pause / complete.
+    private func refreshHistoryFillProgress() {
+        guard Self.historyFillProgressEnabled else { return }
+        if !fillProgressTracker.isArmed, firstPaintCacheFinished || hasLiveSnapshot {
+            fillProgressTracker.armIfNeeded(
+                oldestSeq: journal.oldestSeq,
+                hasMoreOlder: journal.hasMoreOlder
+            )
+        }
+ // Slow cache restore landing after the live snapshot: widen the denominator
+ // once (only valid while no filler page has been merged).
+        if didRestoreFirstPaintCache, !fillProgressSawCacheRestore {
+            fillProgressSawCacheRestore = true
+            fillProgressTracker.widenOrigin(to: journal.oldestSeq)
+        }
+        fillProgressTracker.note(
+            oldestSeq: journal.oldestSeq,
+            hasMoreOlder: journal.hasMoreOlder
+        )
+        let activePhase: HistoryFillProgress.Phase = historyFillState == .loading ? .loading : .paused
+        guard let candidate = fillProgressTracker.progress(activePhase: activePhase) else {
+            clearHistoryFillProgress()
+            return
+        }
+        switch candidate.phase {
+        case .loading, .paused:
+            fillProgressHideTask?.cancel()
+            fillProgressHideTask = nil
+            if fillProgressRevealed {
+                if historyFillProgress != candidate { historyFillProgress = candidate }
+            } else {
+                scheduleHistoryFillProgressReveal()
+            }
+        case .completed:
+            guard fillProgressRevealed else {
+ // Finished inside the reveal window: per design the bar never shows.
+                clearHistoryFillProgress()
+                return
+            }
+            if historyFillProgress != candidate { historyFillProgress = candidate }
+            scheduleHistoryFillProgressHide()
+        }
+    }
+
+    private func clearHistoryFillProgress() {
+        fillProgressRevealTask?.cancel()
+        fillProgressRevealTask = nil
+        fillProgressHideTask?.cancel()
+        fillProgressHideTask = nil
+        if historyFillProgress != nil { historyFillProgress = nil }
+    }
+
+    private func scheduleHistoryFillProgressReveal() {
+        guard fillProgressRevealTask == nil else { return }
+        fillProgressRevealTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(Self.historyFillProgressRevealDelay * 1_000_000_000))
+            guard let self, !Task.isCancelled else { return }
+            self.fillProgressRevealTask = nil
+            self.fillProgressRevealed = true
+            self.fillProgressRevealedAt = Date()
+            DetailMetrics.markHistoryFillProgressVisible()
+            self.refreshHistoryFillProgress()
+        }
+    }
+
+    private func scheduleHistoryFillProgressHide() {
+        guard fillProgressHideTask == nil else { return }
+        let visibleFor = fillProgressRevealedAt.map { Date().timeIntervalSince($0) }
+            ?? TimeInterval.greatestFiniteMagnitude
+        let linger = visibleFor < Self.historyFillProgressMinVisible
+            ? Self.historyFillProgressRevealDelay
+            : Self.historyFillProgressCompletionLinger
+        fillProgressHideTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(linger * 1_000_000_000))
+            guard let self, !Task.isCancelled else { return }
+            self.fillProgressHideTask = nil
+            self.fillProgressRevealed = false
+            self.fillProgressRevealedAt = nil
+            self.historyFillProgress = nil
+        }
+    }
+
+ /// Stops publishing progress (detail left the screen) and forgets this visit.
+    private func stopHistoryFillProgress() {
+        fillProgressRevealTask?.cancel()
+        fillProgressRevealTask = nil
+        fillProgressHideTask?.cancel()
+        fillProgressHideTask = nil
+        fillProgressRevealed = false
+        fillProgressRevealedAt = nil
+        fillProgressSawCacheRestore = false
+        fillProgressTracker.reset()
+        historyFillProgress = nil
     }
 
  // MARK: - History filler watchdog (self-heal)

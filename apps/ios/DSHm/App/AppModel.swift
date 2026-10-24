@@ -142,6 +142,11 @@ final class AppModel: ObservableObject {
         var parentAddress: SessionFollowAddress
     }
     @Published private(set) var subagentRoute: SubagentRoute?
+ /// Snapshot of the page a subagent detail was pushed from, used as the revealed
+ /// background of the interactive edge-pop (iOS swipe-back, requirement
+ /// ). Captured when the subagent list sheet opens (parent page fully
+ /// visible); the child detail then replaces the parent in the route.
+    @Published private(set) var backSnapshot: UIImage?
     @Published var language: AppLanguage {
         didSet { UserDefaults.standard.set(language.storageKey, forKey: "appLanguage") }
     }
@@ -253,8 +258,10 @@ final class AppModel: ObservableObject {
         }
  // E2E: simulate a notification tap N ms after launch. Posts the exact
  // NotificationCenter signal AppDelegate sends for a real push response, so
- // UI tests exercise the real "already in a session -> tap turn-end push"
- // path (AppModel.handlePushApprovalRoute -> openSession). Debug-only.
+ // UI tests exercise the real tap path (AppModel.handlePushTap). Tap the
+ // session currently on screen: requirement says this must be a
+ // no-op (no detail rebuild / scroll reset / refetch); tap another session
+ // id: the detail is replaced. Debug-only.
         if let tappedSession = ProcessInfo.processInfo.environment["DSHM_E2E_TAP_PUSH_SESSION"],
            !tappedSession.isEmpty {
             let delay = Int(ProcessInfo.processInfo.environment["DSHM_E2E_TAP_PUSH_AFTER_MS"] ?? "") ?? 1_500
@@ -329,11 +336,7 @@ final class AppModel: ObservableObject {
             .receive(on: RunLoop.main)
             .sink { [weak self] notification in
                 guard let self else { return }
-                if let sessionId = notification.object as? String, !sessionId.isEmpty {
-                    self.openSession(sessionId)
-                } else {
-                    self.route = .workspaces
-                }
+                self.handlePushTap(sessionId: notification.object as? String)
             }
             .store(in: &cancellables)
 
@@ -371,7 +374,7 @@ final class AppModel: ObservableObject {
             if link.credentials == nil {
                 pendingDeepLinkSessionId = parkedSessionId
             } else {
-                openSession(parkedSessionId)
+                handlePushTap(sessionId: parkedSessionId)
             }
         }
     }
@@ -491,6 +494,45 @@ final class AppModel: ObservableObject {
         NSLog("[P0-LIVE] foreground resume %@", value)
     }
 
+ // MARK: - 需求 #5：推送点击的同会话 no-op
+
+ /// 推送点击是否需要真的切换会话（需求：推送对应的会话就是
+ /// 当前正在看的会话时不转跳）。
+ ///
+ /// 详情页的身份就是 route 里的 `address.sessionId`（`RootView` 用
+ /// `address.sessionId` 做 `.id`），所以「当前路由地址的会话 id == 推送目标」
+ /// 即同一会话：
+ /// - 顶层会话：route 是 `.session(.session(id))`；
+ /// - 子会话（subagent）：route 的地址是 durable parent 地址，其
+ /// `address.sessionId` 就是 childSessionId，同样成立；
+ /// - `.pairing` / `.workspaces`：没有打开的详情页，必须导航。
+ ///
+ /// 同一会话时返回 false：不重建详情页、不丢滚动位置、不触发按需重拉数据。
+    nonisolated static func shouldOpenPushDeepLink(
+        currentRoute: Route,
+        targetSessionId: String?
+    ) -> Bool {
+        guard let targetSessionId, !targetSessionId.isEmpty else { return true }
+        guard case .session(let address) = currentRoute else { return true }
+        return address.sessionId != targetSessionId
+    }
+
+ /// 通知 tap 的统一入口（前台横幅点击、冷启动停放、审批 fallback 都走这里）：
+ /// 同会话 no-op，空 payload 回工作区列表。
+    private func handlePushTap(sessionId rawSessionId: String?) {
+        guard let sessionId = rawSessionId, !sessionId.isEmpty else {
+            route = .workspaces
+            return
+        }
+        guard Self.shouldOpenPushDeepLink(currentRoute: route, targetSessionId: sessionId) else {
+ // 需求：正在看这个会话，点击通知不应打断（滚动/已加载
+ // 数据都保持原样）。
+            Self.pushDbg("push tap: already viewing session=" + sessionId + " (no-op)")
+            return
+        }
+        openSession(sessionId)
+    }
+
  // MARK: - M4 notification-action approvals
 
  /// Handles one routed notification response: allow/deny decisions are queued
@@ -501,15 +543,12 @@ final class AppModel: ObservableObject {
             enqueueApprovalDecision(decision)
         case .fallback(let sessionId):
             showToast(L10n.t("审批信息不完整，请在 App 内处理"))
+ // 没有可用深链时保持当前页面（旧行为）；有会话才走同会话 no-op 判定。
             if let sessionId, !sessionId.isEmpty {
-                openSession(sessionId)
+                handlePushTap(sessionId: sessionId)
             }
         case .deepLink(let sessionId):
-            if let sessionId, !sessionId.isEmpty {
-                openSession(sessionId)
-            } else {
-                self.route = .workspaces
-            }
+            handlePushTap(sessionId: sessionId)
         case .ignored:
             break
         }
@@ -613,6 +652,7 @@ final class AppModel: ObservableObject {
 
     func didPair() {
         subagentRoute = nil
+        backSnapshot = nil
  // 配对前点过通知：配对完成后再补跳会话详情，而不是丢掉这次意图。
         if let pending = pendingDeepLinkSessionId {
             pendingDeepLinkSessionId = nil
@@ -673,6 +713,9 @@ final class AppModel: ObservableObject {
         } else {
             subagentRoute = nil
         }
+ // A deep link always replaces the page identity; a stale reveal snapshot
+ // must never be shown for the new route.
+        backSnapshot = nil
         route = .session(navigation.address)
     }
 
@@ -768,6 +811,9 @@ final class AppModel: ObservableObject {
 
     func openSession(_ address: SessionFollowAddress) {
         subagentRoute = nil
+ // Top-level pages reveal the live workspace list on swipe-back; a snapshot
+ // captured for a subagent push must never shadow it.
+        backSnapshot = nil
         route = .session(address)
     }
 
@@ -798,6 +844,15 @@ final class AppModel: ObservableObject {
             subagentRoute = nil
             route = .workspaces
         }
+ // The revealed previous page (if any) is gone after the route settles.
+        backSnapshot = nil
+    }
+
+ /// Captures the parent page for the interactive swipe-back reveal. Called when
+ /// the subagent list sheet opens: the parent detail is still fully visible then
+ /// (capturing later, after the sheet animates in, would capture the sheet).
+    func captureBackSnapshot() {
+        backSnapshot = WindowSnapshot.capture()
     }
 
  /// Address a deep-linked session id must be opened with. Falls back to the
@@ -816,6 +871,7 @@ final class AppModel: ObservableObject {
 
     func backToWorkspaces() {
         subagentRoute = nil
+        backSnapshot = nil
         route = .workspaces
     }
 

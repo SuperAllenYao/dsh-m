@@ -50,7 +50,7 @@ import { probeWithRetries } from './contract.js';
 import { DeviceStore, keyFingerprint256, normalizeDevicePublicKey } from './devices.js';
 import { FrameAudit } from './frame-audit.js';
 import { ensureHostIdentity } from './host-identity.js';
-import { APPROVAL_CATEGORY, Notifier } from './notifier.js';
+import { APPROVAL_CATEGORY, Notifier, pushTitleForSession } from './notifier.js';
 import { createHostTurnEventHandler, TurnWatcher } from './session-watcher.js';
 import { buildEndpoints, PairCodeService, PairingService, selectDeviceEndpoints, trimDeviceName } from './pairing.js';
 import { BonjourResponder } from './bonjour.js';
@@ -64,6 +64,14 @@ import { detectListLiteRequest, LIST_LITE_HEADER, trimSessionListResponse } from
 const PLUGIN_NAME = 'dsh-m-link';
 const PLUGIN_VERSION = '2.9.0';
 const MUX_PATH = '/api/remote.mux';
+
+/**
+ * user requirement: an alert push is titled with the title of the
+ * session that triggered it (`session/list` → `projections.values.title`). The
+ * title cache is refreshed on demand from the loopback list; this TTL bounds
+ * the extra `session/list` reads to at most one per window per push burst.
+ */
+const PUSH_TITLE_TTL_MS = 5000;
 
 /**
  * 同一设备只允许一条 mux（协议不变量）。旧连接**静默**超过这个窗口即视为死连接：
@@ -202,6 +210,27 @@ const DEFAULTS = {
 
 function log(message) {
   process.stderr.write('[dsh-m-link] ' + message + '\n');
+}
+
+/**
+ * Reject if `promise` does not settle within `ms`. Used by the push-title
+ * refresh: a wedged loopback must never stall (or reorder) an alert push.
+ */
+function withTimeout(promise, ms, label) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(label + ' timeout after ' + String(ms) + 'ms')), ms);
+    if (typeof timer?.unref === 'function') timer.unref();
+    Promise.resolve(promise).then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
 }
 
 function isPlainObject(value) {
@@ -472,6 +501,15 @@ export class LinkServer {
     this.notifier = undefined;
  /** task-5: host-side turn watcher (created in startInternal). */
     this.sessionWatcher = undefined;
+ /**
+ * (push title): sessionId -> {title, blank} cache used to title
+ * alert pushes with the triggering session's title. Seeded by watcher polls
+ * and refreshed on demand in the push path (`refreshPushTitleCache`).
+ */
+    this.pushTitleCache = new Map();
+    this.pushTitleCacheAt = 0;
+ /** In-flight title-cache refresh promise (deduped), undefined when idle. */
+    this.pushTitleRefresh = undefined;
  /** task-5b: disposers for the in-process host event subscriptions. */
     this.hostEventDisposers = [];
  /** task-5b: true while the host session-event bus drives turn-end pushes. */
@@ -645,9 +683,21 @@ export class LinkServer {
     return [...byToken.values()];
   }
 
-  notifyTurnEndAllDevices(sessionId) {
+ /**
+ * Fan one completed turn out to every push-token device. While the watcher is
+ * active this is the only turn-end source (the frame path is suppressed), so
+ * the push is delivered even if the phone never followed the session.
+ *
+ * `titleInfo` is the ended session's `{title, blank}` from the same
+ * `session/list` snapshot the watcher diffed (undefined falls back to the cached
+ * snapshot), and the alert title becomes the session title; the body only says
+ * what happened.
+ */
+  notifyTurnEndAllDevices(sessionId, titleInfo) {
     if (this.disposed || typeof sessionId !== 'string' || sessionId.length === 0) return 0;
     if (this.notifier === undefined || this.devices === undefined) return 0;
+    const info = titleInfo ?? this.pushTitleInfoFor?.(sessionId);
+    const title = pushTitleForSession(info, 'DSH 回合完成');
     let sent = 0;
     const targets = typeof this.pushTargets === 'function'
       ? this.pushTargets()
@@ -656,8 +706,8 @@ export class LinkServer {
       this.notifier.notify(device, {
         kind: 'turn-end',
         collapseId: 'turn-end:' + sessionId,
-        title: 'DSH 回合完成',
-        body: '任务已在 Mac 上完成',
+        title,
+        body: '回合完成',
         threadId: sessionId,
         data: { type: 'turn-end', sessionId },
       });
@@ -666,10 +716,15 @@ export class LinkServer {
     return sent;
   }
 
- /** Push a finished-with-error turn to every push-capable device (host event bus). */
-  notifyTurnFailureAllDevices(sessionId) {
+ /**
+ * Push a finished-with-error turn to every push-capable device (host event bus).
+ * Title = session title (see `notifyTurnEndAllDevices`), body = the failure.
+ */
+  notifyTurnFailureAllDevices(sessionId, titleInfo) {
     if (this.disposed || typeof sessionId !== 'string' || sessionId.length === 0) return 0;
     if (this.notifier === undefined || this.devices === undefined) return 0;
+    const info = titleInfo ?? this.pushTitleInfoFor?.(sessionId);
+    const title = pushTitleForSession(info, 'DSH 回合失败');
     let sent = 0;
     const targets = typeof this.pushTargets === 'function'
       ? this.pushTargets()
@@ -678,8 +733,8 @@ export class LinkServer {
       this.notifier.notify(device, {
         kind: 'failure',
         collapseId: 'turn-failure:' + sessionId,
-        title: 'DSH 回合失败',
-        body: '任务执行出错，打开 App 查看详情',
+        title,
+        body: '回合失败',
         threadId: sessionId,
         data: { type: 'failure', sessionId },
       });
@@ -755,8 +810,15 @@ export class LinkServer {
       return;
     }
     const handler = createHostTurnEventHandler({
-      notifyTurnEnd: (sessionId) => this.notifyTurnEndAllDevices(sessionId),
-      notifyFailure: (sessionId) => this.notifyTurnFailureAllDevices(sessionId),
+ // refresh the title cache once before the fan-out so the push
+ // is titled with the session that just ended (fire-and-forget: the event
+ // bus itself must never wait on the loopback read).
+      notifyTurnEnd: (sessionId) => {
+        void this.deliverTurnAlert('turn-end', sessionId);
+      },
+      notifyFailure: (sessionId) => {
+        void this.deliverTurnAlert('failure', sessionId);
+      },
       config: this.config.notifications,
       isEnabled: () => this.disposed !== true,
     });
@@ -773,10 +835,17 @@ export class LinkServer {
   }
 
  /**
- * One loopback `session/list` for the watcher: the same target the phone
- * unary proxy uses, authenticated with a device peer cookie. Only
- * `sessionId` + `running` are kept, so the transient full projection object
- * (up to ~1.5 MB) is dropped immediately and the watcher never holds list data.
+ * One loopback `session/list` for the watcher and the push-title cache: the same
+ * target the phone unary proxy uses, authenticated with a device peer cookie.
+ * Only the small fields the watcher needs are trimmed out of each row
+ * (`sessionId`/`running`/`title`/`blank`/`origin`/`parentSessionId`), so the
+ * transient full projection object (up to ~1.5 MB) is dropped immediately and
+ * neither the watcher nor the title cache holds list data.
+ *
+ * `title` is the desktop card title (`projections.values.title`) — the
+ * push-title source. `origin`/`parentSessionId` are kept so
+ * `isSubagentSessionItem` can still filter subagent children *after* the trim
+ * (dropping them here used to make the watcher push subagent turn-ends).
  */
   async fetchSessionListForWatcher(device) {
     const peer = this.ensurePeer(device);
@@ -821,12 +890,114 @@ export class LinkServer {
       throw new Error('session/list envelope is not ok');
     }
     return value.items
-      .map((item) =>
-        item !== null && typeof item === 'object'
-          ? { sessionId: item.sessionId, running: item.running === true }
-          : null
-      )
-      .filter((item) => item !== null && typeof item.sessionId === 'string');
+      .map((item) => {
+        if (item === null || typeof item !== 'object') return null;
+        if (typeof item.sessionId !== 'string' || item.sessionId.length === 0) return null;
+        const values = item.projections?.values;
+        return {
+          sessionId: item.sessionId,
+          running: item.running === true,
+ // Desktop card title; undefined when the host did not project one.
+          title: typeof values?.title === 'string' ? values.title : undefined,
+          blank: item.blank === true,
+          origin: typeof item.origin === 'string' ? item.origin : undefined,
+          parentSessionId: typeof item.parentSessionId === 'string' ? item.parentSessionId : undefined,
+        };
+      })
+      .filter((item) => item !== null);
+  }
+
+ // ------------------------------- push titles ---
+
+ /**
+ * Seed/refresh the sessionId -> {title, blank} cache from one trimmed
+ * `session/list` snapshot. Both sources feed it: watcher polls (free) and
+ * on-demand refreshes in the push path.
+ */
+  seedPushTitles(items) {
+    const cache = new Map();
+    for (const item of Array.isArray(items) ? items : []) {
+      if (item === null || typeof item !== 'object') continue;
+      if (typeof item.sessionId !== 'string' || item.sessionId.length === 0) continue;
+      cache.set(item.sessionId, {
+        title: typeof item.title === 'string' ? item.title : undefined,
+        blank: item.blank === true,
+      });
+    }
+    this.pushTitleCache = cache;
+    this.pushTitleCacheAt = Date.now();
+  }
+
+ /** Cached title info for one session (undefined = unknown -> fixed type title). */
+  pushTitleInfoFor(sessionId) {
+    if (typeof sessionId !== 'string' || sessionId.length === 0) return undefined;
+    return this.pushTitleCache?.get(sessionId);
+  }
+
+ /**
+ * Refresh the push-title cache from `session/list` at most once per
+ * `PUSH_TITLE_TTL_MS`; concurrent pushes share one in-flight read. Best effort:
+ * a host/transport failure keeps the previous cache and never blocks a push
+ * (the alert then keeps its fixed type title).
+ */
+  async refreshPushTitleCache({ maxAgeMs = PUSH_TITLE_TTL_MS } = {}) {
+    if (this.disposed === true) return;
+    if (this.pushTitleRefresh !== undefined) return this.pushTitleRefresh;
+    if (Date.now() - this.pushTitleCacheAt < maxAgeMs) return;
+    const device = this.watchableDevices()[0];
+    if (device === undefined) return;
+    const timeoutMs =
+      Number.isInteger(this.config?.notifications?.requestTimeoutMs) && this.config.notifications.requestTimeoutMs >= 100
+        ? this.config.notifications.requestTimeoutMs
+        : 1500;
+    this.pushTitleRefresh = (async () => {
+      try {
+        const items = await withTimeout(
+          this.fetchSessionListForWatcher(device),
+          timeoutMs,
+          'push title refresh'
+        );
+        this.seedPushTitles(items);
+      } catch (error) {
+ // Throttle retries: a dead loopback must not add a timeout to every push.
+        this.pushTitleCacheAt = Date.now();
+        log('push title refresh failed: ' + String(error?.message ?? error));
+      } finally {
+        this.pushTitleRefresh = undefined;
+      }
+    })();
+    return this.pushTitleRefresh;
+  }
+
+ /**
+ * Resolve the title of the session behind an alert push (async: may refresh the
+ * cache once). `undefined` means "unknown" — the notifier keeps the fixed type
+ * title in that case.
+ */
+  async resolvePushTitle(sessionId) {
+    try {
+      await this.refreshPushTitleCache();
+    } catch {
+ /* fall back to the fixed type title */
+    }
+    return this.pushTitleInfoFor(sessionId);
+  }
+
+ /**
+ * Host-event turn-end/failure delivery: refresh the title cache first so the
+ * push is titled with the session, then fan out synchronously. Returns the
+ * number of devices notified (0 when disposed/invalid).
+ */
+  async deliverTurnAlert(kind, sessionId) {
+    if (this.disposed === true || typeof sessionId !== 'string' || sessionId.length === 0) return 0;
+    try {
+      await this.refreshPushTitleCache();
+    } catch {
+ /* the title is best effort; the push must still go out */
+    }
+    return kind === 'turn-end'
+      ? this.notifyTurnEndAllDevices(sessionId)
+      : this.notifyTurnFailureAllDevices(sessionId);
   }
 
  /**
@@ -939,6 +1110,9 @@ export class LinkServer {
  // task-5: while the TurnWatcher owns turn-end delivery (a push-token
  // device exists), the frame path must not push a second time.
       isTurnEndWatched: () => this.hostTurnEventsActive === true || this.sessionWatcher?.active === true,
+ // approval/question (and the frame-path turn-end/failure
+ // fallback) are titled with the triggering session's title.
+      resolveSessionTitle: (sessionId) => this.resolvePushTitle(sessionId),
     });
  // task-5 (user requirement): turn completion must be delivered even when the
  // App is not following the session / not running. The watcher polls
@@ -946,8 +1120,14 @@ export class LinkServer {
  // path only covers the no-watcher case.
     this.sessionWatcher = new TurnWatcher({
       listDevices: () => this.watchableDevices(),
-      fetchSessionList: (device) => this.fetchSessionListForWatcher(device),
-      notifyTurnEnd: (sessionId) => this.notifyTurnEndAllDevices(sessionId),
+ // Watcher polls double as free title-cache refreshes.
+      fetchSessionList: async (device) => {
+        const items = await this.fetchSessionListForWatcher(device);
+        this.seedPushTitles(items);
+        return items;
+      },
+ // The diff's snapshot already carries the ended session's title.
+      notifyTurnEnd: (sessionId, titleInfo) => this.notifyTurnEndAllDevices(sessionId, titleInfo),
       isAvailable: () => this.disposed !== true && this.contract?.ok === true,
       config: this.config.notifications,
       log,

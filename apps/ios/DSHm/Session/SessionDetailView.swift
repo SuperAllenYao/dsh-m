@@ -42,6 +42,7 @@ enum SessionMessageItemsBuilder {
 struct SessionDetailView: View {
     @EnvironmentObject private var app: AppModel
     @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let address: SessionFollowAddress
     let sessionId: String
  /// v5.4 task-13: non-nil when this detail is a child subagent session.
@@ -266,6 +267,11 @@ struct SessionDetailView: View {
     }
 
     private func present(_ sheet: SessionDetailSheet) {
+        if case .subagentList = sheet {
+ // Interactive swipe-back reveal: capture the parent page while it is
+ // still fully visible (the sheet would otherwise cover it).
+            app.captureBackSnapshot()
+        }
         withAnimation(Theme.Motion.standard) { detailSheet = sheet }
     }
 
@@ -830,19 +836,18 @@ struct SessionDetailView: View {
                 .accessibilityIdentifier("session-message-list")
             }
         }
- // §2.1 / §6.3-8：后台自动补齐历史进行中 → 顶部 2pt 细进度条。
- // overlay 不参与布局（不撑高、不挤压消息），也不拦截点击；
- // 只在.loading 时显示，completed / failed / idle 均不显示。
+ // 设计稿 r2：后台自动补齐历史 → 顶部 2pt
+ // 确定态进度条。overlay 不参与布局（不撑高、不挤压消息）、不拦截点击；
+ // 视图只在 VM 发布进度时存在（hidden 即移除），完成后的 100% 停留与淡出
+ // 由 VM 的定时器收尾。
         .overlay(alignment: .top) {
-            if viewModel.historyFillState == .loading {
-                ProgressView()
-                    .progressViewStyle(.linear)
-                    .tint(Theme.Palette.accent)
-                    .frame(maxWidth: .infinity)
-                    .frame(height: 2)
-                    .allowsHitTesting(false)
-                    .accessibilityIdentifier("session-history-fill-progress")
+            ZStack(alignment: .top) {
+                if let progress = viewModel.historyFillProgress {
+                    HistoryFillProgressBar(progress: progress)
+                        .transition(reduceMotion ? .identity : .opacity)
+                }
             }
+            .animation(reduceMotion ? nil : Theme.Motion.standard, value: viewModel.historyFillProgress)
         }
     }
 

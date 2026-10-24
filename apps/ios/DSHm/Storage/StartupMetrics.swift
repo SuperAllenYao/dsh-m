@@ -152,6 +152,8 @@ enum DetailMetrics {
     private static var fillCompletedMs: Double = -1
     private static var fillPages: Int = -1
     private static var fillOldestSeq: Int = -1
+ /// Design r2: when the 2pt history-fill bar was first revealed (progress < 0 = never).
+    private static var fillProgressAt: TimeInterval?
 
  /// Call first thing in `SessionViewModel.init` (t0). The cache-hit flag is
  /// filled in by `setCacheHit(_:)` once the synchronous restore has run.
@@ -171,6 +173,7 @@ enum DetailMetrics {
         fillCompletedMs = -1
         fillPages = -1
         fillOldestSeq = -1
+        fillProgressAt = nil
     }
 
     static func setCacheHit(_ hit: Bool) {
@@ -222,6 +225,12 @@ enum DetailMetrics {
         if fillCompletedMs < 0 { fillCompletedMs = milliseconds }
         fillPages = pages
         fillOldestSeq = oldestSeq
+    }
+
+ /// Design r2: the 2pt history-fill bar became visible (after the reveal delay).
+    static func markHistoryFillProgressVisible() {
+        guard isEnabled, openedAt != nil, fillProgressAt == nil else { return }
+        fillProgressAt = ProcessInfo.processInfo.systemUptime
     }
 
  /// First live `session/follow` snapshot applied.
@@ -292,11 +301,18 @@ enum DetailMetrics {
         } else {
             cacheChunk0 = "-1"
         }
+        let progressVisible: String
+        if let fillProgressAt {
+            progressVisible = secondsString(fillProgressAt - openedAt)
+        } else {
+            progressVisible = "-1"
+        }
         return "tapMs=" + tap + ";tapAtEpochMs=" + String(tapAtEpochMs)
             + ";shellMs=" + shell + ";contentMs=" + content
             + ";firstContentMs=" + content + ";cacheChunk0Ms=" + cacheChunk0
             + ";fillMs=" + fill + ";fillPages=" + String(fillPages)
             + ";fillOldest=" + String(fillOldestSeq)
+            + ";fillProgressMs=" + progressVisible
     }
 
  /// Clears every mark (unit tests).
@@ -317,6 +333,7 @@ enum DetailMetrics {
         fillCompletedMs = -1
         fillPages = -1
         fillOldestSeq = -1
+        fillProgressAt = nil
     }
 }
 

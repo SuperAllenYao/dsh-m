@@ -48,6 +48,39 @@ export function sessionRunningState(items) {
 }
 
 /**
+ * `session/list` snapshot -> session title info (`sessionId -> {title, blank}`).
+ *
+ * User requirement: alerts are titled with the title of the session
+ * that triggered them (the desktop card title, `projections.values.title`). The
+ * watcher already polls the list every tick, so it is the cheapest place to
+ * cache that title and hand it to the notification callback.
+ *
+ * Unlike `sessionRunningState`, this keeps **every** row (subagent children
+ * included): approval/question pushes deep-link to a child session and should
+ * still show its title. Rows without a usable id are ignored; `title` may be
+ * undefined (callers fall back to the App-list wording) and `blank` is true
+ * only when the row explicitly says so.
+ *
+ * @param {unknown} items session/list `items` array (or the value object); rows
+ * are the trimmed shape produced by LinkServer.fetchSessionListForWatcher
+ * (`{sessionId, running, title?, blank?}`).
+ * @returns {Map<string, {title?: string, blank?: boolean}>}
+ */
+export function sessionTitleInfo(items) {
+  const list = Array.isArray(items) ? items : Array.isArray(items?.items) ? items.items : [];
+  const titles = new Map();
+  for (const item of list) {
+    if (item === null || typeof item !== 'object') continue;
+    if (typeof item.sessionId !== 'string' || item.sessionId.length === 0) continue;
+    titles.set(item.sessionId, {
+      title: typeof item.title === 'string' ? item.title : undefined,
+      blank: item.blank === true,
+    });
+  }
+  return titles;
+}
+
+/**
  * Diff the previous running set against a fresh snapshot.
  *
  * - `ended`: was running, still listed, now idle -> a completed turn (notify);
@@ -57,13 +90,18 @@ export function sessionRunningState(items) {
  *
  * Pure so the transition rule is unit-tested instead of only observed live.
  *
+ * `titles` is the snapshot's full title map (see `sessionTitleInfo`), so the
+ * caller can title the push with the title of the session that just ended
+ * without a second `session/list` read.
+ *
  * @param {Set<string>|undefined} previousRunning
  * @param {unknown} items
- * @returns {{running: Set<string>, ended: string[], dropped: string[]}}
+ * @returns {{running: Set<string>, ended: string[], dropped: string[], titles: Map<string, {title?: string, blank?: boolean}>}}
  */
 export function diffRunningSessions(previousRunning, items) {
   const list = Array.isArray(items) ? items : Array.isArray(items?.items) ? items.items : [];
   const running = sessionRunningState(list);
+  const titles = sessionTitleInfo(list);
   const listed = new Set();
   for (const item of list) {
     if (item !== null && typeof item === 'object' && typeof item.sessionId === 'string') {
@@ -78,7 +116,7 @@ export function diffRunningSessions(previousRunning, items) {
     if (listed.has(sessionId)) ended.push(sessionId);
     else dropped.push(sessionId);
   }
-  return { running, ended, dropped };
+  return { running, ended, dropped, titles };
 }
 
 /**
@@ -106,8 +144,11 @@ export function shouldWatchSessions({ notifications = {}, devices = [] } = {}) {
  *
  * The host wiring supplies `listDevices` (active devices with a push token),
  * `fetchSessionList(device)` (loopback session/list) and
- * `notifyTurnEnd(sessionId)` (fan-out to every push-token device). `sync()`
- * starts/stops the timer as devices come and go; `pollOnce()` is the test seam.
+ * `notifyTurnEnd(sessionId, titleInfo)` (fan-out to every push-token device;
+ * `titleInfo` is the ended session's `{title, blank}` from the same snapshot, so
+ * the push can be titled with the session title without another list read).
+ * `sync()` starts/stops the timer as devices come and go; `pollOnce()` is the
+ * test seam.
  */
 export class TurnWatcher {
   constructor({
@@ -145,8 +186,20 @@ export class TurnWatcher {
     this.primed = false;
  /** @type {Set<string>} */
     this.running = new Set();
+ /**
+ * sessionId -> {title, blank} from the last snapshot, so pushes
+ * can be titled with the triggering session's title (desktop card title).
+ * @type {Map<string, {title?: string, blank?: boolean}>}
+ */
+    this.titles = new Map();
  /** Last error message, so a repeated failure does not spam the log. */
     this.lastError = undefined;
+  }
+
+ /** Title info cached from the last successful poll (undefined when unknown). */
+  titleInfoFor(sessionId) {
+    if (typeof sessionId !== 'string' || sessionId.length === 0) return undefined;
+    return this.titles.get(sessionId);
   }
 
  /** True while the polling timer is armed (used to suppress frame-path pushes). */
@@ -168,6 +221,7 @@ export class TurnWatcher {
     if (this.active) return true;
     this.primed = false;
     this.running = new Set();
+    this.titles = new Map();
     this.lastError = undefined;
     this.timer = this.setIntervalFn(() => {
       void this.pollOnce();
@@ -185,6 +239,7 @@ export class TurnWatcher {
     }
     this.primed = false;
     this.running = new Set();
+    this.titles = new Map();
     this.polling = false;
   }
 
@@ -222,16 +277,20 @@ export class TurnWatcher {
  // Baseline: sessions already running when the watcher started must not
  // be reported as "just finished" on the first diff.
         this.running = sessionRunningState(items);
+        this.titles = sessionTitleInfo(items);
         this.primed = true;
         this.clearError();
         return { primed: true };
       }
-      const { running, ended, dropped } = diffRunningSessions(this.running, items);
+      const { running, ended, dropped, titles } = diffRunningSessions(this.running, items);
       this.running = running;
+      this.titles = titles;
       this.clearError();
       for (const sessionId of ended) {
         try {
-          this.notifyTurnEnd(sessionId);
+ // hand the session title over with the sessionId so the
+ // push is titled with the session, not with the fixed type label.
+          this.notifyTurnEnd(sessionId, titles.get(sessionId));
         } catch (error) {
           this.log('turn watcher notify failed: ' + String(error?.message ?? error));
         }

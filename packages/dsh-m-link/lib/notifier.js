@@ -17,6 +17,40 @@ const DEDUPE_LIMIT = 512;
 export const APPROVAL_CATEGORY = 'dshm-approval';
 
 /**
+ * Session title information carried by a push (`session/list` row ->
+ * `projections.values.title` + the row's `blank` flag).
+ *
+ * User requirement: the alert **title** must be the title of the
+ * session that triggered the push (the desktop session-card title), and only the
+ * **body** describes the event. A session id alone is not enough — the title is
+ * looked up through `resolveSessionTitle`.
+ *
+ * @typedef {{title?: unknown, blank?: unknown}} SessionTitleInfo
+ */
+
+/**
+ * Pure: pick the alert title for a session.
+ *
+ * - `info` missing (no row / not polled yet) -> keep the fixed type title
+ * ("DSH 回合完成"), so an old host or a cold cache never produces an empty
+ * notification title;
+ * - a non-empty title -> that title (desktop card title);
+ * - an empty/blank title -> same wording as the App session list
+ * (`apps/ios/DSHm/Protocol/RemoteModels.swift`, `displayTitle`):
+ * "新会话" when the row is blank, "未命名会话" otherwise.
+ *
+ * @param {SessionTitleInfo|null|undefined} info
+ * @param {string} fallback fixed type title used when no title info exists
+ * @returns {string}
+ */
+export function pushTitleForSession(info, fallback) {
+  if (info === null || typeof info !== 'object') return fallback;
+  const title = typeof info.title === 'string' ? info.title.trim() : '';
+  if (title.length > 0) return title;
+  return info.blank === true ? '新会话' : '未命名会话';
+}
+
+/**
  * Session id carried by a session-follow open frame
  * (`{type:'open', streamId, endpoint, payload:{args:{request:{address}}}}').
  * Orders of preference: normal session address, subagent child address, then
@@ -46,7 +80,14 @@ export class Notifier {
  * log?: (message: string) => void,
  * now?: => number,
  * isTurnEndWatched?: (device) => boolean,
+ * resolveSessionTitle?: (sessionId: string) => Promise<SessionTitleInfo|undefined>|SessionTitleInfo|undefined,
  * }} options
+ *
+ * `resolveSessionTitle` is the session-title source: the caller
+ * (link-server) resolves the title of the session that triggered the push from
+ * its `session/list` cache, refreshing it on demand. It may be async — the
+ * alert is already queued behind `this.queue`, so resolving there never blocks
+ * the frame bridge.
  */
   constructor({
     devices,
@@ -56,7 +97,11 @@ export class Notifier {
     log = () => {},
     now = () => Date.now(),
     isTurnEndWatched = () => false,
+    resolveSessionTitle = () => undefined,
   }) {
+ /** Session-title resolver (see the constructor JSDoc above). */
+    this.resolveSessionTitle =
+      typeof resolveSessionTitle === 'function' ? resolveSessionTitle : () => undefined;
     this.devices = devices;
     this.apns = apns;
     this.audit = audit;
@@ -139,11 +184,14 @@ export class Notifier {
     if (value.type === 'waterfall' && value.event === 'approval/request') {
       if (!this.config.approval || !this.dedupe('approval|' + String(value.eventId))) return;
       const toolName = typeof value.request?.toolName === 'string' ? value.request.toolName : 'tool';
+      const sessionId = typeof value.agentId === 'string' ? value.agentId : undefined;
       this.notify(device, {
         kind: 'approval',
+ // title = the triggering session's title, body = the event.
         title: 'DSH 需要审批',
+        titleSessionId: sessionId,
         body: '工具调用 ' + toolName + ' 等待你的确认',
-        threadId: typeof value.agentId === 'string' ? value.agentId : undefined,
+        threadId: sessionId,
  // The category is what makes iOS render the 允许/拒绝 actions (M4).
         category: APPROVAL_CATEGORY,
         data: { type: 'approval', toolName, eventId: value.eventId, sessionId: value.agentId },
@@ -156,11 +204,13 @@ export class Notifier {
  // A waterfall without usable questions can only open an empty card; the
  // iOS side treats it as not answerable as well (StreamFrames P1-4).
       if (questions.length === 0) return;
+      const sessionId = typeof value.agentId === 'string' ? value.agentId : undefined;
       this.notify(device, {
         kind: 'question',
         title: 'DSH 需要你的回答',
+        titleSessionId: sessionId,
         body: questions.length === 1 ? '有 1 个问题等待你回答' : '有 ' + String(questions.length) + ' 个问题等待你回答',
-        threadId: typeof value.agentId === 'string' ? value.agentId : undefined,
+        threadId: sessionId,
         data: {
           type: 'question',
           eventId: value.eventId,
@@ -190,7 +240,9 @@ export class Notifier {
         this.notify(device, {
           kind: 'turn-end',
           title: 'DSH 回合完成',
-          body: '任务已在 Mac 上完成',
+          titleSessionId: sessionId,
+ // Title carries the session; the body only describes the event.
+          body: '回合完成',
           threadId: sessionId,
           data: { type: 'turn-end', sessionId },
         });
@@ -201,7 +253,10 @@ export class Notifier {
         this.notify(device, {
           kind: 'failure',
           title: 'DSH 回合失败',
-          body: '任务执行出错，打开 App 查看详情',
+          titleSessionId: sessionId,
+ // The protocol has no error text on turn/end (only reason.kind), so
+ // there is no cheap detail to append: report the event only.
+          body: '回合失败',
           threadId: sessionId,
           data: { type: 'failure', sessionId },
         });
@@ -217,7 +272,26 @@ export class Notifier {
     this.queue = Promise.resolve();
   }
 
-  notify(device, { kind, title, body, threadId, data, category, collapseId }) {
+ /**
+ * Resolve the alert title for one push.
+ *
+ * `title` is the fixed type title kept as the fallback; `titleSessionId` is the
+ * session the alert belongs to, resolved through `resolveSessionTitle`. The
+ * resolver may be async (link-server refreshes its `session/list` title cache
+ * on demand) — this runs inside the send queue, never on the bridge path.
+ */
+  async alertTitle(titleSessionId, fallbackTitle) {
+    if (typeof titleSessionId !== 'string' || titleSessionId.length === 0) return fallbackTitle;
+    let info;
+    try {
+      info = await this.resolveSessionTitle(titleSessionId);
+    } catch {
+      info = undefined;
+    }
+    return pushTitleForSession(info, fallbackTitle);
+  }
+
+  notify(device, { kind, title, titleSessionId, body, threadId, data, category, collapseId }) {
     const delivery = this.apns.mode === 'ready' ? 'push' : this.apns.mode;
     this.audit.record('notify.' + kind, {
       deviceId: device.deviceId,
@@ -228,11 +302,11 @@ export class Notifier {
     });
     if (device.pushToken === undefined) return;
     this.queue = this.queue
-      .then(() => this.apns.send({
+      .then(async () => this.apns.send({
         deviceToken: device.pushToken,
         environment: device.pushEnvironment,
         topic: this.apns.topic,
-        title,
+        title: await this.alertTitle(titleSessionId, title),
         body,
         threadId,
         data,
