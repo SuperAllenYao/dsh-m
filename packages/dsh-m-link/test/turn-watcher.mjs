@@ -417,6 +417,38 @@ await check('server-fans-turn-end-out-to-push-devices', async () => {
   assert.equal(LinkServer.prototype.notifyTurnEndAllDevices.call(fake, ''), 0);
 });
 
+// 真机报障（2026-10-24）：一台手机在重复配对/重装后留下多条 active 设备记录
+// （同 keyId、同 APNs token），逐设备发送导致一次 turn-end 收到 8 条通知。
+// 推送目标必须按 token 去重，同一 token 只发一次；配对/启动时清理重复记录。
+await check('push-targets-dedupe-by-token', async () => {
+  const duplicateToken = 'a'.repeat(64);
+  const fake = {
+    disposed: false,
+    devices: {
+      active: () => [
+        { deviceId: 'old', pushToken: duplicateToken, lastSeenAt: 1 },
+        { deviceId: 'new', pushToken: duplicateToken, lastSeenAt: 9 },
+        { deviceId: 'other', pushToken: 'b'.repeat(64), lastSeenAt: 2 },
+        { deviceId: 'no-token', lastSeenAt: 3 },
+      ],
+    },
+  };
+  const targets = LinkServer.prototype.pushTargets.call(fake);
+  assert.deepEqual(targets.map((device) => device.deviceId), ['new', 'other'],
+    'same push token collapses to the newest record; tokenless records are skipped');
+
+  const calls = [];
+  const fanOutFake = {
+    ...fake,
+    pushTargets: LinkServer.prototype.pushTargets,
+    notifier: { notify(device, payload) { calls.push({ device, payload }); } },
+  };
+  const sent = LinkServer.prototype.notifyTurnEndAllDevices.call(fanOutFake, 'session-y');
+  assert.equal(sent, 2, 'fan-out must send once per unique push token');
+  assert.deepEqual(calls.map((call) => call.device.deviceId), ['new', 'other']);
+  assert.equal(calls[0].payload.collapseId, 'turn-end:session-y', 'duplicate deliveries collapse on iOS');
+});
+
 await check('loopback-session-list-request-shape', async () => {
   const originalFetch = globalThis.fetch;
   const captured = [];

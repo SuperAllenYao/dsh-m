@@ -649,7 +649,10 @@ export class LinkServer {
     if (this.disposed || typeof sessionId !== 'string' || sessionId.length === 0) return 0;
     if (this.notifier === undefined || this.devices === undefined) return 0;
     let sent = 0;
-    for (const device of this.pushTargets()) {
+    const targets = typeof this.pushTargets === 'function'
+      ? this.pushTargets()
+      : this.devices.active().filter((device) => typeof device.pushToken === 'string' && device.pushToken.length > 0);
+    for (const device of targets) {
       this.notifier.notify(device, {
         kind: 'turn-end',
         collapseId: 'turn-end:' + sessionId,
@@ -668,7 +671,10 @@ export class LinkServer {
     if (this.disposed || typeof sessionId !== 'string' || sessionId.length === 0) return 0;
     if (this.notifier === undefined || this.devices === undefined) return 0;
     let sent = 0;
-    for (const device of this.pushTargets()) {
+    const targets = typeof this.pushTargets === 'function'
+      ? this.pushTargets()
+      : this.devices.active().filter((device) => typeof device.pushToken === 'string' && device.pushToken.length > 0);
+    for (const device of targets) {
       this.notifier.notify(device, {
         kind: 'failure',
         collapseId: 'turn-failure:' + sessionId,
