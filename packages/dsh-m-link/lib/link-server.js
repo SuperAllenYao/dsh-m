@@ -624,14 +624,35 @@ export class LinkServer {
  * active this is the only turn-end source (the frame path is suppressed), so
  * the push is delivered even if the phone never followed the session.
  */
+ /**
+ * Active devices that can receive a push, **deduped by APNs token**.
+ *
+ * 同一台手机在重复配对/重装后会留下多条 active 设备记录（同 keyId、同 push token），
+ * 逐设备发送会让同一条通知重复 N 次。
+ * 这里按 token 去重，只保留 lastSeenAt 最新的一条；同一 token 只发一次。
+ */
+  pushTargets() {
+    if (this.devices === undefined) return [];
+    const byToken = new Map();
+    for (const device of this.devices.active()) {
+      const token = device.pushToken;
+      if (typeof token !== 'string' || token.length === 0) continue;
+      const previous = byToken.get(token);
+      if (previous === undefined || (device.lastSeenAt ?? 0) > (previous.lastSeenAt ?? 0)) {
+        byToken.set(token, device);
+      }
+    }
+    return [...byToken.values()];
+  }
+
   notifyTurnEndAllDevices(sessionId) {
     if (this.disposed || typeof sessionId !== 'string' || sessionId.length === 0) return 0;
     if (this.notifier === undefined || this.devices === undefined) return 0;
     let sent = 0;
-    for (const device of this.devices.active()) {
-      if (typeof device.pushToken !== 'string' || device.pushToken.length === 0) continue;
+    for (const device of this.pushTargets()) {
       this.notifier.notify(device, {
         kind: 'turn-end',
+        collapseId: 'turn-end:' + sessionId,
         title: 'DSH 回合完成',
         body: '任务已在 Mac 上完成',
         threadId: sessionId,
@@ -647,10 +668,10 @@ export class LinkServer {
     if (this.disposed || typeof sessionId !== 'string' || sessionId.length === 0) return 0;
     if (this.notifier === undefined || this.devices === undefined) return 0;
     let sent = 0;
-    for (const device of this.devices.active()) {
-      if (typeof device.pushToken !== 'string' || device.pushToken.length === 0) continue;
+    for (const device of this.pushTargets()) {
       this.notifier.notify(device, {
         kind: 'failure',
+        collapseId: 'turn-failure:' + sessionId,
         title: 'DSH 回合失败',
         body: '任务执行出错，打开 App 查看详情',
         threadId: sessionId,
@@ -659,6 +680,60 @@ export class LinkServer {
       sent += 1;
     }
     return sent;
+  }
+
+ /**
+ * Revoke older active device records that represent the same physical phone as
+ * `keepDevice` (same device public-key fingerprint or same APNs push token).
+ * Used by pairing and by startup migration; returns the number revoked.
+ */
+  revokeDuplicateDevices(keepDevice) {
+    if (keepDevice === undefined || this.devices === undefined) return 0;
+    const keepKeyId = typeof keepDevice.keyId === 'string' && keepDevice.keyId.length > 0 ? keepDevice.keyId : undefined;
+    const keepToken = typeof keepDevice.pushToken === 'string' && keepDevice.pushToken.length > 0 ? keepDevice.pushToken : undefined;
+    let revoked = 0;
+    for (const other of this.devices.active()) {
+      if (other.deviceId === keepDevice.deviceId) continue;
+      const sameKey = keepKeyId !== undefined && other.keyId === keepKeyId;
+      const sameToken = keepToken !== undefined && other.pushToken === keepToken;
+      if (!sameKey && !sameToken) continue;
+      this.devices.revoke(other.deviceId, 'duplicate-pairing');
+      this.audit.record('device.deduped', {
+        deviceId: other.deviceId,
+        keptDeviceId: keepDevice.deviceId,
+        reason: sameToken ? 'push-token' : 'keyId',
+      });
+      revoked += 1;
+    }
+    return revoked;
+  }
+
+ /**
+ * Startup migration: collapse pre-existing duplicate active device records
+ * (left behind by older plugin versions that never deduped pairing) so turn-end
+ * pushes fan out once per physical phone instead of once per stale record.
+ */
+  dedupeActiveDevicesAtStartup() {
+    if (this.devices === undefined) return 0;
+    let revoked = 0;
+    const seenKeys = new Map();
+    const seenTokens = new Map();
+    const active = [...this.devices.active()].sort((a, b) => (b.lastSeenAt ?? 0) - (a.lastSeenAt ?? 0));
+    for (const device of active) {
+      if (device.revokedAt !== undefined) continue;
+      const keyId = typeof device.keyId === 'string' && device.keyId.length > 0 ? device.keyId : undefined;
+      const token = typeof device.pushToken === 'string' && device.pushToken.length > 0 ? device.pushToken : undefined;
+      if ((keyId !== undefined && seenKeys.has(keyId)) || (token !== undefined && seenTokens.has(token))) {
+        this.devices.revoke(device.deviceId, 'startup-duplicate');
+ // audit 可能还没初始化（构造函数早期），这里做可选调用。
+        this.audit?.record?.('device.deduped', { deviceId: device.deviceId, reason: 'startup' });
+        revoked += 1;
+        continue;
+      }
+      if (keyId !== undefined) seenKeys.set(keyId, device.deviceId);
+      if (token !== undefined) seenTokens.set(token, device.deviceId);
+    }
+    return revoked;
   }
 
  /**
@@ -841,6 +916,12 @@ export class LinkServer {
     this.frameAudit = this.createFrameAudit();
     this.hostIdentity = ensureHostIdentity({ dir: this.dataDir, log });
     this.devices = new DeviceStore({ dir: this.dataDir, hostId: this.hostIdentity.hostId, log }).load();
+    try {
+      const dedupedAtStartup = this.dedupeActiveDevicesAtStartup();
+      if (dedupedAtStartup > 0) log('deduped ' + dedupedAtStartup + ' stale duplicate device record(s) at startup');
+    } catch (error) {
+      log('device startup dedupe failed: ' + String(error?.message ?? error));
+    }
     this.qr = new QrRenderer({ log });
     this.apns = new ApnsProvider({ config: this.config.apns, log }).init();
     this.notifier = new Notifier({
@@ -1798,7 +1879,11 @@ export class LinkServer {
       return { status: 502, body: { ok: false, error: 'upstream-connect-failed', message: String(error?.message ?? error) } };
     }
     this.counters.redeemed += 1;
-    this.audit.record('pair.redeemed', { deviceId: device.deviceId, keyId: device.keyId, name: device.name, platform: device.platform, ip });
+ // 同一把设备公钥/同一 push token 的旧记录会在重装/重新配对时残留为多条 active 设备；
+ // 推送是按设备逐条发送的，重复记录会让同一条通知弹 N 次。
+ // 配对成功即撤销旧重复记录，只保留本次这条。
+    const deduped = this.revokeDuplicateDevices(device);
+    this.audit.record('pair.redeemed', { deviceId: device.deviceId, keyId: device.keyId, name: device.name, platform: device.platform, ip, deduped });
     log('pair/redeem ok: device ' + device.deviceId + ' (' + device.name + ', key ' + String(device.keyId).slice(0, 12) + '…)');
     if (this.config.debug.reissuePairToken) {
       this.pairing.refresh('debug-reissue');
@@ -3195,7 +3280,7 @@ export class LinkServer {
         reason: result.reason ?? result.error ?? undefined,
       };
     }
-    const devices = this.devices.active().filter((device) => device.pushToken !== undefined);
+    const devices = this.pushTargets();
     const results = [];
     for (const device of devices) {
       const result = await this.apns.send({
