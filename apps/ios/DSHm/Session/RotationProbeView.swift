@@ -1,3 +1,5 @@
+#if DEBUG
+
 import SwiftUI
 
 /// inverted list 几何语义取证（r7-inverted 前置实验)。
@@ -109,3 +111,5 @@ private struct MountProbeView: View {
         }
     }
 }
+
+#endif
