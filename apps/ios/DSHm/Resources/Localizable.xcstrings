@@ -7072,6 +7072,40 @@
           }
         }
       }
+    },
+    "下滑收起": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "下滑收起"
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Swipe down to close"
+          }
+        }
+      }
+    },
+    "已截断：仅显示前 %lld 行，另有 %lld 行未渲染": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "已截断：仅显示前 %lld 行，另有 %lld 行未渲染"
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Truncated: showing only the first %lld lines; %lld more hidden"
+          }
+        }
+      }
     }
   },
   "version": "1.0"

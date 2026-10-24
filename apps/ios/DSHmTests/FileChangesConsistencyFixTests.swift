@@ -204,7 +204,6 @@ final class FileChangesConsistencyFixTests: XCTestCase {
         XCTAssertEqual(changes.deleted, 45)
         XCTAssertEqual(changes.source, .exactFetch)
         XCTAssertEqual(changes.seq, 9)
-        XCTAssertFalse(changes.isLoading)
     }
 
     func testTitleFallsBackToFileCountWhenHostOmitsTotal() throws {
@@ -235,7 +234,6 @@ final class FileChangesConsistencyFixTests: XCTestCase {
         XCTAssertEqual(changes.files.count, 18, "sheet list length stays 18 (files.length)")
         XCTAssertEqual(changes.added, 123)
         XCTAssertEqual(changes.deleted, 45)
-        XCTAssertFalse(changes.isLoading, "an injected summary must not render the loading card")
         XCTAssertFalse(viewModel.fileChangesExactFetchPending)
     }
 
@@ -244,5 +242,279 @@ final class FileChangesConsistencyFixTests: XCTestCase {
         let viewModel = SessionViewModel(sessionId: "session-e2e-changes")
         viewModel.installE2EChangesSummaryPreview(json: "{not-json")
         XCTAssertNil(viewModel.latestTurnFileChanges, "malformed seam JSON must be ignored, not crash the card")
+    }
+
+    // MARK: - 2026-10-24 #1/#2 回归：仅空闲显示 + 零转圈取数 + 尾部刷新
+
+    private func decodeSummary(_ json: String) throws -> ChangesSummaryValue {
+        try JSONDecoder().decode(ChangesSummaryValue.self, from: Data(json.utf8))
+    }
+
+    private func eventJSON(_ type: String, seq: Int, data: String) -> String {
+        "{\"type\":\"\(type)\",\"seq\":\(seq),\"time\":1792510000000,\"data\":\(data)}"
+    }
+
+    private func eventFrame(_ event: String) -> JSONValue {
+        TestJSON.value("{\"type\":\"event\",\"event\":\(event)}")
+    }
+
+    private func snapshotValue(sessionId: String, cursor: Int, eventJSONs: [String]) -> JSONValue {
+        let records = eventJSONs.map { "{\"type\":\"event\",\"event\":\($0)}" }.joined(separator: ",")
+        let json = """
+        {"type":"snapshot","header":{"version":4,"id":"\(sessionId)"},"cursor":\(cursor),
+         "records":[\(records)],"hasMore":false,
+         "projections":{"asOfSeq":\(cursor),"values":{}},
+         "assistantStream":{"revision":0}}
+        """
+        return TestJSON.value(json)
+    }
+
+    /// 一轮已结束、带工具 meta.diffs 的会话（latestFileChangeSeq=4）。
+    private func endedTurnEvents() -> [String] {
+        [
+            eventJSON("turn/start", seq: 1, data: #"{"turn":1}"#),
+            eventJSON("tool/call", seq: 2, data: #"{"callId":"call_edit","name":"edit","arguments":"{}","turn":1,"step":1}"#),
+            eventJSON(
+                "tool/result",
+                seq: 3,
+                data: #"{"name":"edit","toolCallId":"call_edit","meta":{"diffs":[{"path":"src/App.swift","oldText":"a","newText":"a\nb"}]}}"#
+            ),
+            eventJSON("workspace/changes", seq: 4, data: #"{"turn":1}"#),
+            eventJSON("turn/end", seq: 5, data: #"{"turn":1}"#),
+        ]
+    }
+
+    /// SessionViewModel 的行重建有 40ms 防抖，断言派生状态前等一拍。
+    @MainActor
+    private func waitForRowsRebuild() async {
+        try? await Task.sleep(nanoseconds: 200_000_000)
+    }
+
+    /// #1 可见性纯函数：running 期间 items 里完全不出现文件变更卡行。
+    func testMessageItemsHideFileChangesCardWhileRunning() {
+        let changes = TurnFileChanges(source: .exactFetch, files: [], added: 12, deleted: 3, seq: 4, total: 7)
+        let make = { (running: Bool) in
+            SessionMessageItemsBuilder.build(
+                groups: [],
+                isRunning: running,
+                fileChanges: changes,
+                processPreviewSteps: nil,
+                liveAssistantText: "streaming",
+                streamErrorText: nil,
+                actionErrorText: nil
+            )
+        }
+        let idle = make(false)
+        XCTAssertEqual(idle.filter { if case .fileChanges = $0 { return true } else { return false } }.count, 1)
+        let running = make(true)
+        XCTAssertTrue(running.allSatisfy { if case .fileChanges = $0 { return false } else { return true } },
+                      "#1 running 期间文件变更卡完全不渲染")
+        XCTAssertEqual(running.count, 1, "只有流式文本行，没有卡片占位")
+    }
+
+    /// #2 数据源纯函数：内存 exact → 磁盘缓存 exact → 工具聚合；永不 loading。
+    @MainActor
+    func testResolveLatestTurnFileChangesPrecedenceAndNeverLoading() throws {
+        let memory = try decodeSummary(#"{"files":[{"path":"mem.swift"}],"total":7,"added":12,"deleted":3}"#)
+        let cached = try decodeSummary(#"{"files":[{"path":"cache.swift"}],"total":9,"added":4,"deleted":1}"#)
+        let fallback = FileChangeSummary(files: ["src/App.swift"], additions: 2, deletions: 1)
+
+        let memoryHit = try XCTUnwrap(SessionViewModel.resolveLatestTurnFileChanges(
+            seq: 4, memorySummary: memory, cachedSummary: cached, fallback: fallback
+        ))
+        XCTAssertEqual(memoryHit.source, .exactFetch)
+        XCTAssertEqual(memoryHit.titleFileCount, 7, "内存 exact 优先于磁盘缓存")
+
+        let cacheHit = try XCTUnwrap(SessionViewModel.resolveLatestTurnFileChanges(
+            seq: 4, memorySummary: nil, cachedSummary: cached, fallback: fallback
+        ))
+        XCTAssertEqual(cacheHit.source, .exactFetch, "Host 404 后磁盘缓存仍提供精确数字")
+        XCTAssertEqual(cacheHit.titleFileCount, 9)
+
+        let aggregate = try XCTUnwrap(SessionViewModel.resolveLatestTurnFileChanges(
+            seq: 4, memorySummary: nil, cachedSummary: nil, fallback: fallback
+        ))
+        XCTAssertEqual(aggregate.source, .metaDiffsFallback, "精确数据未就绪先显示工具聚合数字")
+        XCTAssertEqual(aggregate.titleFileCount, 1)
+        XCTAssertEqual(aggregate.added, 2)
+        XCTAssertEqual(aggregate.deleted, 1)
+
+        XCTAssertNil(SessionViewModel.resolveLatestTurnFileChanges(
+            seq: 4, memorySummary: nil, cachedSummary: nil, fallback: nil
+        ), "没有任何数据时返回 nil，而不是渲染空的 loading 卡片")
+    }
+
+    /// #1 取数时机：running 期间卡片不提供数据、也不发请求；turn/end 后才请求 latest seq。
+    @MainActor
+    func testCardHiddenWhileRunningAndRequestOnlyAfterTurnEnd() async throws {
+        let sessionId = "session-card-running-\(UUID().uuidString)"
+        let viewModel = SessionViewModel(sessionId: sessionId)
+        viewModel.applyStreamValue(snapshotValue(sessionId: sessionId, cursor: 2, eventJSONs: [
+            eventJSON("turn/start", seq: 1, data: #"{"turn":1}"#),
+            eventJSON("workspace/changes", seq: 2, data: #"{"turn":1}"#),
+        ]))
+        await waitForRowsRebuild()
+
+        XCTAssertTrue(viewModel.isRunning)
+        XCTAssertNil(viewModel.latestTurnFileChanges, "#1 running 期间不提供卡片数据")
+        XCTAssertTrue(viewModel.requestedFileChangeSeqs.isEmpty, "#1 running 期间绝不发 exact 请求")
+
+        viewModel.applyStreamValue(eventFrame(eventJSON("turn/end", seq: 3, data: #"{"turn":1}"#)))
+        await waitForRowsRebuild()
+
+        XCTAssertFalse(viewModel.isRunning)
+        XCTAssertEqual(viewModel.requestedFileChangeSeqs, [2], "turn 结束才请求，且只请求 latest seq")
+    }
+
+    /// #2 无缓存时显示工具聚合数字；磁盘缓存命中时显示精确数字（Host 重启 404 后仍精确）。
+    @MainActor
+    func testLatestTurnFileChangesFallsBackToAggregateThenUsesDiskCachedExact() async throws {
+        let fallbackSessionId = "session-fallback-\(UUID().uuidString)"
+        let fallbackVM = SessionViewModel(sessionId: fallbackSessionId)
+        fallbackVM.applyStreamValue(snapshotValue(
+            sessionId: fallbackSessionId,
+            cursor: 5,
+            eventJSONs: endedTurnEvents()
+        ))
+        await waitForRowsRebuild()
+
+        let fallback = try XCTUnwrap(fallbackVM.latestTurnFileChanges)
+        XCTAssertEqual(fallback.source, .metaDiffsFallback)
+        XCTAssertEqual(fallback.seq, 4)
+        XCTAssertEqual(fallback.titleFileCount, 1)
+        XCTAssertEqual(fallback.added, 1, "a -> a\nb 是 1 行新增")
+
+        let suiteName = "FileChangesConsistencyFixTests.vm.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let cachedSessionId = "session-cached-\(UUID().uuidString)"
+        var cache = FileChangesSummaryCache(defaults: defaults)
+        let summary = try decodeSummary(#"{"turn":1,"files":[{"path":"src/App.swift","display":"App.swift","added":5,"deleted":2}],"total":7,"added":12,"deleted":3}"#)
+        cache.save(summary, sessionId: cachedSessionId, seq: 4)
+
+        let cachedVM = SessionViewModel(sessionId: cachedSessionId)
+        cachedVM.fileChangesSummaryCache = cache
+        cachedVM.applyStreamValue(snapshotValue(
+            sessionId: cachedSessionId,
+            cursor: 5,
+            eventJSONs: endedTurnEvents()
+        ))
+        await waitForRowsRebuild()
+
+        let cached = try XCTUnwrap(cachedVM.latestTurnFileChanges)
+        XCTAssertEqual(cached.source, .exactFetch, "缓存命中必须显示精确数字")
+        XCTAssertEqual(cached.titleFileCount, 7, "标题仍用 Host total，不是 files.count")
+        XCTAssertEqual(cached.added, 12)
+        XCTAssertEqual(cached.deleted, 3)
+        XCTAssertEqual(cached.seq, 4)
+    }
+
+    /// #2 磁盘缓存：sessionId+seq 往返、覆盖写与容量淘汰。
+    func testExactSummaryDiskCacheRoundTripAndCapacity() throws {
+        let suiteName = "FileChangesConsistencyFixTests.cache.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        var cache = FileChangesSummaryCache(defaults: defaults)
+        cache.maxEntries = 2
+
+        let a = try decodeSummary(#"{"files":[{"path":"a.swift"}],"total":5,"added":1,"deleted":0}"#)
+        let b = try decodeSummary(#"{"files":[{"path":"b.swift","display":"B.swift","added":2,"deleted":1}],"total":6,"added":2,"deleted":1}"#)
+        let c = try decodeSummary(#"{"files":[{"path":"c.swift"}],"total":7}"#)
+        cache.save(a, sessionId: "s1", seq: 10)
+        cache.save(b, sessionId: "s1", seq: 11)
+        cache.save(c, sessionId: "s2", seq: 12)
+
+        let s1 = cache.load(sessionId: "s1")
+        XCTAssertEqual(Set(s1.keys), [11], "超出容量时淘汰最旧条目")
+        XCTAssertEqual(s1[11]?.total, 6)
+        XCTAssertEqual(s1[11]?.files.first?.display, "B.swift", "files/display/added/deleted 全字段往返")
+        XCTAssertEqual(cache.load(sessionId: "s2")[12]?.total, 7)
+
+        cache.save(a, sessionId: "s1", seq: 11)
+        XCTAssertEqual(cache.load(sessionId: "s1")[11]?.total, 5, "同 sessionId+seq 覆盖写")
+    }
+
+    /// 尾部冻结修复：读历史（不贴底）时，尾部行内容变化必须原地应用，且不移动行序。
+    func testTrailingUpdatesApplyExactNumbersWhileReadingHistory() {
+        let group = FlowRowGroup.single(FlowRow(id: "row-1", seq: 1, content: .text("hello")))
+        let fallback = TurnFileChanges(source: .metaDiffsFallback, files: [], added: 0, deleted: 0, seq: 4)
+        let exact = TurnFileChanges(source: .exactFetch, files: [], added: 12, deleted: 3, seq: 4, total: 7)
+        let displayed: [SessionMessageItem] = [.group(group), .fileChanges(fallback)]
+        let incoming: [SessionMessageItem] = [.group(group), .fileChanges(exact)]
+
+        let update = MessageListUpdatePolicy.applyingTrailingUpdates(
+            displayed: displayed, incoming: incoming, running: false
+        )
+        XCTAssertTrue(update.changed, "尾部内容变化必须被应用，否则数字永远停在旧值")
+        XCTAssertEqual(update.items.count, 2, "行数与顺序不变 → 阅读锚点不动")
+        guard case .fileChanges(let applied)? = update.items.last else {
+            return XCTFail("尾部仍是文件变更行")
+        }
+        XCTAssertEqual(applied.source, .exactFetch)
+        XCTAssertEqual(applied.titleFileCount, 7)
+        XCTAssertEqual(applied.added, 12)
+
+        let unchanged = MessageListUpdatePolicy.applyingTrailingUpdates(
+            displayed: update.items, incoming: incoming, running: false
+        )
+        XCTAssertFalse(unchanged.changed, "内容没变时不做多余的状态更新")
+    }
+
+    /// 历史补齐与 exact 到达同帧：前置补齐照旧，尾部数字同帧更新。
+    func testTrailingUpdatesApplyWhenHistoryPrependAndExactArriveTogether() {
+        let older = FlowRowGroup.single(FlowRow(id: "row-0", seq: 0, content: .text("older")))
+        let group = FlowRowGroup.single(FlowRow(id: "row-1", seq: 1, content: .text("hello")))
+        let fallback = TurnFileChanges(source: .metaDiffsFallback, files: [], added: 0, deleted: 0, seq: 4)
+        let exact = TurnFileChanges(source: .exactFetch, files: [], added: 2, deleted: 1, seq: 4, total: 3)
+        let displayed: [SessionMessageItem] = [.group(group), .fileChanges(fallback)]
+        let incoming: [SessionMessageItem] = [.group(older), .group(group), .fileChanges(exact)]
+
+        let prepended = MessageListUpdatePolicy.leadingPrependedItems(displayed: displayed, incoming: incoming)
+        XCTAssertEqual(prepended.map { $0.id }, [older.id])
+        let update = MessageListUpdatePolicy.applyingTrailingUpdates(
+            displayed: displayed, incoming: incoming, running: false
+        )
+        XCTAssertTrue(update.changed)
+        let combined = prepended + update.items
+        XCTAssertEqual(combined.map { $0.id }, incoming.map { $0.id }, "补齐 + 尾部更新后与 incoming 行序一致")
+        guard case .fileChanges(let applied)? = combined.last else { return XCTFail("尾部必须是文件变更行") }
+        XCTAssertEqual(applied.source, .exactFetch)
+    }
+
+    /// #1 读历史时再次进入 running：已显示的卡片行必须被摘掉（只动尾部，锚点不动）。
+    func testTrailingUpdatesDropCardWhileRunningEvenReadingHistory() {
+        let group = FlowRowGroup.single(FlowRow(id: "row-1", seq: 1, content: .text("hello")))
+        let fallback = TurnFileChanges(source: .metaDiffsFallback, files: [], added: 0, deleted: 0, seq: 4)
+        let displayed: [SessionMessageItem] = [.group(group), .fileChanges(fallback)]
+        let incoming: [SessionMessageItem] = [.group(group)]
+
+        let update = MessageListUpdatePolicy.applyingTrailingUpdates(
+            displayed: displayed, incoming: incoming, running: true
+        )
+        XCTAssertTrue(update.changed)
+        XCTAssertEqual(update.items.map { $0.id }, [group.id], "running 期间卡片行必须消失，其余行保持不动")
+    }
+
+    /// E2E diff seam：按 index 返回注入的 ChangesDiffValue，越界返回 nil。
+    @MainActor
+    func testE2EChangesDiffSeamReturnsInjectedHunksByIndex() async throws {
+        let viewModel = SessionViewModel(sessionId: "session-e2e-diff")
+        viewModel.installE2EChangesDiffPreview(json: #"""
+        [
+          {"kind":"update","path":"src/App.swift","display":"App.swift","hunks":[{"oldStart":1,"oldLines":1,"newStart":1,"newLines":2,"lines":["@@ -1,1 +1,2 @@"," a","+b"]}],"coarse":false},
+          {"kind":"update","path":"docs/README.md","display":"README.md","hunks":[],"coarse":true}
+        ]
+        """#)
+
+        let firstDiff = await viewModel.loadFileDiff(seq: 1, index: 0)
+        let first = try XCTUnwrap(firstDiff)
+        XCTAssertEqual(first.path, "src/App.swift")
+        XCTAssertEqual(first.hunks?.first?.lines.count, 3)
+        let secondDiff = await viewModel.loadFileDiff(seq: 1, index: 1)
+        let second = try XCTUnwrap(secondDiff)
+        XCTAssertEqual(second.path, "docs/README.md")
+        XCTAssertEqual(second.coarse, true)
+        let outOfRange = await viewModel.loadFileDiff(seq: 1, index: 5)
+        XCTAssertNil(outOfRange, "数组形态越界返回 nil，与 Host「index 不存在」一致")
     }
 }

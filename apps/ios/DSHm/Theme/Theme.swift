@@ -49,6 +49,54 @@ enum Theme {
         static let success = Color(hex: 0x22D3EE)
     }
 
+    // MARK: - GitHub diff palette (task-2: unified diff rendering)
+
+    /// GitHub Primer **dark** diff palette, used only by the file-change detail
+    /// sheet's unified diff. Source: GitHub Primer primitives as shipped by the
+    /// GitHub dark theme (color-canvas-default / color-canvas-subtle /
+    /// color-border-default / fgColor-default / fgColor-muted and the
+    /// color-diff-blob-* diff tokens):
+    ///
+    ///   canvas #0d1117 · surface + hunk #161b22 · border #30363d
+    ///   text #e6edf3 · muted #8b949e
+    ///   added line rgba(46,160,67,.15) · added gutter rgba(46,160,67,.35) · + #3fb950
+    ///   removed line rgba(248,81,73,.10) · removed gutter rgba(248,81,73,.20) · - #f85149
+    ///
+    /// Rows are 22pt tall with 11-12pt mono (see Typography.diffLine).
+    enum Diff {
+        /// canvas-default
+        static let canvas = Color(hex: 0x0D1117)
+        /// canvas-subtle: file header + hunk header
+        static let surface = Color(hex: 0x161B22)
+        /// border-default
+        static let border = Color(hex: 0x30363D)
+        /// fgColor-default (diff code)
+        static let text = Color(hex: 0xE6EDF3)
+        /// fgColor-muted (line numbers, hunk header text)
+        static let muted = Color(hex: 0x8B949E)
+        /// diff-blob-addition-line-bg — rgba(46,160,67,.15)
+        static let addedLine = Color(hex: 0x2EA043).opacity(0.15)
+        /// diff-blob-addition-num-bg — rgba(46,160,67,.35)
+        static let addedGutter = Color(hex: 0x2EA043).opacity(0.35)
+        /// fgColor-success (the "+" marker / +N counter)
+        static let addMark = Color(hex: 0x3FB950)
+        /// diff-blob-deletion-line-bg — rgba(248,81,73,.10)
+        static let removedLine = Color(hex: 0xF85149).opacity(0.10)
+        /// diff-blob-deletion-num-bg — rgba(248,81,73,.20)
+        static let removedGutter = Color(hex: 0xF85149).opacity(0.20)
+        /// fgColor-danger (the "-" marker / -N counter)
+        static let delMark = Color(hex: 0xF85149)
+        /// Hunk header strip (-a,b +c,d).
+        static let hunkHeader = Color(hex: 0x161B22)
+        static let hunkHeaderText = Color(hex: 0x8B949E)
+        /// Row metrics: GitHub mobile diffs use 22pt rows.
+        static let lineHeight: CGFloat = 22
+        /// Width of one line-number gutter (up to 4 digits at 11pt mono).
+        static let gutterWidth: CGFloat = 38
+        /// Width of the "+" / "-" marker column.
+        static let markerWidth: CGFloat = 14
+    }
+
     // MARK: - Radius tokens
 
     enum Radius {
@@ -101,6 +149,9 @@ enum Theme {
         /// Mono is used for commands / code / diffs only.
         static let mono = Font.system(size: 12, weight: .regular, design: .monospaced)
         static let monoSmall = Font.system(size: 11, weight: .regular, design: .monospaced)
+        /// GitHub-style unified diff: 11.5pt mono on a 22pt line (Theme.Diff.lineHeight).
+        static let diffLine = Font.system(size: 11.5, weight: .regular, design: .monospaced)
+        static let diffGutter = Font.system(size: 11, weight: .regular, design: .monospaced)
         static let button = Font.system(size: 15, weight: .semibold)
     }
 

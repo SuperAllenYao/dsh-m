@@ -1,6 +1,42 @@
 import Combine
 import SwiftUI
 
+/// 消息流 item 构建的纯函数（#1：主会话 running 期间不产生「本轮文件变更」行）。
+/// 抽成纯函数让「卡片可见性」可直接单测，不需要起 SwiftUI 视图。
+enum SessionMessageItemsBuilder {
+    static func build(
+        groups: [FlowRowGroup],
+        isRunning: Bool,
+        fileChanges: TurnFileChanges?,
+        processPreviewSteps: [ProcessStep]?,
+        liveAssistantText: String,
+        streamErrorText: String?,
+        actionErrorText: String?
+    ) -> [SessionMessageItem] {
+        var items: [SessionMessageItem] = []
+        items.reserveCapacity(groups.count + 4)
+        for group in groups { items.append(.group(group)) }
+        if let processPreviewSteps {
+            items.append(.group(.process(processPreviewSteps)))
+        }
+        // #1 用户拍板（2026-10-24）：卡片只在主会话不执行任务时存在；
+        // running 期间完全不渲染（不占位、不转圈）。
+        if !isRunning, let fileChanges {
+            items.append(.fileChanges(fileChanges))
+        }
+        if !liveAssistantText.isEmpty {
+            items.append(.liveText(liveAssistantText))
+        }
+        if let streamErrorText {
+            items.append(.streamError(streamErrorText))
+        }
+        if let actionErrorText {
+            items.append(.actionError(actionErrorText))
+        }
+        return items
+    }
+}
+
 /// Session detail (v5 03/04): turn-grouped message flow + status strip + composer,
 /// with approval / permission sheets driven by $events and projections.
 struct SessionDetailView: View {
@@ -83,6 +119,8 @@ struct SessionDetailView: View {
             // DEBUG-only; product launches never set these env vars.
             if app.isE2EMode {
                 viewModel.installE2EChangesSummaryPreviewIfRequested()
+                // 文件对比 E2E：sheet → 行 → diff 页可显示注入的 hunk（DSHM_E2E_CHANGES_DIFF）。
+                viewModel.installE2EChangesDiffPreviewIfRequested()
             }
             if let percent = e2eContextPreviewPercent {
                 viewModel.installE2EContextPreview(percent: percent)
@@ -632,7 +670,7 @@ struct SessionDetailView: View {
         if let cwd = app.link.credentials?.originURL?.host {
             parts.append(cwd)
         }
-        if viewModel.isRunning {
+        if isRunningForMessageItems {
             parts.append(L10n.t("运行中"))
         } else if !viewModel.rows.isEmpty {
             parts.append(L10n.t("空闲"))
@@ -725,28 +763,23 @@ struct SessionDetailView: View {
     }
 
     private func buildMessageItems() -> [SessionMessageItem] {
-        var items: [SessionMessageItem] = []
-        let groups = viewModel.flowGroups
-        items.reserveCapacity(groups.count + 4)
-        for group in groups { items.append(.group(group)) }
-        if e2eProcessRunningPreview {
+        SessionMessageItemsBuilder.build(
+            groups: viewModel.flowGroups,
+            isRunning: isRunningForMessageItems,
+            fileChanges: viewModel.latestTurnFileChanges,
             // E2E 证据钩子：真实会话里不一定有正在跑的 turn，这里注入一组合成「运行中」步骤，
             // 用于稳定复现/断言「固定窗口 ⇄ 全高」两态（仅 DEBUG + DSHM_E2E=1）。
-            items.append(.group(.process(e2eProcessPreviewSteps)))
-        }
-        if let fileChanges = viewModel.latestTurnFileChanges {
-            items.append(.fileChanges(fileChanges))
-        }
-        if !viewModel.liveAssistantText.isEmpty {
-            items.append(.liveText(viewModel.liveAssistantText))
-        }
-        if let errorText = viewModel.streamErrorText {
-            items.append(.streamError(errorText))
-        }
-        if let actionError = viewModel.actionErrorText {
-            items.append(.actionError(actionError))
-        }
-        return items
+            processPreviewSteps: e2eProcessRunningPreview ? e2eProcessPreviewSteps : nil,
+            liveAssistantText: viewModel.liveAssistantText,
+            streamErrorText: viewModel.streamErrorText,
+            actionErrorText: viewModel.actionErrorText
+        )
+    }
+
+    /// 卡片/列表统一的 running 判定：#1 生产态就是「本轮真的在跑」；DEBUG E2E 下还可被
+    /// `DSHM_E2E_FORCE_RUNNING=1` 强制视作 running（卡片不渲染、列表按运行态渲染）。
+    private var isRunningForMessageItems: Bool {
+        viewModel.isRunning || e2eProcessRunningPreview || e2eForceRunningPreview
     }
 
     private var messageList: some View {
@@ -772,7 +805,7 @@ struct SessionDetailView: View {
                     attachments: attachments,
                     pendingApprovalCallIds: Set(app.link.pendingApprovals.compactMap(\.callId)),
                     subagentLabels: viewModel.subagentLabels,
-                    isRunning: viewModel.isRunning || e2eProcessRunningPreview,
+                    isRunning: isRunningForMessageItems,
                     historyBatchToken: viewModel.historyBatchToken,
                     scrollToBottomToken: scrollToBottomToken,
                     processGroupModes: processGroupModes,
@@ -839,6 +872,18 @@ struct SessionDetailView: View {
         #if DEBUG
         guard app.isE2EMode else { return false }
         return ProcessInfo.processInfo.environment["DSHM_E2E_PROCGROUP"] == "running"
+        #else
+        return false
+        #endif
+    }
+
+    /// #1 E2E 钩子：`DSHM_E2E=1` + `DSHM_E2E_FORCE_RUNNING=1` 把主会话视作 running，
+    /// 用于断言「running 期间文件变更卡完全不渲染」。只影响视图判定，不改 VM 状态，
+    /// 也不影响任何真实 turn（Release 不编译）。
+    private var e2eForceRunningPreview: Bool {
+        #if DEBUG
+        guard app.isE2EMode else { return false }
+        return ProcessInfo.processInfo.environment["DSHM_E2E_FORCE_RUNNING"] == "1"
         #else
         return false
         #endif
