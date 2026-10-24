@@ -36,6 +36,7 @@ struct UserQuestionCardView: View {
     @State private var model: UserQuestionPagerModel
  /// question.id set whose long detail is expanded.
     @State private var expandedDetails: Set<String> = []
+    @Environment(\.userToggleReporter) private var userToggleReporter
  /// True after a submit attempt bounced back because a question was left blank.
     @State private var showsIncompleteNotice = false
  /// Measured natural height of the current page's stem (question + detail). The
@@ -243,6 +244,7 @@ struct UserQuestionCardView: View {
                 .lineLimit(isLong && !isExpanded ? 4 : nil)
             if isLong {
                 Button(isExpanded ? L10n.t("收起") : L10n.t("展开")) {
+                    userToggleReporter?()
                     withAnimation(Theme.Motion.quick) {
                         if isExpanded {
                             expandedDetails.remove(question.id)

@@ -1,5 +1,20 @@
 import SwiftUI
 
+/// 用户主动展开/收起（cell 内 SwiftUI 状态）的信号。
+///
+/// 只有「用户点击」触发的行高变化才需要「入口行固定」的锚点动画；布局期/流式内容/
+/// 首次渲染的高度变化不走这条路径。
+struct UserToggleReporterKey: EnvironmentKey {
+    static let defaultValue: (() -> Void)? = nil
+}
+
+extension EnvironmentValues {
+    var userToggleReporter: (() -> Void)? {
+        get { self[UserToggleReporterKey.self] }
+        set { self[UserToggleReporterKey.self] = newValue }
+    }
+}
+
 /// Dispatches one FlowRow to its renderer. Every row maps to a DSH event/field;
 /// see §2/§3 and session-field-inventory §2.
 struct FlowRowView: View {
@@ -105,6 +120,7 @@ struct RelayCardView: View {
  /// `subagentCatalog` label for the sender child session (falls back to id prefix).
     var agentLabel: String? = nil
     @State private var isExpanded = false
+    @Environment(\.userToggleReporter) private var userToggleReporter
 
     private var senderLabel: String {
         if let agentLabel, !agentLabel.isEmpty { return agentLabel }
@@ -115,6 +131,7 @@ struct RelayCardView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: Theme.Spacing.xs) {
             Button {
+                userToggleReporter?()
                 withAnimation(Theme.Motion.standard) { isExpanded.toggle() }
             } label: {
                 HStack(spacing: 6) {
@@ -203,10 +220,12 @@ struct NoticeCardView: View {
 struct ReasoningRowView: View {
     var text: String
     @State private var expanded = false
+    @Environment(\.userToggleReporter) private var userToggleReporter
 
     var body: some View {
         VStack(alignment: .leading, spacing: Theme.Spacing.xs) {
             Button {
+                userToggleReporter?()
                 withAnimation(Theme.Motion.quick) { expanded.toggle() }
             } label: {
                 HStack(spacing: Theme.Spacing.xs) {
