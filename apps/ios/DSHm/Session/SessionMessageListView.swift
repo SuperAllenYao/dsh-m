@@ -206,6 +206,11 @@ struct SessionMessageListView: UIViewRepresentable {
                     guard let self else { return }
                     self.coordinator?.rowContentHeightChanged(rowID: item.id, contentHeight: height)
                 }
+                // 只有用户主动点开的展开体（思考块/子代理卡/问题详情）才上报「用户交互」，
+                // 供 coordinator 区分「用户点击导致的行高变化」与「布局期/流式内容的高度变化」。
+                .environment(\.userToggleReporter, { [weak self] in
+                    self?.coordinator?.noteUserToggle(rowID: item.id)
+                })
             }
             .margins(.all, 0)
             #if DEBUG
@@ -227,6 +232,9 @@ struct SessionMessageListView: UIViewRepresentable {
         private var userHasScrolled = false
         /// 读历史期间被冻结的尾部内容（回到近底部时一次性应用）。
         private var frozenItems: [SessionMessageItem]?
+        /// 用户主动展开/收起的行（时间戳）：只有这些行的行高变化才走「入口行固定」锚点会话，
+        /// 其余（首屏布局/流式内容/历史补齐）走无锚点重测，避免滚动被吸回旧位置。
+        private var pendingUserToggleRowIDs: [String: CFAbsoluteTime] = [:]
         private var userIsScrolling = false
         private var isAdjustingOffset = false
         /// 静止阅读时的冻结锚点（最上方可见行 + 屏幕位置）；每次布局后保持它不动。
@@ -277,6 +285,8 @@ struct SessionMessageListView: UIViewRepresentable {
 
         func detach() {
             heightPinSession = nil
+            legacyHeightRefreshWork?.cancel()
+            legacyHeightRefreshWork = nil
             #if DEBUG
             offsetObservation?.invalidate()
             offsetObservation = nil
@@ -423,12 +433,23 @@ struct SessionMessageListView: UIViewRepresentable {
             let rowID: String
             /// 被点行视觉顶边在列表视口内的目标 Y。
             let targetTop: CGFloat
-            /// 会话截止时间（CACurrentMediaTime）。
-            let deadline: CFTimeInterval
+            /// 会话软截止时间（可因行高仍在变化而顺延）。
+            var deadline: CFTimeInterval
+            /// 会话硬截止时间（兜底，避免无限顺延）。
+            let hardDeadline: CFTimeInterval
+            /// 上一帧的行高：连续稳定若干帧后才允许收尾（避免 SwiftUI 动画/文本排版
+            /// 收尾晚于会话结束造成的「上方内容被拉下再挤回」弹跳）。
+            var lastRowHeight: CGFloat
+            var stableTicks: Int
         }
         private var heightPinSession: HeightPinSession?
-        /// 行高变化后的逐帧会话时长（覆盖 SwiftUI 150ms 展开动画 + 收尾）。
+        /// 逐帧会话基础时长（覆盖 SwiftUI 150–200ms 展开动画 + 收尾）。
         private static let heightPinDuration: TimeInterval = 0.2
+        /// 行高稳定判定阈值（pt）与需要的连续稳定帧数。
+        private static let heightPinStableEpsilon: CGFloat = 0.5
+        private static let heightPinStableTicks = 2
+        /// 非用户交互的行高变化（首屏/流式/历史补齐）的无锚点重测防抖任务。
+        private var legacyHeightRefreshWork: DispatchWorkItem?
 
         /// 行视觉顶边（反转列表里 cell 的视觉顶边 = rect.maxY 端）。
         private func visualTop(ofRow rowID: String, tableView: UITableView) -> CGFloat? {
@@ -453,6 +474,20 @@ struct SessionMessageListView: UIViewRepresentable {
             isAdjustingOffset = false
         }
 
+        /// SwiftUI 行内「用户主动展开/收起」信号（由行视图按钮通过 Environment 上报）。
+        func noteUserToggle(rowID: String) {
+            let now = CACurrentMediaTime()
+            pendingUserToggleRowIDs = pendingUserToggleRowIDs.filter { now - $0.value < 1.0 }
+            pendingUserToggleRowIDs[rowID] = now
+        }
+
+        /// 取出并消费「用户主动交互」标记（1s 内有效）。
+        private func consumeUserToggle(rowID: String) -> Bool {
+            let now = CACurrentMediaTime()
+            pendingUserToggleRowIDs = pendingUserToggleRowIDs.filter { now - $0.value < 1.0 }
+            return pendingUserToggleRowIDs.removeValue(forKey: rowID) != nil
+        }
+
         func rowContentHeightChanged(rowID: String, contentHeight: CGFloat) {
             guard contentHeight > 1, let tableView, let dataSource else { return }
             guard let indexPath = dataSource.indexPath(for: rowID) else { return }
@@ -466,19 +501,67 @@ struct SessionMessageListView: UIViewRepresentable {
             let rowHeight = tableView.rectForRow(at: indexPath).height
             // 变高和变矮都要处理（收起展开体后旧行高留白、上下文不归位）。
             guard rowHeight > 1, abs(contentHeight - rowHeight) > 1 else { return }
+            // 只有用户主动点开的行才走「入口行固定」锚点会话。布局期/流式内容/首屏渲染的
+            // 高度变化如果也走锚点会话，会让列表被钉在一个旧位置（真机报障：滚动后被吸回）。
+            let userInitiated = consumeUserToggle(rowID: rowID)
             #if DEBUG
-            pinLog("report row=\(rowID) content=\(String(format: "%.1f", contentHeight)) rowHeight=\(String(format: "%.1f", rowHeight))")
+            pinLog("report row=\(rowID) content=\(String(format: "%.1f", contentHeight)) rowHeight=\(String(format: "%.1f", rowHeight)) user=\(userInitiated ? 1 : 0)")
             #endif
+            guard userInitiated else {
+                scheduleLegacyHeightRefresh()
+                return
+            }
             guard let top = visualTop(ofRow: rowID, tableView: tableView) else { return }
             startHeightPinSession(rowID: rowID, targetTop: top)
         }
 
+        /// 非用户交互的行高变化：沿用旧行为（合并重测 + 底部可见行锚点），不做入口行固定。
+        private func scheduleLegacyHeightRefresh() {
+            legacyHeightRefreshWork?.cancel()
+            let work = DispatchWorkItem { [weak self] in self?.refreshHeightsLegacy() }
+            legacyHeightRefreshWork = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.08, execute: work)
+        }
+
+        private func refreshHeightsLegacy() {
+            guard let tableView, let dataSource else { return }
+            guard heightPinSession == nil else { return }
+            guard !tableView.isTracking, !tableView.isDecelerating else { return }
+            let anchor = captureAnchor(tableView: tableView)
+            isAdjustingOffset = true
+            UIView.performWithoutAnimation {
+                tableView.performBatchUpdates(nil) { _ in }
+            }
+            tableView.layoutIfNeeded()
+            if let anchor, let indexPath = dataSource.indexPath(for: anchor.rowID) {
+                let rect = tableView.rectForRow(at: indexPath)
+                let delta = (rect.minY - tableView.contentOffset.y) - anchor.screenY
+                if abs(delta) > 0.5 {
+                    var offset = tableView.contentOffset
+                    offset.y += delta
+                    let maxY = max(0, tableView.contentSize.height - tableView.bounds.height + tableView.adjustedContentInset.bottom)
+                    offset.y = min(max(offset.y, 0), maxY)
+                    tableView.setContentOffset(offset, animated: false)
+                }
+            }
+            isAdjustingOffset = false
+            freezeAnchorFromCurrentViewport(tableView)
+        }
+
         /// 开始一次「行高变化 + 位置固定」的逐帧会话：被点行视觉顶边始终钉在 targetTop。
         func startHeightPinSession(rowID: String, targetTop: CGFloat) {
+            let now = CACurrentMediaTime()
+            var initialRowHeight: CGFloat = 0
+            if let tableView, let dataSource, let indexPath = dataSource.indexPath(for: rowID) {
+                initialRowHeight = tableView.rectForRow(at: indexPath).height
+            }
             heightPinSession = HeightPinSession(
                 rowID: rowID,
                 targetTop: targetTop,
-                deadline: CACurrentMediaTime() + Self.heightPinDuration
+                deadline: now + Self.heightPinDuration,
+                hardDeadline: now + 0.5,
+                lastRowHeight: initialRowHeight,
+                stableTicks: 0
             )
             #if DEBUG
             pinLog("session start row=\(rowID) targetTop=\(String(format: "%.1f", targetTop))")
@@ -487,7 +570,7 @@ struct SessionMessageListView: UIViewRepresentable {
         }
 
         private func tickHeightPinSession() {
-            guard let tableView, let session = heightPinSession else { return }
+            guard let tableView, var session = heightPinSession else { return }
             guard !tableView.isTracking, !tableView.isDecelerating else {
                 // 手势中顺延一帧，避免和手势抢 offset。
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1.0 / 60.0) { [weak self] in self?.tickHeightPinSession() }
@@ -498,10 +581,28 @@ struct SessionMessageListView: UIViewRepresentable {
             tableView.layoutIfNeeded()
             isAdjustingOffset = false
             pinRowTop(session.rowID, targetTop: session.targetTop, tableView: tableView)
-            if CACurrentMediaTime() < session.deadline {
+            // 稳定性判定：行高仍在变化就把软截止时间往后顺延一小段（硬截止兜底），
+            // 保证 SwiftUI 动画/文本排版的最后一次布局也被「钉住」，避免收尾弹跳。
+            let now = CACurrentMediaTime()
+            if let dataSource, let indexPath = dataSource.indexPath(for: session.rowID) {
+                let rowHeightNow = tableView.rectForRow(at: indexPath).height
+                if abs(rowHeightNow - session.lastRowHeight) > Self.heightPinStableEpsilon {
+                    session.lastRowHeight = rowHeightNow
+                    session.stableTicks = 0
+                    session.deadline = min(session.hardDeadline, now + 0.08)
+                } else {
+                    session.stableTicks += 1
+                }
+            } else {
+                session.stableTicks += 1
+            }
+            heightPinSession = session
+            let canFinish = now >= session.deadline && session.stableTicks >= Self.heightPinStableTicks
+            if !canFinish && now < session.hardDeadline {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1.0 / 60.0) { [weak self] in self?.tickHeightPinSession() }
             } else {
-                // 收尾：再重测 + 钉一次，然后恢复常规锚点。
+                // 收尾：再重测 + 钉一次；锚点落在被点行自身（而不是重新冻结到底部可见行），
+                // 避免收尾瞬间整段内容被另一套锚点拉回。
                 isAdjustingOffset = true
                 tableView.performBatchUpdates(nil) { _ in }
                 tableView.layoutIfNeeded()
@@ -513,7 +614,12 @@ struct SessionMessageListView: UIViewRepresentable {
                 }
                 #endif
                 heightPinSession = nil
-                freezeAnchorFromCurrentViewport(tableView)
+                if let dataSource, let indexPath = dataSource.indexPath(for: session.rowID) {
+                    let rect = tableView.rectForRow(at: indexPath)
+                    desiredAnchor = (session.rowID, rect.minY - tableView.contentOffset.y)
+                } else {
+                    freezeAnchorFromCurrentViewport(tableView)
+                }
                 updateNearBottom(tableView: tableView)
             }
         }
