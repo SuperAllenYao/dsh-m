@@ -448,7 +448,17 @@ struct SessionMessageListView: View {
                     }
                 )
  // 首屏贴底定位完成前不显示：不允许「先显示顶部、再跳到底」。
+ // r7：隐藏期给一个轻量加载指示——无缓存会话首窗口到达
+ // 后有短暂「有数据但未定位」窗口，纯 opacity 0 会被用户看成黑屏。
                 .opacity(isContentReady ? 1 : 0)
+                .overlay {
+                    if !isContentReady {
+                        ProgressView()
+                            .tint(Theme.Palette.accent)
+                            .allowsHitTesting(false)
+                            .accessibilityIdentifier("session-firstscreen-locating")
+                    }
+                }
             }
  // 程序化滚动的唯一通道：锚点式意图（edge/id），系统负责物化行。
             .scrollPosition($scrollPosition)
@@ -931,17 +941,13 @@ struct SessionMessageListView: View {
         metrics.pendingVerify = nil
     }
 
- /// 贴底跟随（edge 意图）：immediate 无动画；animated 由 withAnimation 缓动。
+ /// 贴底跟随（edge 意图）。两种模式都**无动画**直贴： 反馈
+ /// 「加载过程中页面内容上下自动滚动弹跳」——加载批次（首窗口/历史补齐/流式）
+ /// 陆续到达时，0.16s 缓动 follow 会连播多次可见滚动 = 弹跳。无动画直贴下
+ /// 视口始终钉在内容底边，新内容只在底部出现，视觉稳定。
     private func applyFollowCorrection(_ mode: FollowMode) {
         metrics.pendingVerify = nil
-        switch mode {
-        case .immediate:
-            scrollPosition.scrollTo(edge: .bottom)
-        case .animated:
-            withAnimation(.easeOut(duration: 0.16)) {
-                scrollPosition.scrollTo(edge: .bottom)
-            }
-        }
+        scrollPosition.scrollTo(edge: .bottom)
         metrics.followCount += 1
         scrollDebug("follow mode=\(mode == .animated ? "anim" : "now") \(scrollGeometrySummary())")
     }
