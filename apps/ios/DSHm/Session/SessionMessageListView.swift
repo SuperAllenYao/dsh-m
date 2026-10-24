@@ -631,22 +631,34 @@ struct SessionMessageListView: View {
         return maxOffsetY - scrollView.contentOffset.y
     }
 
-    /// 距底距离：优先 UIScrollView 真值，退回底部哨兵全局坐标。
-    private func distanceFromBottomForPin() -> CGFloat {
-        if let distance = trueDistanceFromBottom() { return distance }
-        guard !metrics.viewportFrame.isNull, let bottom = metrics.bottomFrame else {
-            return .greatestFiniteMagnitude
-        }
+    /// 底部哨兵行相对视口底边的距离（全局坐标，nil = 哨兵未物化）。
+    private func sentinelDistanceFromBottom() -> CGFloat? {
+        guard !metrics.viewportFrame.isNull, let bottom = metrics.bottomFrame else { return nil }
         return bottom.maxY - metrics.viewportFrame.maxY
     }
 
-    /// 「真的贴底」：可滚动极限已到（含内容不足一屏 / 安全区 inset 偏差的负值）。
+    /// 距底距离：底部哨兵可见时以它为准（用户真正看到的内容底边），
+    /// 未物化时退回 UIScrollView 真值。
+    ///
+    /// 两个信号在真机上会互相矛盾的两种情况都已覆盖：
+    /// - 真值说 0、但哨兵还在视口下方（contentSize 估算落后于实际布局）→ 用哨兵，
+    ///   继续重试等布局追上，避免「最后一屏还没出来就以为到底」；
+    /// - 真值说还能滚 75pt、但哨兵已在视口底边（contentSize 多了底部 inset/空白）→
+    ///   用哨兵判贴底，避免自证永远差一截、重试链空转。
+    private func distanceFromBottomForPin() -> CGFloat {
+        if let sentinel = sentinelDistanceFromBottom() { return sentinel }
+        return trueDistanceFromBottom() ?? .greatestFiniteMagnitude
+    }
+
+    /// 「真的贴底」：哨兵已在视口底边（优先）；哨兵未物化时用可滚动极限真值。
     private func isSettledAtBottom() -> Bool {
-        if trueDistanceFromBottom() != nil {
-            return distanceFromBottomForPin() <= 1
+        if let sentinel = sentinelDistanceFromBottom() {
+            return sentinel <= 1
         }
-        guard !metrics.viewportFrame.isNull else { return false }
-        return distanceFromBottomForPin() <= MessageListUpdatePolicy.stickBottomTolerance
+        if let truth = trueDistanceFromBottom() {
+            return truth <= 1
+        }
+        return false
     }
 
     /// 当前是否处于用户交互（拖拽/惯性）中：UIScrollView 真值优先，退回手势/静默期。
