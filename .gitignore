@@ -81,3 +81,5 @@ packages/dsh-m-link/test/lib/mock-llm*.mjs
 !/docs/release-notes/v0.2.6.md
 # 用户已授权入库（2026-10-24，发布面板选择「发（推荐：全绿后走发布流程）」，含版本冻结 + 中英 release note + push/tag）：
 !/docs/release-notes/v0.2.7.md
+# 用户已授权入库（2026-10-24，「采用版本号 v2.8.0，合并，然后走完整的发版流程」）：
+!/docs/release-notes/v2.8.0.md
