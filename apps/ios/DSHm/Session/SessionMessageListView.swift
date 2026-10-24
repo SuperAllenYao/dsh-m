@@ -441,9 +441,13 @@ struct SessionMessageListView: UIViewRepresentable {
             /// 收尾晚于会话结束造成的「上方内容被拉下再挤回」弹跳）。
             var lastRowHeight: CGFloat
             var stableTicks: Int
+            /// 0 = 尚未播放主动画；1 = 动画结束后进入稳定性收尾。
+            var phase: Int
         }
         private var heightPinSession: HeightPinSession?
-        /// 逐帧会话基础时长（覆盖 SwiftUI 150–200ms 展开动画 + 收尾）。
+        /// 展开/收起主动画时长（用户口径：150ms 非线性 ease-in-out）。
+        private static let heightPinAnimationDuration: TimeInterval = 0.15
+        /// 逐帧会话基础时长（覆盖主动画 + 收尾）。
         private static let heightPinDuration: TimeInterval = 0.2
         /// 行高稳定判定阈值（pt）与需要的连续稳定帧数。
         private static let heightPinStableEpsilon: CGFloat = 0.5
@@ -479,6 +483,14 @@ struct SessionMessageListView: UIViewRepresentable {
             let now = CACurrentMediaTime()
             pendingUserToggleRowIDs = pendingUserToggleRowIDs.filter { now - $0.value < 1.0 }
             pendingUserToggleRowIDs[rowID] = now
+            // 行视图在 toggle 状态**之前**调用这里，所以此刻拿到的视觉顶边才是「点击时」的
+            // 真实位置；会话立即登记（首帧异步执行，避免在 SwiftUI 更新周期内做表格批更新）。
+            guard heightPinSession == nil, let tableView = self.tableView,
+                  let top = visualTop(ofRow: rowID, tableView: tableView) else { return }
+            #if DEBUG
+            pinLog("userTap row=\(rowID) top=\(String(format: "%.1f", top))")
+            #endif
+            startHeightPinSession(rowID: rowID, targetTop: top)
         }
 
         /// 取出并消费「用户主动交互」标记（1s 内有效）。
@@ -512,7 +524,12 @@ struct SessionMessageListView: UIViewRepresentable {
                 return
             }
             guard let top = visualTop(ofRow: rowID, tableView: tableView) else { return }
-            startHeightPinSession(rowID: rowID, targetTop: top)
+            // 关键：preference 回调发生在 SwiftUI 布局周期内，此时同步跑
+            // performBatchUpdates/改 contentOffset 会和 SwiftUI 布局重入打架，
+            // 表现为「展开/收起时整屏先掉一下再弹回」。挪到下一个 runloop 再启动会话。
+            DispatchQueue.main.async { [weak self] in
+                self?.startHeightPinSession(rowID: rowID, targetTop: top)
+            }
         }
 
         /// 非用户交互的行高变化：沿用旧行为（合并重测 + 底部可见行锚点），不做入口行固定。
@@ -561,12 +578,14 @@ struct SessionMessageListView: UIViewRepresentable {
                 deadline: now + Self.heightPinDuration,
                 hardDeadline: now + 0.5,
                 lastRowHeight: initialRowHeight,
-                stableTicks: 0
+                stableTicks: 0,
+                phase: 0
             )
             #if DEBUG
             pinLog("session start row=\(rowID) targetTop=\(String(format: "%.1f", targetTop))")
             #endif
-            tickHeightPinSession()
+            // 首帧异步执行：避免在 SwiftUI 布局/preference 回调内重入表格布局。
+            DispatchQueue.main.async { [weak self] in self?.tickHeightPinSession() }
         }
 
         private func tickHeightPinSession() {
@@ -576,14 +595,52 @@ struct SessionMessageListView: UIViewRepresentable {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1.0 / 60.0) { [weak self] in self?.tickHeightPinSession() }
                 return
             }
+            let now = CACurrentMediaTime()
+            if session.phase == 0 {
+                // 主动画：行高与 offset 在同一 UIKit 动画里等量变化 —— 入口行视觉顶边逐帧
+                // 由 layoutPass 钉住，看起来就是「内容向下展开 / 向上收起」的 150ms 手风琴。
+                session.phase = 1
+                session.deadline = min(session.hardDeadline, now + Self.heightPinAnimationDuration + 0.1)
+                heightPinSession = session
+                isAdjustingOffset = true
+                UIView.animate(
+                    withDuration: Self.heightPinAnimationDuration,
+                    delay: 0,
+                    options: [.curveEaseInOut, .beginFromCurrentState, .allowUserInteraction]
+                ) {
+                    tableView.performBatchUpdates(nil) { _ in }
+                    tableView.layoutIfNeeded()
+                    self.pinRowTop(session.rowID, targetTop: session.targetTop, tableView: tableView)
+                } completion: { [weak self] _ in
+                    guard let self else { return }
+                    self.isAdjustingOffset = false
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.02) { [weak self] in
+                        self?.tickHeightPinSession()
+                    }
+                }
+                return
+            }
+            #if DEBUG
+            if let ip = dataSource?.indexPath(for: session.rowID) {
+                let preRect = tableView.rectForRow(at: ip)
+                let preTop = tableView.bounds.height - (preRect.maxY - tableView.contentOffset.y)
+                pinLog("tick.pre row=\(session.rowID) h=\(String(format: "%.1f", preRect.height)) top=\(String(format: "%.1f", preTop)) off=\(String(format: "%.1f", tableView.contentOffset.y))")
+            }
+            #endif
             isAdjustingOffset = true
             tableView.performBatchUpdates(nil) { _ in }
             tableView.layoutIfNeeded()
             isAdjustingOffset = false
             pinRowTop(session.rowID, targetTop: session.targetTop, tableView: tableView)
+            #if DEBUG
+            if let ip = dataSource?.indexPath(for: session.rowID) {
+                let rect = tableView.rectForRow(at: ip)
+                let top = tableView.bounds.height - (rect.maxY - tableView.contentOffset.y)
+                pinLog("tick row=\(session.rowID) h=\(String(format: "%.1f", rect.height)) top=\(String(format: "%.1f", top)) target=\(String(format: "%.1f", session.targetTop)) off=\(String(format: "%.1f", tableView.contentOffset.y))")
+            }
+            #endif
             // 稳定性判定：行高仍在变化就把软截止时间往后顺延一小段（硬截止兜底），
             // 保证 SwiftUI 动画/文本排版的最后一次布局也被「钉住」，避免收尾弹跳。
-            let now = CACurrentMediaTime()
             if let dataSource, let indexPath = dataSource.indexPath(for: session.rowID) {
                 let rowHeightNow = tableView.rectForRow(at: indexPath).height
                 if abs(rowHeightNow - session.lastRowHeight) > Self.heightPinStableEpsilon {
@@ -889,8 +946,16 @@ struct SessionMessageListView: UIViewRepresentable {
         /// 每次布局后把冻结锚点行放回原屏幕位置（真实 frame，不依赖估算）。
         func stabilizeAfterLayout() {
             guard let tableView, didInitialBottom else { return }
-            // 展开/收起会话期间由会话自己逐帧钉住被点行，这里不要再按旧锚点纠偏抢 offset。
-            guard heightPinSession == nil else { return }
+            // 展开/收起会话期间：**每次布局提交前**把被点行视觉顶边钉回原位。
+            // 关键：SwiftUI 内容高度变化会在本帧触发表格重排（行高/offset 瞬间变化），
+            // 如果等到下一个 runloop 才纠正，会先渲染出一帧「内容跳走」再弹回。
+            // 放在 layoutSubviews 回调里（屏幕提交前）执行，让位移在同一帧被抵消。
+            if let session = heightPinSession {
+                isAdjustingOffset = true
+                pinRowTop(session.rowID, targetTop: session.targetTop, tableView: tableView)
+                isAdjustingOffset = false
+                return
+            }
             // 视口高度变化（键盘弹出/收起、内联提示行、输入框多行增高）：
             // 读历史时保持可见内容不动；贴底时不动 offset（底部本就随视口移动）。
             let height = tableView.bounds.height
