@@ -505,7 +505,7 @@ struct SessionMessageListView: UIViewRepresentable {
             guard pendingHeightChange == nil, heightAnimationSession == nil,
                   animatedRowHeight == nil, startHeight > 1 else { return }
             #if DEBUG
-            pinLog("tap row=\(rowID) top=\(String(format: "%.1f", targetTop)) h=\(String(format: "%.1f", startHeight))")
+            pinLog("userTap row=\(rowID) top=\(String(format: "%.1f", targetTop)) h=\(String(format: "%.1f", startHeight))")
             #endif
             pendingHeightChange = PendingHeightChange(rowID: rowID, targetTop: targetTop, startHeight: startHeight)
             animatedRowHeight = (rowID, startHeight)
@@ -587,7 +587,7 @@ struct SessionMessageListView: UIViewRepresentable {
             updateNearBottom(tableView: tableView)
             #if DEBUG
             if let ip = dataSource?.indexPath(for: session.rowID) {
-                pinLog("animation done row=\(session.rowID) finalRowH=\(String(format: "%.1f", tableView.rectForRow(at: ip).height)) off=\(String(format: "%.1f", tableView.contentOffset.y))")
+                pinLog("session done row=\(session.rowID) finalRowH=\(String(format: "%.1f", tableView.rectForRow(at: ip).height)) off=\(String(format: "%.1f", tableView.contentOffset.y))")
             }
             #endif
         }
@@ -617,7 +617,7 @@ struct SessionMessageListView: UIViewRepresentable {
  // 用户点击动画进行中/测量中：行高由动画模块统一驱动，忽略上报。
             if pendingHeightChange != nil || heightAnimationSession != nil {
                 #if DEBUG
-                pinLog("report ignored(anim) row=\(rowID) content=\(String(format: "%.1f", contentHeight))")
+                pinLog("report ignored(session) row=\(rowID) content=\(String(format: "%.1f", contentHeight))")
                 #endif
                 return
             }
