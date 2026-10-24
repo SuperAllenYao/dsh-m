@@ -191,6 +191,7 @@ enum DetailMetrics {
     static func markCacheRestored(milliseconds: Double) {
         guard isEnabled, openedAt != nil, cacheRestoreMs == nil else { return }
         cacheRestoreMs = milliseconds
+        NSLog("[DETAILMETRIC] cacheRestored %.0fms", milliseconds)
     }
 
  /// The card tap action entry (t0 of the user-perceived detail latency). Called
@@ -199,6 +200,7 @@ enum DetailMetrics {
         guard isEnabled else { return }
         tapAt = ProcessInfo.processInfo.systemUptime
         tapAtEpochMs = Int64(Date().timeIntervalSince1970 * 1000)
+        NSLog("[DETAILMETRIC] tap")
     }
 
  /// The detail shell is on screen (header / composer / message skeleton, content
@@ -206,12 +208,14 @@ enum DetailMetrics {
     static func markShellFrame() {
         guard isEnabled, openedAt != nil, shellAt == nil else { return }
         shellAt = ProcessInfo.processInfo.systemUptime
+        NSLog("[DETAILMETRIC] shell +%.0fms", (shellAt! - openedAt!) * 1000)
     }
 
  /// Detail's first visible content: title and/or first rows are on screen.
     static func markFirstContent() {
         guard isEnabled, openedAt != nil, firstFrameAt == nil else { return }
         firstFrameAt = ProcessInfo.processInfo.systemUptime
+        NSLog("[DETAILMETRIC] firstContent +%.0fms", (firstFrameAt! - openedAt!) * 1000)
     }
 
  /// Backward-compatible alias.
@@ -225,6 +229,7 @@ enum DetailMetrics {
         if fillCompletedMs < 0 { fillCompletedMs = milliseconds }
         fillPages = pages
         fillOldestSeq = oldestSeq
+        NSLog("[DETAILMETRIC] fillDone +%.0fms pages=%d", milliseconds, pages)
     }
 
  /// Design r2: the 2pt history-fill bar became visible (after the reveal delay).
@@ -237,12 +242,14 @@ enum DetailMetrics {
     static func markNetworkApplied() {
         guard isEnabled, openedAt != nil, networkAt == nil else { return }
         networkAt = ProcessInfo.processInfo.systemUptime
+        NSLog("[DETAILMETRIC] networkApplied +%.0fms", (networkAt! - openedAt!) * 1000)
     }
 
  /// Background fill applied: the legacy 40-message window is on screen.
     static func markFullWindowApplied() {
         guard isEnabled, openedAt != nil, fullAt == nil else { return }
         fullAt = ProcessInfo.processInfo.systemUptime
+        NSLog("[DETAILMETRIC] fullWindow +%.0fms", (fullAt! - openedAt!) * 1000)
     }
 
  /// Reserved for P1 stream resume; P1.5-B always keeps 0.

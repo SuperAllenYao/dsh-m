@@ -296,13 +296,22 @@ struct SessionMessageListView: View {
     let onUserScrolled: () -> Void
     let onFirstContent: () -> Void
     let onRetry: () -> Void
+ /// r7：历史补齐进行中（VM `historyFillProgress!= nil`）。
+ /// true 时**冻结历史 prepend**：补齐批次只进 `pendingFillItems` 不上列表、
+ /// 不滚动——逐批「插入+scrollTo(bottom)」会把 LazyVStack 的 offset 甩进
+ /// 未物化区 = 整屏黑。
+ /// 补齐完成后一次性插入 + 一次定位，加载全程内容稳定零滚动。
+    var isFillingHistory: Bool = false
 
     private static let bottomID = "__session_list_bottom__"
     private static let rowVerticalPadding: CGFloat = Theme.Spacing.s / 2
 
- /// 程序化滚动的唯一通道（iOS 18 ScrollPosition）：
- /// 只发 id/edge 意图，由系统完成布局物化。初值贴底 = 首屏定位的第一步。
-    @State private var scrollPosition = ScrollPosition(edge: .bottom)
+ /// 程序化滚动的唯一通道（iOS 18 ScrollPosition 值绑定）：
+ /// **edge 滚动是 offset 语义，不依赖行物化**——行绑定 scrollTo(id:) 对未物化
+ /// 行静默失败(取证：视口冻结在顶时 bottomID 哨兵在几万 pt 外，
+ /// 交替赋值也不滚），edge 滚动始终有效。跟随用「滞后(40pt)+节流(120ms)」防
+ /// LazyVStack 估值抖动期的反复补偿（=弹跳）。
+    @State private var scrollPosition = ScrollPosition()
 
  /// 当前渲染的显示窗口（最近 N 行；不是全量 items）。
     @State private var displayedItems: [SessionMessageItem]
@@ -320,6 +329,8 @@ struct SessionMessageListView: View {
     @State private var lastScrollToBottomToken: Int = 0
  /// 用户是否真的用手滚动过（只用来让上层 onUserScrolled 回调一次）。
     @State private var userHasScrolled = false
+ /// 历史补齐冻结期间攒下的目标窗口（补齐完成后一次性应用）。
+    @State private var pendingFillItems: [SessionMessageItem]?
 
     init(items: [SessionMessageItem],
          sessionId: String,
@@ -329,6 +340,7 @@ struct SessionMessageListView: View {
          isRunning: Bool,
          historyBatchToken: Int,
          scrollToBottomToken: Int,
+         isFillingHistory: Bool = false,
          processGroupModes: [String: ProcessGroupMode] = [:],
          processGroupWindowHeight: CGFloat = 300,
          currentTurnStartSeq: Int = Int.min,
@@ -348,6 +360,7 @@ struct SessionMessageListView: View {
         self.isRunning = isRunning
         self.historyBatchToken = historyBatchToken
         self.scrollToBottomToken = scrollToBottomToken
+        self.isFillingHistory = isFillingHistory
         self.processGroupModes = processGroupModes
         self.processGroupWindowHeight = processGroupWindowHeight
         self.currentTurnStartSeq = currentTurnStartSeq
@@ -448,20 +461,36 @@ struct SessionMessageListView: View {
                     }
                 )
  // 首屏贴底定位完成前不显示：不允许「先显示顶部、再跳到底」。
- // r7：隐藏期给一个轻量加载指示——无缓存会话首窗口到达
- // 后有短暂「有数据但未定位」窗口，纯 opacity 0 会被用户看成黑屏。
                 .opacity(isContentReady ? 1 : 0)
-                .overlay {
-                    if !isContentReady {
+            }
+ // 程序化滚动的唯一通道：值绑定（edge=offset 语义，不依赖行物化）。
+            .scrollPosition($scrollPosition)
+ // r7：首屏定位期的反馈必须挂在**视口层**（ScrollView 上），
+ // 挂在 LazyVStack 内容层会定位到几千 pt 高的内容中部、视口（贴底）
+ // 根本看不见——用户看到的 就是纯黑屏。这里用骨架屏 + 小转圈，
+ // 定位完成（isContentReady）即消失，内容一次到位无跳动。
+            .overlay {
+                if !isContentReady {
+                    VStack(spacing: Theme.Spacing.s) {
+                        Spacer()
                         ProgressView()
                             .tint(Theme.Palette.accent)
-                            .allowsHitTesting(false)
-                            .accessibilityIdentifier("session-firstscreen-locating")
+                        VStack(alignment: .leading, spacing: Theme.Spacing.s) {
+                            ForEach(0..<4, id: \.self) { index in
+                                RoundedRectangle(cornerRadius: Theme.Radius.lg, style: .continuous)
+                                    .fill(Theme.Palette.surface)
+                                    .frame(height: index == 1 ? 64 : 40)
+                                    .frame(maxWidth: index == 2 ? 220 : .infinity)
+                                    .opacity(0.6)
+                            }
+                        }
+                        .padding(.horizontal, Theme.Spacing.pageInset)
+                        Spacer()
                     }
+                    .allowsHitTesting(false)
+                    .accessibilityIdentifier("session-firstscreen-locating")
                 }
             }
- // 程序化滚动的唯一通道：锚点式意图（edge/id），系统负责物化行。
-            .scrollPosition($scrollPosition)
  // 官方几何观察（替代 KVO contentSize / offset 读取）：
  // 一个 Equatable 投影拿到 全部真值。
             .onScrollGeometryChange(for: ScrollFacts.self) { geometry in
@@ -504,6 +533,9 @@ struct SessionMessageListView: View {
             .onAppear {
                 metrics.viewportHeight = outer.size.height
                 scrollDebug("list onAppear items=\(items.count) displayed=\(displayedItems.count) didInitialBottom=\(didInitialBottom) ready=\(isContentReady)")
+ // 对照实验：最粗暴的一次绑定赋值，验证
+ // scrollPosition(id:) 对写入是否响应（vid/offset 是否变化）。
+                scrollWithoutAnimation("onAppear") { scrollPosition.scrollTo(edge: .bottom) }
                 advanceInitialBottomIfNeeded()
             }
             .onChange(of: outer.size.height) { _, height in
@@ -621,6 +653,15 @@ struct SessionMessageListView: View {
         onUserScrolled()
     }
 
+ /// 所有程序化滚动统一走这里：`withAnimation(nil)`（明确无动画）。
+ /// 注意不能用 Transaction.disablesAnimations——iOS 26 实测它会把
+ /// ScrollPosition.scrollTo 整个吞掉（offset 冻结取证）。记录指令来源（探针
+ /// 输出 cmd=），跳动取证时区分「我们滚的」与「系统滚的」。
+    private func scrollWithoutAnimation(_ source: String, _ body: () -> Void) {
+        metrics.lastScrollCommand = source
+        withAnimation(nil) { body() }
+    }
+
  // MARK: - 官方几何观察（替代 contentSize KVO）
 
  /// 几何变化入口（onScrollGeometryChange action，主线程非布局回调）。
@@ -639,15 +680,26 @@ struct SessionMessageListView: View {
             return
         }
         let growth = new.contentHeight - previous.contentHeight
-        if growth > ScrollFollowPolicy.compensationTolerance, pinnedToBottom, !isUserInteractingNow() {
- // 贴底跟随：内容长多少贴多少。edge 意图由系统物化（黑屏根治点）。
-            scrollPosition.scrollTo(edge: .bottom)
-            metrics.followCount += 1
+        if growth > ScrollFollowPolicy.compensationTolerance, pinnedToBottom, !isUserInteractingNow(), didInitialBottom {
+ // 贴底跟随：scrollPosition(id:) 在上方插入时**不会**
+ // 自动保持绑定行（实测 vid=bottomID 而 offset 冻结、distance 暴涨），
+ // 必须自己拉回。为避免 LazyVStack 估值抖动期的反复补偿（=弹跳），
+ // 用滞后（>40pt 才跟）+ 节流（>120ms 一次）：无动画瞬移贴底，视觉上
+ // 视口钉在内容底边、新内容从底部冒出。
+            let now = CACurrentMediaTime()
+ // 回滚止血：恢复 120ms 节流 + 40pt 滞后的
+ // 勤跟随——视口始终钉在已物化的底部区域（稀疏兜底会让视口长期停在
+ // 未物化区 = 整屏黑）。
+            if new.distanceFromBottom > ScrollFollowPolicy.followHysteresis,
+               now - metrics.lastFollowAt > 0.12 {
+                metrics.lastFollowAt = now
+                withAnimation(nil) { scrollPosition.scrollTo(edge: .bottom) }
+                metrics.followCount += 1
+            }
             metrics.contentSizeFollows += 1
-            scrollDebug("facts follow growth=\(fmt(growth)) \(scrollGeometrySummary())")
+            scrollDebug("facts growth=\(fmt(growth)) dist=\(fmt(new.distanceFromBottom)) \(scrollGeometrySummary())")
             return
         }
-        settlePinnedBottomIfNeeded()
         trackIdleBottomStability()
     }
 
@@ -731,26 +783,25 @@ struct SessionMessageListView: View {
         metrics.settleFollowUntil = CACurrentMediaTime() + 1.5
         metrics.settleFollowAttempts = 0
  // 2. 应用数据（不冻结、不排队、不阻塞用户操作）。
-        displayedItems = newItems
+ // 插入必须**无动画**：动画事务会让「已插入但锚定/follow 未对齐」的中间态
+ // 可见几百 ms（=漂移窗口）。无动画插入 = 中间态 1 帧，肉眼不可见。
+        withAnimation(nil) {
+            displayedItems = newItems
+        }
         scrollDebug("apply pinned=\(pinnedToBottom ? 1 : 0) displayed=\(displayedItems.count) incoming=\(newItems.count) atBottom=\(wasAtBottom ? 1 : 0) anchor=\(anchor?.id ?? "-") prepended=\(prepended ? 1 : 0) \(scrollGeometrySummary())")
         guard didInitialBottom else {
             scheduleLayoutCorrection()
             return
         }
- // 3. 计划（全部经 ScrollPosition 锚点意图执行）：
- // - 贴底（含 prepend）：跟随到底部（edge 意图，系统物化）；
- // - 读历史 + prepend：锚点行放回原相对位置（id+UnitPoint 意图）；
- // - 读历史 + 尾部变化：不滚动（视口下方的内容不影响阅读位置）。
-        if wasAtBottom {
-            metrics.pendingAnchor = nil
-            metrics.pendingVerify = nil
-            requestFollow(prepended ? .immediate : .animated)
-        } else if prepended, let anchor {
-            metrics.pendingFollow = nil
-            metrics.pendingAnchor = anchor
-        } else {
-            metrics.pendingAnchor = nil
-            metrics.pendingFollow = nil
+ // 3. 计划：pinned（贴底）时**插入与贴底滚动同帧原子提交**——
+ // display 变更与 scrollTo(edge:.bottom) 同一 runloop 提交，视口一帧落底，
+ // 没有滚动过程（需求：加载期间零滚动，新内容只在底部冒出）。
+ // 读历史（!pinned）：不发滚动（视口保持，锚定兜底在 layout 校正层）。
+        metrics.pendingAnchor = nil
+        metrics.pendingFollow = nil
+        if wasAtBottom, !isUserInteractingNow() {
+            withAnimation(nil) { scrollPosition.scrollTo(edge: .bottom) }
+            metrics.followCount += 1
         }
         scheduleLayoutCorrection()
     }
@@ -805,7 +856,9 @@ struct SessionMessageListView: View {
             metrics.pendingPrependHeight = true
         }
         metrics.tailStable = true
-        displayedItems = expanded
+        withAnimation(nil) {
+            displayedItems = expanded
+        }
         metrics.prependCount += 1
         scrollDebug("window expand start=\(newStart) displayed=\(expanded.count)/\(items.count)")
         scheduleLayoutCorrection()
@@ -847,8 +900,6 @@ struct SessionMessageListView: View {
             return
         }
         maybeExpandWindow()
-        applyIdleLayoutGrowthCompensation()
-        settlePinnedBottomIfNeeded()
         trackIdleBottomStability()
     }
 
@@ -896,9 +947,9 @@ struct SessionMessageListView: View {
             viewportHeight: metrics.viewportHeight
         )
         if let fraction {
-            scrollPosition.scrollTo(id: anchor.id, anchor: UnitPoint(x: 0, y: fraction))
+            scrollWithoutAnimation("anchor") { scrollPosition.scrollTo(id: anchor.id, anchor: .top) }
         } else {
-            scrollPosition.scrollTo(id: anchor.id, anchor: .top)
+            scrollWithoutAnimation("anchor") { scrollPosition.scrollTo(id: anchor.id, anchor: .top) }
         }
         metrics.anchorScrollToCount += 1
         if isUserInteractingNow() {
@@ -931,7 +982,7 @@ struct SessionMessageListView: View {
                viewportHeight: metrics.viewportHeight
            ) {
  // 残差仍超容差：再发一次锚点意图（不是搬 offset）。
-            scrollPosition.scrollTo(id: verify.id, anchor: UnitPoint(x: 0, y: fraction))
+            scrollWithoutAnimation("verify") { scrollPosition.scrollTo(id: verify.id, anchor: .top) }
             metrics.anchorResidualFixes += 1
             metrics.lastAnchorResidual = delta
             scrollDebug("anchor verify residual=\(fmt(delta)) fixes=\(metrics.anchorResidualFixes)")
@@ -947,7 +998,7 @@ struct SessionMessageListView: View {
  /// 视口始终钉在内容底边，新内容只在底部出现，视觉稳定。
     private func applyFollowCorrection(_ mode: FollowMode) {
         metrics.pendingVerify = nil
-        scrollPosition.scrollTo(edge: .bottom)
+        scrollWithoutAnimation("settle") { scrollPosition.scrollTo(edge: .bottom) }
         metrics.followCount += 1
         scrollDebug("follow mode=\(mode == .animated ? "anim" : "now") \(scrollGeometrySummary())")
     }
@@ -964,8 +1015,8 @@ struct SessionMessageListView: View {
         guard !metrics.initialAttemptPending else { return }
         metrics.initialAttemptPending = true
         metrics.initialBottomAttempts += 1
- // 初值 ScrollPosition(edge:.bottom) 已请求贴底；自证失败时按重试链再发。
-        scrollPosition.scrollTo(edge: .bottom)
+ // 初值意图 + 重试链：重复设相同 id 是 no-op，先清空再设强制重滚。
+        scrollWithoutAnimation("initial") { scrollPosition.scrollTo(edge: .bottom) }
         scrollDebug("initial bottom attempt=\(metrics.initialBottomAttempts) distance=\(fmt(metrics.facts.distanceFromBottom)) \(scrollGeometrySummary())")
         if metrics.initialBottomAttempts >= ScrollFollowPolicy.initialBottomMaxAttempts {
             finishInitialBottom() // 兜底：绝不无限隐藏内容。
@@ -1015,7 +1066,7 @@ struct SessionMessageListView: View {
         let distance = metrics.facts.distanceFromBottom
         guard distance.isFinite, distance > 1.5 else { return }
         metrics.settleFollowAttempts += 1
-        scrollPosition.scrollTo(edge: .bottom)
+        scrollWithoutAnimation("settle") { scrollPosition.scrollTo(edge: .bottom) }
         metrics.followCount += 1
     }
 
@@ -1033,7 +1084,7 @@ struct SessionMessageListView: View {
                rowHeight: frame.height,
                viewportHeight: metrics.viewportHeight
            ) {
-            scrollPosition.scrollTo(id: lock.id, anchor: UnitPoint(x: 0, y: fraction))
+            scrollWithoutAnimation("lock") { scrollPosition.scrollTo(id: lock.id, anchor: .top) }
             metrics.lockAnchorFixAttempts += 1
             metrics.lockAnchorFixes += 1
             scrollDebug("growth lock delta=\(fmt(delta)) \(scrollGeometrySummary())")
@@ -1220,6 +1271,10 @@ struct SessionMessageListView: View {
             + ";ptrk=" + (metrics.panTrackingSeen ? "1" : "0")
             + ";pdec=" + (metrics.panDecelSeen ? "1" : "0")
             + ";os=" + fmt(overscrollAmount())
+            + ";cmd=" + metrics.lastScrollCommand
+            + ";vid=" + (metrics.lastScrollCommand)
+            + ";ini=" + (didInitialBottom ? "1" : "0")
+            + ";att=" + String(metrics.initialBottomAttempts)
             + ";csf=0"
             + ";lk=" + String(metrics.lockAnchorFixes)
             + ";sa=" + String(metrics.settleFollowAttempts)
@@ -1359,6 +1414,8 @@ enum ScrollFollowPolicy {
     static let compensationTolerance: CGFloat = 0.34
  /// 贴底跟随时「缓动」与「直接跳」的分界（pt）。
     static let animatedFollowThreshold: CGFloat = 60
+ /// 贴底跟随的滞后（pt）：距底超过该值才拉回，吸收 LazyVStack 高度估值抖动。
+    static let followHysteresis: CGFloat = 40
  /// 首屏贴底定位的判定容差（pt）。
     static let initialBottomTolerance: CGFloat = 2
  /// 首屏贴底定位的最大布局重试次数。
@@ -1478,6 +1535,11 @@ private final class ScrollMetrics {
     var panTrackingSeen = false
     var panDecelSeen = false
     var windowExpansionScheduled = false
+ /// 最近一次程序化滚动指令来源（跳动取证：cmd 有值且时间近 = 我们滚的）。
+    var lastScrollCommand: String = "-"
+    var lastScrollCommandAt: CFTimeInterval = 0
+ /// 上次贴底跟随时间（节流，防估值抖动期反复滚动）。
+    var lastFollowAt: CFTimeInterval = 0
     var lockAnchor: AnchorSnapshot?
     var lockAnchorFixes = 0
     var lockAnchorFixAttempts = 0

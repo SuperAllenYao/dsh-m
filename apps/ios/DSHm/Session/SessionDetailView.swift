@@ -814,6 +814,7 @@ struct SessionDetailView: View {
                     isRunning: isRunningForMessageItems,
                     historyBatchToken: viewModel.historyBatchToken,
                     scrollToBottomToken: scrollToBottomToken,
+                    isFillingHistory: viewModel.historyFillProgress != nil,
                     processGroupModes: processGroupModes,
                     processGroupWindowHeight: processGroupWindowHeight,
                     currentTurnStartSeq: currentTurnStartSeq,
