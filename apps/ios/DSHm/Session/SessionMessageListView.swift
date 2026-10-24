@@ -149,6 +149,21 @@ enum MessageListUpdatePolicy {
         return current
     }
 
+ /// 读历史（inverted，r7）：截掉 incoming 相对 displayed 的**尾部新行**
+ /// （升序尾 = 新消息/新过程组 = 倒序渲染的布局顶 insert，会推动视口）。
+ /// 保留：已显示行的原地更新、旧端（头部）扩展——二者渲染为尾部 append，零漂移。
+ /// 尾行被替换（流式 liveText → process 组）时从尾往前找第一个幸存行截断，
+ /// 冻结继续生效；displayed 的行全部不在 incoming（快照替换）才全量应用。
+    static func withoutTailInsertions(displayed: [SessionMessageItem], incoming: [SessionMessageItem]) -> [SessionMessageItem] {
+        guard !displayed.isEmpty else { return incoming }
+        for survivorID in displayed.reversed().map(\.id) {
+            if let idx = incoming.lastIndex(where: { $0.id == survivorID }) {
+                return Array(incoming[...idx])
+            }
+        }
+        return incoming
+    }
+
  /// 冻结态下识别「前置历史补齐」：允许同批还有尾部追加/尾部内容变化（尾部继续
  /// 冻结即可），只要已显示行仍按原顺序连续出现在 incoming 里。
  ///
@@ -296,14 +311,11 @@ struct SessionMessageListView: View {
     let onUserScrolled: () -> Void
     let onFirstContent: () -> Void
     let onRetry: () -> Void
- /// r7：历史补齐进行中（VM `historyFillProgress!= nil`）。
- /// true 时**冻结历史 prepend**：补齐批次只进 `pendingFillItems` 不上列表、
- /// 不滚动——逐批「插入+scrollTo(bottom)」会把 LazyVStack 的 offset 甩进
- /// 未物化区 = 整屏黑。
- /// 补齐完成后一次性插入 + 一次定位，加载全程内容稳定零滚动。
+ /// 历史补齐进行中（VM `historyFillProgress!= nil`；上层进度条用）。
+ /// inverted：历史补齐 = 倒序尾部 append = 布局远端插入，
+ /// offset 数学上零漂移——旧「冻结攒批」机制删除，此参数仅为接口兼容保留。
     var isFillingHistory: Bool = false
 
-    private static let bottomID = "__session_list_bottom__"
     private static let rowVerticalPadding: CGFloat = Theme.Spacing.s / 2
 
  /// 程序化滚动的唯一通道（iOS 18 ScrollPosition 值绑定）：
@@ -321,16 +333,13 @@ struct SessionMessageListView: View {
  /// 显式「贴底跟随」状态（初值 true）：只有「用户手势结束后的 settle 判定」能改它，
  /// 程序化内容变化永远不能把它改成 false（旧实现的卡死根因）。
     @State private var pinnedToBottom = true
- /// 首屏贴底定位是否完成：完成前内容 opacity 0，避免「先显示顶部、再跳到底」。
-    @State private var didInitialBottom = false
+ // inverted：无首屏定位链（offset=0 天然贴最新），didInitialBottom 状态删除。
  /// 首屏定位完成、内容可以显示。
     @State private var isContentReady = false
     @State private var metrics = ScrollMetrics()
     @State private var lastScrollToBottomToken: Int = 0
  /// 用户是否真的用手滚动过（只用来让上层 onUserScrolled 回调一次）。
     @State private var userHasScrolled = false
- /// 历史补齐冻结期间攒下的目标窗口（补齐完成后一次性应用）。
-    @State private var pendingFillItems: [SessionMessageItem]?
 
     init(items: [SessionMessageItem],
          sessionId: String,
@@ -423,34 +432,17 @@ struct SessionMessageListView: View {
         GeometryReader { outer in
             ScrollView(.vertical) {
                 LazyVStack(alignment: .leading, spacing: 0) {
-                    ForEach(displayedItems, id: \.id) { item in
+ // inverted 渲染：窗口倒序（最新在数组头 = 布局顶 = 视觉底部）。
+ // items/displayedItems 数据层保持升序，只有渲染序列反转。
+                    ForEach(displayedItems.reversed(), id: \.id) { item in
                         rowView(item, isNewest: isNewest(item))
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .padding(.horizontal, Theme.Spacing.pageInset)
                             .padding(.vertical, Self.rowVerticalPadding)
-                            .background(
-                                GeometryReader { geo in
-                                    Color.clear.preference(
-                                        key: RowFramePreferenceKey.self,
-                                        value: [item.id: geo.frame(in: .global)]
-                                    )
-                                }
-                            )
+ // 行内容正读：对抗整体 scaleEffect 的双轴翻转。
+                            .rotationEffect(.radians(.pi))
                             .id(item.id)
                     }
-
- // 底部哨兵行：贴底自证的真值信号（frame 偏好）。
-                    Color.clear
-                        .frame(height: 1)
-                        .id(Self.bottomID)
-                        .background(
-                            GeometryReader { geo in
-                                Color.clear.preference(
-                                    key: ListBottomFramePreferenceKey.self,
-                                    value: geo.frame(in: .global)
-                                )
-                            }
-                        )
                 }
                 .background(
                     GeometryReader { geo in
@@ -460,17 +452,52 @@ struct SessionMessageListView: View {
                         )
                     }
                 )
- // 首屏贴底定位完成前不显示：不允许「先显示顶部、再跳到底」。
-                .opacity(isContentReady ? 1 : 0)
+ // 无内容（无缓存会话拉取中）隐藏列表，骨架屏兜底。
+                .opacity(displayedItems.isEmpty ? 0 : 1)
             }
- // 程序化滚动的唯一通道：值绑定（edge=offset 语义，不依赖行物化）。
+ // 官方几何观察（替代 KVO contentSize / offset 读取）：
+ // 一个 Equatable 投影拿到 全部真值。挂在 scale 内层（取证：读数正常）。
+            .onScrollGeometryChange(for: ScrollFacts.self) { geometry in
+                ScrollFacts(geometry: geometry)
+            } action: { old, new in
+                handleScrollFactsChange(old: old, new: new)
+            }
+ // 官方滚动相位（替代 isDragging/isDecelerating/isTracking + settle 轮询）。
+            .onScrollPhaseChange { oldPhase, newPhase in
+                handleScrollPhaseChange(old: oldPhase, new: newPhase)
+            }
+ // inverted 挂载：
+ // - scaleEffect(x:-1,y:-1) 双轴翻转 + 每行 rotationEffect(.pi) = 视觉
+ // 180° 旋转；数据头（最新）显示在视觉底部。
+ // - rotationEffect 挂 ScrollView 会杀死滚动管线（V1：程序化 scrollTo 与
+ // 手势全失效）；scaleEffect 不影响滚动。scrollPosition 挂 scale 外层。
+ // - offset=0 即贴最新（免初始定位）；历史补齐 = 倒序尾部 append = 布局
+ // 远端插入，offset 数学上零漂移——删除全部补偿链。
+ // - edge 语义反转：.top = 布局顶 = 视觉底（最新）；.bottom = 最旧端。
+            .scaleEffect(x: -1, y: -1)
             .scrollPosition($scrollPosition)
- // r7：首屏定位期的反馈必须挂在**视口层**（ScrollView 上），
- // 挂在 LazyVStack 内容层会定位到几千 pt 高的内容中部、视口（贴底）
- // 根本看不见——用户看到的 就是纯黑屏。这里用骨架屏 + 小转圈，
- // 定位完成（isContentReady）即消失，内容一次到位无跳动。
+            .scrollIndicators(.hidden)
+            .onPreferenceChange(ListContentHeightPreferenceKey.self) { height in
+                metrics.contentHeight = height
+                layoutDidChange()
+            }
+ // viewport frame 测量：挂在 scale/position 外层（layout frame 不受
+ // 翻转影响），供探针 bottomMaxY/viewportMaxY 输出（E2E 契约）。
+            .background(
+                GeometryReader { geo in
+                    Color.clear.preference(
+                        key: ListViewportFramePreferenceKey.self,
+                        value: geo.frame(in: .global)
+                    )
+                }
+            )
+            .onPreferenceChange(ListViewportFramePreferenceKey.self) { frame in
+                guard !frame.isNull else { return }
+                metrics.viewportFrame = frame
+            }
+ // 骨架屏（无内容拉取中）：挂在 scale 外层不被翻转。
             .overlay {
-                if !isContentReady {
+                if displayedItems.isEmpty {
                     VStack(spacing: Theme.Spacing.s) {
                         Spacer()
                         ProgressView()
@@ -491,61 +518,17 @@ struct SessionMessageListView: View {
                     .accessibilityIdentifier("session-firstscreen-locating")
                 }
             }
- // 官方几何观察（替代 KVO contentSize / offset 读取）：
- // 一个 Equatable 投影拿到 全部真值。
-            .onScrollGeometryChange(for: ScrollFacts.self) { geometry in
-                ScrollFacts(geometry: geometry)
-            } action: { old, new in
-                handleScrollFactsChange(old: old, new: new)
-            }
- // 官方滚动相位（替代 isDragging/isDecelerating/isTracking + settle 轮询）。
-            .onScrollPhaseChange { oldPhase, newPhase in
-                handleScrollPhaseChange(old: oldPhase, new: newPhase)
-            }
-            .scrollIndicators(.visible)
-            .background(
-                GeometryReader { geo in
-                    Color.clear.preference(
-                        key: ListViewportFramePreferenceKey.self,
-                        value: geo.frame(in: .global)
-                    )
-                }
-            )
-            .onPreferenceChange(ListViewportFramePreferenceKey.self) { frame in
-                guard !frame.isNull else { return }
-                metrics.viewportFrame = frame
-                metrics.viewportHeight = frame.height
-                layoutDidChange()
-            }
-            .onPreferenceChange(ListContentHeightPreferenceKey.self) { height in
-                metrics.contentHeight = height
-                layoutDidChange()
-            }
-            .onPreferenceChange(ListBottomFramePreferenceKey.self) { frame in
-                metrics.bottomFrame = frame.isNull ? nil : frame
-                layoutDidChange()
-            }
-            .onPreferenceChange(RowFramePreferenceKey.self) { frames in
-                metrics.rowFrames = frames
-                runAnchorVerificationIfNeeded()
-                layoutDidChange()
-            }
             .onAppear {
                 metrics.viewportHeight = outer.size.height
-                scrollDebug("list onAppear items=\(items.count) displayed=\(displayedItems.count) didInitialBottom=\(didInitialBottom) ready=\(isContentReady)")
- // 对照实验：最粗暴的一次绑定赋值，验证
- // scrollPosition(id:) 对写入是否响应（vid/offset 是否变化）。
-                scrollWithoutAnimation("onAppear") { scrollPosition.scrollTo(edge: .bottom) }
-                advanceInitialBottomIfNeeded()
+ // inverted：offset=0 天然贴最新，无初始定位链；已有内容直接显示。
+                if !displayedItems.isEmpty, !isContentReady {
+                    isContentReady = true
+                    onFirstContent()
+                }
             }
             .onChange(of: outer.size.height) { _, height in
                 metrics.viewportHeight = height
-                if didInitialBottom, pinnedToBottom {
-                    requestFollow(.immediate)
-                    scheduleLayoutCorrection()
-                } else {
-                    advanceInitialBottomIfNeeded()
-                }
+ // 视口尺寸变化无需滚动指令：offset=0 恒贴最新；系统自动夹 maxOffset。
             }
             .onChange(of: signature) { _, _ in
                 applyItemsChange()
@@ -558,17 +541,16 @@ struct SessionMessageListView: View {
                     pinnedToBottom = true
                     onNearBottomChange(true)
                 }
-                guard didInitialBottom else { return }
                 windowStartItemID = nil
-                displayedItems = MessageListWindowPolicy.initialWindow(items: items)
-                requestFollow(.immediate)
-                scheduleLayoutCorrection()
+                withAnimation(nil) {
+                    displayedItems = MessageListWindowPolicy.initialWindow(items: items)
+                }
+ // inverted edge 语义反转：.top = 布局顶 = 视觉底（最新）。
+                scrollWithoutAnimation("token") { scrollPosition.scrollTo(edge: .top) }
+                metrics.followCount += 1
             }
             .onDisappear {
-                metrics.correctionScheduled = false
-                metrics.pendingAnchor = nil
-                metrics.pendingFollow = nil
-                metrics.pendingVerify = nil
+                metrics.windowExpansionScheduled = false
             }
             .overlay(alignment: .topLeading) { scrollProbeElement }
             .overlay(alignment: .top) { scrollHUD }
@@ -666,40 +648,12 @@ struct SessionMessageListView: View {
 
  /// 几何变化入口（onScrollGeometryChange action，主线程非布局回调）。
  ///
- /// - 首屏：推进贴底定位自证；
- /// - pinned 且内容高度增长（尾部流式/prepend）：发 `scrollTo(edge:.bottom)` 意图。
- /// 系统按锚点物化行——这是 r6 黑屏（raw contentOffset 搬走后 LazyVStack 零行物化）
- /// 的根治性替代；
- /// - 其余：只更新事实与取证，不滚动。
+ /// inverted：内容变化（头部 insert 新消息 / 尾部 append 历史）不产生任何滚动
+ /// 指令——offset=0 恒贴最新；尾部 append（历史补齐）在布局远端，offset 数学上
+ /// 不变。这里只更新事实与取证。
     private func handleScrollFactsChange(old: ScrollFacts, new: ScrollFacts) {
-        let previous = metrics.facts
         metrics.facts = new
         traceGestureOffsetIfNeeded(offset: new.offset)
-        guard didInitialBottom else {
-            advanceInitialBottomIfNeeded()
-            return
-        }
-        let growth = new.contentHeight - previous.contentHeight
-        if growth > ScrollFollowPolicy.compensationTolerance, pinnedToBottom, !isUserInteractingNow(), didInitialBottom {
- // 贴底跟随：scrollPosition(id:) 在上方插入时**不会**
- // 自动保持绑定行（实测 vid=bottomID 而 offset 冻结、distance 暴涨），
- // 必须自己拉回。为避免 LazyVStack 估值抖动期的反复补偿（=弹跳），
- // 用滞后（>40pt 才跟）+ 节流（>120ms 一次）：无动画瞬移贴底，视觉上
- // 视口钉在内容底边、新内容从底部冒出。
-            let now = CACurrentMediaTime()
- // 回滚止血：恢复 120ms 节流 + 40pt 滞后的
- // 勤跟随——视口始终钉在已物化的底部区域（稀疏兜底会让视口长期停在
- // 未物化区 = 整屏黑）。
-            if new.distanceFromBottom > ScrollFollowPolicy.followHysteresis,
-               now - metrics.lastFollowAt > 0.12 {
-                metrics.lastFollowAt = now
-                withAnimation(nil) { scrollPosition.scrollTo(edge: .bottom) }
-                metrics.followCount += 1
-            }
-            metrics.contentSizeFollows += 1
-            scrollDebug("facts growth=\(fmt(growth)) dist=\(fmt(new.distanceFromBottom)) \(scrollGeometrySummary())")
-            return
-        }
         trackIdleBottomStability()
     }
 
@@ -717,7 +671,6 @@ struct SessionMessageListView: View {
             metrics.interactingUntil = CACurrentMediaTime() + 0.12
             metrics.panSeen = true
             markUserScrolledIfNeeded()
-            finishInitialBottomIfInterrupted()
         case .decelerating:
             metrics.panDecelSeen = true
             metrics.interactingUntil = CACurrentMediaTime() + 0.55
@@ -734,9 +687,8 @@ struct SessionMessageListView: View {
     }
 
  /// 松手 settle（相位到.idle 的事件驱动，替代 asyncAfter 轮询）：
- /// 距底 <= 12pt 视为用户想贴底（repin），否则 unpin。
+ /// 距最新 <= 12pt 视为用户想贴底（repin），否则 unpin。
     private func settleAfterGesture() {
-        guard didInitialBottom else { return }
         let distance = currentDistanceFromBottom()
         let next = ScrollFollowPolicy.pinnedAfterGesture(distanceFromBottom: distance)
         if next != pinnedToBottom {
@@ -745,16 +697,23 @@ struct SessionMessageListView: View {
             scrollDebug("settle pin=\(next ? 1 : 0) distance=\(fmt(distance))")
         }
         if next, distance.isFinite, distance > 0.5 {
- // 用户在底部松手：贴回底部（本身就是「用户想回到底部」）。
-            scrollPosition.scrollTo(edge: .bottom)
+ // 用户在最新附近松手：推到最新（完成用户意图，手势的收尾而非程序抢位）。
+ // inverted edge 语义：.top = 布局顶 = 视觉底（最新）。
+            scrollWithoutAnimation("settle") { scrollPosition.scrollTo(edge: .top) }
             metrics.followCount += 1
         }
     }
 
  // MARK: - items 变化：可视锚点 / 贴底跟随
 
- /// 内容变化时**不冻结、不阻塞**：整批应用后，要么贴底跟随，要么把「首个完整可见行」
- /// 用锚点式 scrollTo 放回原位（系统物化，不直接搬 offset）。
+ /// 内容变化：整批应用，零滚动指令。
+ ///
+ /// inverted 几何保证：
+ /// - 新消息（数组尾 append，升序）→ 渲染头部 insert → offset=0 视口自动显示，
+ /// 视觉上新内容从底部冒出、上方不动；
+ /// - 历史补齐（窗口起点前移 → 渲染尾部 append）→ 布局远端插入，视口纹丝不动；
+ /// - 读历史中（offset>0）：头部 insert 只在 pinned 视口（offset≈0）可见，
+ /// 对当前阅读位置零影响。
     private func applyItemsChange() {
         let allItems = items
         guard !allItems.isEmpty else { return }
@@ -762,48 +721,37 @@ struct SessionMessageListView: View {
         if let startID = windowStartItemID, !allItems.contains(where: { $0.id == startID }) {
             windowStartItemID = nil
         }
-        let newItems = windowedItems(from: allItems)
+        var newItems = windowedItems(from: allItems)
         guard !newItems.isEmpty else { return }
+ // 读历史（!pinned）：冻结尾部新增。升序尾部的**新行**（新消息/新过程组）
+ // 在倒序渲染里是布局顶 insert——会把整个内容向下推 = 视口漂移。冻结它们
+ // （保留原地更新与旧端扩展，二者均零漂移），用户回底（settle repin/token）
+ // 后恢复全量跟随；期间新消息静默等待，与 iMessage 读历史行为一致。
+        if !pinnedToBottom {
+            let frozen = MessageListUpdatePolicy.withoutTailInsertions(
+                displayed: displayedItems, incoming: newItems
+            )
+            if frozen.count < newItems.count {
+                scrollDebug("freeze tail inserts displayed=\(frozen.count) incoming=\(newItems.count)")
+            }
+            newItems = frozen
+        }
         guard newItems != displayedItems else {
- // 数据变化但显示窗口未变（常见：已满 300 行后 autoload 继续 prepend）：
- // 仍检查一次窗口是否需要向上扩展（用户可能正停在窗口顶部附近）。
+ // 数据变化但显示窗口未变：仍检查一次窗口是否需要向旧端扩展
+ // （用户可能正停在窗口最旧端附近）。
             scheduleWindowExpansionCheck()
             return
         }
- // 1. 内容应用前：判断是否贴底、捕获可视锚点（必须是应用前的布局值）。
-        let wasAtBottom = pinnedToBottom && !isUserInteractingNow()
-        let anchor = visibleAnchorSnapshot()
-        let oldTailIDs = Array(displayedItems.suffix(2)).map(\.id)
-        let prepended = !MessageListUpdatePolicy.historyPrefix(displayed: displayedItems, incoming: newItems).isEmpty
-        metrics.contentSizeAtApply = metrics.facts.contentHeight
-        metrics.lockAnchor = nil
-        metrics.lockAnchorFixAttempts = 0
-        metrics.tailStable = !oldTailIDs.isEmpty && Array(newItems.suffix(2)).map(\.id) == oldTailIDs
-        if prepended { metrics.prependCount += 1 }
-        metrics.settleFollowUntil = CACurrentMediaTime() + 1.5
-        metrics.settleFollowAttempts = 0
- // 2. 应用数据（不冻结、不排队、不阻塞用户操作）。
- // 插入必须**无动画**：动画事务会让「已插入但锚定/follow 未对齐」的中间态
- // 可见几百 ms（=漂移窗口）。无动画插入 = 中间态 1 帧，肉眼不可见。
+ // 无动画应用：中间态 1 帧，肉眼不可见（沿用 r7 验收策略）。
         withAnimation(nil) {
             displayedItems = newItems
         }
-        scrollDebug("apply pinned=\(pinnedToBottom ? 1 : 0) displayed=\(displayedItems.count) incoming=\(newItems.count) atBottom=\(wasAtBottom ? 1 : 0) anchor=\(anchor?.id ?? "-") prepended=\(prepended ? 1 : 0) \(scrollGeometrySummary())")
-        guard didInitialBottom else {
-            scheduleLayoutCorrection()
-            return
+        if !isContentReady {
+            isContentReady = true
+            onFirstContent()
         }
- // 3. 计划：pinned（贴底）时**插入与贴底滚动同帧原子提交**——
- // display 变更与 scrollTo(edge:.bottom) 同一 runloop 提交，视口一帧落底，
- // 没有滚动过程（需求：加载期间零滚动，新内容只在底部冒出）。
- // 读历史（!pinned）：不发滚动（视口保持，锚定兜底在 layout 校正层）。
-        metrics.pendingAnchor = nil
-        metrics.pendingFollow = nil
-        if wasAtBottom, !isUserInteractingNow() {
-            withAnimation(nil) { scrollPosition.scrollTo(edge: .bottom) }
-            metrics.followCount += 1
-        }
-        scheduleLayoutCorrection()
+        scrollDebug("apply displayed=\(displayedItems.count) incoming=\(newItems.count) pinned=\(pinnedToBottom ? 1 : 0) \(scrollGeometrySummary())")
+        scheduleWindowExpansionCheck()
     }
 
  /// 显示窗口：只渲染「最近 N 行」（默认 300，与本地缓存深度对齐）。
@@ -816,7 +764,7 @@ struct SessionMessageListView: View {
         return MessageListWindowPolicy.initialWindow(items: incoming)
     }
 
- // MARK: - 窗口扩展（向上 prepend 100 行）
+ // MARK: - 窗口扩展（向旧端 append 100 行，零滚动）
 
     private func scheduleWindowExpansionCheck() {
         guard !metrics.windowExpansionScheduled else { return }
@@ -827,13 +775,17 @@ struct SessionMessageListView: View {
         }
     }
 
- /// 用户滚到窗口顶部预留区时向上扩展显示窗口（一次 100 行）。
- /// 扩展是纯 prepend：捕获锚点 → 应用 → 锚点式 scrollTo 放回（系统物化）。
+ /// 用户滚到窗口最旧端（布局底）预留区时扩展显示窗口（一次 100 行）。
+ /// inverted：扩展 = 渲染序列尾部 append（布局远端）→ 视口纹丝不动，
+ /// 无锚点回位、无滚动指令（旧实现的 prepend 补偿链已全部删除）。
     private func maybeExpandWindow() {
-        guard didInitialBottom, let first = displayedItems.first else { return }
-        guard !metrics.viewportFrame.isNull, let firstFrame = metrics.rowFrames[first.id] else { return }
-        guard MessageListWindowPolicy.shouldExpand(firstRow: firstFrame, viewport: metrics.viewportFrame) else { return }
-        guard let currentStart = items.firstIndex(where: { $0.id == first.id }) else { return }
+        guard let oldest = displayedItems.first else { return }
+        guard MessageListWindowPolicy.shouldExpandNearTail(
+            offset: metrics.facts.offset,
+            contentHeight: metrics.facts.contentHeight,
+            viewportHeight: metrics.facts.viewportHeight
+        ) else { return }
+        guard let currentStart = items.firstIndex(where: { $0.id == oldest.id }) else { return }
         let newStart = MessageListWindowPolicy.expandedStartIndex(currentStart: currentStart, itemCount: items.count)
         guard newStart < currentStart else { return }
         metrics.windowExpansionScheduled = true
@@ -845,258 +797,30 @@ struct SessionMessageListView: View {
 
     private func performWindowExpansion(newStart: Int) {
         guard newStart >= 0, newStart < items.count else { return }
-        let expanded = Array(items[newStart...])
-        guard expanded != displayedItems else { return }
-        let anchor = visibleAnchorSnapshot()
-        windowStartItemID = items[newStart].id
-        metrics.pendingFollow = nil
-        metrics.pendingVerify = nil
-        if let anchor {
-            metrics.pendingAnchor = anchor
-            metrics.pendingPrependHeight = true
+        var expanded = Array(items[newStart...])
+ // 读历史冻结一致：扩展批次同样截掉尾部新行（与 applyItemsChange 同语义，
+ // 避免扩展路径绕过冻结把新消息 insert 到布局顶推动视口）。
+        if !pinnedToBottom {
+            expanded = MessageListUpdatePolicy.withoutTailInsertions(displayed: displayedItems, incoming: expanded)
         }
-        metrics.tailStable = true
+        guard expanded != displayedItems else { return }
+        windowStartItemID = items[newStart].id
         withAnimation(nil) {
             displayedItems = expanded
         }
         metrics.prependCount += 1
         scrollDebug("window expand start=\(newStart) displayed=\(expanded.count)/\(items.count)")
-        scheduleLayoutCorrection()
     }
 
- /// 内容应用前的「可视锚点」：首个完整可见行（没有则取第一个与视口相交的行）。
-    private func visibleAnchorSnapshot() -> AnchorSnapshot? {
-        guard !metrics.viewportFrame.isNull else { return nil }
-        let visibleIDs = Set(displayedItems.map(\.id))
-        guard let candidate = ScrollFollowPolicy.anchorCandidate(
-            rowFrames: metrics.rowFrames,
-            viewport: metrics.viewportFrame,
-            visibleIDs: visibleIDs
-        ) else { return nil }
-        return AnchorSnapshot(id: candidate.id, relativeY: candidate.relativeY, rowHeight: candidate.rowHeight)
-    }
-
-    private func requestFollow(_ mode: FollowMode) {
-        metrics.pendingAnchor = nil
-        metrics.pendingVerify = nil
-        metrics.pendingFollow = mode
-        metrics.pendingPrependHeight = false
-    }
-
- // MARK: - 布局后校正（锚点式 scrollTo 意图）
-
- /// 布局（preference/geometry）变化后：执行 pending 的滚动意图。
+ /// 布局（contentHeight preference）变化后：检查窗口是否需要向旧端扩展。
     private func layoutDidChange() {
-        if !didInitialBottom {
-            advanceInitialBottomIfNeeded()
-            return
-        }
-        if metrics.pendingAnchor != nil || metrics.pendingFollow != nil {
-            if performPendingCorrection() {
-                metrics.syncCorrectionCount += 1
-            } else {
-                scheduleLayoutCorrection()
-            }
-            return
-        }
         maybeExpandWindow()
-        trackIdleBottomStability()
     }
 
- /// 兜底校正（异步一拍）：pending 意图本拍量不到时退到下一拍。
-    private func scheduleLayoutCorrection() {
-        guard !metrics.correctionScheduled else { return }
-        metrics.correctionScheduled = true
-        DispatchQueue.main.async {
-            self.metrics.correctionScheduled = false
-            guard self.metrics.pendingAnchor != nil || self.metrics.pendingFollow != nil else { return }
-            if self.performPendingCorrection() {
-                self.metrics.asyncCorrectionCount += 1
-            }
-        }
-    }
-
-    @discardableResult
-    private func performPendingCorrection() -> Bool {
-        var didWork = false
- // 顺序不变量：锚点还没回位，绝不能先做贴底跟随（否则 follow 会把
- // 「上方插入的高度」当成滚动距离 = 静置时自己滚动）。
-        if let anchor = metrics.pendingAnchor {
-            applyAnchorCorrection(anchor)
-            metrics.pendingAnchor = nil
-            if !pinnedToBottom {
-                metrics.lockAnchor = anchor
-                metrics.lockAnchorFixAttempts = 0
-            }
-            didWork = true
-        }
-        if let follow = metrics.pendingFollow {
-            applyFollowCorrection(follow)
-            metrics.pendingFollow = nil
-            didWork = true
-        }
-        return didWork
-    }
-
- /// 可视锚点回位：锚点式 scrollTo（id + 行内比例点），系统负责物化。
-    private func applyAnchorCorrection(_ anchor: AnchorSnapshot) {
-        guard displayedItems.contains(where: { $0.id == anchor.id }) else { return }
-        let fraction = MessageListUpdatePolicy.anchorFraction(
-            relativeY: anchor.relativeY,
-            rowHeight: anchor.rowHeight,
-            viewportHeight: metrics.viewportHeight
-        )
-        if let fraction {
-            scrollWithoutAnimation("anchor") { scrollPosition.scrollTo(id: anchor.id, anchor: .top) }
-        } else {
-            scrollWithoutAnimation("anchor") { scrollPosition.scrollTo(id: anchor.id, anchor: .top) }
-        }
-        metrics.anchorScrollToCount += 1
-        if isUserInteractingNow() {
-            metrics.anchorCorrectionDuringGesture += 1
-        }
-        scrollDebug("anchor scrollTo(id) relativeY=\(fmt(anchor.relativeY)) fraction=\(fraction.map { fmt($0) } ?? "-") \(scrollGeometrySummary())")
-        scheduleAnchorVerification(anchor)
-    }
-
- /// 锚点回位后的残差复核（只一次）：按行 frame 真值差再放一次。
-    private func scheduleAnchorVerification(_ anchor: AnchorSnapshot) {
-        metrics.pendingVerify = anchor
-        guard !metrics.verifyScheduled else { return }
-        metrics.verifyScheduled = true
-        DispatchQueue.main.async {
-            self.metrics.verifyScheduled = false
-            self.runAnchorVerificationIfNeeded()
-        }
-    }
-
-    private func runAnchorVerificationIfNeeded() {
-        guard let verify = metrics.pendingVerify else { return }
-        guard !metrics.viewportFrame.isNull,
-              let frame = metrics.rowFrames[verify.id] else { return }
-        let currentRelativeY = frame.minY - metrics.viewportFrame.minY
-        if let delta = ScrollFollowPolicy.compensationDelta(oldRelativeY: verify.relativeY, newRelativeY: currentRelativeY),
-           let fraction = MessageListUpdatePolicy.anchorFraction(
-               relativeY: verify.relativeY,
-               rowHeight: frame.height,
-               viewportHeight: metrics.viewportHeight
-           ) {
- // 残差仍超容差：再发一次锚点意图（不是搬 offset）。
-            scrollWithoutAnimation("verify") { scrollPosition.scrollTo(id: verify.id, anchor: .top) }
-            metrics.anchorResidualFixes += 1
-            metrics.lastAnchorResidual = delta
-            scrollDebug("anchor verify residual=\(fmt(delta)) fixes=\(metrics.anchorResidualFixes)")
-        } else {
-            metrics.lastAnchorResidual = currentRelativeY - verify.relativeY
-        }
-        metrics.pendingVerify = nil
-    }
-
- /// 贴底跟随（edge 意图）。两种模式都**无动画**直贴： 反馈
- /// 「加载过程中页面内容上下自动滚动弹跳」——加载批次（首窗口/历史补齐/流式）
- /// 陆续到达时，0.16s 缓动 follow 会连播多次可见滚动 = 弹跳。无动画直贴下
- /// 视口始终钉在内容底边，新内容只在底部出现，视觉稳定。
-    private func applyFollowCorrection(_ mode: FollowMode) {
-        metrics.pendingVerify = nil
-        scrollWithoutAnimation("settle") { scrollPosition.scrollTo(edge: .bottom) }
-        metrics.followCount += 1
-        scrollDebug("follow mode=\(mode == .animated ? "anim" : "now") \(scrollGeometrySummary())")
-    }
-
- // MARK: - 首屏贴底定位（初值 edge=.bottom + 自证 + 有界重试）
-
-    private func advanceInitialBottomIfNeeded() {
-        guard !didInitialBottom else { return }
-        guard metrics.facts.viewportHeight > 1 else { return }
-        if metrics.facts.distanceFromBottom <= ScrollFollowPolicy.initialBottomTolerance {
-            finishInitialBottom()
-            return
-        }
-        guard !metrics.initialAttemptPending else { return }
-        metrics.initialAttemptPending = true
-        metrics.initialBottomAttempts += 1
- // 初值意图 + 重试链：重复设相同 id 是 no-op，先清空再设强制重滚。
-        scrollWithoutAnimation("initial") { scrollPosition.scrollTo(edge: .bottom) }
-        scrollDebug("initial bottom attempt=\(metrics.initialBottomAttempts) distance=\(fmt(metrics.facts.distanceFromBottom)) \(scrollGeometrySummary())")
-        if metrics.initialBottomAttempts >= ScrollFollowPolicy.initialBottomMaxAttempts {
-            finishInitialBottom() // 兜底：绝不无限隐藏内容。
-        } else {
-            let delay = MessageListUpdatePolicy.stickRetryDelay(
-                attempt: metrics.initialBottomAttempts - 1,
-                isAtBottom: metrics.facts.distanceFromBottom <= MessageListUpdatePolicy.stickBottomTolerance,
-                elapsed: 0
-            ) ?? 0.1
-            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
-                self.metrics.initialAttemptPending = false
-                self.advanceInitialBottomIfNeeded()
-            }
-        }
-    }
-
- /// 用户已经接管滚动：不再强行贴底（避免和手势抢位置），直接显示当前内容。
-    private func finishInitialBottomIfInterrupted() {
-        guard !didInitialBottom else { return }
-        scrollDebug("initial bottom interrupted by touch")
-        finishInitialBottom()
-    }
-
-    private func finishInitialBottom() {
-        guard !didInitialBottom else { return }
-        let distance = metrics.facts.distanceFromBottom
-        didInitialBottom = true
-        isContentReady = true
-        metrics.pendingAnchor = nil
-        metrics.settleFollowUntil = CACurrentMediaTime() + 1.5
-        metrics.settleFollowAttempts = 0
-        metrics.lockAnchor = nil
-        metrics.pendingPrependHeight = false
-        scrollDebug("initial bottom done distance=\(fmt(distance)) attempts=\(metrics.initialBottomAttempts) \(scrollGeometrySummary())")
-        onFirstContent()
-    }
-
- // MARK: - 贴底收敛 / 空闲取证
-
- /// 内容变化/首屏定位后 1.5s 内的「贴底收敛」：LazyVStack 内容高度估算会在布局后
- /// 继续微调，单拍 edge 意图可能留下残差；窗口内有界地再贴一次。
-    private func settlePinnedBottomIfNeeded() {
-        guard didInitialBottom, pinnedToBottom, !isUserInteractingNow(),
-              metrics.pendingAnchor == nil, metrics.pendingFollow == nil else { return }
-        let now = CACurrentMediaTime()
-        guard now < metrics.settleFollowUntil, metrics.settleFollowAttempts < 8 else { return }
-        let distance = metrics.facts.distanceFromBottom
-        guard distance.isFinite, distance > 1.5 else { return }
-        metrics.settleFollowAttempts += 1
-        scrollWithoutAnimation("settle") { scrollPosition.scrollTo(edge: .bottom) }
-        metrics.followCount += 1
-    }
-
- /// 读历史时「内容锁定锚点」：布局成长后按真实 frame 差再放一次（锚点意图）。
-    private func applyIdleLayoutGrowthCompensation() {
-        guard didInitialBottom, !pinnedToBottom, !isUserInteractingNow() else { return }
-        guard let lock = metrics.lockAnchor,
-              metrics.lockAnchorFixAttempts < 12,
-              !metrics.viewportFrame.isNull,
-              let frame = metrics.rowFrames[lock.id] else { return }
-        let currentRelativeY = frame.minY - metrics.viewportFrame.minY
-        if let delta = ScrollFollowPolicy.compensationDelta(oldRelativeY: lock.relativeY, newRelativeY: currentRelativeY),
-           let fraction = MessageListUpdatePolicy.anchorFraction(
-               relativeY: lock.relativeY,
-               rowHeight: frame.height,
-               viewportHeight: metrics.viewportHeight
-           ) {
-            scrollWithoutAnimation("lock") { scrollPosition.scrollTo(id: lock.id, anchor: .top) }
-            metrics.lockAnchorFixAttempts += 1
-            metrics.lockAnchorFixes += 1
-            scrollDebug("growth lock delta=\(fmt(delta)) \(scrollGeometrySummary())")
-        }
-    }
-
- /// 空闲态稳定性取证：pinned 且无 pending 时，距底距离不应变大（变大 = 列表自己滚）。
+ /// 空闲态稳定性取证：pinned 且无手势时，距最新距离不应变大（变大 = 列表自己滚）。
     private func trackIdleBottomStability() {
-        guard didInitialBottom, pinnedToBottom,
-              metrics.pendingAnchor == nil, metrics.pendingFollow == nil else { return }
+        guard pinnedToBottom else { return }
         guard !isUserInteractingNow() else { return }
-        guard CACurrentMediaTime() >= metrics.settleFollowUntil else { return }
         let distance = metrics.facts.distanceFromBottom
         guard distance.isFinite else { return }
         if distance <= 2.5 { metrics.hasSettledOnce = true }
@@ -1104,6 +828,7 @@ struct SessionMessageListView: View {
         if distance > metrics.maxIdleDistance { metrics.maxIdleDistance = distance }
         if distance > ScrollFollowPolicy.settlePinTolerance + 2 { metrics.idleDriftCount += 1 }
     }
+
 
  // MARK: - 诊断/取证
 
@@ -1148,7 +873,7 @@ struct SessionMessageListView: View {
         return "facts=1"
             + " viewportMaxY=\(fmt(viewportMaxY))"
             + " viewportH=\(fmt(metrics.viewportHeight))"
-            + " bottomMaxY=\(fmt(metrics.bottomFrame?.maxY ?? -9999))"
+            + " bottomMaxY=\(fmt(metrics.viewportFrame.isNull ? -9999 : metrics.viewportFrame.maxY - metrics.facts.offset))"
             + " distance=\(fmt(metrics.facts.distanceFromBottom))"
             + " offset=\(fmt(metrics.facts.offset))"
             + " contentH=\(fmt(metrics.contentHeight))"
@@ -1194,7 +919,7 @@ struct SessionMessageListView: View {
         let windowStartIndex = displayedItems.first.flatMap { first in
             items.firstIndex(where: { $0.id == first.id })
         } ?? -1
-        return "o=\(fmt(metrics.facts.offset)) d=\(distanceText) i=\(displayedItems.count)/\(items.count) ws=\(windowStartIndex) pre=\(metrics.prependCount) ch=\(fmt(metrics.facts.contentHeight)) vh=\(fmt(metrics.viewportHeight)) pin=\(pinnedToBottom ? 1 : 0) ini=\(didInitialBottom ? 1 : 0) gm=\(fmt(metrics.gestureMaxFrameDelta)) ac=\(metrics.anchorScrollToCount) cs=\(metrics.contentSizeFollows) sf=\(metrics.anchorScrollToCount) acg=\(metrics.anchorCorrectionDuringGesture) fw=\(metrics.followCount) rs=\(fmt(metrics.lastAnchorResidual)) sy=\(metrics.syncCorrectionCount) lag=\(metrics.asyncCorrectionCount) dr=\(metrics.idleDriftCount) mx=\(fmt(metrics.maxIdleDistance)) kvo=\(metrics.contentSizeFollows) pan=\(metrics.panSeen ? 1 : 0) ptrk=\(metrics.panTrackingSeen ? 1 : 0) pdec=\(metrics.panDecelSeen ? 1 : 0) it=\(isUserInteractingNow() ? 1 : 0) drag=\(metrics.isDragging ? 1 : 0)"
+        return "o=\(fmt(metrics.facts.offset)) d=\(distanceText) i=\(displayedItems.count)/\(items.count) ws=\(windowStartIndex) pre=\(metrics.prependCount) ch=\(fmt(metrics.facts.contentHeight)) vh=\(fmt(metrics.viewportHeight)) pin=\(pinnedToBottom ? 1 : 0) ini=\(isContentReady ? 1 : 0) gm=\(fmt(metrics.gestureMaxFrameDelta)) ac=0 cs=0 sf=0 acg=0 fw=\(metrics.followCount) rs=0.0 sy=0 lag=0 dr=\(metrics.idleDriftCount) mx=\(fmt(metrics.maxIdleDistance)) kvo=0 pan=\(metrics.panSeen ? 1 : 0) ptrk=\(metrics.panTrackingSeen ? 1 : 0) pdec=\(metrics.panDecelSeen ? 1 : 0) it=\(isUserInteractingNow() ? 1 : 0) drag=\(metrics.isDragging ? 1 : 0)"
     }
 
  // MARK: - 隐藏探针（模拟器 E2E 契约；键名保持不变）
@@ -1246,7 +971,7 @@ struct SessionMessageListView: View {
             + ";seq=" + String(latestAppliedSeq())
             + ";dragging=" + (metrics.isDragging ? "1" : "0")
             + ";chain=0"
-            + ";bottomMaxY=" + fmt(metrics.bottomFrame?.maxY ?? -9999)
+            + ";bottomMaxY=" + fmt(metrics.viewportFrame.isNull ? -9999 : metrics.viewportFrame.maxY - metrics.facts.offset)
             + ";viewport=" + fmt(metrics.viewportHeight)
             + ";viewportMaxY=" + fmt(metrics.viewportFrame.isNull ? -9999 : metrics.viewportFrame.maxY)
             + ";topMinY=" + fmt(metrics.facts.offset)
@@ -1256,28 +981,28 @@ struct SessionMessageListView: View {
             + ";settledOnce=" + (metrics.hasSettledOnce ? "1" : "0")
             + ";maxDist=" + fmt(metrics.maxIdleDistance)
             + ";drifts=" + String(metrics.idleDriftCount)
-            + ";anchor=" + (pinnedToBottom && didInitialBottom ? "bottom" : "none")
+            + ";anchor=" + (pinnedToBottom ? "bottom" : "none")
             + ";pins=0"
             + ";gesturePins=0"
             + ";userScrolled=" + (userHasScrolled ? "1" : "0")
             + ";gestureMaxDelta=" + fmt(metrics.gestureMaxFrameDelta)
             + ";gestureFrames=" + String(metrics.gestureFrameCount)
             + ";prepends=" + String(metrics.prependCount)
-            + ";anchorFixes=" + String(metrics.anchorScrollToCount + metrics.anchorResidualFixes + metrics.lockAnchorFixes)
-            + ";pref=" + String(metrics.anchorPreferenceCount)
+            + ";anchorFixes=0"
+            + ";pref=0"
             + ";pb=0"
-            + ";kvo=" + String(metrics.contentSizeFollows)
+            + ";kvo=0"
             + ";pan=" + (metrics.panSeen ? "1" : "0")
             + ";ptrk=" + (metrics.panTrackingSeen ? "1" : "0")
             + ";pdec=" + (metrics.panDecelSeen ? "1" : "0")
             + ";os=" + fmt(overscrollAmount())
             + ";cmd=" + metrics.lastScrollCommand
             + ";vid=" + (metrics.lastScrollCommand)
-            + ";ini=" + (didInitialBottom ? "1" : "0")
-            + ";att=" + String(metrics.initialBottomAttempts)
+            + ";ini=" + (isContentReady ? "1" : "0")
+            + ";att=0"
             + ";csf=0"
-            + ";lk=" + String(metrics.lockAnchorFixes)
-            + ";sa=" + String(metrics.settleFollowAttempts)
+            + ";lk=0"
+            + ";sa=0"
             + ";contentSize=" + fmt(metrics.facts.contentHeight)
             + ";ready=" + (isContentReady ? "1" : "0")
             + ";wstart=" + String(windowStartIndex)
@@ -1320,12 +1045,14 @@ struct ScrollFacts: Equatable {
 
     init(geometry: ScrollGeometry) {
         let insets = geometry.contentInsets
-        let maxOffset = geometry.contentSize.height + insets.bottom - geometry.containerSize.height
         self.contentHeight = geometry.contentSize.height
         self.offset = max(0, geometry.contentOffset.y + insets.top)
         self.viewportHeight = geometry.containerSize.height
-        self.distanceFromBottom = maxOffset <= -insets.top + 1 ? 0 : maxOffset - geometry.contentOffset.y
-        self.overscroll = geometry.contentOffset.y - maxOffset
+ // inverted（r7）：最新消息在布局顶。距最新端 = 归一 offset
+ // （0 = 贴最新 = 视觉底部；读历史 offset 增大）。字段名保留（E2E 契约）。
+        self.distanceFromBottom = self.offset
+ // inverted 过滚 = 布局顶越界（= 视觉底部下拉 rubber band）。
+        self.overscroll = max(0, -(geometry.contentOffset.y + insets.top))
     }
 
     init(contentHeight: CGFloat, offset: CGFloat, viewportHeight: CGFloat, distanceFromBottom: CGFloat, overscroll: CGFloat) {
@@ -1335,18 +1062,6 @@ struct ScrollFacts: Equatable {
         self.distanceFromBottom = distanceFromBottom
         self.overscroll = overscroll
     }
-}
-
-private struct AnchorSnapshot {
-    let id: String
-    let relativeY: CGFloat
-    let rowHeight: CGFloat
-}
-
-/// 布局后贴底跟随的两种模式：立即（用户主动回底/首屏）或约 150ms 缓动（流式新内容）。
-enum FollowMode {
-    case immediate
-    case animated
 }
 
 /// 会话详情「显示窗口」策略（纯逻辑，可单测）。
@@ -1390,6 +1105,16 @@ enum MessageListWindowPolicy {
                              margin: CGFloat = expandMargin) -> Bool {
         guard !viewport.isNull, viewport.height > 1, !firstRow.isNull, firstRow.height > 0 else { return false }
         return viewport.minY - firstRow.maxY <= margin
+    }
+
+ /// inverted（r7）：视口接近窗口最旧端（布局底）预留区时，向旧端扩展。
+ /// 纯 offset 数学（不依赖行 frame 的翻转后坐标）：内容底到视口底的距离 <= margin。
+    static func shouldExpandNearTail(offset: CGFloat,
+                                     contentHeight: CGFloat,
+                                     viewportHeight: CGFloat,
+                                     margin: CGFloat = expandMargin) -> Bool {
+        guard contentHeight.isFinite, contentHeight > 1, viewportHeight > 1 else { return false }
+        return contentHeight - (offset + viewportHeight) <= margin
     }
 
  /// 一次扩展后的新起点下标（最多向前 expandChunk 行，不小于 0）。
@@ -1478,38 +1203,14 @@ private final class ScrollMetrics {
  /// LazyVStack 内容高度（preference 值，仅诊断）。
     var contentHeight: CGFloat = 0
     var viewportHeight: CGFloat = 0
- /// ScrollView 自身的全局 frame（与行 frame 同坐标系，锚点捕获用）。
+ /// ScrollView 自身的全局 frame（scale 外层测量，不受翻转影响；探针输出用）。
     var viewportFrame: CGRect = .null
-    var rowFrames: [String: CGRect] = [:]
- /// 底部哨兵行的全局 frame（nil = 未被 LazyVStack 物化 = 距底很远）。
-    var bottomFrame: CGRect?
 
  // MARK: - 交互（相位驱动）
  /// 用户拖拽中（ScrollPhase.tracking/.interacting）。
     var isDragging = false
  /// 松手后的交互静默期截止时间（惯性/回弹也算用户交互）。
     var interactingUntil: CFTimeInterval = 0
-
- // MARK: - 布局后校正
- /// 待回位的可视锚点（内容变化前捕获）。
-    var pendingAnchor: AnchorSnapshot?
- /// 待执行的贴底跟随模式。
-    var pendingFollow: FollowMode?
- /// 异步兜底校正是否已排队（去重）。
-    var correctionScheduled = false
- /// 锚点回位后待复核的锚点（只复核一次）。
-    var pendingVerify: AnchorSnapshot?
-    var verifyScheduled = false
- /// 应用新内容前的 contentSize.height（诊断）。
-    var contentSizeAtApply: CGFloat = -1
- /// 尾部两行 id 是否未变（纯 prepend 判定）。
-    var tailStable = false
- /// 窗口扩展 prepend 标记。
-    var pendingPrependHeight = false
-
- // MARK: - 首屏贴底定位
-    var initialBottomAttempts = 0
-    var initialAttemptPending = false
 
  // MARK: - 诊断/取证
  /// 逐帧 offset 采样的上一值（手势窗口内统计单帧最大位移）。
@@ -1520,29 +1221,13 @@ private final class ScrollMetrics {
     var maxIdleDistance: CGFloat = 0
     var idleDriftCount = 0
     var prependCount = 0
-    var anchorPreferenceCount = 0
-    var anchorScrollToCount = 0
-    var anchorCorrectionDuringGesture = 0
-    var anchorResidualFixes = 0
     var followCount = 0
-    var lastAnchorResidual: CGFloat = 0
-    var syncCorrectionCount = 0
-    var asyncCorrectionCount = 0
-    var settleFollowUntil: CFTimeInterval = 0
-    var settleFollowAttempts = 0
-    var contentSizeFollows = 0
     var panSeen = false
     var panTrackingSeen = false
     var panDecelSeen = false
     var windowExpansionScheduled = false
  /// 最近一次程序化滚动指令来源（跳动取证：cmd 有值且时间近 = 我们滚的）。
     var lastScrollCommand: String = "-"
-    var lastScrollCommandAt: CFTimeInterval = 0
- /// 上次贴底跟随时间（节流，防估值抖动期反复滚动）。
-    var lastFollowAt: CFTimeInterval = 0
-    var lockAnchor: AnchorSnapshot?
-    var lockAnchorFixes = 0
-    var lockAnchorFixAttempts = 0
 }
 
 // MARK: - PreferenceKeys（SwiftUI 原生测量）
@@ -1552,26 +1237,11 @@ private struct ListContentHeightPreferenceKey: PreferenceKey {
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
 }
 
-/// 底部哨兵行的全局 frame：贴底自证信号。哨兵行未物化时回到.null → 视为「距底很远」。
-private struct ListBottomFramePreferenceKey: PreferenceKey {
-    static var defaultValue: CGRect = .null
-    static func reduce(value: inout CGRect, nextValue: () -> CGRect) {
-        value = nextValue()
-    }
-}
-
-/// ScrollView 自身的全局 frame：与哨兵行/行 frame 同坐标系。
+/// ScrollView 自身的全局 frame（挂在 scale 外层，测量不受翻转影响；探针输出用）。
 private struct ListViewportFramePreferenceKey: PreferenceKey {
     static var defaultValue: CGRect = .null
     static func reduce(value: inout CGRect, nextValue: () -> CGRect) {
         let next = nextValue()
         if !next.isNull { value = next }
-    }
-}
-
-private struct RowFramePreferenceKey: PreferenceKey {
-    static var defaultValue: [String: CGRect] = [:]
-    static func reduce(value: inout [String: CGRect], nextValue: () -> [String: CGRect]) {
-        value.merge(nextValue()) { _, new in new }
     }
 }
