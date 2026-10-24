@@ -245,12 +245,10 @@ struct UserQuestionCardView: View {
             if isLong {
                 Button(isExpanded ? L10n.t("收起") : L10n.t("展开")) {
                     userToggleReporter?()
-                    withAnimation(Theme.Motion.quick) {
-                        if isExpanded {
-                            expandedDetails.remove(question.id)
-                        } else {
-                            expandedDetails.insert(question.id)
-                        }
+                    if isExpanded {
+                        expandedDetails.remove(question.id)
+                    } else {
+                        expandedDetails.insert(question.id)
                     }
                 }
                 .font(Theme.Typography.label)
@@ -259,6 +257,8 @@ struct UserQuestionCardView: View {
                 .accessibilityIdentifier("uq-detail-toggle-\(question.id)")
             }
         }
+ // 行高由 SessionMessageListView 显式逐帧驱动；这里只做边界裁剪。
+        .clipped()
         .padding(Theme.Spacing.s)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(Theme.Palette.surface, in: RoundedRectangle(cornerRadius: Theme.Radius.sm, style: .continuous))

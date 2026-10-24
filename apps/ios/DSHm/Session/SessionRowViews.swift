@@ -132,7 +132,7 @@ struct RelayCardView: View {
         VStack(alignment: .leading, spacing: Theme.Spacing.xs) {
             Button {
                 userToggleReporter?()
-                withAnimation(Theme.Motion.standard) { isExpanded.toggle() }
+                isExpanded.toggle()
             } label: {
                 HStack(spacing: 6) {
                     Image(systemName: "person.2")
@@ -176,6 +176,8 @@ struct RelayCardView: View {
                 }
             }
         }
+ // 行高由 SessionMessageListView 显式逐帧驱动；这里只做边界裁剪。
+        .clipped()
         .padding(Theme.Spacing.s)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(Theme.Palette.surface, in: RoundedRectangle(cornerRadius: Theme.Radius.lg, style: .continuous))
@@ -226,7 +228,7 @@ struct ReasoningRowView: View {
         VStack(alignment: .leading, spacing: Theme.Spacing.xs) {
             Button {
                 userToggleReporter?()
-                withAnimation(Theme.Motion.quick) { expanded.toggle() }
+                expanded.toggle()
             } label: {
                 HStack(spacing: Theme.Spacing.xs) {
                     Image(systemName: "sparkles")
@@ -257,6 +259,9 @@ struct ReasoningRowView: View {
                     .accessibilityIdentifier("reasoning-full-text")
             }
         }
+ // 行高由 SessionMessageListView 显式逐帧驱动（hosted 内容高度是瞬间变化的，
+ // 无法靠 SwiftUI 动画带动 hosting intrinsic size），这里只做边界裁剪。
+        .clipped()
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(Theme.Palette.surface, in: RoundedRectangle(cornerRadius: Theme.Radius.lg, style: .continuous))
         .overlay(
