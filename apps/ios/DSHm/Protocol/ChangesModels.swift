@@ -55,10 +55,6 @@ struct TurnFileChanges: Equatable {
  /// 跨端口径（桌面端一致）：标题文件数用 Host 的 `total`，不是客户端 files 数组长度。
  /// 桌面端实测「标题用 total、列表用 files.length」，二者可能不等。
     var total: Int? = nil
- /// task-2: the exact summary is still being fetched (first try or backoff
- /// retry). Card/sheet render a loading state instead of the fallback numbers
- /// so the meta.diffs aggregate is never mistaken for the desktop numbers.
-    var isLoading: Bool = false
 
  /// 卡片标题的文件数口径（跨端一致）：Host `total` 优先，缺省才回退客户端
  /// files 数组长度。桌面端实测「标题用 total、列表用 files.length」，二者可能

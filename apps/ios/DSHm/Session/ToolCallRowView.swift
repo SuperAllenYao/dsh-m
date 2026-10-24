@@ -97,8 +97,9 @@ struct FileChangesCard: View {
     var changes: TurnFileChanges
     var onTap: () -> Void
 
+ /// 来源只有两种，#2：任何时刻都不表达「读取中」——精确数据未就绪时先显示
+ /// 工具聚合数字，exact 到达后原地替换（绝不出现 spinner/占位文案）。
     private var sourceLabel: String {
-        if changes.isLoading { return L10n.t("读取中") }
         switch changes.source {
         case .exactFetch: return "Host"
         case .metaDiffsFallback: return L10n.t("工具聚合")
@@ -118,21 +119,12 @@ struct FileChangesCard: View {
                     .font(Theme.Typography.label)
                     .foregroundStyle(Theme.Palette.textTertiary)
                 Spacer()
- // task-2: never present the meta.diffs fallback numbers while the
- // exact Host summary is still loading (first try or backoff retry).
-                if changes.isLoading {
-                    ProgressView()
-                        .controlSize(.mini)
-                        .tint(Theme.Palette.accent)
-                    Text(L10n.t("正在读取精确数据…"))
-                        .font(Theme.Typography.label)
-                        .foregroundStyle(Theme.Palette.textTertiary)
-                } else {
- // 与桌面端口径一致：标题文件数用 Host 的 total（不是 files 数组长度）。
-                    Text(L10n.f("%lld 个文件 · +%lld -%lld", changes.titleFileCount, changes.added, changes.deleted))
-                        .font(Theme.Typography.label)
-                        .foregroundStyle(Theme.Palette.textTertiary)
-                }
+ // #2：卡片始终显示数字，不出现 loading/转圈。
+ // 与桌面端口径一致：标题文件数用 Host 的 total（不是 files 数组长度）；
+ // exact 未就绪时这就是工具聚合数字，精确数据到达后同一行原地替换。
+                Text(L10n.f("%lld 个文件 · +%lld -%lld", changes.titleFileCount, changes.added, changes.deleted))
+                    .font(Theme.Typography.label)
+                    .foregroundStyle(Theme.Palette.textTertiary)
                 Image(systemName: "chevron.right")
                     .font(.system(size: 9, weight: .semibold))
                     .foregroundStyle(Theme.Palette.textTertiary)

@@ -147,6 +147,108 @@ struct FileChangesFetchState: Equatable {
     func retriesMade(_ seq: Int) -> Int { attempts[seq] ?? 0 }
 }
 
+// MARK: - Exact summary 本地缓存（Host 释放后的精确数字）
+
+/// 成功取到的 `/api/changes.summary` 按 `sessionId + seq` 落盘缓存。
+///
+/// 协议 §3.9：Host 只在进程内存里持有最近一轮 summary，重启 / 释放会话后 exact
+/// fetch 必然 404。缓存让 App 下次打开同一会话时仍先显示 Host 口径的精确数字，
+/// 而不是退回工具聚合（#2：数字不因取数失败而「看起来变了」）。
+///
+/// UserDefaults 单键存一个条目数组；容量上限 `maxEntries`（默认 200）条，超出后
+/// 按写入时间淘汰最旧。纯值类型 + 可注入 defaults，便于单测用独立 suite。
+struct FileChangesSummaryCache {
+    struct StoredFile: Codable, Equatable {
+        var path: String
+        var display: String?
+        var added: Int?
+        var deleted: Int?
+    }
+
+    struct StoredSummary: Codable, Equatable {
+        var turn: Int?
+        var files: [StoredFile]
+        var total: Int?
+        var added: Int?
+        var deleted: Int?
+
+        init(_ summary: ChangesSummaryValue) {
+            turn = summary.turn
+            files = summary.files.map {
+                StoredFile(path: $0.path, display: $0.display, added: $0.added, deleted: $0.deleted)
+            }
+            total = summary.total
+            added = summary.added
+            deleted = summary.deleted
+        }
+
+        var value: ChangesSummaryValue {
+            ChangesSummaryValue(
+                turn: turn,
+                files: files.map {
+                    ChangesSummaryValue.File(
+                        path: $0.path,
+                        display: $0.display,
+                        added: $0.added,
+                        deleted: $0.deleted
+                    )
+                },
+                total: total,
+                added: added,
+                deleted: deleted
+            )
+        }
+    }
+
+    struct Entry: Codable, Equatable {
+        var sessionId: String
+        var seq: Int
+        var savedAt: Double
+        var summary: StoredSummary
+    }
+
+    static let defaultsKey = "DSHm.fileChanges.exactSummaries.v1"
+ /// 跨会话总条目上限。200 条约几十 KB，正常使用远用不满；超出淘汰最旧。
+    static let defaultMaxEntries = 200
+
+    var defaults: UserDefaults = .standard
+    var maxEntries = FileChangesSummaryCache.defaultMaxEntries
+
+ /// 该会话已缓存的 exact 摘要（seq → summary）。命中即可直接显示精确数字。
+    func load(sessionId: String) -> [Int: ChangesSummaryValue] {
+        var result: [Int: ChangesSummaryValue] = [:]
+        for entry in entries() where entry.sessionId == sessionId {
+            result[entry.seq] = entry.summary.value
+        }
+        return result
+    }
+
+    mutating func save(_ summary: ChangesSummaryValue, sessionId: String, seq: Int) {
+        var all = entries().filter { !($0.sessionId == sessionId && $0.seq == seq) }
+        all.append(Entry(
+            sessionId: sessionId,
+            seq: seq,
+            savedAt: Date().timeIntervalSince1970,
+            summary: StoredSummary(summary)
+        ))
+        if all.count > maxEntries {
+            all.sort { $0.savedAt < $1.savedAt }
+            all.removeFirst(all.count - maxEntries)
+        }
+        persist(all)
+    }
+
+    private func entries() -> [Entry] {
+        guard let data = defaults.data(forKey: Self.defaultsKey) else { return [] }
+        return (try? JSONDecoder().decode([Entry].self, from: data)) ?? []
+    }
+
+    private func persist(_ entries: [Entry]) {
+        guard let data = try? JSONEncoder().encode(entries) else { return }
+        defaults.set(data, forKey: Self.defaultsKey)
+    }
+}
+
 /// Session detail state: owns the session/follow subscription, applies frames
 /// through SessionJournal and rebuilds render rows (turn grouping).
 @MainActor
@@ -240,6 +342,11 @@ final class SessionViewModel: ObservableObject {
     @Published private(set) var fileChangeFetch = FileChangesFetchState()
  /// Seqs the Host really released (404 only). Computed view of the fetch state.
     var fileChangeUnavailableSeqs: Set<Int> { fileChangeFetch.terminalSeqs }
+ /// #2: 成功取到的 exact summary 的磁盘缓存（Host 进程内存释放后仍显示精确数字）。
+ /// 单测可替换成独立 UserDefaults suite，避免污染标准域。
+    var fileChangesSummaryCache = FileChangesSummaryCache()
+ /// 懒加载的「本会话」磁盘缓存镜像；一旦载入就不再每次渲染读 UserDefaults。
+    private var loadedFileChangesSummaryCache: [Int: ChangesSummaryValue]?
 
     private(set) var journal = SessionJournal()
  /// M2b-2: the detail was first painted from the on-disk window cache. The live
@@ -334,7 +441,8 @@ final class SessionViewModel: ObservableObject {
     @Published private(set) var sendMetricsValue: String?
     private var detailViewVisible = false
     private var detailFirstFrameMarked = false
-    private var requestedFileChangeSeqs: Set<Int> = []
+ /// #1/#2: 已发起过 exact 请求的 seq（UI 不再用它表达 loading，只做去重/诊断）。
+    private(set) var requestedFileChangeSeqs: Set<Int> = []
  /// task-2: retry timers and stale-completion guards per changes seq.
     private var fileChangeRetryTasks: [Int: Task<Void, Never>] = [:]
     private var fileChangeFetchTokens: [Int: Int] = [:]
@@ -1545,6 +1653,9 @@ final class SessionViewModel: ObservableObject {
                 await self?.refreshSubagentRuntime()
             }
         }
+ // #1/#2: exact 取数只在空闲态发起（方法内部 guard!isRunning）。running
+ // 期间的每次 publish 都不发请求；turn/end 后的重建（wasRunning →!isRunning）
+ // 是第一次放行点，卡片也只在此时开始存在。reset hooks 负责空闲态重试。
         requestFileChangeSummariesIfNeeded()
  // v5.4 queue: a finished turn automatically releases the oldest queued
  // prompt with mode=queue; the rest keep waiting for the next turn/end.
@@ -2108,6 +2219,52 @@ final class SessionViewModel: ObservableObject {
               !summary.files.isEmpty else { return }
         e2eFileChangesSummary = summary
     }
+
+ /// E2E 合成 seq：`DSHM_E2E_CHANGES_SUMMARY` 在样本会话没有
+ /// `latestFileChangeSeq`（idle 且窗口无 workspace/changes）时使用。
+ /// 取值远大于任何真实 seq，只用于 DEBUG E2E 的卡片/弹层/文件对比展示。
+    static let e2eSyntheticChangesSeq = Int.max / 4
+
+ /// E2E seam：注入 `/api/changes.diff` 的返回值，供模拟器验证
+ /// sheet → 文件对比（GitHub 风格 diff）链路，不依赖真实 Host 内存。
+ ///
+ /// 三重门（Release 不编译、无产品行为）：
+ /// - DEBUG 编译；
+ /// - `DSHM_E2E=1`（SessionDetailView 只在 `app.isE2EMode` 时调用本方法）；
+ /// - `DSHM_E2E_CHANGES_DIFF` = 单个 `ChangesDiffValue` JSON（所有 index 同一份）
+ /// 或 `ChangesDiffValue` 数组（按 file index 取，越界返回 nil）。
+    private var e2eFileDiffs: [ChangesDiffValue]?
+ /// 非数组形态：单个 diff 对所有 index 生效。
+    private var e2eFileDiffForAllIndices: ChangesDiffValue?
+
+    func installE2EChangesDiffPreviewIfRequested() {
+        guard ProcessInfo.processInfo.environment["DSHM_E2E"] == "1" else { return }
+        guard let raw = ProcessInfo.processInfo.environment["DSHM_E2E_CHANGES_DIFF"] else { return }
+        installE2EChangesDiffPreview(json: raw)
+    }
+
+ /// Same injection path without the env gate so unit tests can prove the diff
+ /// loader returns injected hunks (the sheet itself is UI-only).
+    func installE2EChangesDiffPreview(json: String) {
+        guard e2eFileDiffs == nil, e2eFileDiffForAllIndices == nil else { return }
+        let raw = json.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !raw.isEmpty, let data = raw.data(using: .utf8) else { return }
+        let decoder = JSONDecoder()
+        if let array = try? decoder.decode([ChangesDiffValue].self, from: data) {
+            guard !array.isEmpty else { return }
+            e2eFileDiffs = array
+        } else if let single = try? decoder.decode(ChangesDiffValue.self, from: data) {
+            e2eFileDiffForAllIndices = single
+        }
+    }
+
+ /// DEBUG E2E：`loadFileDiff` 的注入路径（数组按 index，单对象所有 index）。
+    private func e2eInjectedFileDiff(index: Int) -> ChangesDiffValue? {
+        if let e2eFileDiffs, e2eFileDiffs.indices.contains(index) {
+            return e2eFileDiffs[index]
+        }
+        return e2eFileDiffForAllIndices
+    }
     #endif
 
  // MARK: - User questions (task-2 / tech-design §14)
@@ -2305,54 +2462,92 @@ final class SessionViewModel: ObservableObject {
 
  // MARK: - File changes (exact-fetch §3.9, meta.diffs fallback)
 
- /// 最新一轮合并后的文件变更视图：Host 仍保留时用精确取数，否则退回
- /// 客户端 meta.diffs 聚合。turn UI 删除后只在流末尾保留「最近一轮」卡片。
+ /// 最新一轮合并后的文件变更视图（卡片/弹层的唯一数据源）。
  ///
- /// task-2: while the exact fetch is still loading (first try or backoff) the
- /// fallback numbers are NOT surfaced as truth — the card/sheet render a loading
- /// state instead (reported illusion: App 18 files +712 −42 vs desktop 50 files).
+ /// 设计决策后的口径（#1 只在空闲存在 / #2 永不转圈）：
+ /// - **主会话执行任务期间（`isRunning`）不提供数据**：窗口起点晚于本轮
+ /// `turn/start` 时 `latestFileChangeSeq` 可能是上一轮残留的 seq
+ /// （SessionRowBuilder.replay 的 Int.min 分支），这里兜底，running 中不展示；
+ /// - **永不 loading**：内存 exact → 磁盘缓存 exact → meta.diffs 聚合，有什么
+ /// 先显示什么；精确数据到达后原地替换，不出现「读取中/转圈」；
+ /// - 两者都没有时返回 nil（宁可不显示卡片，也不显示空数字）。
     var latestTurnFileChanges: TurnFileChanges? {
+ // #1: 主会话执行任务期间完全没有卡片。
+        guard !isRunning else { return nil }
         #if DEBUG
  // E2E seam (installE2EChangesSummaryPreviewIfRequested): a synthetic exact
- // summary wins so a real device can verify the cross-end title口径 without a
- // Host that still holds the summary. Mapped lazily so seq follows the flow.
+ // summary wins so a simulator can verify the cross-end title口径 without a
+ // Host that still holds the summary. Without a real seq (idle session with no
+ // workspace/changes event) a synthetic seq keeps the sheet/diff path usable.
  // Release builds never compile this.
         if let summary = e2eFileChangesSummary {
-            return .exact(from: summary, seq: flow.latestFileChangeSeq)
+            return .exact(from: summary, seq: flow.latestFileChangeSeq ?? Self.e2eSyntheticChangesSeq)
         }
         #endif
-        if let seq = flow.latestFileChangeSeq, let summary = fileChangeSummaries[seq] {
-            return TurnFileChanges.exact(from: summary, seq: seq)
-        }
-        if let pendingSeq = flow.latestFileChangeSeq, isFileChangeFetchUnsettled(pendingSeq) {
-            return TurnFileChanges(
-                source: .metaDiffsFallback,
-                files: [],
-                added: 0,
-                deleted: 0,
-                seq: pendingSeq,
-                isLoading: true
-            )
-        }
-        guard let fallback = flow.latestFileChanges else { return nil }
-        return TurnFileChanges(
-            source: .metaDiffsFallback,
-            files: fallback.files.map { ChangesSummaryValue.File(path: $0, display: ($0 as NSString).lastPathComponent, added: nil, deleted: nil) },
-            added: fallback.additions,
-            deleted: fallback.deletions,
-            seq: flow.latestFileChangeSeq
+        let seq = flow.latestFileChangeSeq
+        return Self.resolveLatestTurnFileChanges(
+            seq: seq,
+            memorySummary: seq.flatMap { fileChangeSummaries[$0] },
+            cachedSummary: seq.flatMap { cachedFileChangeSummary(seq: $0) },
+            fallback: flow.latestFileChanges
         )
     }
 
- /// True while the newest turn's exact summary is in flight (card/sheet loading).
+ /// 卡片数据源的纯函数口径（#2）：内存 exact → 磁盘缓存 exact → meta.diffs
+ /// 聚合。任何分支都不产生 loading 态；精确数据未就绪时先返回聚合数字。
+ /// - Parameters:
+ /// - seq: 最新一轮 `workspace/changes` 的 seq（exact 取数 key）
+ /// - memorySummary: 本次进程内成功取到的 exact
+ /// - cachedSummary: 上次运行落盘的 exact（Host 重启 404 后仍显示精确数字）
+ /// - fallback: 工具结果 meta.diffs 的客户端聚合
+    static func resolveLatestTurnFileChanges(
+        seq: Int?,
+        memorySummary: ChangesSummaryValue?,
+        cachedSummary: ChangesSummaryValue?,
+        fallback: FileChangeSummary?
+    ) -> TurnFileChanges? {
+        if let seq, let memorySummary { return .exact(from: memorySummary, seq: seq) }
+        if let seq, let cachedSummary { return .exact(from: cachedSummary, seq: seq) }
+        guard let fallback else { return nil }
+        return TurnFileChanges(
+            source: .metaDiffsFallback,
+            files: fallback.files.map {
+                ChangesSummaryValue.File(
+                    path: $0,
+                    display: ($0 as NSString).lastPathComponent,
+                    added: nil,
+                    deleted: nil
+                )
+            },
+            added: fallback.additions,
+            deleted: fallback.deletions,
+            seq: seq
+        )
+    }
+
+ /// 懒加载本会话的磁盘 exact 缓存（首次渲染读一次 UserDefaults，之后纯内存）。
+    private func cachedFileChangeSummary(seq: Int) -> ChangesSummaryValue? {
+        if loadedFileChangesSummaryCache == nil {
+            loadedFileChangesSummaryCache = fileChangesSummaryCache.load(sessionId: sessionId)
+        }
+        return loadedFileChangesSummaryCache?[seq]
+    }
+
+ /// 成功取数后写穿磁盘缓存（写失败不影响 UI，下一次仍会重新取）。
+    private func persistFileChangeSummary(_ summary: ChangesSummaryValue, seq: Int) {
+        fileChangesSummaryCache.save(summary, sessionId: sessionId, seq: seq)
+        loadedFileChangesSummaryCache?[seq] = summary
+    }
+
+ /// 诊断用：exact 取数是否仍在重试/等待中。**UI 不再消费**（#2 无 loading 态）。
     var fileChangesExactFetchPending: Bool {
         guard let seq = flow.latestFileChangeSeq else { return false }
         return isFileChangeFetchUnsettled(seq)
     }
 
- /// No summary yet, not a terminal 404, and the fetch is in flight or about to be
- /// requested → show loading instead of the fallback numbers (avoids the flash of
- /// the aggregate口径 before the first request starts).
+ /// No summary yet and not a terminal 404 → the exact fetch is in flight or about
+ /// to be requested. **诊断用**： 起卡片/弹层不再用它表达 loading
+ /// （#2 永不转圈），UI 只按 resolveLatestTurnFileChanges 的口径显示数字。
     private func isFileChangeFetchUnsettled(_ seq: Int) -> Bool {
         if fileChangeFetch.isLoading(seq) { return true }
         return !fileChangeFetch.isTerminal(seq) && !requestedFileChangeSeqs.contains(seq)
@@ -2361,7 +2556,12 @@ final class SessionViewModel: ObservableObject {
  /// Requests the exact-fetch summary of the newest turn's workspace/changes
  /// event. Only a real 404 is terminal; everything else retries 1/2/4 s and is
  /// re-armed by every lifecycle reset (network / foreground / reconnect / reopen).
+ ///
+ /// #1 取数时机：**主会话执行任务期间绝不发请求**。
+ /// 本方法在每个 journal publish 后都会被调用，running 期间直接返回；turn/end
+ /// 之后的那次重建是第一次放行点（卡片也只在此时开始存在）。
     private func requestFileChangeSummariesIfNeeded() {
+        guard !isRunning else { return }
         guard let seq = flow.latestFileChangeSeq else { return }
         guard fileChangeSummaries[seq] == nil else { return }
         guard !fileChangeFetch.isTerminal(seq) else { return }
@@ -2385,6 +2585,9 @@ final class SessionViewModel: ObservableObject {
                 guard self.isCurrentFileChangeFetch(seq: seq, token: token), !Task.isCancelled else { return }
                 self.fileChangeFetch.succeeded(seq: seq)
                 self.fileChangeSummaries[seq] = summary
+ // #2: 成功结果按 sessionId+seq 落盘——Host 重启/释放后 exact fetch
+ // 会 404，下次打开仍应先显示精确数字而不是聚合数字。
+                self.persistFileChangeSummary(summary, seq: seq)
                 let added = summary.added ?? summary.files.reduce(0) { $0 + ($1.added ?? 0) }
                 let deleted = summary.deleted ?? summary.files.reduce(0) { $0 + ($1.deleted ?? 0) }
                 ChangesDebugLog.log("summary ok seq=\(seq) files=\(summary.files.count) added=\(added) deleted=\(deleted) ms=\(Self.millisSince(started))")
@@ -2505,6 +2708,12 @@ final class SessionViewModel: ObservableObject {
 
  /// Loads `/api/changes.diff` for one file in a turn's change set.
     func loadFileDiff(seq: Int, index: Int) async -> ChangesDiffValue? {
+        #if DEBUG
+ // E2E seam (installE2EChangesDiffPreviewIfRequested /...DiffPreview(json:)):
+ // injected hunks win so the sheet → 文件对比 链路 can be verified on a
+ // simulator without a Host holding the turn's diff.
+        if let injected = e2eInjectedFileDiff(index: index) { return injected }
+        #endif
         guard let link else { return nil }
         do {
             return try await link.changesDiff(sessionId: sessionId, seq: seq, index: index)

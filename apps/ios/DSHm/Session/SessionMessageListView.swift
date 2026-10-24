@@ -54,6 +54,57 @@ enum MessageListUpdatePolicy {
         guard Array(incomingIDs.suffix(shownIDs.count)) == shownIDs else { return [] }
         return Array(incoming.prefix(incomingIDs.count - shownIDs.count))
     }
+
+ /// 非贴底（读历史）时尾部更新的结果：`changed` 为 false 时调用方可直接返回。
+    struct TailUpdate {
+        var items: [SessionMessageItem]
+        var changed: Bool
+    }
+
+ /// 读历史（不贴底）时仍必须应用的尾部变化：
+ ///
+ /// 1. 尾部行**内容**原地更新（id 不变、行数与顺序不变）。典型场景：#2 精确数据
+ /// 未就绪时卡片先显示工具聚合数字，exact 到达后同一行原地替换——旧实现只接收
+ /// 前置历史，尾部内容永远停在首次渲染的值；
+ /// 2. `running` 期间把文件变更卡行直接摘掉（#1 卡片只在空闲存在）。尾部行移除
+ /// 不会移动当前视口内的行，阅读锚点保持不动。
+ ///
+ /// 结构变化（历史补齐、尾部增删）不在这里处理，仍由调用方冻结/解冻策略决定。
+    static func applyingTrailingUpdates(
+        displayed: [SessionMessageItem],
+        incoming: [SessionMessageItem],
+        running: Bool
+    ) -> TailUpdate {
+        var result = displayed
+        var changed = false
+        if running {
+            let kept = result.filter { item in
+                if case .fileChanges = item { return false }
+                return true
+            }
+            if kept.count != result.count {
+                result = kept
+                changed = true
+            }
+        }
+ // 已显示行的尾部与 incoming 的**后缀**按 id 对齐（前置历史补齐不会改变尾部
+ // 行在 incoming 里的相对位置；running 摘卡后行数可能比 incoming 少）。
+ // 结构变化（尾部增删）保持冻结，交给回到贴底时的整体应用。
+        if result.count <= incoming.count {
+            let offset = incoming.count - result.count
+            var index = result.count - 1
+            while index >= 0 {
+                if case .group = result[index] { break }
+                guard result[index].id == incoming[offset + index].id else { break }
+                if result[index] != incoming[offset + index] {
+                    result[index] = incoming[offset + index]
+                    changed = true
+                }
+                index -= 1
+            }
+        }
+        return TailUpdate(items: result, changed: changed)
+    }
 }
 
 /// **原生 SwiftUI 消息列表（v0.2.7 方案 B)**
@@ -167,7 +218,7 @@ struct SessionMessageListView: View {
             case .streamError(let message): parts.append("se:\(message)")
             case .actionError(let message): parts.append("ae:\(message)")
             case .fileChanges(let changes):
-                parts.append("fc:\(changes.source)|\(changes.isLoading)|\(changes.titleFileCount)|\(changes.files.count)|\(changes.added)|\(changes.deleted)")
+                parts.append("fc:\(changes.source)|\(changes.titleFileCount)|\(changes.files.count)|\(changes.added)|\(changes.deleted)")
             }
         }
         return parts.joined(separator: "#")
@@ -396,10 +447,19 @@ struct SessionMessageListView: View {
         }
  // 读历史：只接收前置的历史补齐行，保持阅读位置（用可见行做锚点）。
         let prepended = MessageListUpdatePolicy.leadingPrependedItems(displayed: displayedItems, incoming: newItems)
-        guard !prepended.isEmpty else { return }
+ // 修复：尾部行的内容更新（文件变更卡从「工具聚合」数字切成 Host
+ // 精确数字）即使不贴底也必须应用，否则读历史时数字永远停在首次渲染值；
+ // running 期间还要把卡片行摘掉（#1 卡片只在空闲存在）。
+        let tail = MessageListUpdatePolicy.applyingTrailingUpdates(
+            displayed: displayedItems,
+            incoming: newItems,
+            running: isRunning
+        )
+        guard !prepended.isEmpty || tail.changed else { return }
         let anchorID = visibleAnchorID()
-        displayedItems = prepended + displayedItems
-        if let anchorID {
+        displayedItems = prepended + tail.items
+ // 只有前置补齐会移动可见行；尾部内容/尾部行移除不会改变当前 offset。
+        if !prepended.isEmpty, let anchorID {
             DispatchQueue.main.async {
                 proxy.scrollTo(anchorID, anchor: .top)
             }
