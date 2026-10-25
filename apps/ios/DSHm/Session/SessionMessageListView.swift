@@ -337,6 +337,8 @@ struct SessionMessageListView: View {
  /// 首屏定位完成、内容可以显示。
     @State private var isContentReady = false
     @State private var metrics = ScrollMetrics()
+ /// 自绘滚动条数据镜像（@Published 驱动指示条重算；与 metrics 分离避免列表 body 重算）。
+    @StateObject private var indicatorModel = ScrollIndicatorModel()
     @State private var lastScrollToBottomToken: Int = 0
  /// 用户是否真的用手滚动过（只用来让上层 onUserScrolled 回调一次）。
     @State private var userHasScrolled = false
@@ -497,7 +499,7 @@ struct SessionMessageListView: View {
             }
  // 自绘滚动条（系统指示条被翻转错位；对标 UIKit 外观，语义贴底=最新）。
             .overlay(alignment: .trailing) {
-                InvertedScrollIndicator(metrics: metrics)
+                InvertedScrollIndicator(model: indicatorModel)
             }
  // 骨架屏（无内容拉取中）：挂在 scale 外层不被翻转。
             .overlay {
@@ -657,9 +659,16 @@ struct SessionMessageListView: View {
  /// 不变。这里只更新事实与取证。
     private func handleScrollFactsChange(old: ScrollFacts, new: ScrollFacts) {
         metrics.facts = new
+        metrics.factsCalls += 1
+        indicatorModel.facts = new
+        indicatorModel.factsCalls = metrics.factsCalls
         traceGestureOffsetIfNeeded(offset: new.offset)
-        if isUserInteractingNow() {
+ // 指示条可见性用 offset 驱动（手势/惯性/程序滚动时 offset 必然逐帧变化）。
+ // 不依赖 onScrollPhaseChange：该事件在 scaleEffect 翻转下未实证触发过，
+ // 若不触发则 phase 链死锁 = 指示条永不显示。
+        if abs(new.offset - old.offset) > 0.1 {
             metrics.lastActiveAt = CACurrentMediaTime()
+            indicatorModel.lastActiveAt = metrics.lastActiveAt
         }
         trackIdleBottomStability()
     }
@@ -970,7 +979,9 @@ struct SessionMessageListView: View {
         let windowStartIndex = displayedItems.first.flatMap { first in
             items.firstIndex(where: { $0.id == first.id })
         } ?? -1
-        return "pinned=" + (pinnedToBottom ? "1" : "0")
+        return "mid=" + metrics.uuid
+            + ";calls=" + String(metrics.factsCalls)
+            + ";pinned=" + (pinnedToBottom ? "1" : "0")
             + ";displayed=" + String(displayedItems.count)
             + ";incoming=" + String(items.count)
             + ";distance=" + distanceText
@@ -1241,17 +1252,27 @@ enum ScrollIndicatorGeometry {
 /// primary 30%（自适配深浅色）、最小 20pt；手势/惯性期间显示，停稳后淡出。
 /// TimelineView 轮询 metrics（引用类型）——重绘隔离在指示条自身，不触发列表 body。
 private struct InvertedScrollIndicator: View {
-    let metrics: ScrollMetrics
+ /// @Published facts 变化直接驱动本视图重算（TimelineView 轮询读引用属性
+ /// 不构成依赖追踪，AX 输出冻结在首次快照——真机取证 04:0x）。
+    @ObservedObject var model: ScrollIndicatorModel
 
     private static let width: CGFloat = 3
     private static let trailingInset: CGFloat = 2.5
-    private static let fadeAfter: TimeInterval = 0.45
+    private static let fadeAfter: TimeInterval = 0.7
 
     var body: some View {
         TimelineView(.periodic(from: .now, by: 0.05)) { _ in
             GeometryReader { geo in
-                let f = metrics.facts
+                let f = model.facts
                 let track = geo.size.height
+ // 诊断探针（无条件存在）：输出显示条件真值，E2E 一次定位。
+                Text("scroll-indicator-diag")
+                    .font(.system(size: 1))
+                    .frame(width: 2, height: 2)
+                    .opacity(0.02)
+                    .allowsHitTesting(false)
+                    .accessibilityIdentifier("scroll-indicator-diag")
+                    .accessibilityValue("mid=\(model.uuid);maxOff=\(Int(f.maxOffset));track=\(Int(track));ch=\(Int(f.contentHeight));calls=\(model.factsCalls);off=\(Int(f.offset))")
                 if f.maxOffset > 1, track > 40, f.contentHeight > 1 {
                     let base = ScrollIndicatorGeometry.thumbLength(track: track, contentHeight: f.contentHeight, viewportHeight: f.viewportHeight)
                     let y = ScrollIndicatorGeometry.thumbY(track: track, contentHeight: f.contentHeight, viewportHeight: f.viewportHeight, offset: f.offset, maxOffset: f.maxOffset)
@@ -1260,9 +1281,7 @@ private struct InvertedScrollIndicator: View {
                         ScrollIndicatorGeometry.rubberBandCompression(overscroll: f.offset - f.maxOffset)
                     )
                     let now = CACurrentMediaTime()
-                    let visible = metrics.isDragging
-                        || now < metrics.interactingUntil
-                        || now < metrics.lastActiveAt + Self.fadeAfter
+                    let visible = now < model.lastActiveAt + Self.fadeAfter
  // rubber band：滑块向对应边缘压短（简化：保持顶边，缩短长度）。
                     let len = max(8, base * (1 - compression))
                     Capsule()
@@ -1271,20 +1290,40 @@ private struct InvertedScrollIndicator: View {
                         .offset(x: -Self.trailingInset, y: y)
                         .opacity(visible ? 1 : 0)
                         .animation(.easeOut(duration: 0.25), value: visible)
+ // E2E 探针（Text 通道——Capsule 即使 accessibilityElement() 也
+ // 不稳定进 AX 树，Text 手法已被 probe/diag 两轮真机验证）。
+                    Text("scroll-indicator")
+                        .font(.system(size: 1))
+                        .frame(width: 2, height: 2)
+                        .opacity(0.02)
+                        .allowsHitTesting(false)
+                        .accessibilityIdentifier("scroll-indicator")
+                        .accessibilityValue("visible=\(visible ? 1 : 0);maxOff=\(Int(f.maxOffset));off=\(Int(f.offset));track=\(Int(track));len=\(Int(len))")
                 }
             }
         }
         .allowsHitTesting(false)
-        .accessibilityHidden(true)
     }
+}
+
+/// 自绘滚动条专用发布器：@Published 变化只触发订阅它的指示条重算（列表零影响）。
+private final class ScrollIndicatorModel: ObservableObject {
+    @Published var facts = ScrollFacts(contentHeight: 0, offset: 0, viewportHeight: 0, distanceFromBottom: .greatestFiniteMagnitude, overscroll: 0, maxOffset: 0)
+    var lastActiveAt: CFTimeInterval = 0
+    var factsCalls = 0
+    let uuid = UUID().uuidString.prefix(8)
 }
 
 /// 滚动几何/校正状态（引用类型：不触发 SwiftUI body 重算，每帧滚动零成本）。
 private final class ScrollMetrics {
+ /// 实例指纹（诊断：双实例分叉取证）。
+    let uuid = UUID().uuidString.prefix(8)
  /// 官方几何观察的最新事实。
     var facts = ScrollFacts(contentHeight: 0, offset: 0, viewportHeight: 0, distanceFromBottom: .greatestFiniteMagnitude, overscroll: 0, maxOffset: 0)
  /// 最近一次用户手势活跃时刻（自绘滚动条淡出计时用）。
     var lastActiveAt: CFTimeInterval = 0
+ /// onScrollGeometryChange action 调用计数（指示条诊断用）。
+    var factsCalls = 0
  /// LazyVStack 内容高度（preference 值，仅诊断）。
     var contentHeight: CGFloat = 0
     var viewportHeight: CGFloat = 0
