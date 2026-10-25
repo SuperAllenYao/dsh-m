@@ -593,6 +593,7 @@ struct WorkspaceListView: View {
                     .opacity(0.02)
                     .allowsHitTesting(false)
                     .accessibilityIdentifier("e2e-created-session")
+                    .accessibilityLabel(viewModel.e2eCreatedSessionId)
                     .accessibilityValue(viewModel.e2eCreatedSessionId)
             }
         }
