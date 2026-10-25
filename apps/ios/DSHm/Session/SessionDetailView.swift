@@ -188,9 +188,19 @@ struct SessionDetailView: View {
             }
         }
         .onDisappear {
+            #if DEBUG
+            if ProcessInfo.processInfo.environment["DSHM_E2E"] == "1" {
+                NSLog("[NAVLIFE] detail disappear session=%@ sub=%d", sessionId, subagentContext != nil ? 1 : 0)
+            }
+            #endif
             viewModel.stop()
         }
         .onAppear {
+            #if DEBUG
+            if ProcessInfo.processInfo.environment["DSHM_E2E"] == "1" {
+                NSLog("[NAVLIFE] detail appear session=%@ sub=%d", sessionId, subagentContext != nil ? 1 : 0)
+            }
+            #endif
  // 壳优先：header/返回/输入框/消息区骨架这一帧就上屏（幂等）。
             viewModel.markDetailShellFrame()
  // M2b-2c: detail in-app first-frame mark (idempotent).

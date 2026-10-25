@@ -270,6 +270,23 @@ final class AppModel: ObservableObject {
                 route = .session(.session(sessionId: probe))
             }
         }
+ // E2E: `parent/child/mode` + DSHM_E2E_NAV_PROBE_SUBAGENT_AFTER_MS — open the
+ // parent LIVE first, then push the subagent child after the delay. Proves
+ // whether covering a live parent fires its onDisappear (dormancy).
+        if let raw = ProcessInfo.processInfo.environment["DSHM_E2E_NAV_PROBE_SUBAGENT_AFTER_MS"],
+           let delayMs = Int(raw), delayMs > 0,
+           let probe = ProcessInfo.processInfo.environment["DSHM_E2E_NAV_PROBE_PARENT"], !probe.isEmpty {
+            let parts = probe.split(separator: "/").map(String.init)
+            guard parts.count == 3 else { return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(delayMs)) { [weak self] in
+                guard let self, case .session = self.route else { return }
+                self.openSubagentSession(
+                    SubagentCatalogEntry(id: parts[1], mode: parts[2]),
+                    parentAddress: .session(sessionId: parts[0]),
+                    parentSessionId: parts[0]
+                )
+            }
+        }
  // E2E: simulate a notification tap N ms after launch. Posts the exact
  // NotificationCenter signal AppDelegate sends for a real push response, so
  // UI tests exercise the real tap path (AppModel.handlePushTap). Tap the

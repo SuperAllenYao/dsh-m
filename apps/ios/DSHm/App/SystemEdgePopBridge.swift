@@ -19,6 +19,11 @@ import UIKit
 /// Rollback: delete this file and the `.background(SystemEdgePopBridge())`
 /// line — everything else keeps working (the header back button pops the same
 /// stack seam without it).
+///
+/// `DSHM_NAVDBG=1` (DEBUG) logs every gate/delegate/recognizer event through
+/// `NavDiagnostics` — persisted to Documents/nav-events.log so a manual device
+/// repro (jank / dead edge-swipe during subagent load) can be analyzed after
+/// the fact; device app stdout is not otherwise capturable.
 struct SystemEdgePopBridge: UIViewRepresentable {
     func makeUIView(context: Context) -> WireView {
         let view = WireView()
@@ -26,6 +31,7 @@ struct SystemEdgePopBridge: UIViewRepresentable {
             context.coordinator.navigationController = nav
             nav.interactivePopGestureRecognizer?.delegate = context.coordinator
             nav.interactivePopGestureRecognizer?.isEnabled = true
+            NavDiagnostics.log("gate wired depth=\(nav.viewControllers.count) enabled=\(nav.interactivePopGestureRecognizer?.isEnabled ?? false)")
         }
         return view
     }
@@ -41,7 +47,32 @@ struct SystemEdgePopBridge: UIViewRepresentable {
         weak var navigationController: UINavigationController?
 
         func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
-            (navigationController?.viewControllers.count ?? 0) > 1
+            let count = navigationController?.viewControllers.count ?? 0
+            let allowed = count > 1
+            NavDiagnostics.log("shouldBegin depth=\(count) -> \(allowed ? 1 : 0) state=\(gestureRecognizer.state.rawValue)")
+            return allowed
+        }
+
+ /// device repro (user + nav-events.log): during the subagent
+ /// load the message list is scrolling/decelerating, and with the minimal
+ /// delegate the system edge pan LOST arbitration to the UIScrollView pan
+ /// (many `shouldReceive touch`, no `shouldBegin`) — the bezel swipe only
+ /// worked when the list happened to be still. Apple's own delegate lets
+ /// the edge pan begin over live scrolling content (native apps pop while
+ /// a list is still moving); restoring exactly that rule.
+        func gestureRecognizer(
+            _ gestureRecognizer: UIGestureRecognizer,
+            shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer
+        ) -> Bool {
+            true
+        }
+
+        func gestureRecognizer(
+            _ gestureRecognizer: UIGestureRecognizer,
+            shouldReceive touch: UITouch
+        ) -> Bool {
+            NavDiagnostics.log("shouldReceive touch state=\(gestureRecognizer.state.rawValue)")
+            return true
         }
     }
 
@@ -69,3 +100,33 @@ struct SystemEdgePopBridge: UIViewRepresentable {
         }
     }
 }
+
+#if DEBUG
+/// DEBUG-only diagnostics sink for the native pop seam. Enabled by
+/// `DSHM_NAVDBG=1`; appends lines to Documents/nav-events.log (and NSLog).
+@MainActor
+enum NavDiagnostics {
+    static let isEnabled = ProcessInfo.processInfo.environment["DSHM_NAVDBG"] == "1"
+
+    static func log(_ line: String) {
+        guard isEnabled else { return }
+        NSLog("[NAVDBG] %@", line)
+        let stamp = Int(CACurrentMediaTime() * 1000)
+        let text = "\(stamp)ms \(line)\n"
+        let url = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("nav-events.log")
+        if let handle = FileHandle(forWritingAtPath: url.path) {
+            handle.seekToEndOfFile()
+            handle.write(Data(text.utf8))
+            try? handle.close()
+        } else {
+            try? text.data(using: .utf8)?.write(to: url)
+        }
+    }
+}
+#else
+@MainActor
+enum NavDiagnostics {
+    static func log(_ line: String) {}
+}
+#endif
