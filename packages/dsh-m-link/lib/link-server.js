@@ -10,6 +10,9 @@
  * POST /auth/verify ECDSA-P256 signature -> short-lived bearer token
  * POST /devices/push-token register the phone's APNs device token
  * POST /session/permission switch a session's permission preset (host service bridge)
+ * POST /session/create new session for one workspace (blank-reuse, host bridge)
+ * POST /session/pin pin/unpin one session (host registry bridge)
+ * POST /session/archive archive one session, optionally stopping work
  * POST /api/<ns/method> transparent unary proxy (api bearer token)
  * WSS /api/remote.mux frame-level 1:1 proxy (single-use mux bearer token)
  * POST /debug/admin test-only admin channel (config.debug.enabled)
@@ -56,6 +59,15 @@ import { buildEndpoints, PairCodeService, PairingService, selectDeviceEndpoints,
 import { BonjourResponder } from './bonjour.js';
 import { QrRenderer } from './qr.js';
 import { applySessionPermission, normalizePermissionRequest, SESSION_PERMISSION_PATH } from './session-permission.js';
+import { applySessionCreate, loopbackCall, normalizeCreateRequest, SESSION_CREATE_PATH } from './session-create.js';
+import {
+  applySessionArchive,
+  applySessionPin,
+  normalizeArchiveRequest,
+  normalizePinRequest,
+  SESSION_ARCHIVE_PATH,
+  SESSION_PIN_PATH,
+} from './session-pin-archive.js';
 import { UpstreamPeer } from './upstream-peer.js';
 import { loadWs, wsBindings, wsLoadedFrom } from './ws-provider.js';
 import { mintResumeTicket, MuxRpcChannel, P1_LIMITS, TicketUseGuard, verifyResumeTicket } from './mux-rpc.js';
@@ -1870,6 +1882,9 @@ export class LinkServer {
     if (url.pathname === '/auth/verify' && request.method === 'POST') return this.handleAuthVerify(request, response, ip);
     if (url.pathname === '/devices/push-token' && request.method === 'POST') return this.handlePushToken(request, response, ip);
     if (url.pathname === SESSION_PERMISSION_PATH && request.method === 'POST') return this.handleSessionPermission(request, response, ip);
+    if (url.pathname === SESSION_CREATE_PATH && request.method === 'POST') return this.handleSessionCreate(request, response, ip);
+    if (url.pathname === SESSION_PIN_PATH && request.method === 'POST') return this.handleSessionPin(request, response, ip);
+    if (url.pathname === SESSION_ARCHIVE_PATH && request.method === 'POST') return this.handleSessionArchive(request, response, ip);
     if (url.pathname === '/debug/admin' && request.method === 'POST') return this.handleDebugAdmin(request, response, ip);
     if (this.isAllowedFetchRoute(url.pathname)) return this.handleFetchRoute(request, response, url, ip);
     if (ENDPOINT_RE.test(url.pathname)) {
@@ -2364,6 +2379,141 @@ export class LinkServer {
       deviceId: authorized.device.deviceId,
       sessionId: normalized.sessionId,
       preset: normalized.preset,
+      error: result.error,
+    });
+    return sendJson(response, result.status, result);
+  }
+
+ // ------------------------------------------------- R2/R3 session actions ---
+
+ /** Shared prelude for the three session-action routes: auth + JSON + 503. */
+  async readSessionActionRequest(request, response, ip, badRequestError) {
+    const authorized = this.authorizeApi(request, ip);
+    if (authorized.device === undefined) {
+      return {
+        rejected: sendJson(response, authorized.status ?? 401, {
+          ok: false,
+          error: authorized.error ?? 'auth/required',
+          message: 'authenticate with POST /auth/challenge + /auth/verify first',
+        }),
+      };
+    }
+    let body;
+    try {
+      body = await readJson(request);
+    } catch {
+      return { rejected: sendJson(response, 400, { ok: false, error: badRequestError, message: 'body must be JSON' }) };
+    }
+    if (!this.ctxActive()) {
+      return {
+        rejected: sendJson(response, 503, {
+          ok: false,
+          error: 'host/inactive',
+          message: 'the plugin context is inactive (HMR/restart in progress); retry after the host reloads the plugin',
+        }),
+      };
+    }
+    return { device: authorized.device, body };
+  }
+
+ /**
+ * `POST /session/create` — new (or reused blank) session for one workspace.
+ * The reuse scan and the mint both ride the loopback Remote API with the
+ * device peer cookie (lib/session-create.js); the workspace itself resolves
+ * through ctx.get('workspaceRegistry').
+ */
+  async handleSessionCreate(request, response, ip) {
+    const prelude = await this.readSessionActionRequest(request, response, ip, 'session-create/bad-request');
+    if (prelude.rejected !== undefined || prelude.device === undefined) return;
+    const normalized = normalizeCreateRequest(prelude.body);
+    if (normalized.error !== undefined) {
+      return sendJson(response, normalized.status, { ok: false, error: normalized.error, message: normalized.message });
+    }
+    let peer;
+    try {
+      peer = this.ensurePeer(prelude.device);
+    } catch (error) {
+      return sendJson(response, 502, { ok: false, error: 'session-create/failed', message: String(error?.message ?? error) });
+    }
+    const result = await applySessionCreate({
+      ctx: this.ctx,
+      peer,
+      workspaceId: normalized.workspaceId,
+      loopbackOrigin: this.loopbackOrigin,
+      requestTimeoutMs: this.config.notifications.requestTimeoutMs,
+    });
+    if (result.ok) {
+      this.audit.record('session.create', {
+        deviceId: prelude.device.deviceId,
+        workspaceId: normalized.workspaceId,
+        sessionId: result.sessionId,
+        reused: result.reused,
+      });
+      return sendJson(response, 200, result);
+    }
+    this.audit.record('session.create.rejected', {
+      deviceId: prelude.device.deviceId,
+      workspaceId: normalized.workspaceId,
+      error: result.error,
+      hostCode: result.hostCode,
+    });
+    return sendJson(response, result.status, result);
+  }
+
+ /**
+ * `POST /session/pin` — pin or unpin one session through the host
+ * workspaceRegistry. Idempotent on the host side; the response carries the
+ * complete pin set so the phone can reconcile its optimistic copy.
+ */
+  async handleSessionPin(request, response, ip) {
+    const prelude = await this.readSessionActionRequest(request, response, ip, 'pin/bad-request');
+    if (prelude.rejected !== undefined || prelude.device === undefined) return;
+    const normalized = normalizePinRequest(prelude.body);
+    if (normalized.error !== undefined) {
+      return sendJson(response, normalized.status, { ok: false, error: normalized.error, message: normalized.message });
+    }
+    const result = applySessionPin({ ctx: this.ctx, sessionId: normalized.sessionId, pinned: normalized.pinned });
+    if (result.ok) {
+      this.audit.record('session.pin', {
+        deviceId: prelude.device.deviceId,
+        sessionId: normalized.sessionId,
+        pinned: normalized.pinned,
+      });
+      return sendJson(response, 200, result);
+    }
+    this.audit.record('session.pin.rejected', {
+      deviceId: prelude.device.deviceId,
+      sessionId: normalized.sessionId,
+      error: result.error,
+    });
+    return sendJson(response, result.status, result);
+  }
+
+ /**
+ * `POST /session/archive` — archive one session through the host
+ * workspaceRegistry. A running session without `stopActivity` refuses with
+ * 409 `archive/session-active` so the phone can offer the stop-and-archive
+ * confirmation; the response carries the complete archive set.
+ */
+  async handleSessionArchive(request, response, ip) {
+    const prelude = await this.readSessionActionRequest(request, response, ip, 'archive/bad-request');
+    if (prelude.rejected !== undefined || prelude.device === undefined) return;
+    const normalized = normalizeArchiveRequest(prelude.body);
+    if (normalized.error !== undefined) {
+      return sendJson(response, normalized.status, { ok: false, error: normalized.error, message: normalized.message });
+    }
+    const result = applySessionArchive({ ctx: this.ctx, sessionId: normalized.sessionId, stopActivity: normalized.stopActivity });
+    if (result.ok) {
+      this.audit.record('session.archive', {
+        deviceId: prelude.device.deviceId,
+        sessionId: normalized.sessionId,
+        stopActivity: normalized.stopActivity,
+      });
+      return sendJson(response, 200, result);
+    }
+    this.audit.record('session.archive.rejected', {
+      deviceId: prelude.device.deviceId,
+      sessionId: normalized.sessionId,
       error: result.error,
     });
     return sendJson(response, result.status, result);
