@@ -150,13 +150,23 @@ struct WorkspaceListView: View {
     private var header: some View {
         VStack(alignment: .leading, spacing: Theme.Spacing.m) {
             HStack(spacing: Theme.Spacing.xs) {
-                BrandMark()
- // app version (marketing + build) right of the DSH·m wordmark.
-                Text(appVersionText)
-                    .font(Theme.Typography.label)
-                    .foregroundStyle(Theme.Palette.textTertiary)
-                    .lineLimit(1)
-                    .accessibilityIdentifier("app-version")
+                BrandMark(showWordmark: false)
+ // R1 (design m1-header): name + version stack into a
+ // 30pt lockup matching the logo height exactly — 16pt name
+ // tucked to the top edge, 11pt mono version to the bottom.
+                ZStack(alignment: .leading) {
+                    Text("DSH·m")
+                        .font(Theme.Typography.workspaceName)
+                        .foregroundStyle(Theme.Palette.textPrimary)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                    Text(appVersionText)
+                        .font(Theme.Typography.monoSmallMedium)
+                        .foregroundStyle(Theme.Palette.textTertiary)
+                        .lineLimit(1)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+                        .accessibilityIdentifier("app-version")
+                }
+                .frame(height: 30)
                 Spacer()
  // IP/host detail removed by requirement — the pill
  // shows only the dot + phase label (在线 etc.).
