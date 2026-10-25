@@ -299,6 +299,13 @@ final class AppModel: ObservableObject {
                 self?.objectWillChange.send()
             }
             .store(in: &cancellables)
+ // E2E-only visibility (nav-debug marker): when the link actually reached
+ // each phase during the run.
+        link.$phase
+            .sink { [weak self] phase in
+                self?.pushDbg("link phase -> \(String(describing: phase))")
+            }
+            .store(in: &cancellables)
 
  // APNs: forward device tokens to the link plugin; retry after pairing or
  // when a reconnect reaches the ready state.
@@ -538,10 +545,11 @@ final class AppModel: ObservableObject {
             route = .workspaces
             return
         }
+        pushDbg("push tap: session=" + sessionId + " route=\(route)")
         guard Self.shouldOpenPushDeepLink(currentRoute: route, targetSessionId: sessionId) else {
  // 需求：正在看这个会话，点击通知不应打断（滚动/已加载
  // 数据都保持原样）。
-            Self.pushDbg("push tap: already viewing session=" + sessionId + " (no-op)")
+            pushDbg("push tap: already viewing session=" + sessionId + " (no-op)")
             return
         }
         openSession(sessionId)
@@ -721,7 +729,12 @@ final class AppModel: ObservableObject {
  // t0 for the user-perceived detail latency on the notification
  // deep-link path (same clock as the list tap).
         DetailMetrics.beginTap()
-        withAnimation(.default) {
+        pushDbg("deep link apply address=\(navigation.address.sessionId) subagent=\(navigation.context != nil ? 1 : 0) currentRoute=\(route)")
+        navWriteAt = Date()
+ // 真机实证：replace 走系统转场会竞态（SwiftUI 把 replace 拆成
+ // pop+push，pop 段回写旧 path，页面被弹回旧会话）。深链替换改为瞬时直写
+ // ——与旧 ZStack 时代的「深链换页无动画」行为一致；手势返回仍是系统动效。
+        withTransaction(Self.instantNavTransaction) {
             if let context = navigation.context, let parentAddress = navigation.parentAddress {
                 subagentRoute = SubagentRoute(context: context, parentAddress: parentAddress)
             } else {
@@ -800,7 +813,7 @@ final class AppModel: ObservableObject {
                 sessionId: sessionId,
                 resolver: self.deepLinkResolver
             )
-            Self.pushDbg(
+            pushDbg(
                 "deep link resolve session=" + sessionId
                     + " listed=" + String(items != nil)
                     + " subagent=" + String(navigation.context != nil)
@@ -816,14 +829,25 @@ final class AppModel: ObservableObject {
  /// DSHM_DEBUG_STREAM-gated diagnostic (notification deep-link navigation).
     private static let pushDebugEnabled =
         ProcessInfo.processInfo.environment["DSHM_DEBUG_STREAM"] == "1"
+            || ProcessInfo.processInfo.environment["DSHM_E2E"] == "1"
 
-    private static func pushDbg(_ message: @autoclosure () -> String) {
-        guard pushDebugEnabled else { return }
-        NSLog("[PUSHDBG] %@", message())
+    private func pushDbg(_ message: @autoclosure () -> String) {
+        guard Self.pushDebugEnabled else { return }
+        let line = message()
+        NSLog("[PUSHDBG] %@", line)
+ // E2E-only visibility channel (hidden accessibility marker in RootView):
+ // device app stdout is not captured by xcodebuild, the marker value is.
+        navDebugLog = (navDebugLog.count > 800 ? String(navDebugLog.suffix(800)) : navDebugLog) + "\n" + line
     }
 
+ /// E2E-only navigation debug trail, surfaced through the hidden
+ /// `nav-debug` accessibility marker (empty outside E2E).
+    @Published var navDebugLog: String = ""
+
     func openSession(_ address: SessionFollowAddress) {
-        withAnimation(.default) {
+        navWriteAt = Date()
+ // 瞬时直写（见 applyDeepLinkNavigation 注释）。
+        withTransaction(Self.instantNavTransaction) {
             subagentRoute = nil
             route = .session(address)
         }
@@ -841,7 +865,9 @@ final class AppModel: ObservableObject {
             childSessionId: entry.id,
             modeRaw: entry.mode
         )
-        withAnimation(.default) {
+        navWriteAt = Date()
+ // 瞬时直写（见 applyDeepLinkNavigation 注释）。
+        withTransaction(Self.instantNavTransaction) {
             subagentRoute = SubagentRoute(context: context, parentAddress: parentAddress)
             route = .session(context.followAddress)
         }
@@ -851,6 +877,7 @@ final class AppModel: ObservableObject {
  /// session -> workspace list. Drives the NavigationStack pop (:
  /// system push/pop transition).
     func backFromSession() {
+        navWriteAt = Date()
         withAnimation(.default) {
             switch SessionBackNavigation.destination(subagentParent: subagentRoute?.parentAddress) {
             case .parentSession(let parentAddress):
@@ -885,25 +912,55 @@ final class AppModel: ObservableObject {
 
  /// Translates a user-driven NavigationStack change (system back button /
  /// edge-swipe pop) back into the model. Pushes never arrive here — they only
- /// go through `openSession` / `openSubagentSession` / deep links — so this
- /// seam only ever shrinks (or keeps) the stack.
+ /// go through `openSession` / `openSubagentSession` / deep links — so exactly
+ /// two shapes are legitimate:
+ /// * depth 1 -> [] (pop the top-level session to the list)
+ /// * depth 2 -> [parent] (pop the subagent child to its parent)
+ /// Anything else is an ECHO of a previous path (observed on
+ /// device: during an animated deep-link REPLACE, SwiftUI re-writes the old
+ /// single element mid-transition; accepting it would revert the replace —
+ /// "title stayed..." in SessionHistoryE2ETests). Echoes also arrive while a
+ /// programmatic push is still animating, so sets inside `navEchoWindow`
+ /// after a model-driven nav write are ignored: UIKit cannot start a user
+ /// pop during another transition, so nothing legitimate is lost.
     func applySessionNavPath(_ newPath: [SessionNavTarget]) {
-        guard newPath.count <= 2 else { return }
+        guard Date().timeIntervalSince(navWriteAt) > navEchoWindowSeconds else { return }
+        let current = sessionNavPath()
+        guard newPath != current else { return }
         switch newPath.count {
         case 0:
-            if case .session = route {
+ // Legit only from depth 1: popping the top-level session to the list.
+            if current.count == 1 {
                 subagentRoute = nil
                 route = .workspaces
             }
         case 1:
-            guard case .session = route else { return }
-            subagentRoute = nil
-            route = .session(newPath[0].address)
+ // Legit only from depth 2, and only to the parent element that is
+ // already underneath the child (subagent pop). A different element
+ // while at depth 1 is the replace echo described above.
+            if current.count == 2, newPath[0] == current[0] {
+                subagentRoute = nil
+                route = .session(newPath[0].address)
+            }
         default:
  // Depth stays 2; nothing to reconcile.
             break
         }
     }
+
+ /// A transaction that disables ALL animations for a navigation write
+ /// (push/replace seams; pops keep the system animation).
+    static var instantNavTransaction: Transaction {
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        return transaction
+    }
+
+ /// Time after a model-driven navigation write during which binding `set`
+ /// calls are treated as transition echoes (test-injectable).
+    var navEchoWindowSeconds: TimeInterval = 0.6
+ /// When the model last wrote a navigation route (push/replace/pop seams).
+    var navWriteAt = Date.distantPast
 
  /// Address a deep-linked session id must be opened with. Falls back to the
  /// plain address when the session was not in the last loaded `session/list`

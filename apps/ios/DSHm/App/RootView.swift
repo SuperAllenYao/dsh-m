@@ -24,6 +24,12 @@ struct RootView: View {
                                 address: target.address,
                                 subagentContext: target.subagentContext
                             )
+ // Identity must change between sessions (
+ // device regression): when a deep link REPLACES the
+ // top path element, the destination slot survives and
+ // @StateObject would otherwise keep the previous
+ // session's viewModel (title stayed on the old page).
+                            .id(target.address.sessionId)
                             .toolbar(.hidden, for: .navigationBar)
  // Re-enable Apple's own edge-swipe pop (bar hidden =>
  // UIKit gates its recognizer; see the file header).
@@ -146,6 +152,18 @@ struct RootView: View {
                     .accessibilityIdentifier("foreground-metrics")
                     .accessibilityLabel(metrics)
                     .accessibilityValue(metrics)
+            }
+ // E2E-only navigation debug trail (device app stdout is not captured
+ // by xcodebuild; the hidden marker value is readable from the test).
+            if app.isE2EMode {
+                Text("nav-debug")
+                    .font(.system(size: 1))
+                    .frame(width: 2, height: 2)
+                    .opacity(0.02)
+                    .allowsHitTesting(false)
+                    .accessibilityIdentifier("nav-debug")
+                    .accessibilityLabel("nav-debug")
+                    .accessibilityValue(app.navDebugLog)
             }
         }
     }
