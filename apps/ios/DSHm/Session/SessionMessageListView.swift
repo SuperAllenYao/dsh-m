@@ -468,6 +468,8 @@ struct SessionMessageListView: View {
             .onScrollPhaseChange { oldPhase, newPhase in
                 handleScrollPhaseChange(old: oldPhase, new: newPhase)
             }
+ // 系统指示条在 scale 内层就藏掉（翻转会跑到左缘且方向反）。
+            .scrollIndicators(.hidden)
  // inverted 挂载：
  // - scaleEffect(x:-1,y:-1) 双轴翻转 + 每行 rotationEffect(.pi) = 视觉
  // 180° 旋转；数据头（最新）显示在视觉底部。
@@ -478,7 +480,6 @@ struct SessionMessageListView: View {
  // - edge 语义反转：.top = 布局顶 = 视觉底（最新）；.bottom = 最旧端。
             .scaleEffect(x: -1, y: -1)
             .scrollPosition($scrollPosition)
-            .scrollIndicators(.hidden)
             .onPreferenceChange(ListContentHeightPreferenceKey.self) { height in
                 metrics.contentHeight = height
                 layoutDidChange()
@@ -1256,7 +1257,7 @@ private struct InvertedScrollIndicator: View {
  /// 不构成依赖追踪，AX 输出冻结在首次快照——真机取证 04:0x）。
     @ObservedObject var model: ScrollIndicatorModel
 
-    private static let width: CGFloat = 3
+    private static let width: CGFloat = 4.5
     private static let trailingInset: CGFloat = 2.5
     private static let fadeAfter: TimeInterval = 0.7
 
@@ -1287,16 +1288,23 @@ private struct InvertedScrollIndicator: View {
                     Capsule()
                         .fill(Color.primary.opacity(0.3))
                         .frame(width: Self.width, height: len)
-                        .offset(x: -Self.trailingInset, y: y)
+ // GeometryReader 子视图默认 topLeading 对齐（上一版贴左缘
+ // 的根因）——position 显式钉在右缘。
+                        .position(x: geo.size.width - Self.trailingInset - Self.width / 2,
+                                  y: y + len / 2)
                         .opacity(visible ? 1 : 0)
                         .animation(.easeOut(duration: 0.25), value: visible)
  // E2E 探针（Text 通道——Capsule 即使 accessibilityElement() 也
  // 不稳定进 AX 树，Text 手法已被 probe/diag 两轮真机验证）。
+ // GeometryReader 子视图默认 topLeading 对齐，探针同样要 position
+ // 钉右缘（位置断言的锚点）。
                     Text("scroll-indicator")
                         .font(.system(size: 1))
                         .frame(width: 2, height: 2)
                         .opacity(0.02)
                         .allowsHitTesting(false)
+                        .position(x: geo.size.width - Self.trailingInset - 1,
+                                  y: geo.size.height - 1)
                         .accessibilityIdentifier("scroll-indicator")
                         .accessibilityValue("visible=\(visible ? 1 : 0);maxOff=\(Int(f.maxOffset));off=\(Int(f.offset));track=\(Int(track));len=\(Int(len))")
                 }
