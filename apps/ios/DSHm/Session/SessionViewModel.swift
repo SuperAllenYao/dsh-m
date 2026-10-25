@@ -773,6 +773,27 @@ final class SessionViewModel: ObservableObject {
         followProbeValue = "opened=\(followOpenedCount);snap=\(followSnapshotCount);events=\(followEventCount);ended=\(followEndedCount);err=\(followErrorCode);sent=\(followSentCount)"
     }
 
+    private var followProbeCoalesceTask: Task<Void, Never>?
+
+ /// Burst path (event/snapshot frames). Republishing @Published on every
+ /// frame invalidated the detail body hundreds of times during a large
+ /// session's initial load and pushed first-row materialization past the
+ /// first post-switch sample (push-switch blank-viewport E2E regression,
+ /// branch failed rowsImmediate>0 while main passed; flow rows
+ /// appeared ~0.1-0.2s later, 2s count was healthy). Coalesce to one publish
+ /// per 250ms trailing-edge; lifecycle transitions (open/end/error/sent)
+ /// stay immediate. E2E polls the probe at 2s granularity, so this is
+ /// test-equivalent.
+    private func refreshFollowProbeCoalesced() {
+        guard followProbeCoalesceTask == nil else { return }
+        followProbeCoalesceTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 250_000_000)
+            guard let self else { return }
+            self.followProbeCoalesceTask = nil
+            self.refreshFollowProbe()
+        }
+    }
+
  /// Test seam: apply one raw session/follow item value (snapshot/event/...).
  /// 测试 seam：**同步**应用一帧。生产路径走后台解码流水线（handleItem），
  /// 但单测需要在一次调用内看到效果，因此这里保持同步解码 + 同步处理。
@@ -1774,7 +1795,7 @@ final class SessionViewModel: ObservableObject {
         guard let value else { return }
         lastEventAt = Date()
         followEventCount += 1
-        refreshFollowProbe()
+        refreshFollowProbeCoalesced()
         pendingFrameValues.append(value)
         drainFrameDecodeIfNeeded()
     }
@@ -1836,7 +1857,7 @@ final class SessionViewModel: ObservableObject {
         switch frame {
             case .snapshot(let snapshot):
                 followSnapshotCount += 1
-                refreshFollowProbe()
+                refreshFollowProbeCoalesced()
                 dbg("snapshot: records=" + String(snapshot.records.count) + " cursor=" + String(snapshot.cursor) + " hasMore=" + String(describing: snapshot.hasMore))
                 #if DEBUG
                 let update = PerfProbe.shared.measure("snapshotJournalApply", ["records": snapshot.records.count]) {
