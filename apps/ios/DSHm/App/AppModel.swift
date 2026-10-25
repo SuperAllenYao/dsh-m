@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import SwiftUI
 #if canImport(UIKit)
 import UIKit
 #endif
@@ -142,11 +143,6 @@ final class AppModel: ObservableObject {
         var parentAddress: SessionFollowAddress
     }
     @Published private(set) var subagentRoute: SubagentRoute?
- /// Snapshot of the page a subagent detail was pushed from, used as the revealed
- /// background of the interactive edge-pop (iOS swipe-back, requirement
- /// ). Captured when the subagent list sheet opens (parent page fully
- /// visible); the child detail then replaces the parent in the route.
-    @Published private(set) var backSnapshot: UIImage?
     @Published var language: AppLanguage {
         didSet {
             UserDefaults.standard.set(language.storageKey, forKey: "appLanguage")
@@ -259,6 +255,20 @@ final class AppModel: ObservableObject {
  // measures list/detail latency and drives the composer on a real device).
         if let deepLink = ProcessInfo.processInfo.environment["DSHM_E2E_OPEN_SESSION"], !deepLink.isEmpty {
             openSession(deepLink)
+        }
+ // E2E: push a session detail with no Host round-trip — the navigation-pop
+ // UI tests (native edge-swipe back) only need a real pushed page, not
+ // live session data. `parent/child/mode` pushes the subagent depth.
+ // Debug-only; no product behavior.
+        if let probe = ProcessInfo.processInfo.environment["DSHM_E2E_NAV_PROBE_SESSION"], !probe.isEmpty {
+            let parts = probe.split(separator: "/").map(String.init)
+            if parts.count == 3 {
+                let context = SubagentSessionContext(parentSessionId: parts[0], childSessionId: parts[1], modeRaw: parts[2])
+                subagentRoute = SubagentRoute(context: context, parentAddress: .session(sessionId: parts[0]))
+                route = .session(context.followAddress)
+            } else {
+                route = .session(.session(sessionId: probe))
+            }
         }
  // E2E: simulate a notification tap N ms after launch. Posts the exact
  // NotificationCenter signal AppDelegate sends for a real push response, so
@@ -656,7 +666,6 @@ final class AppModel: ObservableObject {
 
     func didPair() {
         subagentRoute = nil
-        backSnapshot = nil
  // 配对前点过通知：配对完成后再补跳会话详情，而不是丢掉这次意图。
         if let pending = pendingDeepLinkSessionId {
             pendingDeepLinkSessionId = nil
@@ -712,15 +721,15 @@ final class AppModel: ObservableObject {
  // t0 for the user-perceived detail latency on the notification
  // deep-link path (same clock as the list tap).
         DetailMetrics.beginTap()
-        if let context = navigation.context, let parentAddress = navigation.parentAddress {
-            subagentRoute = SubagentRoute(context: context, parentAddress: parentAddress)
-        } else {
-            subagentRoute = nil
+        withAnimation(.default) {
+            if let context = navigation.context, let parentAddress = navigation.parentAddress {
+                subagentRoute = SubagentRoute(context: context, parentAddress: parentAddress)
+            } else {
+                subagentRoute = nil
+            }
+ // A deep link always replaces the page identity.
+            route = .session(navigation.address)
         }
- // A deep link always replaces the page identity; a stale reveal snapshot
- // must never be shown for the new route.
-        backSnapshot = nil
-        route = .session(navigation.address)
     }
 
  /// Pure decision seam (unit-tested): route + subagent context for one id.
@@ -814,11 +823,10 @@ final class AppModel: ObservableObject {
     }
 
     func openSession(_ address: SessionFollowAddress) {
-        subagentRoute = nil
- // Top-level pages reveal the live workspace list on swipe-back; a snapshot
- // captured for a subagent push must never shadow it.
-        backSnapshot = nil
-        route = .session(address)
+        withAnimation(.default) {
+            subagentRoute = nil
+            route = .session(address)
+        }
     }
 
  /// v5.4 task-13: opens a child subagent session from its parent catalog and
@@ -833,30 +841,68 @@ final class AppModel: ObservableObject {
             childSessionId: entry.id,
             modeRaw: entry.mode
         )
-        subagentRoute = SubagentRoute(context: context, parentAddress: parentAddress)
-        route = .session(context.followAddress)
+        withAnimation(.default) {
+            subagentRoute = SubagentRoute(context: context, parentAddress: parentAddress)
+            route = .session(context.followAddress)
+        }
     }
 
  /// Back from a session detail: subagent detail -> parent session; normal
- /// session -> workspace list.
+ /// session -> workspace list. Drives the NavigationStack pop (:
+ /// system push/pop transition).
     func backFromSession() {
-        switch SessionBackNavigation.destination(subagentParent: subagentRoute?.parentAddress) {
-        case .parentSession(let parentAddress):
-            subagentRoute = nil
-            route = .session(parentAddress)
-        case .workspaces:
-            subagentRoute = nil
-            route = .workspaces
+        withAnimation(.default) {
+            switch SessionBackNavigation.destination(subagentParent: subagentRoute?.parentAddress) {
+            case .parentSession(let parentAddress):
+                subagentRoute = nil
+                route = .session(parentAddress)
+            case .workspaces:
+                subagentRoute = nil
+                route = .workspaces
+            }
         }
- // The revealed previous page (if any) is gone after the route settles.
-        backSnapshot = nil
     }
 
- /// Captures the parent page for the interactive swipe-back reveal. Called when
- /// the subagent list sheet opens: the parent detail is still fully visible then
- /// (capturing later, after the sheet animates in, would capture the sheet).
-    func captureBackSnapshot() {
-        backSnapshot = WindowSnapshot.capture()
+ /// The NavigationStack path derived from `route` + `subagentRoute` (single
+ /// source of truth; unit-tested). Level 1 = top-level session, level 2 =
+ /// subagent child. Empty everywhere except an open session detail.
+ /// native system navigation (Apple's own edge-swipe back).
+    func sessionNavPath() -> [SessionNavTarget] {
+        var path: [SessionNavTarget] = []
+        switch route {
+        case .session(let address):
+            if let sub = subagentRoute {
+                path.append(SessionNavTarget(address: sub.parentAddress, subagentContext: nil))
+                path.append(SessionNavTarget(address: sub.context.followAddress, subagentContext: sub.context))
+            } else {
+                path.append(SessionNavTarget(address: address, subagentContext: nil))
+            }
+        case .pairing, .workspaces:
+            break
+        }
+        return path
+    }
+
+ /// Translates a user-driven NavigationStack change (system back button /
+ /// edge-swipe pop) back into the model. Pushes never arrive here — they only
+ /// go through `openSession` / `openSubagentSession` / deep links — so this
+ /// seam only ever shrinks (or keeps) the stack.
+    func applySessionNavPath(_ newPath: [SessionNavTarget]) {
+        guard newPath.count <= 2 else { return }
+        switch newPath.count {
+        case 0:
+            if case .session = route {
+                subagentRoute = nil
+                route = .workspaces
+            }
+        case 1:
+            guard case .session = route else { return }
+            subagentRoute = nil
+            route = .session(newPath[0].address)
+        default:
+ // Depth stays 2; nothing to reconcile.
+            break
+        }
     }
 
  /// Address a deep-linked session id must be opened with. Falls back to the
@@ -875,7 +921,6 @@ final class AppModel: ObservableObject {
 
     func backToWorkspaces() {
         subagentRoute = nil
-        backSnapshot = nil
         route = .workspaces
     }
 

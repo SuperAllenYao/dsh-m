@@ -158,7 +158,9 @@ struct WorkspaceListView: View {
                     .lineLimit(1)
                     .accessibilityIdentifier("app-version")
                 Spacer()
-                ConnectionStatusPill(phase: app.link.phase, detail: app.link.credentials?.originURL?.host)
+ // IP/host detail removed by requirement — the pill
+ // shows only the dot + phase label (在线 etc.).
+                ConnectionStatusPill(phase: app.link.phase)
                 Menu {
                     Button {
                         showSettings = true

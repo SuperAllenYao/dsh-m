@@ -151,14 +151,3 @@ enum ConnectionIndicator {
         color(for: ConnectionStatusKind.kind(for: phase))
     }
 }
-
-/// Subtitle leading dot: colour/animation from the current link phase.
-struct ConnectionDot: View {
-    var phase: LinkService.Phase
-
-    var body: some View {
-        let kind = ConnectionStatusKind.kind(for: phase)
-        StatusDot(color: ConnectionIndicator.color(for: kind), size: 6, pulsing: ConnectionIndicator.isPulsing(kind))
-            .accessibilityIdentifier("connection-dot")
-    }
-}
