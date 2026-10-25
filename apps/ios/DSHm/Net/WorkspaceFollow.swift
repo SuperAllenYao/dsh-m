@@ -109,6 +109,42 @@ struct WorkspaceFollowState: Equatable {
         applySnapshot(snapshot)
     }
 
+ /// R3 optimistic local writes (design 3.2): the phone applies an optimistic
+ /// pin/archive change before the RPC, reconciles with the returned complete
+ /// set, and rolls back on failure — later broadcast frames remain the final
+ /// word (concurrent edits on either end converge on the host's sets).
+    @discardableResult
+    mutating func applyOptimisticPin(_ sessionId: String, pinned: Bool) -> [String] {
+        let previous = pinnedSessionIds
+        if pinned, !previous.contains(sessionId) {
+            pinnedSessionIds = [sessionId] + previous
+        } else if !pinned {
+            pinnedSessionIds = previous.filter { $0 != sessionId }
+        }
+        return previous
+    }
+
+    mutating func restorePins(_ pins: [String]) { pinnedSessionIds = pins }
+
+    mutating func replacePins(_ pins: [String]) { pinnedSessionIds = pins }
+
+ /// Optimistically archive one session (drop it from the pin set too);
+ /// returns the previous sets for rollback.
+    @discardableResult
+    mutating func applyOptimisticArchive(_ sessionId: String) -> (archived: Set<String>, pinned: [String]) {
+        let previous = (archivedSessionIds, pinnedSessionIds)
+        archivedSessionIds.insert(sessionId)
+        pinnedSessionIds = pinnedSessionIds.filter { $0 != sessionId }
+        return previous
+    }
+
+    mutating func restoreArchive(_ archived: Set<String>, pinned: [String]) {
+        archivedSessionIds = archived
+        pinnedSessionIds = pinned
+    }
+
+    mutating func replaceArchived(_ ids: Set<String>) { archivedSessionIds = ids }
+
     mutating func apply(_ frame: WorkspaceFollowFrame) {
         switch frame {
         case .baseline(let snapshot), .replace(let snapshot):

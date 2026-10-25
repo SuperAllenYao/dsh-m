@@ -62,6 +62,10 @@ final class WorkspaceViewModel: ObservableObject {
     @Published private(set) var phoneCreatedDraftPreviews: [String: String] = [:]
  /// Workspace whose plus button is currently minting a session (spinner state).
     @Published private(set) var creatingWorkspaceId: String?
+ /// R3: the one session card whose swipe actions are revealed (single-card
+ /// exclusivity). Closed by tapping elsewhere, another swipe, a scroll, or a
+ /// groups refresh (design 3.2).
+    @Published var swipedSessionId: String?
 
  /// Every session from the last `session/list`, including subagent/blank/
  /// archived/ungrouped rows. Kept for deep-link address resolution only.
@@ -680,6 +684,11 @@ final class WorkspaceViewModel: ObservableObject {
         rebuildGroups()
     }
 
+ /// Surface one inline error from a view action (R3 disconnect hints etc.).
+    func showInlineError(_ text: String) {
+        errorText = text
+    }
+
  /// R2 (design 2.2): mint a session in one workspace through the plugin
  /// route. Returns the new session id (reused or minted); failures surface
  /// through `errorText` (NetworkErrorInterpreter wording) and return nil.
@@ -695,6 +704,72 @@ final class WorkspaceViewModel: ObservableObject {
         } catch {
             errorText = NetworkErrorInterpreter.message(for: error)
             return nil
+        }
+    }
+
+ // MARK: - R3 pin / archive (optimistic + reconcile, design 3.2)
+
+ /// Apply one optimistic pin change to the local follow-state copy and
+ /// rebuild (the pinned group re-sorts immediately). Returns the previous
+ /// pin list for rollback.
+    @discardableResult
+    private func applyOptimisticPin(_ sessionId: String, pinned: Bool) -> [String] {
+        let previous = followState.applyOptimisticPin(sessionId, pinned: pinned)
+        rebuildGroups()
+        return previous
+    }
+
+    private func rollbackPin(_ previous: [String]) {
+        followState.restorePins(previous)
+        rebuildGroups()
+    }
+
+ /// Toggle one session's pin. No confirmation (design 3.2): optimistic
+ /// reorder + RPC; the returned complete set wins on success, rollback +
+ /// inline error otherwise (the later host broadcast frame is the final
+ /// word for concurrent edits on both ends).
+    @MainActor
+    func togglePin(sessionId: String, link: LinkService) async {
+        let pinned = !followState.pinnedSessionIds.contains(sessionId)
+        let previous = applyOptimisticPin(sessionId, pinned: pinned)
+        do {
+            let result = try await link.pinSession(sessionId: sessionId, pinned: pinned)
+            followState.replacePins(result.pinnedSessionIds)
+            rebuildGroups()
+        } catch {
+            rollbackPin(previous)
+            errorText = NetworkErrorInterpreter.message(for: error)
+        }
+    }
+
+ /// Archive one session. Optimistic removal; a 409 session-active rolls the
+ /// card back and rethrows `archive/session-active` so the caller swaps the
+ /// idle confirmation for the running one (same dialog, stopActivity: true).
+    @MainActor
+    func archiveSession(
+        sessionId: String, stopActivity: Bool, link: LinkService
+    ) async throws {
+        let previous = followState.applyOptimisticArchive(sessionId)
+        rebuildGroups()
+        do {
+            let result = try await link.archiveSession(sessionId: sessionId, stopActivity: stopActivity)
+            followState.replaceArchived(Set(result.archivedSessionIds))
+            closeOutPhoneCreatedBlanksIfArchived([sessionId])
+            rebuildGroups()
+        } catch {
+            followState.restoreArchive(previous.archived, pinned: previous.pinned)
+            rebuildGroups()
+            throw error
+        }
+    }
+
+    private func closeOutPhoneCreatedBlanksIfArchived(_ ids: [String]) {
+        guard !phoneCreatedBlanks.isEmpty else { return }
+        var survivors = phoneCreatedBlanks
+        for id in ids where survivors.contains(id) { survivors.remove(id) }
+        if survivors != phoneCreatedBlanks {
+            phoneCreatedBlanks = survivors
+            persistPhoneCreatedBlanks()
         }
     }
 

@@ -30,6 +30,21 @@ struct WorkspaceListView: View {
             }
         }
         .background(Theme.Palette.background.ignoresSafeArea())
+        .overlay {
+ // R3 (m4): the archive confirmation is the only readable layer
+ // while pending (55% scrim blocks interaction behind it).
+            if let pending = pendingArchive {
+                ArchiveConfirmOverlay(
+                    dialog: ArchiveConfirmDialog(
+                        sessionTitle: pending.title,
+                        isRunning: pending.isRunning,
+                        onCancel: { pendingArchive = nil },
+                        onConfirm: { stop in confirmArchive(pending, stopActivity: stop) }
+                    )
+                )
+                .zIndex(10)
+            }
+        }
         .sheet(isPresented: $showSettings) {
             SettingsView().environmentObject(app)
         }
@@ -62,7 +77,20 @@ struct WorkspaceListView: View {
             app.updateKnownSessions(viewModel.allSessions)
         }
         .onChange(of: viewModel.groupsVersion) { _ in
+ // R3: a list refresh closes any revealed swipe actions.
+            viewModel.swipedSessionId = nil
             autoOpenFirstSessionIfNeeded()
+        }
+        .onScrollPhaseChange { _, phase in
+ // R3 (design 3.2): scrolling closes the revealed action block.
+            if phase.isScrolling, viewModel.swipedSessionId != nil {
+                viewModel.swipedSessionId = nil
+            }
+        }
+        .onTapGesture {
+ // R3: tapping outside any card (group headers, paddings) closes the
+ // revealed actions; button taps win the hit-test inside cards.
+            if viewModel.swipedSessionId != nil { viewModel.swipedSessionId = nil }
         }
         .onChange(of: app.link.generation) { generation in
             viewModel.handleGenerationChange(generation)
@@ -220,6 +248,69 @@ struct WorkspaceListView: View {
  /// session page right away. Failures surface
  /// through the list's inline error banner (viewModel.errorText) — including
  /// the old-plugin 404, which reads as the upgrade hint.
+ /// R3: one pending archive confirmation (m4 two-state dialog).
+    private struct PendingArchive: Identifiable, Equatable {
+        let id = UUID()
+        let sessionId: String
+        let title: String
+        var isRunning: Bool
+    }
+
+    @State private var pendingArchive: PendingArchive?
+
+ /// R3 (design 3.2): pin has no confirmation - optimistic toggle straight
+ /// from the swipe block. Offline taps surface the disconnect hint and send
+ /// nothing (never queue, never fail silently).
+    private func handlePinToggle(_ session: SessionListItem) {
+        guard app.link.phase.isConnected else {
+            viewModel.showInlineError(L10n.t("连接已断开"))
+            return
+        }
+        let sessionId = session.sessionId
+        Task { @MainActor in
+            await viewModel.togglePin(sessionId: sessionId, link: app.link)
+        }
+    }
+
+ /// R3: archive always confirms first (m4); the running state is known from
+ /// the list row, the 409 path re-opens the dialog in running mode.
+    private func handleArchiveRequest(_ session: SessionListItem) {
+        guard app.link.phase.isConnected else {
+            viewModel.showInlineError(L10n.t("连接已断开"))
+            return
+        }
+        pendingArchive = PendingArchive(
+            sessionId: session.sessionId,
+            title: session.title ?? "",
+            isRunning: session.isRunning
+        )
+    }
+
+    private func confirmArchive(_ pending: PendingArchive, stopActivity: Bool) {
+        pendingArchive = nil
+        let sessionId = pending.sessionId
+        Task { @MainActor in
+            do {
+                try await viewModel.archiveSession(
+                    sessionId: sessionId, stopActivity: stopActivity, link: app.link
+                )
+            } catch {
+                if case LinkError.remote(let remote) = error,
+                   remote.code == "archive/session-active" {
+ // The session started running between the list read and the
+ // call: swap the idle dialog for the running one (m4 state 2).
+                    pendingArchive = PendingArchive(
+                        sessionId: sessionId,
+                        title: pending.title,
+                        isRunning: true
+                    )
+                } else {
+                    viewModel.showInlineError(NetworkErrorInterpreter.message(for: error))
+                }
+            }
+        }
+    }
+
     private func createSession(in group: WorkspaceViewModel.WorkspaceGroup) {
         guard viewModel.creatingWorkspaceId == nil else { return }
         Task { @MainActor in
@@ -420,19 +511,37 @@ struct WorkspaceListView: View {
             if !collapsed {
                 ForEach(Array(group.sessions.enumerated()), id: \.element.id) { _, session in
                     let cardIndex = globalIndex(of: session)
+                    let pinned = viewModel.followState.pinnedSessionIds.contains(session.sessionId)
+ // R3 (design 3.2): the swipeable wrapper owns the left-swipe
+ // reveal; the equatable card stays the content.
+                    SwipeableSessionCard(
+                        sessionId: session.sessionId,
+                        isPinned: pinned,
+                        open: viewModel.swipedSessionId == session.sessionId,
+                        onSwipeOpen: { openedId in viewModel.swipedSessionId = openedId },
+                        onPin: { handlePinToggle(session) },
+                        onArchive: { handleArchiveRequest(session) }
+                    ) {
                     SessionCardView(
                         session: session,
                         pendingApprovals: viewModel.pendingApprovalCount(sessionId: session.sessionId, link: app.link),
                         isConnected: app.link.phase.isConnected,
                         draftPreview: session.blank == true
                             ? viewModel.phoneCreatedDraftPreviews[session.sessionId]
-                            : nil
+                            : nil,
+                        isPinned: pinned
                     ) {
+ // A tap on a card with revealed actions closes them first
+ // (single-card exclusivity); otherwise it opens the session.
+                        if viewModel.swipedSessionId == session.sessionId {
+                            viewModel.swipedSessionId = nil
+                        } else {
  // t0 for the user-perceived detail latency (tap ->
  // first content). The route switch must stay synchronous and
  // cheap; the detail's own work happens after this mark.
-                        DetailMetrics.beginTap()
-                        app.openSession(session.followAddress)
+                            DetailMetrics.beginTap()
+                            app.openSession(session.followAddress)
+                        }
                     }
                     .equatable()
                     .accessibilityIdentifier("session-card-\(cardIndex)")
@@ -444,6 +553,7 @@ struct WorkspaceListView: View {
  // gating on `cardIndex == 0` silently lost the metric.
  // `markFirstFrameVisible()` is idempotent.
                         viewModel.markFirstFrameVisible()
+                    }
                     }
                 }
             }
@@ -514,6 +624,7 @@ struct SessionCardView: View, Equatable {
     var pendingApprovals: Int
     var isConnected: Bool
     var draftPreview: String? = nil
+    var isPinned: Bool = false
     var onTap: () -> Void
 
  /// cold-launch freeze: the workspace list re-renders several times
@@ -525,6 +636,7 @@ struct SessionCardView: View, Equatable {
             && lhs.pendingApprovals == rhs.pendingApprovals
             && lhs.isConnected == rhs.isConnected
             && lhs.draftPreview == rhs.draftPreview
+            && lhs.isPinned == rhs.isPinned
     }
 
  /// v5.4 status: waiting-for-answer > in-progress > not-started > idle; offline
@@ -542,6 +654,14 @@ struct SessionCardView: View, Equatable {
         Button(action: onTap) {
             VStack(alignment: .leading, spacing: Theme.Spacing.xs) {
                 HStack(alignment: .firstTextBaseline, spacing: Theme.Spacing.xs) {
+ // R3 (m3 panel 1): the pinned card leads its title with the
+ // 13pt pin mark (Lucide path, accent) - no chip.
+                    if isPinned {
+                        PinMark()
+                            .alignmentGuide(.firstTextBaseline) { dimension in
+                                dimension.height / 2 + 4
+                            }
+                    }
                     Text(session.title?.isEmpty == false
                          ? (session.title ?? "")
                          : (session.blank == true ? L10n.t("新会话") : L10n.t("未命名会话")))
@@ -583,11 +703,18 @@ struct SessionCardView: View, Equatable {
             }
             .padding(Theme.Spacing.m)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(Theme.Palette.surface, in: RoundedRectangle(cornerRadius: Theme.Radius.lg, style: .continuous))
+            .background(
+ // R3 (design 3.2): pinned = accent-soft fill (10%) + accent
+ // border (28%); every other card keeps the neutral surface.
+                isPinned ? AnyShapeStyle(Theme.Palette.accentSoft) : AnyShapeStyle(Theme.Palette.surface),
+                in: RoundedRectangle(cornerRadius: Theme.Radius.lg, style: .continuous)
+            )
             .overlay(
                 RoundedRectangle(cornerRadius: Theme.Radius.lg, style: .continuous)
                     .strokeBorder(
-                        status.emphasizedBorderColor ?? Theme.Palette.border,
+                        isPinned
+                            ? Theme.Palette.accentBorder
+                            : (status.emphasizedBorderColor ?? Theme.Palette.border),
                         lineWidth: 1
                     )
             )
