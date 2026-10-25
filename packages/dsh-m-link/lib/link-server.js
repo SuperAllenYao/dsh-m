@@ -2448,6 +2448,7 @@ export class LinkServer {
         workspaceId: normalized.workspaceId,
         sessionId: result.sessionId,
         reused: result.reused,
+        reuseScan: result.reuseScan,
       });
       return sendJson(response, 200, result);
     }

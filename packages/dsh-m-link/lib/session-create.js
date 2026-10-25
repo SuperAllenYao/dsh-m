@@ -178,6 +178,7 @@ export async function applySessionCreate({ ctx, peer, workspaceId, loopbackOrigi
   const registry = readWorkspaceRegistry(ctx);
   if (registry === undefined) return { ok: false, ...HOST_UNAVAILABLE };
 
+  let reuseScanNote = 'skipped';
   const workspace = registry.get(workspaceId);
   if (workspace === undefined || workspace === null) {
     return {
@@ -196,6 +197,10 @@ export async function applySessionCreate({ ctx, peer, workspaceId, loopbackOrigi
         origin: loopbackOrigin,
         peer,
         method: 'session/list',
+ // The parameter is NAMED _request (typert direct invocation, same
+ // convention as request on session/create) - a bare args object
+ // fails the strict codec with gateway/arguments-invalid.
+        args: { _request: {} },
  // Same lite opt-in the watcher uses: small rows, all fields this scan
  // reads (sessionId/cwd/updatedAt/blank/origin/parentSessionId) survive
  // the trim. An older host ignores the header — harmless, just bigger.
@@ -207,8 +212,11 @@ export async function applySessionCreate({ ctx, peer, workspaceId, loopbackOrigi
       if (reusable !== undefined) {
         return { ok: true, status: 200, sessionId: reusable, reused: true };
       }
-    } catch {
+      reuseScanNote = 'no-match:items=' + (Array.isArray(listValue?.items) ? listValue.items.length : -1)
+        + ':blanks=' + (Array.isArray(listValue?.items) ? listValue.items.filter((item) => item?.blank === true).length : -1);
+    } catch (error) {
  // Fall through to minting: the host stays the single source of truth.
+      reuseScanNote = 'scan-error:' + String(error?.message ?? error).slice(0, 120);
     }
   }
 
@@ -217,14 +225,19 @@ export async function applySessionCreate({ ctx, peer, workspaceId, loopbackOrigi
       origin: loopbackOrigin,
       peer,
       method: 'session/create',
-      args: { workspaceId },
+ // The Remote method's single parameter is NAMED request (typert direct
+ // invocation): a bare workspaceId object fails the strict codec with
+ // gateway/arguments-invalid (verified live).
+      args: { request: { workspaceId } },
       timeoutMs: requestTimeoutMs,
       fetchImpl,
     });
     if (created === null || typeof created !== 'object' || typeof created.sessionId !== 'string' || created.sessionId.length === 0) {
       return { ok: false, status: 502, error: 'session-create/failed', message: 'host session/create returned no sessionId' };
     }
-    return { ok: true, status: 200, sessionId: created.sessionId, reused: false };
+    const result = { ok: true, status: 200, sessionId: created.sessionId, reused: false };
+    if (reuseScanNote) result.reuseScan = reuseScanNote;
+    return result;
   } catch (error) {
     if (error instanceof LoopbackError && error.kind === 'rpc') {
       if (error.detail === 'workspace/not-found') {

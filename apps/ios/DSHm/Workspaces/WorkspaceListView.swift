@@ -408,30 +408,58 @@ struct WorkspaceListView: View {
                 .padding(.top, Theme.Spacing.xl)
             }
         } else {
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: Theme.Spacing.xl) {
-                    if let errorText = viewModel.errorText {
-                        InlineErrorView(message: errorText) {
-                            Task { await viewModel.refresh() }
-                        }
-                        .padding(.horizontal, Theme.Spacing.pageInset)
+ // Step4R: the session list rides a native
+ // List so the swipe actions get system-grade reveal/snap/dismisson-
+ // tap-outside behaviour. Cards keep their exact custom look through
+ // row insets/background/separator; pull-to-refresh and every a11y
+ // identifier survive unchanged.
+            List {
+                if let errorText = viewModel.errorText {
+                    InlineErrorView(message: errorText) {
+                        Task { await viewModel.refresh() }
                     }
-                    ForEach(Array(viewModel.groups.enumerated()), id: \.element.id) { index, group in
-                        workspaceSection(group, index: index)
-                    }
+                    .listRowInsets(EdgeInsets(top: 0, leading: Theme.Spacing.pageInset, bottom: Theme.Spacing.s, trailing: Theme.Spacing.pageInset))
+                    .listRowBackground(Color.clear)
+                    .listRowSeparator(.hidden)
+                    .accessibilityIdentifier("workspace-list-error")
                 }
-                .padding(.horizontal, Theme.Spacing.pageInset)
-                .padding(.bottom, Theme.Spacing.xxl)
+                ForEach(Array(viewModel.groups.enumerated()), id: \.element.id) { index, group in
+                    workspaceSection(group, index: index)
+                }
+ // Bottom breathing room: a tail row inside the list (a
+ // .contentMargins modifier here would propagate through the
+ // NavigationStack into the pushed session detail).
+                Color.clear
+                    .frame(height: Theme.Spacing.xxl)
+                    .listRowInsets(EdgeInsets())
+                    .listRowBackground(Color.clear)
+                    .listRowSeparator(.hidden)
+                    .accessibilityHidden(true)
             }
+            .listStyle(.plain)
+            .listSectionSpacing(Theme.Spacing.l)
+            .scrollContentBackground(.hidden)
+            .accessibilityIdentifier("workspace-session-list")
         }
     }
 
     private func workspaceSection(_ group: WorkspaceViewModel.WorkspaceGroup, index: Int) -> some View {
         let collapsed = viewModel.isCollapsed(group.path)
-        return VStack(alignment: .leading, spacing: Theme.Spacing.s) {
- // The whole header row toggles the group; collapsed groups show their
- // session count so a "missing" workspace still reads as non-empty.
-            Button {
+        return Section {
+            if !collapsed {
+                ForEach(Array(group.sessions.enumerated()), id: \.element.id) { _, session in
+                    sessionRow(session)
+                }
+            }
+        } header: {
+            groupHeader(group, index: index, collapsed: collapsed)
+        }
+    }
+
+ /// The whole header row toggles the group; collapsed groups show their
+ /// session count so a "missing" workspace still reads as non-empty.
+    private func groupHeader(_ group: WorkspaceViewModel.WorkspaceGroup, index: Int, collapsed: Bool) -> some View {
+        Button {
                 withAnimation(Theme.Motion.quick) {
                     viewModel.toggleCollapsed(group.path)
                 }
@@ -443,12 +471,25 @@ struct WorkspaceListView: View {
  // name enlarged to 16pt and path moved onto its own
  // second line instead of sharing the name's line.
                     VStack(alignment: .leading, spacing: Theme.Spacing.xxs) {
-                        Text(group.displayName)
-                            .font(Theme.Typography.workspaceName)
-                            .foregroundStyle(Theme.Palette.textSecondary)
-                            .lineLimit(1)
-                            .truncationMode(.tail)
-                            .accessibilityIdentifier("workspace-name-\(index)")
+ // M2 rev2 (m2-groupheader-v2): the name line always
+ // carries the session count - a dot separator in
+ // tertiary and the bare number in secondary, baseline-
+ // aligned; the collapsed-state count text is gone.
+                        HStack(alignment: .firstTextBaseline, spacing: Theme.Spacing.xxs) {
+                            Text(group.displayName)
+                                .font(Theme.Typography.workspaceName)
+                                .foregroundStyle(Theme.Palette.textSecondary)
+                                .lineLimit(1)
+                                .truncationMode(.tail)
+                                .accessibilityIdentifier("workspace-name-\(index)")
+                            Text("·")
+                                .font(Theme.Typography.label)
+                                .foregroundStyle(Theme.Palette.textTertiary)
+                            Text("\(group.sessions.count)")
+                                .font(Theme.Typography.label)
+                                .foregroundStyle(Theme.Palette.textSecondary)
+                                .accessibilityIdentifier("workspace-count-\(index)")
+                        }
                         Text(group.path)
                             .font(Theme.Typography.label)
                             .foregroundStyle(Theme.Palette.textTertiary)
@@ -483,23 +524,8 @@ struct WorkspaceListView: View {
                     .buttonStyle(.plain)
                     .disabled(viewModel.creatingWorkspaceId != nil)
                     .accessibilityIdentifier("workspace-new-session-\(index)")
- // M2 geometry: 1pt hairline, 18pt tall, between + and chevron.
-                    Rectangle()
-                        .fill(Theme.Palette.border)
-                        .frame(width: 1, height: 18)
-                        .padding(.horizontal, Theme.Spacing.xs)
-                    if collapsed {
-                        Text(L10n.f("%lld 个会话", group.sessions.count))
-                            .font(Theme.Typography.label)
-                            .foregroundStyle(Theme.Palette.textTertiary)
-                    }
- // Same chevron symbol rotating (no glyph swap), synced with
- // the folder's open/close morph.
-                    Image(systemName: "chevron.down")
-                        .font(.system(size: 10, weight: .semibold))
-                        .foregroundStyle(Theme.Palette.textTertiary)
-                        .rotationEffect(.degrees(collapsed ? -90 : 0))
-                        .animation(Theme.Motion.folder, value: collapsed)
+ // M2 rev2: the plus button is the ONLY trailing accessory -
+ // no chevron, no hairline, no collapsed count text.
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .contentShape(Rectangle())
@@ -507,22 +533,22 @@ struct WorkspaceListView: View {
             .buttonStyle(.plain)
             .accessibilityIdentifier("workspace-toggle-\(index)")
             .accessibilityValue(collapsed ? "collapsed" : "expanded")
+            .padding(.horizontal, Theme.Spacing.pageInset)
+            .padding(.bottom, Theme.Spacing.xxs)
+ // Plain-list section headers carry their own system insets; zero
+ // them so the header width matches the cards exactly.
+            .listRowInsets(EdgeInsets())
+    }
 
-            if !collapsed {
-                ForEach(Array(group.sessions.enumerated()), id: \.element.id) { _, session in
-                    let cardIndex = globalIndex(of: session)
-                    let pinned = viewModel.followState.pinnedSessionIds.contains(session.sessionId)
+ /// One session row inside the native List: the equatable card plus the
+ /// system swipe actions (Step4R). Pin toggles straight away (no
+ /// confirmation, optimistic + reconcile); archive always confirms first.
+    private func sessionRow(_ session: SessionListItem) -> some View {
+        let cardIndex = globalIndex(of: session)
+        let pinned = viewModel.followState.pinnedSessionIds.contains(session.sessionId)
  // R3 (design 3.2): the swipeable wrapper owns the left-swipe
  // reveal; the equatable card stays the content.
-                    SwipeableSessionCard(
-                        sessionId: session.sessionId,
-                        isPinned: pinned,
-                        open: viewModel.swipedSessionId == session.sessionId,
-                        onSwipeOpen: { openedId in viewModel.swipedSessionId = openedId },
-                        onPin: { handlePinToggle(session) },
-                        onArchive: { handleArchiveRequest(session) }
-                    ) {
-                    SessionCardView(
+        return SessionCardView(
                         session: session,
                         pendingApprovals: viewModel.pendingApprovalCount(sessionId: session.sessionId, link: app.link),
                         isConnected: app.link.phase.isConnected,
@@ -530,12 +556,10 @@ struct WorkspaceListView: View {
                             ? viewModel.phoneCreatedDraftPreviews[session.sessionId]
                             : nil,
                         isPinned: pinned
-                    ) {
- // A tap on a card with revealed actions closes them first
- // (single-card exclusivity); otherwise it opens the session.
-                        if viewModel.swipedSessionId == session.sessionId {
-                            viewModel.swipedSessionId = nil
-                        } else {
+        ) {
+ // Step4R: system swipeActions handle reveal/close;
+ // the card tap only opens the session now.
+            if true {
  // t0 for the user-perceived detail latency (tap ->
  // first content). The route switch must stay synchronous and
  // cheap; the detail's own work happens after this mark.
@@ -543,20 +567,36 @@ struct WorkspaceListView: View {
                             app.openSession(session.followAddress)
                         }
                     }
-                    .equatable()
-                    .accessibilityIdentifier("session-card-\(cardIndex)")
-                    .onAppear {
+        .equatable()
+        .accessibilityIdentifier("session-card-\(cardIndex)")
+        .onAppear {
  // M2b-2b: the first list card on screen marks the in-app first
  // frame. Any card may be the first visibly rendered one: the
  // first workspace group can be collapsed (persisted collapse
  // state) or the global card order can differ per host, so
  // gating on `cardIndex == 0` silently lost the metric.
  // `markFirstFrameVisible()` is idempotent.
-                        viewModel.markFirstFrameVisible()
-                    }
-                    }
-                }
+            viewModel.markFirstFrameVisible()
+        }
+        .listRowInsets(EdgeInsets(top: 6, leading: Theme.Spacing.pageInset, bottom: 6, trailing: Theme.Spacing.pageInset))
+        .listRowBackground(Color.clear)
+        .listRowSeparator(.hidden)
+        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+            Button {
+                handlePinToggle(session)
+            } label: {
+                Label(pinned ? L10n.t("取消置顶") : L10n.t("置顶"), systemImage: pinned ? "pin.slash" : "pin")
             }
+ // Pinned = accent fill; unpin = neutral raised fill (tokens only).
+            .tint(pinned ? Theme.Palette.borderStrong : Theme.Palette.accent)
+            .accessibilityIdentifier("swipe-pin-" + session.sessionId)
+            Button {
+                handleArchiveRequest(session)
+            } label: {
+                Label(L10n.t("归档"), systemImage: "archivebox")
+            }
+            .tint(Theme.Palette.warning)
+            .accessibilityIdentifier("swipe-archive-" + session.sessionId)
         }
     }
 

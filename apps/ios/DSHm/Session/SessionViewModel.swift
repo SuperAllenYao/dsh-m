@@ -758,6 +758,21 @@ final class SessionViewModel: ObservableObject {
         applyJournalUpdate(update)
     }
 
+ /// E2E follow probe: counts
+ /// the follow lifecycle so a test can tell an opened-but-ended stream from
+ /// a live one. Format: opened/snap/events/ended/err/sent.
+    @Published private(set) var followProbeValue = "opened=0;snap=0;events=0;ended=0;err=-;sent=0"
+    private var followOpenedCount = 0
+    private var followSnapshotCount = 0
+    private var followEventCount = 0
+    private var followEndedCount = 0
+    private var followErrorCode = "-"
+    private var followSentCount = 0
+
+    private func refreshFollowProbe() {
+        followProbeValue = "opened=\(followOpenedCount);snap=\(followSnapshotCount);events=\(followEventCount);ended=\(followEndedCount);err=\(followErrorCode);sent=\(followSentCount)"
+    }
+
  /// Test seam: apply one raw session/follow item value (snapshot/event/...).
  /// 测试 seam：**同步**应用一帧。生产路径走后台解码流水线（handleItem），
  /// 但单测需要在一次调用内看到效果，因此这里保持同步解码 + 同步处理。
@@ -1036,6 +1051,8 @@ final class SessionViewModel: ObservableObject {
                 ]),
             ]
             dbg("session/follow send: messages=" + String(messages) + " sections=" + String(rows.count) + " cache=" + String(didRestoreFirstPaintCache) + " hasLive=" + String(hasLiveSnapshot))
+            followOpenedCount += 1
+            refreshFollowProbe()
             stream = try link.openStream(
                 endpoint: "session/follow",
                 args: args,
@@ -1044,10 +1061,14 @@ final class SessionViewModel: ObservableObject {
                 },
                 onEnd: { [weak self] in
                     self?.dbg("session/follow ended by host")
+                self?.followEndedCount += 1
+                self?.refreshFollowProbe()
                     self?.streamErrorText = "会话流已结束"
                 },
                 onError: { [weak self] error in
                     self?.dbg("session/follow error: " + error.code + " " + error.message)
+                    self?.followErrorCode = error.code
+                    self?.refreshFollowProbe()
                     self?.streamErrorText = error.message.isEmpty ? error.code : error.message
                     self?.isLoading = false
                 },
@@ -1752,6 +1773,8 @@ final class SessionViewModel: ObservableObject {
     private func handleItem(_ value: JSONValue?) {
         guard let value else { return }
         lastEventAt = Date()
+        followEventCount += 1
+        refreshFollowProbe()
         pendingFrameValues.append(value)
         drainFrameDecodeIfNeeded()
     }
@@ -1812,6 +1835,8 @@ final class SessionViewModel: ObservableObject {
     private func processFrame(_ frame: SessionStreamFrame) {
         switch frame {
             case .snapshot(let snapshot):
+                followSnapshotCount += 1
+                refreshFollowProbe()
                 dbg("snapshot: records=" + String(snapshot.records.count) + " cursor=" + String(snapshot.cursor) + " hasMore=" + String(describing: snapshot.hasMore))
                 #if DEBUG
                 let update = PerfProbe.shared.measure("snapshotJournalApply", ["records": snapshot.records.count]) {
@@ -2182,6 +2207,8 @@ final class SessionViewModel: ObservableObject {
         DraftStore.shared.remove(for: sessionId)
         SendMetrics.begin()
         let connected = link?.phase.isConnected ?? false
+        followSentCount += 1
+        refreshFollowProbe()
         if isRunning || !connected {
             queuedPrompts.enqueue(text: text)
             SendMetrics.markQueued()

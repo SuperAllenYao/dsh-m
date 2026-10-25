@@ -173,6 +173,19 @@ final class WorkspaceViewModel: ObservableObject {
         self.prewarmLimit = Self.prewarmLimitFromEnvironment()
         collapsedPaths = Set(defaults.stringArray(forKey: Self.collapsedPathsKey) ?? [])
         phoneCreatedBlanks = Set(defaults.stringArray(forKey: Self.phoneCreatedBlanksKey) ?? [])
+ // DEBUG-only E2E seam (same family as DSHM_E2E_RESET_CACHE): repeated
+ // create-flow rounds leave drafted blank cards behind (product-correct
+ // persistence across launches); rounds opt into a clean slate here.
+        #if DEBUG
+        if ProcessInfo.processInfo.environment["DSHM_E2E_RESET_BLANKS"] == "1" {
+            phoneCreatedBlanks = []
+            phoneCreatedDraftPreviews = [:]
+            persistPhoneCreatedBlanks()
+            try? FileManager.default.removeItem(
+                at: CacheIO.defaultDirectory().appendingPathComponent("Drafts", isDirectory: true)
+            )
+        }
+        #endif
         restoreCachedList()
     }
 

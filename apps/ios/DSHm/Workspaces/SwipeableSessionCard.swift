@@ -94,6 +94,13 @@ struct SwipeableSessionCard<Content: View>: View {
         }
     }
 
+ /// True while the actions are actually revealed (past ~1/4 of the rail).
+ /// Drives accessibility: a covered action block must not sit in the a11y
+ /// tree (XCUITest taps/hit-tests through the card otherwise).
+    private var actionsRevealed: Bool {
+        offsetX < -SwipeCardGeometry.openWidth * 0.25
+    }
+
     private var actionBlocks: some View {
         HStack(spacing: 0) {
             Button(action: onPin) {
@@ -125,5 +132,6 @@ struct SwipeableSessionCard<Content: View>: View {
             .buttonStyle(.plain)
             .accessibilityIdentifier("swipe-archive-" + sessionId)
         }
+        .accessibilityHidden(!actionsRevealed)
     }
 }
