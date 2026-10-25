@@ -52,6 +52,20 @@ final class WorkspaceViewModel: ObservableObject {
     private(set) var timeToFirstContentMilliseconds: Double = 0
  /// Workspace paths whose session list is collapsed (persisted by path).
     @Published private var collapsedPaths: Set<String> = []
+ /// R2 (design 2.3): blank sessions minted through this phone's plus button.
+ /// Only these blanks may show the new-session card - a blank the desktop
+ /// created or focused never becomes visible here just because a draft exists.
+    @Published private(set) var phoneCreatedBlanks: Set<String> = []
+ /// Draft preview lines for the phone-created blank cards (sessionId -> first
+ /// line). Refreshed on list appear / draft flush; the cards read from it so
+ /// SessionCardView stays equatable on value identity.
+    @Published private(set) var phoneCreatedDraftPreviews: [String: String] = [:]
+ /// Workspace whose plus button is currently minting a session (spinner state).
+    @Published private(set) var creatingWorkspaceId: String?
+ /// R3: the one session card whose swipe actions are revealed (single-card
+ /// exclusivity). Closed by tapping elsewhere, another swipe, a scroll, or a
+ /// groups refresh (design 3.2).
+    @Published var swipedSessionId: String?
 
  /// Every session from the last `session/list`, including subagent/blank/
  /// archived/ungrouped rows. Kept for deep-link address resolution only.
@@ -148,6 +162,7 @@ final class WorkspaceViewModel: ObservableObject {
  /// How many recent sessions to prewarm (env-tunable for the live bench; 0 = off).
     private let prewarmLimit: Int
     static let collapsedPathsKey = "workspaceList.collapsedPaths"
+    static let phoneCreatedBlanksKey = "workspaceList.phoneCreatedBlanks"
 
     init(
         defaults: UserDefaults = .standard,
@@ -157,6 +172,20 @@ final class WorkspaceViewModel: ObservableObject {
         self.cacheStore = cacheStore
         self.prewarmLimit = Self.prewarmLimitFromEnvironment()
         collapsedPaths = Set(defaults.stringArray(forKey: Self.collapsedPathsKey) ?? [])
+        phoneCreatedBlanks = Set(defaults.stringArray(forKey: Self.phoneCreatedBlanksKey) ?? [])
+ // DEBUG-only E2E seam (same family as DSHM_E2E_RESET_CACHE): repeated
+ // create-flow rounds leave drafted blank cards behind (product-correct
+ // persistence across launches); rounds opt into a clean slate here.
+        #if DEBUG
+        if ProcessInfo.processInfo.environment["DSHM_E2E_RESET_BLANKS"] == "1" {
+            phoneCreatedBlanks = []
+            phoneCreatedDraftPreviews = [:]
+            persistPhoneCreatedBlanks()
+            try? FileManager.default.removeItem(
+                at: CacheIO.defaultDirectory().appendingPathComponent("Drafts", isDirectory: true)
+            )
+        }
+        #endif
         restoreCachedList()
     }
 
@@ -591,6 +620,12 @@ final class WorkspaceViewModel: ObservableObject {
 
  /// Test seam: apply one decoded `workspace/follow` frame.
     func applyWorkspaceFrame(_ frame: WorkspaceFollowFrame) {
+ // R2 close-out (design 2.3 c): remember which sessions the frame is about
+ // to drop, then release phone-created blanks that were archived/removed.
+        let knownIds = phoneCreatedBlanks.isEmpty
+            ? Set<String>()
+            : Set(followState.workspaces.flatMap(\.sessionIds))
+        let archivedBefore = followState.archivedSessionIds
         followState.apply(frame)
         if case .baseline = frame {
             isLoading = false
@@ -598,10 +633,164 @@ final class WorkspaceViewModel: ObservableObject {
             cancelReuseLivenessProbe()
             link?.noteReuseLivenessConfirmed()
         }
+        closeOutPhoneCreatedBlanks(knownWorkspaceIds: knownIds, archivedBefore: archivedBefore)
         errorText = nil
         rebuildGroups()
         maybeStartPrewarm()
         scheduleListCacheSave()
+    }
+
+ /// Release phone-created blanks the frame archived or removed (2.3 c). An id
+ /// this phone minted moments ago may not have reached the registry yet, so a
+ /// blank that was never seen in any workspace is kept (never a false drop).
+    private func closeOutPhoneCreatedBlanks(knownWorkspaceIds: Set<String>, archivedBefore: Set<String>) {
+        guard !phoneCreatedBlanks.isEmpty else { return }
+        let liveIds = Set(followState.workspaces.flatMap(\.sessionIds))
+        var survivors: Set<String> = []
+        for id in phoneCreatedBlanks {
+            if followState.archivedSessionIds.contains(id) { continue }
+            if knownWorkspaceIds.contains(id), !liveIds.contains(id) { continue }
+            if archivedBefore.contains(id) { continue }
+            survivors.insert(id)
+        }
+        if survivors != phoneCreatedBlanks {
+            phoneCreatedBlanks = survivors
+            persistPhoneCreatedBlanks()
+        }
+    }
+
+    private func persistPhoneCreatedBlanks() {
+        defaults.set(phoneCreatedBlanks.sorted(), forKey: Self.phoneCreatedBlanksKey)
+    }
+
+ /// Register a freshly minted blank (2.3): visible as soon as a draft exists.
+    func registerPhoneCreatedBlank(sessionId: String) {
+        guard !phoneCreatedBlanks.contains(sessionId) else { return }
+        phoneCreatedBlanks.insert(sessionId)
+        persistPhoneCreatedBlanks()
+    }
+
+ /// Refresh blank-card previews + visibility from the draft store. Called on
+ /// list appear (returning from a session page) - the card must reflect the
+ /// draft that was typed without any live cross-object push (design 2.3/2.4).
+ /// This is also close-out (2.3 b): a blank that came back with an empty
+ /// draft is released here, and a blank that has since sent its first
+ /// message (no longer blank) is dropped from the set so it cannot pile up.
+    func refreshBlankCardState() {
+        guard !phoneCreatedBlanks.isEmpty else {
+            if !phoneCreatedDraftPreviews.isEmpty { phoneCreatedDraftPreviews = [:] }
+            return
+        }
+        var survivors: Set<String> = []
+        var previews: [String: String] = [:]
+        for id in phoneCreatedBlanks {
+            if let item = sessionsById[id], item.blank != true { continue }
+            guard let text = DraftStore.shared.text(for: id) else { continue }
+            survivors.insert(id)
+            previews[id] = String(text.split(separator: "\n", omittingEmptySubsequences: true).first ?? "")
+        }
+        if survivors != phoneCreatedBlanks {
+            phoneCreatedBlanks = survivors
+            persistPhoneCreatedBlanks()
+        }
+        phoneCreatedDraftPreviews = previews
+        rebuildGroups()
+    }
+
+ /// Surface one inline error from a view action (R3 disconnect hints etc.).
+    func showInlineError(_ text: String) {
+        errorText = text
+    }
+
+ /// E2E-only companion to `createSession`: the session id returned by the
+ /// most recent phone-side create RPC (minted or reused). Write-capable UI
+ /// tests address their targets strictly through this id — positional card
+ /// lookups once archived a live session, never again.
+    @Published private(set) var e2eCreatedSessionId = ""
+
+ /// R2 (design 2.2): mint a session in one workspace through the plugin
+ /// route. Returns the new session id (reused or minted); failures surface
+ /// through `errorText` (NetworkErrorInterpreter wording) and return nil.
+    @MainActor
+    func createSession(inWorkspace workspaceId: String, link: LinkService) async -> String? {
+        creatingWorkspaceId = workspaceId
+        defer { creatingWorkspaceId = nil }
+        do {
+            let result = try await link.createSession(workspaceId: workspaceId)
+            registerPhoneCreatedBlank(sessionId: result.sessionId)
+            e2eCreatedSessionId = result.sessionId
+            errorText = nil
+            return result.sessionId
+        } catch {
+            errorText = NetworkErrorInterpreter.message(for: error)
+            return nil
+        }
+    }
+
+ // MARK: - R3 pin / archive (optimistic + reconcile, design 3.2)
+
+ /// Apply one optimistic pin change to the local follow-state copy and
+ /// rebuild (the pinned group re-sorts immediately). Returns the previous
+ /// pin list for rollback.
+    @discardableResult
+    private func applyOptimisticPin(_ sessionId: String, pinned: Bool) -> [String] {
+        let previous = followState.applyOptimisticPin(sessionId, pinned: pinned)
+        rebuildGroups()
+        return previous
+    }
+
+    private func rollbackPin(_ previous: [String]) {
+        followState.restorePins(previous)
+        rebuildGroups()
+    }
+
+ /// Toggle one session's pin. No confirmation (design 3.2): optimistic
+ /// reorder + RPC; the returned complete set wins on success, rollback +
+ /// inline error otherwise (the later host broadcast frame is the final
+ /// word for concurrent edits on both ends).
+    @MainActor
+    func togglePin(sessionId: String, link: LinkService) async {
+        let pinned = !followState.pinnedSessionIds.contains(sessionId)
+        let previous = applyOptimisticPin(sessionId, pinned: pinned)
+        do {
+            let result = try await link.pinSession(sessionId: sessionId, pinned: pinned)
+            followState.replacePins(result.pinnedSessionIds)
+            rebuildGroups()
+        } catch {
+            rollbackPin(previous)
+            errorText = NetworkErrorInterpreter.message(for: error)
+        }
+    }
+
+ /// Archive one session. Optimistic removal; a 409 session-active rolls the
+ /// card back and rethrows `archive/session-active` so the caller swaps the
+ /// idle confirmation for the running one (same dialog, stopActivity: true).
+    @MainActor
+    func archiveSession(
+        sessionId: String, stopActivity: Bool, link: LinkService
+    ) async throws {
+        let previous = followState.applyOptimisticArchive(sessionId)
+        rebuildGroups()
+        do {
+            let result = try await link.archiveSession(sessionId: sessionId, stopActivity: stopActivity)
+            followState.replaceArchived(Set(result.archivedSessionIds))
+            closeOutPhoneCreatedBlanksIfArchived([sessionId])
+            rebuildGroups()
+        } catch {
+            followState.restoreArchive(previous.archived, pinned: previous.pinned)
+            rebuildGroups()
+            throw error
+        }
+    }
+
+    private func closeOutPhoneCreatedBlanksIfArchived(_ ids: [String]) {
+        guard !phoneCreatedBlanks.isEmpty else { return }
+        var survivors = phoneCreatedBlanks
+        for id in ids where survivors.contains(id) { survivors.remove(id) }
+        if survivors != phoneCreatedBlanks {
+            phoneCreatedBlanks = survivors
+            persistPhoneCreatedBlanks()
+        }
     }
 
  /// Loads the live `session/list` snapshot. `silent` suppresses the error
@@ -1083,7 +1272,12 @@ final class WorkspaceViewModel: ObservableObject {
             sessions.reserveCapacity(workspace.sessionIds.count)
             for sessionId in workspace.sessionIds {
                 guard let session = sessionsById[sessionId],
-                      Self.isVisible(session, archivedSessionIds: archived) else { continue }
+                      Self.isVisible(
+                        session,
+                        archivedSessionIds: archived,
+                        phoneCreatedBlanks: phoneCreatedBlanks,
+                        hasDraft: { DraftStore.shared.hasDraft($0) }
+                      ) else { continue }
                 sessions.append(session)
             }
             sessions.sort(by: comparator)
@@ -1111,11 +1305,22 @@ final class WorkspaceViewModel: ObservableObject {
 
  // MARK: - Visibility & ordering (shared with unit tests)
 
- /// Desktop-sidebar visibility rule on top of registry membership.
-    static func isVisible(_ session: SessionListItem, archivedSessionIds: Set<String>) -> Bool {
+ /// Desktop-sidebar visibility rule on top of registry membership, plus the
+ /// R2 phone-created blank release (design 2.3): a blank session is visible
+ /// only when this phone minted it through the plus button AND a draft
+ /// exists - the card disappears the moment the draft is gone or the session
+ /// is archived.
+    static func isVisible(
+        _ session: SessionListItem,
+        archivedSessionIds: Set<String>,
+        phoneCreatedBlanks: Set<String> = [],
+        hasDraft: (String) -> Bool = { _ in false }
+    ) -> Bool {
         if session.isSubagent { return false }
-        if session.blank == true { return false }
         if archivedSessionIds.contains(session.sessionId) { return false }
+        if session.blank == true {
+            return phoneCreatedBlanks.contains(session.sessionId) && hasDraft(session.sessionId)
+        }
         return true
     }
 

@@ -334,6 +334,8 @@ final class SessionViewModel: ObservableObject {
  /// v5.4 task-13: runtime status of child subagent sessions (parent detail only).
     @Published private(set) var subagentRuntimes: [String: SubagentRuntime] = [:]
     @Published var draft: String = ""
+ /// R2 (design 2.4): debounce pipeline persisting the draft to DraftStore.
+    private var draftPersistCancellable: AnyCancellable?
  /// Exact-fetch (protocol §3.9) summaries keyed by workspace/changes seq.
     @Published private(set) var fileChangeSummaries: [Int: ChangesSummaryValue] = [:]
  /// task-2: loading/retry/404-terminal bookkeeping of the exact fetch. While
@@ -596,6 +598,12 @@ final class SessionViewModel: ObservableObject {
  // background (the manual "load earlier" feature is gone).
         self.firstWindowMessages = SessionWindowPolicy.deviceFirstWindowMessages
         DetailMetrics.setFirstWindow(self.firstWindowMessages)
+ // R2 (design 2.4): restore the persisted draft (a back-navigation or app
+ // backgrounding used to silently drop what the user had typed), then
+ // persist edits on a 500 ms debounce; flushDraft() covers disappear and
+ // scene backgrounding, submitDraft() deletes on send.
+        draft = DraftStore.shared.text(for: address.sessionId) ?? ""
+        startDraftPersistence(sessionId: address.sessionId)
  // The first-paint cache is read/decoded off-main after init: the route switch
  // and the first render must never wait for disk IO / JSON decoding (user bug:
  // tapping a session froze ~1s before the detail appeared). The cached chunks
@@ -748,6 +756,42 @@ final class SessionViewModel: ObservableObject {
         guard kept.last?.seq == front - 1 else { return }
         let update = journal.prepend(events: kept, hasMoreOlder: true)
         applyJournalUpdate(update)
+    }
+
+ /// E2E follow probe: counts
+ /// the follow lifecycle so a test can tell an opened-but-ended stream from
+ /// a live one. Format: opened/snap/events/ended/err/sent.
+    @Published private(set) var followProbeValue = "opened=0;snap=0;events=0;ended=0;err=-;sent=0"
+    private var followOpenedCount = 0
+    private var followSnapshotCount = 0
+    private var followEventCount = 0
+    private var followEndedCount = 0
+    private var followErrorCode = "-"
+    private var followSentCount = 0
+
+    private func refreshFollowProbe() {
+        followProbeValue = "opened=\(followOpenedCount);snap=\(followSnapshotCount);events=\(followEventCount);ended=\(followEndedCount);err=\(followErrorCode);sent=\(followSentCount)"
+    }
+
+    private var followProbeCoalesceTask: Task<Void, Never>?
+
+ /// Burst path (event/snapshot frames). Republishing @Published on every
+ /// frame invalidated the detail body hundreds of times during a large
+ /// session's initial load and pushed first-row materialization past the
+ /// first post-switch sample (push-switch blank-viewport E2E regression,
+ /// branch failed rowsImmediate>0 while main passed; flow rows
+ /// appeared ~0.1-0.2s later, 2s count was healthy). Coalesce to one publish
+ /// per 250ms trailing-edge; lifecycle transitions (open/end/error/sent)
+ /// stay immediate. E2E polls the probe at 2s granularity, so this is
+ /// test-equivalent.
+    private func refreshFollowProbeCoalesced() {
+        guard followProbeCoalesceTask == nil else { return }
+        followProbeCoalesceTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 250_000_000)
+            guard let self else { return }
+            self.followProbeCoalesceTask = nil
+            self.refreshFollowProbe()
+        }
     }
 
  /// Test seam: apply one raw session/follow item value (snapshot/event/...).
@@ -1028,6 +1072,8 @@ final class SessionViewModel: ObservableObject {
                 ]),
             ]
             dbg("session/follow send: messages=" + String(messages) + " sections=" + String(rows.count) + " cache=" + String(didRestoreFirstPaintCache) + " hasLive=" + String(hasLiveSnapshot))
+            followOpenedCount += 1
+            refreshFollowProbe()
             stream = try link.openStream(
                 endpoint: "session/follow",
                 args: args,
@@ -1036,10 +1082,14 @@ final class SessionViewModel: ObservableObject {
                 },
                 onEnd: { [weak self] in
                     self?.dbg("session/follow ended by host")
+                self?.followEndedCount += 1
+                self?.refreshFollowProbe()
                     self?.streamErrorText = "会话流已结束"
                 },
                 onError: { [weak self] error in
                     self?.dbg("session/follow error: " + error.code + " " + error.message)
+                    self?.followErrorCode = error.code
+                    self?.refreshFollowProbe()
                     self?.streamErrorText = error.message.isEmpty ? error.code : error.message
                     self?.isLoading = false
                 },
@@ -1744,6 +1794,8 @@ final class SessionViewModel: ObservableObject {
     private func handleItem(_ value: JSONValue?) {
         guard let value else { return }
         lastEventAt = Date()
+        followEventCount += 1
+        refreshFollowProbeCoalesced()
         pendingFrameValues.append(value)
         drainFrameDecodeIfNeeded()
     }
@@ -1804,6 +1856,8 @@ final class SessionViewModel: ObservableObject {
     private func processFrame(_ frame: SessionStreamFrame) {
         switch frame {
             case .snapshot(let snapshot):
+                followSnapshotCount += 1
+                refreshFollowProbeCoalesced()
                 dbg("snapshot: records=" + String(snapshot.records.count) + " cursor=" + String(snapshot.cursor) + " hasMore=" + String(describing: snapshot.hasMore))
                 #if DEBUG
                 let update = PerfProbe.shared.measure("snapshotJournalApply", ["records": snapshot.records.count]) {
@@ -2137,6 +2191,30 @@ final class SessionViewModel: ObservableObject {
  /// Unified composer send (v5.4): while a turn runs the message joins the
  /// client-side queue; when idle it is sent immediately with `mode=queue`.
  ///
+ /// R2 (design 2.4): the 500 ms debounce behind the draft store. A failed
+ /// write keeps the in-memory state (the store retries on the next save) —
+ /// typing is never blocked by disk IO (failure mode matrix).
+    private func startDraftPersistence(sessionId: String) {
+        draftPersistCancellable = $draft
+            .dropFirst()
+            .debounce(for: .milliseconds(500), scheduler: DispatchQueue.main)
+            .sink { [weak self] text in
+                guard let self else { return }
+                DraftStore.shared.save(text, for: sessionId)
+                self.onDraftPersisted?()
+            }
+    }
+
+ /// Called after a debounced draft save so surfaces (workspace list blank
+ /// card) can refresh their preview lazily.
+    var onDraftPersisted: (() -> Void)?
+
+ /// R2 (design 2.4): immediate persist (session view disappear, scene
+ /// backgrounding). Empty text removes the draft file entirely.
+    func flushDraft() {
+        DraftStore.shared.save(draft, for: sessionId)
+    }
+
  /// M2a fix: never dead-end on transport state. If the link is reconnecting or
  /// offline the prompt is queued locally (with feedback) and flushed as soon as
  /// the next connected phase arrives — the button used to be disabled/greyed
@@ -2145,8 +2223,13 @@ final class SessionViewModel: ObservableObject {
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty, !sending else { return }
         draft = ""
+ // R2 (design 2.4): sent (or queued — the send intent is final) means the
+ // draft is gone; delete immediately instead of waiting for the debounce.
+        DraftStore.shared.remove(for: sessionId)
         SendMetrics.begin()
         let connected = link?.phase.isConnected ?? false
+        followSentCount += 1
+        refreshFollowProbe()
         if isRunning || !connected {
             queuedPrompts.enqueue(text: text)
             SendMetrics.markQueued()

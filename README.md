@@ -6,7 +6,7 @@ DSH-m 通过自托管、TLS 证书钉扎的桥接，把 iPhone App **DSH-m** 连
 
 ## 状态
 
-当前版本 **v2.11.0**（2026-10-25）。已交付的能力：
+当前版本 **v2.12.0**（2026-10-25）。已交付的能力：
 
 **导航**
 
@@ -24,6 +24,9 @@ DSH-m 通过自托管、TLS 证书钉扎的桥接，把 iPhone App **DSH-m** 连
 **会话与交互**
 
 - 工作区 / 会话浏览与实时流；会话列表轻量投影，首屏更快。
+- 会话卡片左滑快捷操作：置顶、归档（归档带二次确认弹窗）。
+- 分组「+」一键新建会话并直达；未发送输入自动存草稿，回到该工作区继续；新建空白会话布局与有消息会话一致。
+- 顶栏品牌与版本信息重排：版本号下沉第二行，两行与 logo 等高。
 - 会话详情为一条平铺消息流（对齐 DSH 桌面端）：无 turn 卡片与按轮折叠；推理与工具调用按「过程组」折叠，文件变更卡在流尾；每行独立懒加载，长会话滚动更稳、下拉加载的新消息立即可见。
 - 子代理与工具调用视图；子代理入口常驻数量，只有真实运行中才播放边框流光，运行期间新启动的子代理即时计入。
 - 审批与用户提问：底部交互面板强制作答，可向下折叠查看会话输出，右上角「等待审批 / 等待作答」徽标可重新展开；多题问答一题一页（上一题 / 下一题、进度、单选自动前进、返回保留草稿、跳过与提交校验）；支持锁屏推送直接处理。
@@ -158,6 +161,9 @@ Current version **v0.2.3** (2026-10-23). What ships today:
 **Sessions and interaction**
 
 - Workspace / session browsing with live streams; a lite session-list projection makes the first screen faster.
+- Swipe a session card left to pin or archive it (archiving confirms first).
+- The「+」on a group header creates a new session and jumps straight in; unsent input is kept as a draft, and a brand-new empty session lays out like one with messages.
+- Header redesign: the version number sits on a second line level with the logo.
 - The session detail is a single flat message stream (matching the DSH desktop app): no turn cards or per-turn folding; reasoning and tool calls fold into process groups, the file-changes card sits at the end of the stream, and every row lazy-loads on its own, so long sessions stay smooth and newly paged-in messages appear immediately.
 - Subagent and tool-call views; the subagent entry keeps a persistent count, plays the border beam only while subagents are actually running, and counts subagents started while the session is open immediately.
 - Approvals and user questions: the bottom interaction panel makes answering mandatory, folds down so you can read the conversation output, and the top-right "waiting for approval / waiting for answer" badge re-opens it; multi-question prompts page one question at a time (previous / next, progress, auto-advance for single-select, drafts preserved, skip / submit validation); lock-screen push actions are supported.

@@ -151,6 +151,9 @@ enum Theme {
  /// Mono is used for commands / code / diffs only.
         static let mono = Font.system(size: 12, weight: .regular, design: .monospaced)
         static let monoSmall = Font.system(size: 11, weight: .regular, design: .monospaced)
+ /// Version line in the workspace header brand lockup — 11/500 mono
+ /// (digits don't jitter). R1 design m1-header.
+        static let monoSmallMedium = Font.system(size: 11, weight: .medium, design: .monospaced)
  /// GitHub-style unified diff: 11.5pt mono on a 22pt line (Theme.Diff.lineHeight).
         static let diffLine = Font.system(size: 11.5, weight: .regular, design: .monospaced)
         static let diffGutter = Font.system(size: 11, weight: .regular, design: .monospaced)

@@ -193,6 +193,9 @@ struct SessionDetailView: View {
                 NSLog("[NAVLIFE] detail disappear session=%@ sub=%d", sessionId, subagentContext != nil ? 1 : 0)
             }
             #endif
+ // R2 (design 2.4): persist the composer draft on leave (the 500 ms
+ // debounce may still be pending); an empty draft removes the file.
+            viewModel.flushDraft()
             viewModel.stop()
         }
         .onAppear {
@@ -215,6 +218,7 @@ struct SessionDetailView: View {
                 detailMetricsElement
                 sendMetricsElement
                 e2eHistoryFillElement
+                e2eFollowProbeElement
                 e2eLinkDebugElement
             }
         }
@@ -243,6 +247,9 @@ struct SessionDetailView: View {
             }
         }
         .onChange(of: scenePhase) { _, phase in
+ // R2 (design 2.4): backgrounding while editing persists the draft
+ // right away — the debounce may never fire after suspension.
+            if phase != .active { viewModel.flushDraft() }
  // A background gap can leave the last poll stale; refresh once when
  // we come back so the capsule never animates for a stopped child.
             guard phase == .active else { return }
@@ -581,6 +588,21 @@ struct SessionDetailView: View {
  /// 隐藏元素 `e2e-history-fill`：后台自动补齐的诊断值（VM 只在 E2E/DEBUG 时写入，
  /// 产品路径为 nil → 不渲染）。前缀由 VM 固定为 state/pages/oldest/ms/rows/failures，
  /// 这里只在末尾追加滚动几何 key（不影响前缀顺序）。
+ /// E2E follow lifecycle probe (blank-session realtime regression).
+ /// Rendered unconditionally (2pt, opacity 0.02, hit-test disabled - it is
+ /// invisible): during diagnosis the env-gated variant never appeared, so
+ /// this doubles as the page-identity marker for XCUITest.
+    private var e2eFollowProbeElement: some View {
+        Text("probe")
+            .font(.system(size: 1))
+            .frame(width: 2, height: 2)
+            .opacity(0.02)
+            .allowsHitTesting(false)
+            .accessibilityIdentifier("e2e-follow-probe")
+            .accessibilityLabel(viewModel.followProbeValue)
+            .accessibilityValue(viewModel.followProbeValue)
+    }
+
     @ViewBuilder
     private var e2eHistoryFillElement: some View {
         if app.isE2EMode, let probe = viewModel.historyFillProbeValue {
@@ -777,15 +799,25 @@ struct SessionDetailView: View {
             if viewModel.isLoading, items.isEmpty {
                 loadingPlaceholder
             } else if items.isEmpty, viewModel.streamErrorText == nil {
+ // Blank-session fix: the empty states
+ // used to size to their content (~120-260pt), so the whole
+ // session VStack collapsed to a strip in the middle of the
+ // screen with black bands above/below. Fill the available
+ // height so a brand-new blank session lays out exactly like a
+ // session with messages (header / empty body / strip /
+ // composer). Pre-existing layout, first exposed by R2 opening
+ // blank sessions on the phone.
                 if viewModel.hasLiveSnapshot {
                     EmptyStateView(
                         icon: "text.bubble",
                         title: "还没有消息",
                         message: "在下方输入框发一条消息开始这个会话。"
                     )
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .accessibilityIdentifier("session-empty")
                 } else {
                     messageSkeleton
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
             } else {
                 SessionMessageListView(
