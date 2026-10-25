@@ -52,7 +52,7 @@ enum SubagentMode: String, Equatable, Sendable {
 }
 
 /// Context carried by a subagent session detail opened from its parent session.
-struct SubagentSessionContext: Equatable, Sendable {
+struct SubagentSessionContext: Equatable, Sendable, Hashable {
     var parentSessionId: String
     var childSessionId: String
     var mode: SubagentMode

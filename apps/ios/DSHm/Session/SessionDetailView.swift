@@ -188,9 +188,19 @@ struct SessionDetailView: View {
             }
         }
         .onDisappear {
+            #if DEBUG
+            if ProcessInfo.processInfo.environment["DSHM_E2E"] == "1" {
+                NSLog("[NAVLIFE] detail disappear session=%@ sub=%d", sessionId, subagentContext != nil ? 1 : 0)
+            }
+            #endif
             viewModel.stop()
         }
         .onAppear {
+            #if DEBUG
+            if ProcessInfo.processInfo.environment["DSHM_E2E"] == "1" {
+                NSLog("[NAVLIFE] detail appear session=%@ sub=%d", sessionId, subagentContext != nil ? 1 : 0)
+            }
+            #endif
  // 壳优先：header/返回/输入框/消息区骨架这一帧就上屏（幂等）。
             viewModel.markDetailShellFrame()
  // M2b-2c: detail in-app first-frame mark (idempotent).
@@ -267,11 +277,6 @@ struct SessionDetailView: View {
     }
 
     private func present(_ sheet: SessionDetailSheet) {
-        if case .subagentList = sheet {
- // Interactive swipe-back reveal: capture the parent page while it is
- // still fully visible (the sheet would otherwise cover it).
-            app.captureBackSnapshot()
-        }
         withAnimation(Theme.Motion.standard) { detailSheet = sheet }
     }
 
@@ -635,26 +640,17 @@ struct SessionDetailView: View {
             }
             .accessibilityIdentifier("session-back")
 
-            VStack(alignment: .leading, spacing: 2) {
-                Text(viewModel.title?.isEmpty == false ? (viewModel.title ?? "") : L10n.t("会话"))
-                    .font(.system(size: 17, weight: .semibold))
-                    .foregroundStyle(Theme.Palette.textPrimary)
-                    .lineLimit(1)
-                    .accessibilityIdentifier("session-title")
+ // title only — the host · 运行中/空闲 subtitle row below the
+ // title was removed by requirement (no small second line in the header).
+            Text(viewModel.title?.isEmpty == false ? (viewModel.title ?? "") : L10n.t("会话"))
+                .font(.system(size: 17, weight: .semibold))
+                .foregroundStyle(Theme.Palette.textPrimary)
+                .lineLimit(1)
+                .accessibilityIdentifier("session-title")
  // E2E hook (env-gated, no visible/product behavior): lets the
  // push deep-link test prove which session the notification
  // opened. Empty for normal users; VoiceOver reads the title.
-                    .accessibilityValue(e2eSessionIdValue)
-                HStack(spacing: 5) {
- // v5.4: semantic connection dot replaces the old 在线 pill.
-                    ConnectionDot(phase: app.link.phase)
-                    Text(subtitle)
-                        .font(Theme.Typography.label)
-                        .foregroundStyle(Theme.Palette.textTertiary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                }
-            }
+                .accessibilityValue(e2eSessionIdValue)
             Spacer(minLength: Theme.Spacing.xs)
             if let interaction = pendingInteraction {
                 WaitingStatusBadge(
@@ -669,19 +665,6 @@ struct SessionDetailView: View {
         }
         .padding(.horizontal, Theme.Spacing.m)
         .padding(.vertical, Theme.Spacing.xs)
-    }
-
-    private var subtitle: String {
-        var parts: [String] = []
-        if let cwd = app.link.credentials?.originURL?.host {
-            parts.append(cwd)
-        }
-        if isRunningForMessageItems {
-            parts.append(L10n.t("运行中"))
-        } else if !viewModel.rows.isEmpty {
-            parts.append(L10n.t("空闲"))
-        }
-        return parts.joined(separator: " · ")
     }
 
  /// Test-only accessibility value exposing the opened session id (empty in

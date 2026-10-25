@@ -225,7 +225,7 @@ struct SessionListValue: Decodable {
 /// their durable parent address"). `mode:"unknown"` is the safe value: the Host
 /// then resolves the real mode from its projections instead of requiring an exact
 /// `one-shot`/`continuable` match.
-enum SessionFollowAddress: Equatable, Sendable {
+enum SessionFollowAddress: Equatable, Sendable, Hashable {
     case session(sessionId: String)
     case subagent(parentSessionId: String, childSessionId: String, mode: String)
 
