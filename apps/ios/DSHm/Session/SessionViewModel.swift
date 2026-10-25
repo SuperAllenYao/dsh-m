@@ -334,6 +334,8 @@ final class SessionViewModel: ObservableObject {
  /// v5.4 task-13: runtime status of child subagent sessions (parent detail only).
     @Published private(set) var subagentRuntimes: [String: SubagentRuntime] = [:]
     @Published var draft: String = ""
+ /// R2 (design 2.4): debounce pipeline persisting the draft to DraftStore.
+    private var draftPersistCancellable: AnyCancellable?
  /// Exact-fetch (protocol §3.9) summaries keyed by workspace/changes seq.
     @Published private(set) var fileChangeSummaries: [Int: ChangesSummaryValue] = [:]
  /// task-2: loading/retry/404-terminal bookkeeping of the exact fetch. While
@@ -596,6 +598,12 @@ final class SessionViewModel: ObservableObject {
  // background (the manual "load earlier" feature is gone).
         self.firstWindowMessages = SessionWindowPolicy.deviceFirstWindowMessages
         DetailMetrics.setFirstWindow(self.firstWindowMessages)
+ // R2 (design 2.4): restore the persisted draft (a back-navigation or app
+ // backgrounding used to silently drop what the user had typed), then
+ // persist edits on a 500 ms debounce; flushDraft() covers disappear and
+ // scene backgrounding, submitDraft() deletes on send.
+        draft = DraftStore.shared.text(for: address.sessionId) ?? ""
+        startDraftPersistence(sessionId: address.sessionId)
  // The first-paint cache is read/decoded off-main after init: the route switch
  // and the first render must never wait for disk IO / JSON decoding (user bug:
  // tapping a session froze ~1s before the detail appeared). The cached chunks
@@ -2137,6 +2145,30 @@ final class SessionViewModel: ObservableObject {
  /// Unified composer send (v5.4): while a turn runs the message joins the
  /// client-side queue; when idle it is sent immediately with `mode=queue`.
  ///
+ /// R2 (design 2.4): the 500 ms debounce behind the draft store. A failed
+ /// write keeps the in-memory state (the store retries on the next save) —
+ /// typing is never blocked by disk IO (failure mode matrix).
+    private func startDraftPersistence(sessionId: String) {
+        draftPersistCancellable = $draft
+            .dropFirst()
+            .debounce(for: .milliseconds(500), scheduler: DispatchQueue.main)
+            .sink { [weak self] text in
+                guard let self else { return }
+                DraftStore.shared.save(text, for: sessionId)
+                self.onDraftPersisted?()
+            }
+    }
+
+ /// Called after a debounced draft save so surfaces (workspace list blank
+ /// card) can refresh their preview lazily.
+    var onDraftPersisted: (() -> Void)?
+
+ /// R2 (design 2.4): immediate persist (session view disappear, scene
+ /// backgrounding). Empty text removes the draft file entirely.
+    func flushDraft() {
+        DraftStore.shared.save(draft, for: sessionId)
+    }
+
  /// M2a fix: never dead-end on transport state. If the link is reconnecting or
  /// offline the prompt is queued locally (with feedback) and flushed as soon as
  /// the next connected phase arrives — the button used to be disabled/greyed
@@ -2145,6 +2177,9 @@ final class SessionViewModel: ObservableObject {
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty, !sending else { return }
         draft = ""
+ // R2 (design 2.4): sent (or queued — the send intent is final) means the
+ // draft is gone; delete immediately instead of waiting for the debounce.
+        DraftStore.shared.remove(for: sessionId)
         SendMetrics.begin()
         let connected = link?.phase.isConnected ?? false
         if isRunning || !connected {

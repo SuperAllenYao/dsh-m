@@ -193,6 +193,9 @@ struct SessionDetailView: View {
                 NSLog("[NAVLIFE] detail disappear session=%@ sub=%d", sessionId, subagentContext != nil ? 1 : 0)
             }
             #endif
+ // R2 (design 2.4): persist the composer draft on leave (the 500 ms
+ // debounce may still be pending); an empty draft removes the file.
+            viewModel.flushDraft()
             viewModel.stop()
         }
         .onAppear {
@@ -243,6 +246,9 @@ struct SessionDetailView: View {
             }
         }
         .onChange(of: scenePhase) { _, phase in
+ // R2 (design 2.4): backgrounding while editing persists the draft
+ // right away — the debounce may never fire after suspension.
+            if phase != .active { viewModel.flushDraft() }
  // A background gap can leave the last poll stale; refresh once when
  // we come back so the capsule never animates for a stopped child.
             guard phase == .active else { return }

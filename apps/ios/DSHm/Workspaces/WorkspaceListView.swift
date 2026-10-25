@@ -42,6 +42,12 @@ struct WorkspaceListView: View {
             viewModel.attach(link: app.link)
             viewModel.start()
         }
+        .onAppear {
+ // R2 (design 2.3/2.4): returning from a session page re-reads the
+ // draft store — the blank card appears with its preview, or closes
+ // out when the draft is gone (2.3 b).
+            viewModel.refreshBlankCardState()
+        }
         .onDisappear {
  // Leaving the list: stop consuming the workspace stream (protocol §3.13).
             viewModel.stop()
@@ -210,6 +216,19 @@ struct WorkspaceListView: View {
         .padding(.bottom, Theme.Spacing.m)
     }
 
+ /// R2 (design 2.2): "+" creates a session in this workspace and pushes the
+ /// session page right away. Failures surface
+ /// through the list's inline error banner (viewModel.errorText) — including
+ /// the old-plugin 404, which reads as the upgrade hint.
+    private func createSession(in group: WorkspaceViewModel.WorkspaceGroup) {
+        guard viewModel.creatingWorkspaceId == nil else { return }
+        Task { @MainActor in
+            if let sessionId = await viewModel.createSession(inWorkspace: group.workspaceId, link: app.link) {
+                app.openSession(.session(sessionId: sessionId))
+            }
+        }
+    }
+
     private var subtitle: String {
         if let detail = app.link.statusDetail.isEmpty ? nil : app.link.statusDetail, !app.link.phase.isConnected {
             return detail
@@ -347,6 +366,37 @@ struct WorkspaceListView: View {
                             .accessibilityIdentifier("workspace-path-\(index)")
                     }
                     Spacer(minLength: Theme.Spacing.xs)
+ // R2 (design 2.2, M2): per-group "+" mints a session in this
+ // workspace. 30x30 r10 accent block, 44pt hit area; a 1pt
+ // divider separates it from the group's collapse chevron.
+                    Button {
+                        createSession(in: group)
+                    } label: {
+                        Group {
+                            if viewModel.creatingWorkspaceId == group.workspaceId {
+                                ProgressView()
+                                    .controlSize(.small)
+                                    .tint(Theme.Palette.accent)
+                            } else {
+                                Image(systemName: "plus")
+                                    .font(.system(size: 14, weight: .semibold))
+                                    .foregroundStyle(Theme.Palette.accent)
+                            }
+                        }
+                        .frame(width: 30, height: 30)
+                        .background(Theme.Palette.accentSoft, in: RoundedRectangle(cornerRadius: Theme.Radius.sm, style: .continuous))
+                        .overlay(RoundedRectangle(cornerRadius: Theme.Radius.sm, style: .continuous).strokeBorder(Theme.Palette.accentBorder, lineWidth: 1))
+                        .contentShape(Rectangle())
+                    }
+                    .frame(width: 44, height: 44)
+                    .buttonStyle(.plain)
+                    .disabled(viewModel.creatingWorkspaceId != nil)
+                    .accessibilityIdentifier("workspace-new-session-\(index)")
+ // M2 geometry: 1pt hairline, 18pt tall, between + and chevron.
+                    Rectangle()
+                        .fill(Theme.Palette.border)
+                        .frame(width: 1, height: 18)
+                        .padding(.horizontal, Theme.Spacing.xs)
                     if collapsed {
                         Text(L10n.f("%lld 个会话", group.sessions.count))
                             .font(Theme.Typography.label)
@@ -373,7 +423,10 @@ struct WorkspaceListView: View {
                     SessionCardView(
                         session: session,
                         pendingApprovals: viewModel.pendingApprovalCount(sessionId: session.sessionId, link: app.link),
-                        isConnected: app.link.phase.isConnected
+                        isConnected: app.link.phase.isConnected,
+                        draftPreview: session.blank == true
+                            ? viewModel.phoneCreatedDraftPreviews[session.sessionId]
+                            : nil
                     ) {
  // t0 for the user-perceived detail latency (tap ->
  // first content). The route switch must stay synchronous and
@@ -460,6 +513,7 @@ struct SessionCardView: View, Equatable {
     var session: SessionListItem
     var pendingApprovals: Int
     var isConnected: Bool
+    var draftPreview: String? = nil
     var onTap: () -> Void
 
  /// cold-launch freeze: the workspace list re-renders several times
@@ -470,6 +524,7 @@ struct SessionCardView: View, Equatable {
         lhs.session == rhs.session
             && lhs.pendingApprovals == rhs.pendingApprovals
             && lhs.isConnected == rhs.isConnected
+            && lhs.draftPreview == rhs.draftPreview
     }
 
  /// v5.4 status: waiting-for-answer > in-progress > not-started > idle; offline
@@ -498,12 +553,32 @@ struct SessionCardView: View, Equatable {
                         .font(Theme.Typography.label)
                         .foregroundStyle(Theme.Palette.textTertiary)
                 }
-                HStack(spacing: Theme.Spacing.xs) {
-                    StatusDot(color: status.color, size: 6, pulsing: status.isPulsing)
-                    Text(status.localizedLabel)
-                        .font(Theme.Typography.caption)
-                        .foregroundStyle(status.color)
-                    Spacer(minLength: 0)
+                if let draftPreview {
+ // M2: draft chip (warning text on hairline pill) + one-line
+ // preview; replaces the status row on a blank card.
+                    HStack(spacing: Theme.Spacing.xs) {
+                        Text(L10n.t("草稿"))
+                            .font(Theme.Typography.diffGutter)
+                            .foregroundStyle(Theme.Palette.warning)
+                            .padding(.horizontal, Theme.Spacing.xxs + 2)
+                            .padding(.vertical, 2)
+                            .background(Theme.Palette.surface, in: Capsule())
+                            .overlay(Capsule().strokeBorder(Theme.Palette.border, lineWidth: 1))
+                        Text(draftPreview)
+                            .font(Theme.Typography.caption)
+                            .foregroundStyle(Theme.Palette.textSecondary)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                        Spacer(minLength: 0)
+                    }
+                } else {
+                    HStack(spacing: Theme.Spacing.xs) {
+                        StatusDot(color: status.color, size: 6, pulsing: status.isPulsing)
+                        Text(status.localizedLabel)
+                            .font(Theme.Typography.caption)
+                            .foregroundStyle(status.color)
+                        Spacer(minLength: 0)
+                    }
                 }
             }
             .padding(Theme.Spacing.m)

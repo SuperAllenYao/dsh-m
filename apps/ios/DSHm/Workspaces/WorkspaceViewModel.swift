@@ -52,6 +52,16 @@ final class WorkspaceViewModel: ObservableObject {
     private(set) var timeToFirstContentMilliseconds: Double = 0
  /// Workspace paths whose session list is collapsed (persisted by path).
     @Published private var collapsedPaths: Set<String> = []
+ /// R2 (design 2.3): blank sessions minted through this phone's plus button.
+ /// Only these blanks may show the new-session card - a blank the desktop
+ /// created or focused never becomes visible here just because a draft exists.
+    @Published private(set) var phoneCreatedBlanks: Set<String> = []
+ /// Draft preview lines for the phone-created blank cards (sessionId -> first
+ /// line). Refreshed on list appear / draft flush; the cards read from it so
+ /// SessionCardView stays equatable on value identity.
+    @Published private(set) var phoneCreatedDraftPreviews: [String: String] = [:]
+ /// Workspace whose plus button is currently minting a session (spinner state).
+    @Published private(set) var creatingWorkspaceId: String?
 
  /// Every session from the last `session/list`, including subagent/blank/
  /// archived/ungrouped rows. Kept for deep-link address resolution only.
@@ -148,6 +158,7 @@ final class WorkspaceViewModel: ObservableObject {
  /// How many recent sessions to prewarm (env-tunable for the live bench; 0 = off).
     private let prewarmLimit: Int
     static let collapsedPathsKey = "workspaceList.collapsedPaths"
+    static let phoneCreatedBlanksKey = "workspaceList.phoneCreatedBlanks"
 
     init(
         defaults: UserDefaults = .standard,
@@ -157,6 +168,7 @@ final class WorkspaceViewModel: ObservableObject {
         self.cacheStore = cacheStore
         self.prewarmLimit = Self.prewarmLimitFromEnvironment()
         collapsedPaths = Set(defaults.stringArray(forKey: Self.collapsedPathsKey) ?? [])
+        phoneCreatedBlanks = Set(defaults.stringArray(forKey: Self.phoneCreatedBlanksKey) ?? [])
         restoreCachedList()
     }
 
@@ -591,6 +603,12 @@ final class WorkspaceViewModel: ObservableObject {
 
  /// Test seam: apply one decoded `workspace/follow` frame.
     func applyWorkspaceFrame(_ frame: WorkspaceFollowFrame) {
+ // R2 close-out (design 2.3 c): remember which sessions the frame is about
+ // to drop, then release phone-created blanks that were archived/removed.
+        let knownIds = phoneCreatedBlanks.isEmpty
+            ? Set<String>()
+            : Set(followState.workspaces.flatMap(\.sessionIds))
+        let archivedBefore = followState.archivedSessionIds
         followState.apply(frame)
         if case .baseline = frame {
             isLoading = false
@@ -598,10 +616,86 @@ final class WorkspaceViewModel: ObservableObject {
             cancelReuseLivenessProbe()
             link?.noteReuseLivenessConfirmed()
         }
+        closeOutPhoneCreatedBlanks(knownWorkspaceIds: knownIds, archivedBefore: archivedBefore)
         errorText = nil
         rebuildGroups()
         maybeStartPrewarm()
         scheduleListCacheSave()
+    }
+
+ /// Release phone-created blanks the frame archived or removed (2.3 c). An id
+ /// this phone minted moments ago may not have reached the registry yet, so a
+ /// blank that was never seen in any workspace is kept (never a false drop).
+    private func closeOutPhoneCreatedBlanks(knownWorkspaceIds: Set<String>, archivedBefore: Set<String>) {
+        guard !phoneCreatedBlanks.isEmpty else { return }
+        let liveIds = Set(followState.workspaces.flatMap(\.sessionIds))
+        var survivors: Set<String> = []
+        for id in phoneCreatedBlanks {
+            if followState.archivedSessionIds.contains(id) { continue }
+            if knownWorkspaceIds.contains(id), !liveIds.contains(id) { continue }
+            if archivedBefore.contains(id) { continue }
+            survivors.insert(id)
+        }
+        if survivors != phoneCreatedBlanks {
+            phoneCreatedBlanks = survivors
+            persistPhoneCreatedBlanks()
+        }
+    }
+
+    private func persistPhoneCreatedBlanks() {
+        defaults.set(phoneCreatedBlanks.sorted(), forKey: Self.phoneCreatedBlanksKey)
+    }
+
+ /// Register a freshly minted blank (2.3): visible as soon as a draft exists.
+    func registerPhoneCreatedBlank(sessionId: String) {
+        guard !phoneCreatedBlanks.contains(sessionId) else { return }
+        phoneCreatedBlanks.insert(sessionId)
+        persistPhoneCreatedBlanks()
+    }
+
+ /// Refresh blank-card previews + visibility from the draft store. Called on
+ /// list appear (returning from a session page) - the card must reflect the
+ /// draft that was typed without any live cross-object push (design 2.3/2.4).
+ /// This is also close-out (2.3 b): a blank that came back with an empty
+ /// draft is released here, and a blank that has since sent its first
+ /// message (no longer blank) is dropped from the set so it cannot pile up.
+    func refreshBlankCardState() {
+        guard !phoneCreatedBlanks.isEmpty else {
+            if !phoneCreatedDraftPreviews.isEmpty { phoneCreatedDraftPreviews = [:] }
+            return
+        }
+        var survivors: Set<String> = []
+        var previews: [String: String] = [:]
+        for id in phoneCreatedBlanks {
+            if let item = sessionsById[id], item.blank != true { continue }
+            guard let text = DraftStore.shared.text(for: id) else { continue }
+            survivors.insert(id)
+            previews[id] = String(text.split(separator: "\n", omittingEmptySubsequences: true).first ?? "")
+        }
+        if survivors != phoneCreatedBlanks {
+            phoneCreatedBlanks = survivors
+            persistPhoneCreatedBlanks()
+        }
+        phoneCreatedDraftPreviews = previews
+        rebuildGroups()
+    }
+
+ /// R2 (design 2.2): mint a session in one workspace through the plugin
+ /// route. Returns the new session id (reused or minted); failures surface
+ /// through `errorText` (NetworkErrorInterpreter wording) and return nil.
+    @MainActor
+    func createSession(inWorkspace workspaceId: String, link: LinkService) async -> String? {
+        creatingWorkspaceId = workspaceId
+        defer { creatingWorkspaceId = nil }
+        do {
+            let result = try await link.createSession(workspaceId: workspaceId)
+            registerPhoneCreatedBlank(sessionId: result.sessionId)
+            errorText = nil
+            return result.sessionId
+        } catch {
+            errorText = NetworkErrorInterpreter.message(for: error)
+            return nil
+        }
     }
 
  /// Loads the live `session/list` snapshot. `silent` suppresses the error
@@ -1083,7 +1177,12 @@ final class WorkspaceViewModel: ObservableObject {
             sessions.reserveCapacity(workspace.sessionIds.count)
             for sessionId in workspace.sessionIds {
                 guard let session = sessionsById[sessionId],
-                      Self.isVisible(session, archivedSessionIds: archived) else { continue }
+                      Self.isVisible(
+                        session,
+                        archivedSessionIds: archived,
+                        phoneCreatedBlanks: phoneCreatedBlanks,
+                        hasDraft: { DraftStore.shared.hasDraft($0) }
+                      ) else { continue }
                 sessions.append(session)
             }
             sessions.sort(by: comparator)
@@ -1111,11 +1210,22 @@ final class WorkspaceViewModel: ObservableObject {
 
  // MARK: - Visibility & ordering (shared with unit tests)
 
- /// Desktop-sidebar visibility rule on top of registry membership.
-    static func isVisible(_ session: SessionListItem, archivedSessionIds: Set<String>) -> Bool {
+ /// Desktop-sidebar visibility rule on top of registry membership, plus the
+ /// R2 phone-created blank release (design 2.3): a blank session is visible
+ /// only when this phone minted it through the plus button AND a draft
+ /// exists - the card disappears the moment the draft is gone or the session
+ /// is archived.
+    static func isVisible(
+        _ session: SessionListItem,
+        archivedSessionIds: Set<String>,
+        phoneCreatedBlanks: Set<String> = [],
+        hasDraft: (String) -> Bool = { _ in false }
+    ) -> Bool {
         if session.isSubagent { return false }
-        if session.blank == true { return false }
         if archivedSessionIds.contains(session.sessionId) { return false }
+        if session.blank == true {
+            return phoneCreatedBlanks.contains(session.sessionId) && hasDraft(session.sessionId)
+        }
         return true
     }
 
