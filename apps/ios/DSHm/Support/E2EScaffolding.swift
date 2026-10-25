@@ -17,6 +17,16 @@ enum E2EScaffolding {
         ProcessInfo.processInfo.environment["DSHM_E2E"] == "1"
     }
 
+ /// incident hardening: write-capable UI tests (swipe pin/archive)
+ /// must address cards by the sessionId they created, never by list position
+ /// — positional lookups once swiped and archived the LIVE session at the top
+ /// of the real host's list. Opt-in per suite via launch env so every other
+ /// suite keeps positional ids untouched.
+    static var stableCardIds: Bool {
+        isEnabled
+            && ProcessInfo.processInfo.environment["DSHM_E2E_STABLE_CARD_IDS"] == "1"
+    }
+
     static func applyLaunchEnvironment(defaults: UserDefaults = .standard) {
         let env = ProcessInfo.processInfo.environment
  // E2E：关掉 UIKit 隐式动画，让等待从「按动画时长 sleep」变成「等 AX 状态值变化」。

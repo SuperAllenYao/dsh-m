@@ -702,6 +702,12 @@ final class WorkspaceViewModel: ObservableObject {
         errorText = text
     }
 
+ /// E2E-only companion to `createSession`: the session id returned by the
+ /// most recent phone-side create RPC (minted or reused). Write-capable UI
+ /// tests address their targets strictly through this id — positional card
+ /// lookups once archived a live session, never again.
+    @Published private(set) var e2eCreatedSessionId = ""
+
  /// R2 (design 2.2): mint a session in one workspace through the plugin
  /// route. Returns the new session id (reused or minted); failures surface
  /// through `errorText` (NetworkErrorInterpreter wording) and return nil.
@@ -712,6 +718,7 @@ final class WorkspaceViewModel: ObservableObject {
         do {
             let result = try await link.createSession(workspaceId: workspaceId)
             registerPhoneCreatedBlank(sessionId: result.sessionId)
+            e2eCreatedSessionId = result.sessionId
             errorText = nil
             return result.sessionId
         } catch {

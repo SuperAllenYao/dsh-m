@@ -274,6 +274,19 @@ struct WorkspaceListView: View {
 
  /// R3: archive always confirms first (m4); the running state is known from
  /// the list row, the 409 path re-opens the dialog in running mode.
+    #if DEBUG
+ /// E2E (DSHM_E2E + DSHM_E2E_STABLE_CARD_IDS=1): sessionId-keyed card ids so
+ /// write-capable tests can only address the session they created. Every
+ /// other mode keeps the positional ids the read-only suites rely on.
+    private static func e2eCardId(session: SessionListItem, index: Int) -> String {
+        E2EScaffolding.stableCardIds ? "session-card-\(session.sessionId)" : "session-card-\(index)"
+    }
+    #else
+    private static func e2eCardId(session: SessionListItem, index: Int) -> String {
+        "session-card-\(index)"
+    }
+    #endif
+
     private func handleArchiveRequest(_ session: SessionListItem) {
         guard app.link.phase.isConnected else {
             viewModel.showInlineError(L10n.t("连接已断开"))
@@ -568,7 +581,21 @@ struct WorkspaceListView: View {
                         }
                     }
         .equatable()
-        .accessibilityIdentifier("session-card-\(cardIndex)")
+        .accessibilityIdentifier(Self.e2eCardId(session: session, index: cardIndex))
+        .overlay(alignment: .topLeading) {
+ // E2E-only marker (runtime-gated, invisible, 2pt): rendered exactly
+ // on the row whose sessionId matches the most recent phone-side
+ // create RPC. Tests read its value and address cards/actions by id.
+            if app.isE2EMode, session.sessionId == viewModel.e2eCreatedSessionId {
+                Text("probe")
+                    .font(.system(size: 1))
+                    .frame(width: 2, height: 2)
+                    .opacity(0.02)
+                    .allowsHitTesting(false)
+                    .accessibilityIdentifier("e2e-created-session")
+                    .accessibilityValue(viewModel.e2eCreatedSessionId)
+            }
+        }
         .onAppear {
  // M2b-2b: the first list card on screen marks the in-app first
  // frame. Any card may be the first visibly rendered one: the
