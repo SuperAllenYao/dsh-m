@@ -5,6 +5,9 @@ struct ProcessStep: Identifiable, Equatable {
     enum Kind: Equatable {
         case reasoning(String)
         case tool(ToolCallItem)
+ /// v6：工具参数流式阶段（tool-call-delta）的「准备…」占位行；派发（tool/call）后
+ /// 由真实.tool 行替换。name 可能尚未到达（nil）。
+        case preparing(name: String?, args: String)
     }
 
     var id: String
@@ -12,6 +15,9 @@ struct ProcessStep: Identifiable, Equatable {
  /// 该步骤对应事件 seq（v0.2.7：用于判定过程组是否属于「本轮」，
  /// 避免刚发消息、新步骤未到时上一轮的组闪成运行中窗口）。
     var seq: Int = 0
+ /// v6：本轮运行中实时追加的步骤（实时思考 / 工具准备行），渲染为组内实时行。
+ /// 历史步骤恒为 false。
+    var isLive: Bool = false
 
     var tool: ToolCallItem? {
         if case .tool(let item) = kind { return item }
@@ -23,19 +29,52 @@ struct ProcessStep: Identifiable, Equatable {
         return nil
     }
 
+ /// 工具准备行（参数流式中）的工具名；未到达时为 nil。
+    var preparingName: String? {
+        if case .preparing(let name, _) = kind { return name }
+        return nil
+    }
+
+ /// 工具准备行已累积的 arguments 原文（可能不是合法 JSON）。
+    var preparingArgs: String? {
+        if case .preparing(_, let args) = kind { return args }
+        return nil
+    }
+
+    var isPreparing: Bool {
+        if case .preparing = kind { return true }
+        return false
+    }
+
     var isFailure: Bool { tool?.isError ?? false }
-    var isRunning: Bool { tool?.isRunning ?? false }
+    var isRunning: Bool {
+        if isPreparing { return true }
+        return tool?.isRunning ?? false
+    }
 
  /// Chinese verb used by the folded summary ("运行命令 / 读取 / 编辑 / …").
     var verb: String {
-        guard let tool else { return "思考" }
-        return SessionFlowGrouping.verb(for: tool.name)
+        switch kind {
+        case .reasoning:
+            return "思考"
+        case .tool(let item):
+            return SessionFlowGrouping.verb(for: item.name)
+        case .preparing(let name, _):
+            return SessionFlowGrouping.preparingVerb(for: name)
+        }
     }
 
     var localizedVerb: String { L10n.t(verb) }
 
     var summary: String {
-        tool?.summary ?? (reasoningText ?? "").replacingOccurrences(of: "\n", with: " ")
+        switch kind {
+        case .reasoning(let text):
+            return text.replacingOccurrences(of: "\n", with: " ")
+        case .tool(let item):
+            return item.summary
+        case .preparing(_, let args):
+            return args
+        }
     }
 }
 
@@ -68,11 +107,11 @@ enum FlowRowGroup: Identifiable, Equatable {
     }
 }
 
-/// 过程组显示态（v0.2.7，对齐 DSH 桌面端「内联工作步骤」）：
-/// - `window`：运行中默认 —— 固定高度窗口内滚动、自动跟随最新步骤；
-/// - `full`：运行中点图标 —— 取消高度限制，全部步骤内联撑开；
-/// - `collapsed`：这一轮步骤结束 —— 自动折叠成一行摘要；
-/// - `expanded`：点折叠行 —— 展开该轮全部历史步骤。
+/// 过程组显示态（v6，对齐 DSH 桌面端「内联工作步骤」平铺 + 大折叠）：
+/// - `expanded`：默认态（运行中与已结束都默认）—— 全部步骤平铺内联；
+/// - `collapsed`：点组头「收起」—— 折叠成一行（▣ N 步 + 状态 + 展开 ⌄）；
+/// - `window`：v0.2.7 旧运行态（固定高度窗口内展示最近 N 步），保留但不再默认；
+/// - `full`：v0.2.7 旧运行态（无高度限制全量内联），保留但不再默认。
 enum ProcessGroupMode: String, Equatable {
     case window
     case full
@@ -80,18 +119,17 @@ enum ProcessGroupMode: String, Equatable {
     case expanded
 }
 
-/// 过程组显示态解析（默认态由「是否正在跑」推导，用户点击产生覆盖）。
-/// 阶段切换时自动丢弃不适用的覆盖，保证「结束即折叠」不被运行期覆盖卡住。
+/// 过程组显示态解析（v6：默认展开，用户点击产生覆盖）。
+/// - 无覆盖 → `expanded`（运行中与已结束都全量平铺，不再自动折叠/固定窗口）；
+/// - `collapsed`/`expanded` 覆盖在两种阶段都保留（用户收起状态不因阶段切换丢失）；
+/// - 旧 `window`/`full` 仅在运行中有效，结束后丢弃回落到 `expanded`。
 enum ProcessGroupModeResolver {
     static func resolve(isRunning: Bool, override: ProcessGroupMode?) -> ProcessGroupMode {
-        let fallback: ProcessGroupMode = isRunning ? .window : .collapsed
-        guard let override else { return fallback }
-        switch (isRunning, override) {
-        case (true, .collapsed), (true, .expanded):
-            return fallback
-        case (false, .window), (false, .full):
-            return fallback
-        default:
+        guard let override else { return .expanded }
+        switch override {
+        case .window, .full:
+            return isRunning ? override : .expanded
+        case .collapsed, .expanded:
             return override
         }
     }
@@ -184,7 +222,7 @@ enum SessionFlowGrouping {
         for step in steps {
             counts[step.verb, default: 0] += 1
         }
-        let canonicalOrder = ["运行命令", "读取", "编辑", "搜索", "联网", "计划", "交付", "子代理", "后台任务", "工具", "思考"]
+        let canonicalOrder = ["运行命令", "读取", "编辑", "搜索", "联网", "计划", "交付", "子代理", "后台任务", "工具", "思考", "准备运行命令", "准备读取", "准备编辑", "准备搜索", "准备调用工具"]
         let known = canonicalOrder.filter { counts[$0] != nil }
         let unknown = counts.keys.filter { !canonicalOrder.contains($0) }.sorted()
         return (known + unknown)
@@ -223,6 +261,16 @@ enum SessionFlowGrouping {
         }
     }
 
+ /// v6：工具准备行的动词（参数流式阶段、工具名未到达时按「准备调用工具」兜底）。
+    static func preparingVerb(for toolName: String?) -> String {
+        let name = (toolName ?? "").lowercased()
+        if name.contains("bash") || name.contains("run_code") { return "准备运行命令" }
+        if name.contains("read") { return "准备读取" }
+        if name.contains("edit") || name.contains("write") { return "准备编辑" }
+        if name.contains("grep") || name.contains("glob") { return "准备搜索" }
+        return "准备调用工具"
+    }
+
  /// Localized display verb (canonical `verb(for:)` stays Chinese for tests).
     static func localizedVerb(for toolName: String) -> String {
         L10n.t(verb(for: toolName))
@@ -233,7 +281,7 @@ enum SessionFlowGrouping {
         guard !steps.isEmpty else { return "" }
         var counts: [String: Int] = [:]
         for step in steps { counts[step.verb, default: 0] += 1 }
-        let canonicalOrder = ["运行命令", "读取", "编辑", "搜索", "联网", "计划", "交付", "子代理", "后台任务", "工具", "思考"]
+        let canonicalOrder = ["运行命令", "读取", "编辑", "搜索", "联网", "计划", "交付", "子代理", "后台任务", "工具", "思考", "准备运行命令", "准备读取", "准备编辑", "准备搜索", "准备调用工具"]
         let known = canonicalOrder.filter { counts[$0] != nil }
         let unknown = counts.keys.filter { !canonicalOrder.contains($0) }.sorted()
         return (known + unknown)

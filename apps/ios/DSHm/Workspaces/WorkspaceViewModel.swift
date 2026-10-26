@@ -1243,9 +1243,12 @@ final class WorkspaceViewModel: ObservableObject {
 
  /// Test seam: apply one `session/list` snapshot.
     func applySessions(_ items: [SessionListItem]) {
-        allSessions = items
+ // v6：列表快照落地后叠加 `$events` 的实时运行态，避免「请求在 emit 之前、
+ // 回包在 emit 之后」把刚变进行中的卡片打回旧状态。
+        let merged = Self.overlayLiveRunning(items, live: link?.liveSessionRunning ?? [:])
+        allSessions = merged
         var byId: [String: SessionListItem] = [:]
-        for item in items {
+        for item in merged {
             byId[item.sessionId] = item
         }
         sessionsById = byId
@@ -1254,6 +1257,31 @@ final class WorkspaceViewModel: ObservableObject {
         sessionsSnapshotVersion += 1
         rebuildGroups()
         maybeStartPrewarm()
+    }
+
+ /// 纯函数：把 live 运行态叠加到列表行上（可单测，不依赖 LinkService）。
+    static func overlayLiveRunning(
+        _ items: [SessionListItem],
+        live: [String: Bool]
+    ) -> [SessionListItem] {
+        guard !live.isEmpty else { return items }
+        var changed = false
+        let result = items.map { item -> SessionListItem in
+            guard let running = live[item.sessionId], item.running != running else { return item }
+            var copy = item
+            copy.running = running
+            changed = true
+            return copy
+        }
+        return changed ? result : items
+    }
+
+ /// `$events` 运行态变化：不重新拉列表，直接就地更新卡片并重排（running 置顶）。
+    func applyLiveSessionRunning() {
+        guard let link, !link.liveSessionRunning.isEmpty else { return }
+        let merged = Self.overlayLiveRunning(allSessions, live: link.liveSessionRunning)
+        guard merged != allSessions else { return }
+        applySessions(merged)
     }
 
     private func rebuildGroups() {

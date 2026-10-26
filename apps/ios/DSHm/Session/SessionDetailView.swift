@@ -9,6 +9,7 @@ enum SessionMessageItemsBuilder {
         isRunning: Bool,
         fileChanges: TurnFileChanges?,
         processPreviewSteps: [ProcessStep]?,
+        liveProcessSteps: [ProcessStep] = [],
         liveAssistantText: String,
         streamErrorText: String?,
         actionErrorText: String?
@@ -18,6 +19,15 @@ enum SessionMessageItemsBuilder {
         for group in groups { items.append(.group(group)) }
         if let processPreviewSteps {
             items.append(.group(.process(processPreviewSteps)))
+        }
+ // v6：实时步骤（实时思考 / 工具准备行）并入最后一个过程组；若末行不是过程组
+ // 则自成一组排到末尾（组头计步数与运行态随实时行更新）。
+        if !liveProcessSteps.isEmpty {
+            if let lastIndex = items.indices.last, case .group(.process(let steps)) = items[lastIndex] {
+                items[lastIndex] = .group(.process(steps + liveProcessSteps))
+            } else {
+                items.append(.group(.process(liveProcessSteps)))
+            }
         }
  // #1 设计决策：卡片只在主会话不执行任务时存在；
  // running 期间完全不渲染（不占位、不转圈）。
@@ -682,19 +692,28 @@ struct SessionDetailView: View {
  // opened. Empty for normal users; VoiceOver reads the title.
                 .accessibilityValue(e2eSessionIdValue)
             Spacer(minLength: Theme.Spacing.xs)
-            if let interaction = pendingInteraction {
-                WaitingStatusBadge(
-                    kind: interaction.kind,
-                    collapsed: pendingPanelCollapsed
-                ) {
-                    withAnimation(Theme.Motion.standard) {
-                        pendingPanelCollapsed.toggle()
-                    }
-                }
-            }
+ // 右上角常显会话状态图标（A 线性，纯展示不可点）。
+ // 等待审批/作答的处理入口保留在底部面板与折叠输入条（BlockedComposerBar）。
+            SessionStatusIcon(kind: sessionStatusKind, size: 24)
+                .accessibilityIdentifier("session-status-icon")
+                .accessibilityValue(sessionStatusKind.a11yValue)
+                .frame(width: 36, height: 36)
         }
         .padding(.horizontal, Theme.Spacing.m)
         .padding(.vertical, Theme.Spacing.xs)
+    }
+
+ /// 当前会话状态（右上角图标的唯一数据源）：离线 > 等待审批 > 等待作答 >
+ /// 进行中 > 出错 > 未开始 > 空闲。审批/问答来自 live waterfall 与 projection；
+ /// 出错包含链路流错误与本轮失败（turn/end.reason）；未开始 = 会话尚无任何事件。
+    private var sessionStatusKind: SessionStatusKind {
+        if !app.link.phase.isConnected { return .offline }
+        if currentApproval != nil { return .approval }
+        if !visibleUserQuestionCalls.isEmpty { return .answer }
+        if viewModel.isRunning { return .running }
+        if viewModel.streamErrorText != nil || viewModel.lastTurnFailed { return .error }
+        if viewModel.isBlankSession { return .notStarted }
+        return .idle
     }
 
  /// Test-only accessibility value exposing the opened session id (empty in
@@ -782,13 +801,16 @@ struct SessionDetailView: View {
     }
 
     private func buildMessageItems() -> [SessionMessageItem] {
-        SessionMessageItemsBuilder.build(
+ // v6 E2E：注入合成步骤组时不叠加样本会话行，保证几何/模式断言稳定。
+        if e2eProcessHistoryPreview { return e2eProcessHistoryItems }
+        return SessionMessageItemsBuilder.build(
             groups: viewModel.flowGroups,
             isRunning: isRunningForMessageItems,
             fileChanges: viewModel.latestTurnFileChanges,
  // E2E 证据钩子：样本会话里不一定有正在跑的 turn，这里注入一组合成「运行中」步骤，
  // 用于稳定复现/断言「固定窗口 ⇄ 全高」两态（仅 DEBUG + DSHM_E2E=1）。
             processPreviewSteps: e2eProcessRunningPreview ? e2eProcessPreviewSteps : nil,
+            liveProcessSteps: viewModel.liveProcessSteps,
             liveAssistantText: viewModel.liveAssistantText,
             streamErrorText: viewModel.streamErrorText,
             actionErrorText: viewModel.actionErrorText
@@ -971,6 +993,69 @@ struct SessionDetailView: View {
                 step: index
             )
             return ProcessStep(id: "e2e-proc-\(index)", kind: .tool(item), seq: previewSeq)
+        }
+    }
+
+ /// v6 E2E：`DSHM_E2E=1` + `DSHM_E2E_PROCGROUP=history` 注入合成内容
+ /// （12 步主组 + 10 条垫高组），回归「默认平铺展开 / 大折叠 / 组头定住」；
+ /// 不依赖真实长会话，仅 DEBUG 生效，无产品行为。
+ ///
+ /// 几何约束：inverted 列表把内容钉在最新端（offset=0 =
+ /// 视觉底），组头定住必须靠 offset 反向补偿 Δ；补偿余量 = 组头下方（更新侧）
+ /// 的内容高度。主组是最旧的一行（视觉顶部），所以其下方必须垫 ≥348pt 内容，
+ /// 否则「收起 348pt」物理上滚不满（内容不足一屏时 maxOffset=0，任何实现
+ /// 都无法把组头钉住）。10 × 2 步组 ≈ 1100pt 提供充裕余量。
+    private var e2eProcessHistoryPreview: Bool {
+        #if DEBUG
+        guard app.isE2EMode else { return false }
+        return ProcessInfo.processInfo.environment["DSHM_E2E_PROCGROUP"] == "history"
+        #else
+        return false
+        #endif
+    }
+
+    private var e2eProcessHistoryItems: [SessionMessageItem] {
+ // 升序 = 视觉从下往上：主组（12 步）在最旧端（视觉顶部），其后（更新侧）
+ // 垫 10 个 2 步组 ≈ 1100pt，给「组头定住」的 offset 补偿留出余量。
+ // 垫高组用 reasoning 步骤（行高同样 29pt，但 AX id 是 process-reasoning-row，
+ // 不污染 E2E 的 `tool-row-` 计数断言）。
+        var items: [SessionMessageItem] = [
+            .group(.process(Self.e2eHistorySteps(count: 12, idPrefix: "e2e-hist"))),
+        ]
+        for index in 0..<10 {
+            items.append(.group(.process(Self.e2eReasoningSteps(count: 2, idPrefix: "e2e-pad\(index)"))))
+        }
+        return items
+    }
+
+    private static func e2eReasoningSteps(count: Int, idPrefix: String) -> [ProcessStep] {
+        (0..<count).map { index in
+            ProcessStep(
+                id: "\(idPrefix)-\(index)",
+                kind: .reasoning("垫高组 \(idPrefix) 思考步骤 \(index)"),
+                seq: Int.max / 2 + 100 + index
+            )
+        }
+    }
+
+    private static func e2eHistorySteps(count: Int, idPrefix: String) -> [ProcessStep] {
+        let names = ["bash", "read", "edit", "grep"]
+        return (0..<count).map { index in
+            let name = names[index % names.count]
+            let arguments: [String: JSONValue] = name == "bash"
+                ? ["command": .string("xcodebuild build -scheme DSHm #\(index)")]
+                : ["file_path": .string("apps/ios/DSHm/Session/ProcessGroupView.swift")]
+            let item = ToolCallItem(
+                callId: "\(idPrefix)-call-\(index)",
+                name: name,
+                argumentsRaw: nil,
+                arguments: arguments,
+                result: ToolResultItem(isError: false, text: "ok", meta: nil, images: []),
+                children: [],
+                turn: 1,
+                step: index
+            )
+            return ProcessStep(id: "\(idPrefix)-\(index)", kind: .tool(item), seq: Int.max / 2 + index)
         }
     }
 
@@ -1252,8 +1337,10 @@ struct FlowRowGroupView: View, Equatable {
     var subagentLabels: [String: String] = [:]
  /// True only for the last group while the session runs.
     var isNewestGroupRunning: Bool = false
- /// v0.2.7：过程组显示态由页面持有，cell 只读不存。
-    var mode: ProcessGroupMode = .collapsed
+ /// v6：过程组显示态由页面持有，cell 只读不存（默认展开）。
+    var mode: ProcessGroupMode = .expanded
+ /// 展开/收起手驱动动画的步骤内容高度覆盖（nil = 自然高度，见 SessionMessageListView）。
+    var animatedStepsHeight: CGFloat? = nil
     var windowHeight: CGFloat = 300
     var onToggleMode: (() -> Void)? = nil
     var onOpenReasoning: ((String) -> Void)? = nil
@@ -1268,6 +1355,7 @@ struct FlowRowGroupView: View, Equatable {
             && lhs.subagentLabels == rhs.subagentLabels
             && lhs.isNewestGroupRunning == rhs.isNewestGroupRunning
             && lhs.mode == rhs.mode
+            && lhs.animatedStepsHeight == rhs.animatedStepsHeight
     }
 
     private var axIdentifier: String {
@@ -1289,11 +1377,15 @@ struct FlowRowGroupView: View, Equatable {
                     onOpenTool: onOpenTool
                 )
             case .process(let steps):
+ // v6：带实时步骤的组即本轮运行中的组——即便.liveText/错误行排在组后，
+ // 组头也要显示「运行中」（isNewest 只看列表最后一行）。
                 ProcessGroupView(
                     steps: steps,
-                    isRunning: isNewestGroupRunning,
+                    isRunning: isNewestGroupRunning || steps.contains { $0.isLive },
                     pendingApprovalCallIds: pendingApprovalCallIds,
                     mode: mode,
+                    measurementID: group.id,
+                    animatedStepsHeight: animatedStepsHeight,
                     windowHeight: windowHeight,
                     onToggleMode: onToggleMode,
                     onOpenTool: onOpenTool,
@@ -1336,4 +1428,19 @@ enum SessionDetailSheet: Identifiable {
 #Preview {
     SessionDetailView(address: .session(sessionId: "session-preview"))
         .environmentObject(AppModel())
+}
+
+/// E2E / VoiceOver 稳定值：状态图标的可访问值用 ASCII，避免中文文案影响断言。
+private extension SessionStatusKind {
+    var a11yValue: String {
+        switch self {
+        case .offline: return "offline"
+        case .approval: return "approval"
+        case .answer: return "answer"
+        case .running: return "running"
+        case .notStarted: return "notStarted"
+        case .idle: return "idle"
+        case .error: return "error"
+        }
+    }
 }

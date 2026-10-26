@@ -60,6 +60,11 @@ final class LinkService: ObservableObject {
  /// `open` calls answer through `$events/result`; the pending list lets the
  /// UI observe live requests that have no snapshot projection yet.
     @Published var pendingUserQuestions: [UserQuestionWaterfall] = []
+ /// `$events` 实时会话运行态（`api-session/status` emit）：列表卡片用它即时刷新
+ /// 状态，不必等下一次 `session/list`（用户 报障：列表状态不实时）。
+    @Published private(set) var liveSessionRunning: [String: Bool] = [:]
+ /// 每次运行态 emit 递增，供列表页 `.onChange` 触发重算（map 值相等时 SwiftUI 不回调）。
+    @Published private(set) var liveSessionStatusRevision = 0
     @Published private(set) var lastErrorText: String?
     @Published private(set) var lastConnectedAt: Date?
  /// P0: E2E-gated `connect-metrics` summary of the last bring-up round.
@@ -2081,6 +2086,16 @@ final class LinkService: ObservableObject {
     func clearPendingWaterfalls() {
         pendingApprovals.removeAll()
         pendingUserQuestions.removeAll()
+ // 真断开的 live 运行态一并作废：重连后以新的 `session/list` 快照为准。
+        liveSessionRunning.removeAll()
+        liveSessionStatusRevision += 1
+    }
+
+ /// Applies one live `api-session/status` emit (`session/list` 之外的实时运行态源)。
+    func applyLiveSessionStatus(_ emit: LiveSessionStatusEmit) {
+        guard liveSessionRunning[emit.sessionId] != emit.running else { return }
+        liveSessionRunning[emit.sessionId] = emit.running
+        liveSessionStatusRevision += 1
     }
 
  /// Drops the active transport.
