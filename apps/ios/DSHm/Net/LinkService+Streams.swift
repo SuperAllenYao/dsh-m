@@ -765,6 +765,24 @@ enum P1UnaryMapping {
  // HTTP 200 with a non-JSON body cannot be a `server-response` envelope.
             throw LinkError.malformedEnvelope(L10n.t("dsh-m/2 rpc/result 缺少 JSON body"))
         }
+ // Fast path for the huge bodies (a `session/page` history page is
+ // ~1.4 MB of JSON on a real long session): read the envelope
+ // structurally off the already-decoded `JSONValue`. The generic path
+ // below is `JSONValue.decode(_:)`, which re-encodes the whole tree to
+ // JSON and parses it again — that double conversion ran on the main
+ // actor for every history page and starved touch delivery during the
+ // detail-view history fill (freeze report: the page would
+ // not scroll and the header back button would not respond until the
+ // fill progress bar finished).
+        if let object = body.objectValue,
+           object["type"]?.stringValue == "server-response",
+           let resultObject = object["result"]?.objectValue,
+           resultObject["ok"]?.boolValue == true {
+            return resultObject["value"] ?? .null
+        }
+ // Every other shape (business error, non-`server-response`, malformed)
+ // keeps the exact legacy semantics through the typed envelope decode.
+ // Failure envelopes are tiny — they never carry a history page.
         let envelope: ServerResponseEnvelope
         do {
             envelope = try body.decode(ServerResponseEnvelope.self)

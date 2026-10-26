@@ -165,6 +165,22 @@ final class P1StreamHandle {
 
 // MARK: - Channel
 
+/// Where inbound frame JSON is parsed.
+///
+/// Production uses `offMain`: one `session/page` result can be megabytes of
+/// JSON and parsing it on the main actor starved touch delivery during the
+/// detail-view history fill. Unit tests that assert
+/// synchronous frame application use `inline` — same application logic, same
+/// wire order, no thread hop.
+enum P1InboundDecoding: Equatable {
+ /// Parse on the main actor (deterministic for unit tests; handshake-size
+ /// frames only).
+    case inline
+ /// Parse on a background serial lane, then apply on the main actor in wire
+ /// order (production).
+    case offMain
+}
+
 /// The single-connection dsh-m/2 transport core.
 ///
 /// Responsibilities (design §5): hello/welcome handshake, unary correlation by
@@ -206,6 +222,9 @@ final class P1Channel {
     private var inboundBeforeWelcome: [String] = []
     private var hasWelcomed = false
 
+ /// Frame decode lane; see `P1InboundDecoding`.
+    private let inboundDecoding: P1InboundDecoding
+
     private var pendingRPC: [String: CheckedContinuation<P1RPCResult, Error>] = [:]
     private var rpcTimeoutTasks: [String: Task<Void, Never>] = [:]
 
@@ -218,12 +237,14 @@ final class P1Channel {
         socketFactory: @escaping SocketFactory,
         clientInfo: P1ClientInfo = .dshm,
         helloTimeout: TimeInterval = P1ProtocolLimits.helloTimeout,
-        maxFrameBytes: Int = P1ProtocolLimits.maxFrameBytes
+        maxFrameBytes: Int = P1ProtocolLimits.maxFrameBytes,
+        inboundDecoding: P1InboundDecoding = .offMain
     ) {
         self.socketFactory = socketFactory
         self.clientInfo = clientInfo
         self.helloTimeout = helloTimeout
         self.maxFrameBytes = maxFrameBytes
+        self.inboundDecoding = inboundDecoding
     }
 
  /// Production wiring: one pinned WSS to `host:port` per `connect`.
@@ -443,7 +464,7 @@ final class P1Channel {
         let buffered = inboundBeforeWelcome
         inboundBeforeWelcome.removeAll()
         for text in buffered {
-            handleText(text)
+            decodeAndHandleInline(text)
             if welcomeContinuation == nil { return }
         }
     }
@@ -594,6 +615,25 @@ final class P1Channel {
 
  // MARK: Inbound dispatch
 
+ /// Serial lane for inbound frame decoding.
+ ///
+ /// Why off-main (device report: on entering a session detail the
+ /// page froze — the list would not scroll and the header back button would
+ /// not respond — until the top 2pt history-fill progress bar finished):
+ /// one `session/page` rpc/result carries the whole history page (measured
+ /// 1.4 MB of JSON per page on a real long session, 8 pages per fill), and
+ /// `P1FrameCodec.decodeServerFrame` parses all of it. That parse used to
+ /// run on the main actor for every page, back-to-back with no gap, so the
+ /// main thread never got a free slot between pages and touch delivery (pan
+ /// + header button) starved for the whole fill. Decoding here keeps the
+ /// main actor free; frames are decoded in wire order on this serial queue
+ /// and handed back to the main actor in the same order (serial queue +
+ /// `DispatchQueue.main.async` FIFO).
+    private static let inboundDecodeQueue = DispatchQueue(
+        label: "com.dshm.p1.inbound-decode",
+        qos: .userInitiated
+    )
+
     private func handleText(_ text: String) {
         if state == .connecting && welcomeContinuation == nil {
  // Not expected from a real transport (see `P1Socket`), but keep the
@@ -606,6 +646,60 @@ final class P1Channel {
             return
         }
         guard state == .connecting || state == .ready else { return }
+        guard inboundDecoding == .offMain else {
+            decodeAndHandleInline(text)
+            return
+        }
+        guard let source = socket else { return }
+        let maxBytes = maxFrameBytes
+        Self.inboundDecodeQueue.async { [weak self] in
+            let decoded: Result<P1ServerFrame, P1ProtocolError>
+            do {
+                #if DEBUG
+ // Device evidence hook (`DSHM_PERFDBG=1`): confirms the history
+ // page decode really runs off the main actor and how long one
+ // page takes on the phone.
+                decoded = .success(try PerfProbe.shared.measure(
+                    "p1FrameDecodeBG",
+                    ["bytes": text.utf8.count]
+                ) {
+                    try P1FrameCodec.decodeServerFrame(text, maxBytes: maxBytes)
+                })
+                #else
+                decoded = .success(try P1FrameCodec.decodeServerFrame(text, maxBytes: maxBytes))
+                #endif
+            } catch let error as P1ProtocolError {
+                decoded = .failure(error)
+            } catch {
+                decoded = .failure(.violation(error.localizedDescription))
+            }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                MainActor.assumeIsolated {
+ // The socket may have been replaced (reconnect) while the
+ // frame was decoded off-main: a stale frame must never be
+ // applied to the new connection's sid bookkeeping.
+                    guard self.socket === source else { return }
+                    guard self.state == .connecting || self.state == .ready else { return }
+                    switch decoded {
+                    case .success(let frame):
+                        self.applyFrame(frame, rawText: text)
+                    case .failure(let error):
+                        self.violate(error)
+                    }
+                }
+            }
+        }
+    }
+
+ /// Synchronous decode for the pre-welcome buffer flush.
+ ///
+ /// `awaitWelcome` depends on the flush having delivered a buffered welcome
+ /// by the time it returns (otherwise it would send `hello` again). Frames
+ /// that can land before the welcome continuation exists are tiny handshake
+ /// frames — never a history page — so decoding them inline cannot block the
+ /// main thread.
+    private func decodeAndHandleInline(_ text: String) {
         let frame: P1ServerFrame
         do {
             frame = try P1FrameCodec.decodeServerFrame(text, maxBytes: maxFrameBytes)
@@ -613,13 +707,18 @@ final class P1Channel {
             violate(error)
             return
         }
+        applyFrame(frame, rawText: text)
+    }
+
+ /// Main-actor half of the inbound path: applies one decoded frame.
+    private func applyFrame(_ frame: P1ServerFrame, rawText: String) {
         switch frame {
         case .welcome(let welcome):
             handleWelcome(welcome)
         case .down(let envelope):
             do {
                 let advanced = try applyDown(envelope)
-                if advanced { recordReplayFrame(text) }
+                if advanced { recordReplayFrame(rawText) }
             } catch {
                 violate(error)
             }

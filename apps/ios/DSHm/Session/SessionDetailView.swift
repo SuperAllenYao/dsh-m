@@ -589,18 +589,26 @@ struct SessionDetailView: View {
  /// 产品路径为 nil → 不渲染）。前缀由 VM 固定为 state/pages/oldest/ms/rows/failures，
  /// 这里只在末尾追加滚动几何 key（不影响前缀顺序）。
  /// E2E follow lifecycle probe (blank-session realtime regression).
- /// Rendered unconditionally (2pt, opacity 0.02, hit-test disabled - it is
- /// invisible): during diagnosis the env-gated variant never appeared, so
- /// this doubles as the page-identity marker for XCUITest.
+ ///
+ /// E2E-gated: it used to render unconditionally, and reading
+ /// `viewModel.followProbeValue` here made the whole detail body depend on a
+ /// follow-frame `@Published` — every follow frame invalidated this view
+ /// during the initial load / history fill (the exact recompute source the
+ /// 250 ms probe coalescing was added for). XCUITest suites launch with
+ /// `DSHM_E2E=1`, so the marker is still there for them; product builds no
+ /// longer pay for it.
+    @ViewBuilder
     private var e2eFollowProbeElement: some View {
-        Text("probe")
-            .font(.system(size: 1))
-            .frame(width: 2, height: 2)
-            .opacity(0.02)
-            .allowsHitTesting(false)
-            .accessibilityIdentifier("e2e-follow-probe")
-            .accessibilityLabel(viewModel.followProbeValue)
-            .accessibilityValue(viewModel.followProbeValue)
+        if app.isE2EMode {
+            Text("probe")
+                .font(.system(size: 1))
+                .frame(width: 2, height: 2)
+                .opacity(0.02)
+                .allowsHitTesting(false)
+                .accessibilityIdentifier("e2e-follow-probe")
+                .accessibilityLabel(viewModel.followProbeValue)
+                .accessibilityValue(viewModel.followProbeValue)
+        }
     }
 
     @ViewBuilder
