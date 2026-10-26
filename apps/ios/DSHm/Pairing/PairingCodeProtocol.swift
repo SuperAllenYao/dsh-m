@@ -266,7 +266,7 @@ enum PairingCodeProtocol {
                 caCertBase64: payload.tlsCACertBase64 ?? response.tlsCACertBase64
             ),
             payload: payload,
-            relay: RelayServerConfig.from(payloadRelay: payload.relay)
+            relay: RelayConfigStore.controlPlaneConfig(from: payload)
         )
     }
 
@@ -308,7 +308,7 @@ enum PairingCodeProtocol {
                 caCertBase64: payload.tlsCACertBase64 ?? response.tlsCACertBase64
             ),
             payload: payload,
-            relay: RelayServerConfig.from(payloadRelay: payload.relay)
+            relay: RelayConfigStore.controlPlaneConfig(from: payload)
         )
     }
 

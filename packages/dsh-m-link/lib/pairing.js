@@ -185,8 +185,12 @@ export class PairingService {
  /**
  * Optional top-level `relay` object (M2a): `{origin, pin, v:1}`. Set after
  * the tunnel reports `ready`; the App saves it as its server config so it
- * can run the public rendezvous lookup for the 8-digit code. It carries the
- * *relay's* certificate pin (not the Mac's) — see m2-tunnel-design §5.4.
+ * can run the public rendezvous lookup for the 8-digit code.
+ *
+ * §5.4 / P1: `origin` is the relay **control-plane** origin (code lookup,
+ * normalised https, never the bridge data port) and `pin` is the *relay's*
+ * certificate pin (not the Mac's). The bridge data origin stays in
+ * `endpoints[]` with the Mac CA/leaf pin — the two planes must not mix.
  * @type {{origin: string, pin: string, v: number} | undefined}
  */
     this.relay = undefined;
@@ -255,9 +259,15 @@ export class PairingService {
     this.session = undefined;
   }
 
- /** Build the signed QR payload for the current session (issuing one if needed). */
+ /**
+ * Build the signed QR payload for the current session, issuing one when there
+ * is none **or when the current one has expired** (P2/D5). Admin `pairing`
+ * (polled by the desktop panel every 5s) and the debug payload writer both go
+ * through here, so a QR on screen can never carry a dead one-time token: an
+ * expired session is re-signed transparently with reason `auto`.
+ */
   payload() {
-    if (this.session === undefined) this.refresh('auto');
+    if (this.session === undefined || this.session.expiresAt <= Date.now()) this.refresh('auto');
     const session = this.session;
     const deviceEndpoints = this.endpoints.map(publicEndpoint);
     const unsigned = {

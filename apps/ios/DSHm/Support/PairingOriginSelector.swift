@@ -33,9 +33,11 @@ enum PairingOriginSelector {
         raw.append(contentsOf: payload.origins ?? [])
         raw.append(contentsOf: payload.endpoints?.compactMap { $0.url } ?? [])
         if let origin = payload.origin { raw.append(origin) }
- // M2a: the tunnel (relay bridge) origin may only be advertised through the
- // top-level `relay` object, so keep it in the reconnect candidate list.
-        if let relayOrigin = payload.relay?.origin { raw.append(relayOrigin) }
+ // NOTE (spec §3 A3): the top-level `relay` object is the **control plane**
+ // relay config (origin + TLS pin of the relay server), not a data-plane
+ // origin of this Mac — dialing it would fail TLS. The Mac's relay bridge
+ // data endpoint is already listed in `endpoints[]` (kind:"relay", pin =
+ // Mac certificate), so it must NOT be added here again.
         return candidates(from: raw, allowLoopback: allowLoopback)
     }
 
@@ -103,12 +105,4 @@ enum PairingOriginSelector {
         return false
     }
 
- /// P0: dial order for one reconnect round. On cellular/expensive paths the
- /// relay origin is dialed first and LAN origins are dropped entirely when at
- /// least one non-LAN candidate exists (each LAN probe can cost a 15s timeout).
-    static func dialCandidates(_ candidates: [URL], prefersRelay: Bool) -> [URL] {
-        guard prefersRelay else { return candidates }
-        let relay = candidates.filter { !isLANHost($0.host) }
-        return relay.isEmpty ? candidates : relay
-    }
 }

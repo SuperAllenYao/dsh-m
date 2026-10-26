@@ -231,6 +231,10 @@ struct PairingView: View {
 
     private var statusText: String {
         if isPairing { return L10n.t("正在配对…") }
+ // Spec §3 A4/A5: after a failed attempt the scanner is armed again (it
+ // resets 1.25 s after each delivery); tell the user, generically, that a
+ // rescan is possible — no link-type wording.
+        if errorText != nil { return L10n.t("可重新扫描二维码") }
         switch app.link.phase {
         case .connected: return L10n.t("已配对，正在进入工作区")
         case .reconnecting: return L10n.t("已配对，正在重连")

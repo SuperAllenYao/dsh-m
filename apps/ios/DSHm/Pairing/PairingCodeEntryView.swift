@@ -77,7 +77,7 @@ struct PairingCodeEntryView: View {
     private var discoveryCard: some View {
         VStack(alignment: .leading, spacing: Theme.Spacing.xs) {
             HStack {
-                SectionLabel(text: "局域网 Mac")
+                SectionLabel(text: "附近的 Mac")
                 Spacer()
                 Button {
                     model.rediscover()
@@ -143,65 +143,28 @@ struct PairingCodeEntryView: View {
         .accessibilityIdentifier("pair-code-host-row")
     }
 
-    @ViewBuilder
+ /// Server-config entry only. Spec §3 A5: the old "pair through the remote
+ /// server" toggle exposed the link type and is gone — the app decides the
+ /// transport itself (LAN first, relay fallback). The manual config entry stays
+ /// for troubleshooting; QR pairing refreshes the stored config automatically
+ /// (spec §3 A3).
     private var relayRow: some View {
-        if model.hasRelayConfig {
-            HStack(spacing: Theme.Spacing.s) {
-                Button {
-                    if model.prefersRelay {
-                        model.useLAN()
-                    } else {
-                        model.useRelay()
-                    }
-                } label: {
-                    HStack(spacing: Theme.Spacing.xxs) {
-                        Image(systemName: model.prefersRelay ? "checkmark.circle.fill" : "circle")
-                            .font(.system(size: 12, weight: .semibold))
-                        Text(model.prefersRelay ? L10n.t("通过远程服务器配对（已选）") : L10n.t("改用远程服务器配对"))
-                            .font(Theme.Typography.caption)
-                    }
-                    .foregroundStyle(model.prefersRelay ? Theme.Palette.accent : Theme.Palette.textSecondary)
-                    .padding(.horizontal, Theme.Spacing.s)
-                    .padding(.vertical, 8)
-                    .background(
-                        model.prefersRelay ? Theme.Palette.accentSoft : Theme.Palette.surface,
-                        in: Capsule()
-                    )
-                    .overlay(
-                        Capsule().strokeBorder(
-                            model.prefersRelay ? Theme.Palette.accentBorder : Theme.Palette.border,
-                            lineWidth: 1
-                        )
-                    )
-                }
-                .buttonStyle(.plain)
-                .accessibilityIdentifier("pair-code-use-relay")
+        Button {
+            showRelayConfig = true
+        } label: {
+            HStack(spacing: Theme.Spacing.xxs) {
+                Image(systemName: "network")
+                    .font(.system(size: 12, weight: .semibold))
+                Text(model.hasRelayConfig ? L10n.t("服务器配置") : L10n.t("配置远程服务器"))
+                    .font(Theme.Typography.captionMedium)
                 Spacer(minLength: 0)
-                Button {
-                    showRelayConfig = true
-                } label: {
-                    Text("服务器配置")
-                        .font(Theme.Typography.captionMedium)
-                        .foregroundStyle(Theme.Palette.textSecondary)
-                }
-                .buttonStyle(.plain)
-                .accessibilityIdentifier("pair-code-relay-config")
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 11, weight: .semibold))
             }
-        } else {
-            Button {
-                showRelayConfig = true
-            } label: {
-                HStack(spacing: Theme.Spacing.xxs) {
-                    Image(systemName: "network")
-                        .font(.system(size: 12, weight: .semibold))
-                    Text("未配置远程服务器，配置后可在公网配对")
-                        .font(Theme.Typography.caption)
-                }
-                .foregroundStyle(Theme.Palette.textSecondary)
-            }
-            .buttonStyle(.plain)
-            .accessibilityIdentifier("pair-code-relay-config")
+            .foregroundStyle(Theme.Palette.textSecondary)
         }
+        .buttonStyle(.plain)
+        .accessibilityIdentifier("pair-code-relay-config")
     }
 
  // MARK: - Code input

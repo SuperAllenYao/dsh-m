@@ -63,6 +63,12 @@ enum PairingCodeFailure: Equatable {
     case pinMismatch(String)
  /// The signed pairing payload embedded in the redeem response failed Ed25519.
     case signatureInvalid
+ /// The saved relay server config no longer matches the relay server (the
+ /// relay certificate rotated, or a legacy bad config was stored): the lookup
+ /// TLS handshake fails on the pin. Scanning a QR pair once refreshes the
+ /// stored config (spec §3 A3), so this is actionable — not a generic network
+ /// error and not a re-pair requirement.
+    case relayConfigMismatch
  /// Transport-level failure (localized by `NetworkErrorInterpreter`).
     case network(String)
 
@@ -70,7 +76,7 @@ enum PairingCodeFailure: Equatable {
     var keepsCode: Bool {
         switch self {
         case .invalid, .rateLimited, .network, .noTarget, .selectionRequired,
-             .notFound, .hostInactive, .contractPending:
+             .notFound, .hostInactive, .contractPending, .relayConfigMismatch:
             return true
         case .expired, .locked, .malformed, .pinMismatch, .signatureInvalid:
             return false
@@ -97,7 +103,7 @@ enum PairingCodeFailure: Equatable {
         case .contractPending:
             return L10n.t("Mac 上的连接服务正在启动，请稍后重试")
         case .noTarget:
-            return L10n.t("未发现 Mac：请确认 iPhone 与 Mac 在同一 Wi-Fi，或在 Mac 上刷新配对码；也可以先配置远程服务器")
+            return L10n.t("未发现 Mac：请确认 Mac 端连接页已打开，或在 Mac 上刷新二维码后重扫。")
         case .selectionRequired:
             return L10n.t("发现多台 Mac，请先选择要配对的一台")
         case .malformed(let detail):
@@ -106,6 +112,8 @@ enum PairingCodeFailure: Equatable {
             return L10n.f("证书指纹校验失败，已拒绝连接：%@", detail)
         case .signatureInvalid:
             return L10n.t("配对载荷签名校验失败（载荷可能被篡改）")
+        case .relayConfigMismatch:
+            return L10n.t("服务器配置已更新，请用二维码配对一次即可自动同步。")
         case .network(let detail):
             return detail
         }

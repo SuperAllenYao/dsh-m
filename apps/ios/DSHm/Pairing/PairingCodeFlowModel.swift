@@ -79,12 +79,13 @@ final class PairingCodeFlowModel: ObservableObject {
     var discoveryHint: String? {
         switch discoveryState {
         case .idle, .searching:
-            return L10n.t("正在发现局域网内的 Mac…")
+            return L10n.t("正在查找附近的 Mac…")
         case .empty:
+ // Silent link type (spec §0.4): never say *how* the app will connect.
             if relayConfig != nil {
-                return L10n.t("未发现 Mac，将尝试通过远程服务器配对")
+                return L10n.t("未发现 Mac")
             }
-            return L10n.t("未发现 Mac：请确认 iPhone 与 Mac 在同一 Wi-Fi，或在 Mac 上刷新配对码；也可以先配置远程服务器")
+            return L10n.t("未发现 Mac：请确认 Mac 端连接页已打开，或在 Mac 上刷新二维码后重扫。")
         case .found(let count):
             if count > 1, selectedMacId == nil {
                 return L10n.t("发现多台 Mac，请选择要配对的一台")
@@ -257,9 +258,18 @@ final class PairingCodeFlowModel: ObservableObject {
     }
 
     func applyRedemption(_ redemption: PairingCodeRedemption) {
- // Design §5.4: a LAN pairing may teach the app the relay config (its pin
- // is only available from the payload's `relay` object).
-        if let relay = redemption.relay {
+ // Design §5.4 / spec §3 A3: a pairing teaches the app the relay
+ // **control-plane** config (its pin is only available from the payload's
+ // `relay` object). Re-validate before saving: a legacy payload wrote the
+ // Mac's bridge data origin there (D1) and must never overwrite a good
+ // stored config (validation failure = keep the existing config).
+        let validatedRelay: RelayServerConfig?
+        if let payload = redemption.payload {
+            validatedRelay = RelayConfigStore.controlPlaneConfig(from: payload)
+        } else {
+            validatedRelay = redemption.relay
+        }
+        if let relay = validatedRelay {
             relayConfig = relay
             RelayConfigStore.save(relay, defaults: defaults)
         }

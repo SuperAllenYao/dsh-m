@@ -102,6 +102,42 @@ window.__ModuleLoader__.load({
 				opacity: 0.7,
 				fontSize: "12px",
 			},
+ // P3/D6: the inline QR stays compact, but is a real button so the dense
+ // payload can be scanned from a full-screen, much larger rendering.
+			qrButton: { padding: 0, margin: 0, border: "none", background: "none", cursor: "zoom-in", display: "block", lineHeight: 0, borderRadius: "8px" },
+			qrOverlay: {
+				position: "fixed",
+				inset: 0,
+				zIndex: 2147483000,
+				background: "rgba(0, 0, 0, 0.74)",
+				display: "flex",
+				alignItems: "center",
+				justifyContent: "center",
+				padding: "24px",
+				cursor: "zoom-out",
+			},
+			qrOverlayCard: {
+				display: "flex",
+				flexDirection: "column",
+				alignItems: "center",
+				gap: "12px",
+				padding: "16px",
+				borderRadius: "14px",
+				background: "#fff",
+				color: "#111",
+				boxShadow: "0 24px 64px rgba(0, 0, 0, 0.45)",
+				cursor: "default",
+			},
+			qrOverlayImg: {
+				display: "block",
+				background: "#fff",
+ // Fullscreen enlarging for high-density payloads (D6): >= 320px, capped
+ // at 420px so the quiet zone always fits on a laptop screen.
+				width: "clamp(320px, 62vw, 420px)",
+				height: "clamp(320px, 62vw, 420px)",
+				imageRendering: "pixelated",
+			},
+			qrOverlayHint: { fontSize: "12px", color: "#333", opacity: 0.72, textAlign: "center" },
 			grow: { flex: "1 1 280px", minWidth: "260px", display: "flex", flexDirection: "column", gap: "14px" },
 			pairCodeRow: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: "14px", flexWrap: "wrap" },
 			pairCodeDigits: { fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace", fontSize: "30px", fontWeight: 600, letterSpacing: "6px", fontVariantNumeric: "tabular-nums", lineHeight: 1.15, whiteSpace: "nowrap" },
@@ -682,6 +718,9 @@ window.__ModuleLoader__.load({
 			const [now, setNow] = React.useState(Date.now());
 			const [showAudit, setShowAudit] = React.useState(false);
 			const [confirmRevoke, setConfirmRevoke] = React.useState(undefined);
+ // P3/D6: fullscreen enlarged QR (the 186px inline code is too dense for
+ // some phone cameras to resolve — see D6).
+			const [qrZoom, setQrZoom] = React.useState(false);
 			const lastAutoRefresh = React.useRef(0);
  // M5: a revoked phone is a terminal record — kept in devices.json and the
  // audit log (and blocked by auth/revoked), but not rendered in the settings
@@ -703,15 +742,33 @@ window.__ModuleLoader__.load({
 				}
 			}, []);
 
+ // P3: the host re-renders the QR on every poll; if the signed payloadText did
+ // not change, keep the previous image (identical data URL) so swapping the
+ // <img> src for the same content never flashes the panel.
+			const applyPairing = React.useCallback((next) => {
+				setPairing((current) => {
+					if (
+						current !== undefined &&
+						typeof current.payloadText === "string" &&
+						current.payloadText === next?.payloadText &&
+						current.qr?.ok === true &&
+						next?.qr?.ok === true
+					) {
+						return { ...next, qr: current.qr };
+					}
+					return next;
+				});
+				setNow(Date.now());
+			}, []);
+
 			const loadPairing = React.useCallback(async () => {
 				try {
 					const nextPairing = await admin("pairing");
-					setPairing(nextPairing);
-					setNow(Date.now());
+					applyPairing(nextPairing);
 				} catch (caught) {
 					setError(String(caught?.message ?? caught));
 				}
-			}, []);
+			}, [applyPairing]);
 
  // M2a 8-digit pairing code derived state (countdown ticks via `now`).
 			const pairCode = pairing?.code;
@@ -734,16 +791,31 @@ window.__ModuleLoader__.load({
 				return undefined;
 			}, [codeExpired, codeExpiresAt, loadPairing]);
 
+ // P3/D5: refresh the signed pairing payload on the same 5s tick as the status.
+ // The host re-signs an expired session inside payload() (P2), so the QR shown
+ // while this panel stays open is always a live one-time token.
 			React.useEffect(() => {
 				refreshStatus();
 				loadPairing();
-				const timer = setInterval(() => refreshStatus({ quiet: true }), POLL_MS);
+				const timer = setInterval(() => {
+					refreshStatus({ quiet: true });
+					loadPairing();
+				}, POLL_MS);
 				const clock = setInterval(() => setNow(Date.now()), 1000);
 				return () => {
 					clearInterval(timer);
 					clearInterval(clock);
 				};
 			}, [refreshStatus, loadPairing]);
+
+			React.useEffect(() => {
+				if (!qrZoom) return undefined;
+				const onKeyDown = (event) => {
+					if (event.key === "Escape") setQrZoom(false);
+				};
+				window.addEventListener("keydown", onKeyDown);
+				return () => window.removeEventListener("keydown", onKeyDown);
+			}, [qrZoom]);
 
 			React.useEffect(() => {
 				if (!showAudit) return undefined;
@@ -767,8 +839,7 @@ window.__ModuleLoader__.load({
 				setBusy(true);
 				try {
 					const next = await admin("pairing.refresh");
-					setPairing(next);
-					setNow(Date.now());
+					applyPairing(next);
 					setError(undefined);
 				} catch (caught) {
 					setError(String(caught?.message ?? caught));
@@ -951,10 +1022,21 @@ window.__ModuleLoader__.load({
 						"div",
 						{ style: { ...styles.card, ...styles.qrBox } },
 						pairing?.qr?.ok === true
-							? h("img", { src: pairing.qr.dataUrl, style: styles.qrImg, alt: "配对二维码", "data-dshm-qr": "pair" })
+							? h(
+									"button",
+									{
+										type: "button",
+										style: styles.qrButton,
+										onClick: () => setQrZoom(true),
+										title: "点击放大二维码",
+										"aria-label": "放大配对二维码",
+										"data-dshm-qr-zoom": "trigger",
+									},
+									h("img", { src: pairing.qr.dataUrl, style: styles.qrImg, alt: "配对二维码", "data-dshm-qr": "pair" }),
+								)
 							: h("div", { style: styles.qrPlaceholder }, pairing?.qr?.error ? "二维码渲染不可用：" + pairing.qr.error : "正在生成二维码…"),
 						secondsLeft > 0
-							? h("div", { style: styles.sub }, "二维码 " + String(secondsLeft) + " 秒后过期")
+							? h("div", { style: styles.sub }, "二维码 " + String(secondsLeft) + " 秒后过期" + (pairing?.qr?.ok === true ? " · 点击放大" : ""))
 							: h("div", { style: styles.sub }, ready ? "二维码已过期，点击刷新" : "—"),
 						h("div", { style: { display: "flex", gap: "8px" } },
 							h(Button, { onClick: refreshPairing, disabled: busy, variant: "primary" }, "刷新二维码"),
@@ -1106,6 +1188,25 @@ window.__ModuleLoader__.load({
 						),
 					),
 				),
+				qrZoom && pairing?.qr?.ok === true
+					? h(
+							"div",
+							{
+								style: styles.qrOverlay,
+								onClick: () => setQrZoom(false),
+								role: "dialog",
+								"aria-modal": "true",
+								"aria-label": "放大的配对二维码",
+								"data-dshm-qr-overlay": "zoom",
+							},
+							h(
+								"div",
+								{ style: styles.qrOverlayCard, onClick: (event) => event.stopPropagation() },
+								h("img", { src: pairing.qr.dataUrl, style: styles.qrOverlayImg, alt: "配对二维码（放大）", "data-dshm-qr": "pair-zoom" }),
+								h("div", { style: styles.qrOverlayHint }, "手机 App 扫描此二维码 · 按 ESC 或点击空白处关闭"),
+							),
+						)
+					: null,
 				h(
 					"p",
 					{ style: styles.footer },
