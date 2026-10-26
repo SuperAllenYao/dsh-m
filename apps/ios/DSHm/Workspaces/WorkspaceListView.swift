@@ -66,6 +66,14 @@ struct WorkspaceListView: View {
  // out when the draft is gone (2.3 b).
             viewModel.refreshBlankCardState()
             viewModel.applyLiveSessionRunning()
+ // Edge-swipe back has no back-button hook: its flush runs in the
+ // detail's onDisappear, which lands ~580 ms after this onAppear
+ // (probe-measured). Refresh once more after the pop settles so the
+ // draft card appears instead of staying hidden.
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 800_000_000)
+                viewModel.refreshBlankCardState()
+            }
         }
         .onDisappear {
  // Leaving the list: stop consuming the workspace stream (protocol §3.13).

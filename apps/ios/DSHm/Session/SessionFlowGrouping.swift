@@ -143,6 +143,17 @@ enum ProcessGroupModeResolver {
         case .expanded: return .collapsed
         }
     }
+
+ /// turn 结束后修剪用户覆盖（v6 语义）。
+ ///
+ /// v6 默认态是 `.expanded`，所以 `.expanded` 覆盖与「无覆盖」等价，丢弃无副作用；
+ /// 旧运行态覆盖 `.window`/`.full` 只在运行中有效，结束后按 resolver 回落 expanded。
+ /// 用户手动收起（`.collapsed`）必须保留——它跨阶段保留是 v6 契约
+ /// （见 `testProcessGroupModeUserCollapseIsKeptAcrossPhases`）；v0.2.7 遗留的
+ /// 「只保留.expanded」过滤会在每轮结束时把用户收起的历史组全部弹开。
+    static func prunedAfterTurnEnd(_ modes: [String: ProcessGroupMode]) -> [String: ProcessGroupMode] {
+        modes.filter { $0.value == .collapsed }
+    }
 }
 
 /// v5.3 rule: consecutive reasoning + tool-call rows form one folded process

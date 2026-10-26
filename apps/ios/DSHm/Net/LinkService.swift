@@ -65,6 +65,10 @@ final class LinkService: ObservableObject {
     @Published private(set) var liveSessionRunning: [String: Bool] = [:]
  /// 每次运行态 emit 递增，供列表页 `.onChange` 触发重算（map 值相等时 SwiftUI 不回调）。
     @Published private(set) var liveSessionStatusRevision = 0
+ /// 每条 live 运行态 emit 的落库时间。emit 只用于补「快照请求在途」的短暂竞态；
+ /// 超过 `WorkspaceViewModel.liveRunningOverlayMaxAge` 后不再覆盖 `session/list`
+ /// 快照（快照是网络真值），避免丢帧/后台断连后卡片永久「假进行中」。
+    private(set) var liveSessionRunningUpdatedAt: [String: Date] = [:]
     @Published private(set) var lastErrorText: String?
     @Published private(set) var lastConnectedAt: Date?
  /// P0: E2E-gated `connect-metrics` summary of the last bring-up round.
@@ -2031,8 +2035,13 @@ final class LinkService: ObservableObject {
 
  /// P1 `$events` subscription loss: the link itself stays ready (`welcome` was
  /// the ready signal), so only the approval/question waterfall is affected.
+ ///
+ /// The status emits share this stream and there is no re-subscribe path in
+ /// this connection lifetime, so the live running map must be dropped as well:
+ /// otherwise its last values would keep overriding `session/list` snapshots.
     func noteP1EventsStreamLoss(_ message: String) {
         lastErrorText = message
+        clearLiveSessionRunning()
     }
 
  /// Points the credential's current origin at the origin under test.
@@ -2087,14 +2096,27 @@ final class LinkService: ObservableObject {
         pendingApprovals.removeAll()
         pendingUserQuestions.removeAll()
  // 真断开的 live 运行态一并作废：重连后以新的 `session/list` 快照为准。
-        liveSessionRunning.removeAll()
-        liveSessionStatusRevision += 1
+        clearLiveSessionRunning()
     }
 
  /// Applies one live `api-session/status` emit (`session/list` 之外的实时运行态源)。
     func applyLiveSessionStatus(_ emit: LiveSessionStatusEmit) {
+ // 同一开关值也刷新时间戳：只要还在收到 emit，就说明它是新鲜的网络事实。
+        liveSessionRunningUpdatedAt[emit.sessionId] = Date()
         guard liveSessionRunning[emit.sessionId] != emit.running else { return }
         liveSessionRunning[emit.sessionId] = emit.running
+        liveSessionStatusRevision += 1
+    }
+
+ /// Drops the live running overlay. The emit source (`$events`) is gone, so the
+ /// values are unknowable until new emits arrive: the next `session/list` snapshot
+ /// is the truth. Without this a lost `running=false` emit leaves a card stuck in
+ /// 「进行中」 (and sorted to the top) for the rest of the connection, or forever if
+ /// the snapshot is then overlaid with the stale value.
+    func clearLiveSessionRunning() {
+        guard !liveSessionRunning.isEmpty || !liveSessionRunningUpdatedAt.isEmpty else { return }
+        liveSessionRunning.removeAll()
+        liveSessionRunningUpdatedAt.removeAll()
         liveSessionStatusRevision += 1
     }
 
@@ -2128,6 +2150,14 @@ final class LinkService: ObservableObject {
  // and discard the stream table (caller-initiated close must not fire
  // the channel `onClose`).
             teardownP1Channel()
+ // review P1: a full teardown also destroys the `$events`
+ // subscription that feeds `api-session/status`, and reconnect only
+ // re-delivers pending waterfalls (protocol §4.4) — it never replays
+ // status emits. Keeping the map here meant a lost `running=false`
+ // could override every later `session/list` snapshot with a stale
+ // 「进行中」. Unlike approvals (re-delivered idempotently), running
+ // state is not re-delivered, so it must fall back to the snapshot.
+            clearLiveSessionRunning()
         }
         if let continuation = readyContinuation {
             readyContinuation = nil

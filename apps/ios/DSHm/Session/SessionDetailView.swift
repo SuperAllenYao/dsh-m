@@ -247,9 +247,11 @@ struct SessionDetailView: View {
             if running {
                 viewModel.markSendTurnVisible()
             } else {
- // v0.2.7：这一轮步骤结束 → 运行中的过程组自动折叠成一行。
- // 只清掉运行期覆盖（.window/.full），保留用户手动展开的历史组（.expanded）。
-                processGroupModes = processGroupModes.filter { $0.value == .expanded }
+ // v6：v6 默认态已是.expanded，旧的
+ // 「filter ==.expanded」等于把用户手动收起的组也一起丢掉，下一帧按
+ // 默认态全部弹开。现在只保留用户收起覆盖，旧.window/.full 运行态
+ // 覆盖按 resolver 回落 expanded。
+                processGroupModes = ProcessGroupModeResolver.prunedAfterTurnEnd(processGroupModes)
  // A finished turn is a natural refresh point: child runtimes and
  // the context window may have changed while the parent streamed.
  // The 8 s tick must not be the only source of truth for the beam.
@@ -667,6 +669,12 @@ struct SessionDetailView: View {
     private var header: some View {
         HStack(spacing: Theme.Spacing.s) {
             Button {
+ // probe evidence: the list's onAppear/refreshBlankCardState
+ // runs ~580 ms BEFORE this view's onDisappear, so a draft still in
+ // its 500 ms debounce window was not on disk yet when the list
+ // refreshed — the blank card was pruned. Flush synchronously
+ // before the pop; onDisappear keeps covering edge-swipe back.
+                viewModel.flushDraft()
                 viewModel.stop()
  // v5.4 task-13: child subagent -> parent session; normal -> list.
                 app.backFromSession()
