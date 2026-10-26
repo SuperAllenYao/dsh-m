@@ -420,6 +420,41 @@ function certDerPin(fingerprint256) {
 }
 
 /**
+ * Normalize the relay *control-plane* origin carried in the signed pairing
+ * payload's top-level `relay` object (M2a §5.4: `relay.origin` = the code
+ * lookup origin, never the bridge data port).
+ *
+ * The App parses this value as an https origin (RelayServerConfig) and dials it
+ * for the 8-digit-code lookup, so the Mac must not ship a bridge URL there:
+ * mixing the two was the D1 defect (pin from the control plane + origin from the
+ * data plane ⇒ "服务器配置与服务器不匹配"). Rules:
+ * - trim whitespace and strip trailing slashes (App compares normalized origins);
+ * - require an https origin with a non-empty host and no path/query/fragment;
+ * - keep the explicit port untouched — the App resolves a missing port to 443.
+ *
+ * @param {unknown} value raw `tunnel.relayInfo().controlOrigin` (or config value)
+ * @returns {string | undefined} normalized origin, or undefined when unusable
+ */
+export function normalizeRelayControlOrigin(value) {
+  if (typeof value !== 'string') return undefined;
+  let origin = value.trim();
+  while (origin.endsWith('/')) origin = origin.slice(0, -1);
+  if (origin.length === 0) return undefined;
+  let url;
+  try {
+    url = new URL(origin);
+  } catch {
+    return undefined;
+  }
+  if (url.protocol !== 'https:') return undefined;
+  if (url.hostname.length === 0) return undefined;
+  if (url.username !== '' || url.password !== '') return undefined;
+  if (url.pathname !== '/' && url.pathname !== '') return undefined;
+  if (url.search !== '' || url.hash !== '') return undefined;
+  return origin;
+}
+
+/**
  * Live LinkServer instances of *this host process*, grouped by TLS port.
  *
  * Cordis re-applies the plugin on a profile reload (a desktop setting write
@@ -1509,6 +1544,10 @@ export class LinkServer {
       this.lanIps = next;
       this.endpoints = buildEndpoints({ config: this.config, certs: this.certs, lanIps: this.lanIps, hostname: this.hostname });
       this.baseEndpoints = this.endpoints.slice();
+ // A Wi-Fi/LAN change must not drop the relay data endpoint learned by a
+ // ready tunnel (same re-add as applyCerts): phones on another network would
+ // otherwise lose their only dialable fallback until the next tunnel ready.
+      if (this.tunnelEndpoint !== undefined) this.endpoints = [...this.baseEndpoints, this.tunnelEndpoint];
       this.deviceEndpoints = selectDeviceEndpoints(this.endpoints);
       this.pairing?.setTrust?.({ certs: this.certs, endpoints: this.deviceEndpoints });
     } catch (error) {
@@ -1831,7 +1870,36 @@ export class LinkServer {
     return this.tunnel?.health?.() ?? null;
   }
 
- /** Merge the relay origin into the phone-visible endpoints after tunnel ready. */
+ /**
+ * Top-level `relay` object for the signed pairing payload (M2a §5.4): the
+ * relay **control-plane** origin + the relay certificate pin. The bridge data
+ * origin lives in `endpoints[]` only — using it here was D1 (the App then did
+ * the code lookup against the data port with the control pin and the TLS pin
+ * check failed with "服务器配置与服务器不匹配").
+ *
+ * Tunnels that predate `relayInfo()` (or a control origin that fails
+ * normalization) fall back to the legacy bridge URL so an old deployment still
+ * gets *something* in the QR — logged as a warning, and the App-side control
+ * plane validation rejects bridge-equal origins rather than persisting them.
+ */
+  payloadRelayConfig() {
+    let controlOrigin;
+    try {
+      controlOrigin = this.tunnel?.relayInfo?.()?.controlOrigin;
+    } catch {
+ /* tunnel not ready */
+    }
+    const relayOrigin = normalizeRelayControlOrigin(controlOrigin);
+    if (relayOrigin !== undefined) return { origin: relayOrigin, pin: this.config.tunnel.pin };
+    log(
+      'tunnel: relayInfo().controlOrigin unavailable or not a valid https origin (' +
+        String(controlOrigin ?? 'undefined') +
+        '); falling back to the bridge origin for payload relay.origin (legacy compatibility)',
+    );
+    return { origin: this.tunnelEndpoint.url, pin: this.config.tunnel.pin };
+  }
+
+ /** Merge the relay data endpoint + control-plane payload relay after tunnel ready. */
   onTunnelReady({ origin, port }) {
     if (typeof origin !== 'string' || origin.length === 0) return;
     this.tunnelEndpoint = {
@@ -1848,9 +1916,19 @@ export class LinkServer {
  // origin present the QR/health list is phone-visible only.
     this.deviceEndpoints = selectDeviceEndpoints(this.endpoints);
     this.pairing?.setTrust({ certs: this.certs, endpoints: this.deviceEndpoints });
-    this.pairing?.setRelay({ origin: this.tunnelEndpoint.url, pin: this.config.tunnel.pin });
-    log('tunnel: relay origin injected into endpoints: ' + this.tunnelEndpoint.url + (port ? ' (bridge port ' + String(port) + ')' : ''));
-    this.audit?.record('tunnel.ready', { origin: this.tunnelEndpoint.url, port: port ?? null });
+ // P1/D1: two planes, two values. endpoints[] keeps the bridge data origin
+ // (pin = Mac CA/leaf); payload.relay carries the control-plane origin with
+ // the relay certificate pin. They must never be mixed.
+    const payloadRelay = this.payloadRelayConfig();
+    this.pairing?.setRelay(payloadRelay);
+    log(
+      'tunnel: bridge endpoint injected into endpoints: ' +
+        this.tunnelEndpoint.url +
+        (port ? ' (bridge port ' + String(port) + ')' : '') +
+        ' · payload relay.origin (control plane): ' +
+        payloadRelay.origin,
+    );
+    this.audit?.record('tunnel.ready', { origin: this.tunnelEndpoint.url, port: port ?? null, relayOrigin: payloadRelay.origin });
  // TXT `relay=<origin>` is dynamic (public origin appears after ready); the
  // `pair` capability marker stays fixed.
     try {

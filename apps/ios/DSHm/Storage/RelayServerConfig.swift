@@ -170,13 +170,66 @@ enum RelayConfigStore {
         return true
     }
 
- /// Saves the relay config advertised by a freshly paired Mac's signed payload
- /// (design §5.4: the tunnel origin's TLS pin is only available through this
- /// optional `relay` object). Returns the captured config, if any.
-    @discardableResult
-    static func capture(from payload: PairingPayload, defaults: UserDefaults = .standard) -> RelayServerConfig? {
+ /// Validates the relay config advertised by a freshly paired Mac's **signed**
+ /// payload, without saving it (spec §3 A3 / D1+D2).
+ ///
+ /// The top-level `relay` object is the **control plane** config (a config for
+ /// the relay server itself: origin = control origin, pin = relay certificate
+ /// pin). It must never be persisted when it actually points at one of the
+ /// payload's data-plane endpoints: an old plugin (D1) wrote the Mac's bridge
+ /// data origin there, and saving that makes every later `/v1/lookup` fail the
+ /// TLS pin check ("服务器配置与服务器不匹配"). Rejecting it here means a legacy
+ /// bad config can never be written again, and the stored config self-heals on
+ /// the next QR pairing.
+    static func controlPlaneConfig(from payload: PairingPayload) -> RelayServerConfig? {
+ // Spec P2-2: only a signed payload may write the relay config. Callers
+ // verify the Ed25519 signature before adopting; this guard is defence in
+ // depth so the unsigned manual-payload path can never persist one either.
+        guard payload.isSigned else { return nil }
         guard let config = RelayServerConfig.from(payloadRelay: payload.relay) else { return nil }
+        guard let originURL = config.originURL,
+              originURL.scheme?.lowercased() == "https",
+              let host = originURL.host, !host.isEmpty else { return nil }
+ // Legacy bridge semantics: `relay.origin` equals a Mac data endpoint.
+        let dataOrigins = payloadDataOriginStrings(payload)
+        let normalized = normalizedOrigin(config.origin)
+        for dataOrigin in dataOrigins where normalizedOrigin(dataOrigin) == normalized {
+            return nil
+        }
+        return config
+    }
+
+ /// Adopts (validates + persists) the control-plane relay config from a signed
+ /// pairing payload. Returns the saved config, or nil when the payload carries
+ /// none / an invalid one (an existing config is left untouched in that case).
+    @discardableResult
+    static func adoptControlPlane(from payload: PairingPayload, defaults: UserDefaults = .standard) -> RelayServerConfig? {
+        guard let config = controlPlaneConfig(from: payload) else { return nil }
         save(config, defaults: defaults)
         return config
+    }
+
+ /// Backwards-compatible name for `adoptControlPlane(from:)` (the redeem path
+ /// keeps its original call site, spec §3 A3).
+    @discardableResult
+    static func capture(from payload: PairingPayload, defaults: UserDefaults = .standard) -> RelayServerConfig? {
+        adoptControlPlane(from: payload, defaults: defaults)
+    }
+
+ /// Every data-plane origin the payload advertises: `endpoints[].url`,
+ /// `origins[]` and the legacy flat `origin` field.
+    private static func payloadDataOriginStrings(_ payload: PairingPayload) -> [String] {
+        var values: [String] = []
+        values.append(contentsOf: payload.endpoints?.compactMap { $0.url } ?? [])
+        values.append(contentsOf: payload.origins ?? [])
+        if let origin = payload.origin { values.append(origin) }
+        return values
+    }
+
+ /// Lowercased origin without a trailing slash (comparison key only).
+    private static func normalizedOrigin(_ text: String) -> String {
+        var value = text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        while value.hasSuffix("/") { value.removeLast() }
+        return value
     }
 }

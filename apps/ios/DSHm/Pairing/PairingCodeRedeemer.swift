@@ -111,14 +111,19 @@ struct PairingCodeRedeemer: PairingCodeRedeeming {
 
     static func lookupTransportFailure(_ error: Error) -> PairingCodeFailure {
         if isTLSPinFailure(error) {
-            return .network(L10n.t("服务器配置与服务器不匹配，请重新扫码/粘贴"))
+ // Spec §3 A3: a rotated relay certificate (or a legacy bad config)
+ // fails the pinned lookup handshake. That is a *config* problem with a
+ // one-step fix (scan a QR pair once to refresh the stored config), not
+ // a generic network error.
+            return .relayConfigMismatch
         }
         return .network(L10n.f("无法连接远程服务器：%@", NetworkErrorInterpreter.message(for: error)))
     }
 
     static func macTransportFailure(_ error: Error) -> PairingCodeFailure {
         if isTLSPinFailure(error) {
-            return .network(L10n.t("无法用 relay 返回的证书指纹连接 Mac，已拒绝连接"))
+ // Link type stays silent (spec §0.4): no "relay" wording in the copy.
+            return .network(L10n.t("无法验证 Mac 的证书指纹，已拒绝连接"))
         }
         return .network(L10n.f("无法连接 Mac：%@", NetworkErrorInterpreter.message(for: error)))
     }

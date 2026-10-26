@@ -250,9 +250,15 @@ final class LinkService: ObservableObject {
     }
 
 
- /// Picks a reachable origin from the QR payload and pairs. On a physical
- /// iPhone loopback origins (127.0.0.1/localhost) are filtered out; each
- /// remaining origin is tried in order and failures are reported together.
+ /// Picks a reachable origin from the QR payload and pairs, following the
+ /// approved network policy (spec §3 A1/A2):
+ /// - **same Wi-Fi**: one parallel LAN `/health` group (2 s budget) first, then
+ /// the relay group as the fallback — the Mac's LAN address is the fastest path;
+ /// - **cellular/cross-network**: relay origins only; LAN origins are never
+ /// dialed (they can only burn the budget);
+ /// - the whole sequence is capped by a 10 s total budget;
+ /// - a failure is one actionable sentence plus per-host reasons (no link-type
+ /// classification is ever exposed, spec §0.4).
     @discardableResult
     func pair(payload: PairingPayload, deviceName: String) async throws -> PairingCredentials {
         pairStep = "校验配对载荷"
@@ -264,39 +270,117 @@ final class LinkService: ObservableObject {
             guard payload.verifyHostSignature() else {
                 throw LinkError.transport(L10n.t("配对载荷签名校验失败（载荷可能被篡改）"))
             }
+ // Spec §3 A3 / D2 self-heal: adopt the control-plane relay config as
+ // soon as the payload is **trusted** — *before* (not after) a
+ // successful redeem — so a rotated relay certificate is refreshed by
+ // scanning the QR once even if this pairing attempt fails later. A
+ // legacy bad config (`relay.origin` = Mac bridge data endpoint, D1) is
+ // never re-saved. Spec P2-2: an unsigned payload must never write the
+ // relay config (there is no trust anchor for it).
+            RelayConfigStore.adoptControlPlane(from: payload)
         }
+
         guard let pairToken = payload.token, !pairToken.isEmpty else {
             throw LinkError.transport(L10n.t("配对载荷缺少配对码（pair.token）"))
         }
         if payload.isExpired {
-            throw LinkError.transport(L10n.t("配对码已过期，请在 Mac 上刷新二维码"))
+            throw LinkError.transport(L10n.t("二维码已过期，请在 Mac 上刷新后重扫。"))
         }
 
         let candidates = PairingOriginSelector.candidates(payload: payload)
         guard !candidates.isEmpty else {
             throw LinkError.transport(
-                L10n.t("配对二维码里只有 127.0.0.1/localhost 地址，手机无法访问。请让 Mac 使用局域网 IP 重新生成二维码。")
+                L10n.t("二维码里没有手机可访问的地址，请在 Mac 上刷新二维码后重扫。")
             )
         }
-
-        var attempts: [String] = []
-        for origin in candidates {
-            do {
-                return try await pairOn(
-                    origin: origin,
-                    payload: payload,
-                    pairToken: pairToken,
-                    deviceName: deviceName,
-                    candidates: candidates
+        let plan = PairingDialPolicy.plan(
+            candidates: candidates,
+            path: NetworkPathMonitor.shared.snapshot,
+            local: NetworkPathMonitor.shared.currentLocalIPv4Network()
+        )
+        guard plan.isDialable else {
+            if plan.rejection == .cellularWithoutRelay {
+ // User policy: cellular/cross-network never falls back to the
+ // Mac's LAN address; the relay must be advertised by the Mac.
+                throw LinkError.transport(
+                    L10n.t("无法连接 Mac。请确认 Mac 端连接页已打开，并在 Mac 上刷新二维码后重扫。")
                 )
-            } catch {
-                attempts.append((origin.host ?? origin.absoluteString) + ": " + NetworkErrorInterpreter.message(for: error))
+            }
+            throw LinkError.transport(
+                L10n.t("配对二维码里没有可用的 Mac 地址，请在 Mac 上刷新二维码后重扫。")
+            )
+        }
+        let deadline = Date().addingTimeInterval(plan.totalBudget)
+        var attemptSummaries: [String] = []
+
+ // Strict plan order (spec P3): consecutive LAN/direct attempts run as one
+ // parallel `/health` group (hard group budget when a relay step follows),
+ // every relay attempt is dialed serially, and every step is clamped by the
+ // total deadline. `plan.attempts` is the execution order — a relay-first
+ // plan dials relay first and only then the LAN group.
+        stepsLoop: for step in PairingDialPolicy.executionSteps(plan) {
+            guard PairingDialPolicy.remainingBudget(deadline: deadline) != nil else { break stepsLoop }
+            switch step {
+            case .lanGroup(let lanAttempts):
+                let groupBudget = plan.lanProbeBudget ?? PairingDialPolicy.lanProbeTimeout
+                pairStep = "查找 Mac"
+                let group = await probeLANGroup(lanAttempts, payload: payload, budget: groupBudget)
+                attemptSummaries.append(contentsOf: group.failures)
+                guard let pick = group.pick else { continue }
+                guard let redeemTimeout = PairingDialPolicy.attemptTimeout(
+                    cap: PairingDialPolicy.redeemTimeout,
+                    deadline: deadline
+                ) else { break stepsLoop }
+                do {
+                    return try await redeemPairingCredentials(
+                        probe: pick.probe,
+                        payload: payload,
+                        pairToken: pairToken,
+                        deviceName: deviceName,
+                        candidates: candidates,
+                        redeemTimeout: redeemTimeout,
+                        deadline: deadline
+                    )
+                } catch {
+                    attemptSummaries.append(Self.attemptSummary(origin: pick.origin, error: error))
+                }
+            case .relay(let attempt):
+                pairStep = "连接 Mac"
+                do {
+                    return try await pairOn(
+                        origin: attempt.url,
+                        payload: payload,
+                        pairToken: pairToken,
+                        deviceName: deviceName,
+                        candidates: candidates,
+                        healthTimeout: PairingDialPolicy.relayHealthTimeout,
+                        redeemTimeout: PairingDialPolicy.redeemTimeout,
+                        deadline: deadline
+                    )
+                } catch {
+                    attemptSummaries.append(Self.attemptSummary(origin: attempt.url, error: error))
+                }
             }
         }
-        let detail = attempts.joined(separator: "\n")
-        throw LinkError.transport(
-            "无法连接 Mac（已尝试 \(candidates.count) 个地址）：\n\(detail)\n请确认 iPhone 与 Mac 在同一 Wi-Fi、已允许本地网络权限，并让 Mac 使用局域网 IP 生成二维码；若 Mac 开着 VPN/隧道或代理模式，请关闭或对局域网分流。"
-        )
+
+ // Everything inside the budget failed: one actionable sentence + the
+ // per-host reasons (host level only, no link-type wording).
+        let head = L10n.t("无法连接 Mac。请确认 Mac 端连接页已打开，并在 Mac 上刷新二维码后重扫。")
+        guard !attemptSummaries.isEmpty else { throw LinkError.transport(head) }
+        throw LinkError.transport(head + "\n" + attemptSummaries.joined(separator: "\n"))
+    }
+
+ /// Result of one `/health` probe: everything the redeem step needs.
+    private struct PairingOriginProbe {
+        var origin: URL
+        var healthJSON: JSONValue
+        var effectivePin: String
+    }
+
+ /// Winner of the parallel LAN probe group.
+    private struct PairingLANGroupPick {
+        var origin: URL
+        var probe: PairingOriginProbe
     }
 
  /// One pairing attempt against a concrete origin: /health -> /pair/redeem.
@@ -305,23 +389,56 @@ final class LinkService: ObservableObject {
         payload: PairingPayload,
         pairToken: String,
         deviceName: String,
-        candidates: [URL]
+        candidates: [URL],
+        healthTimeout: TimeInterval = PairingDialPolicy.relayHealthTimeout,
+        redeemTimeout: TimeInterval = PairingDialPolicy.redeemTimeout,
+        deadline: Date? = nil,
+        prefetchedProbe: PairingOriginProbe? = nil
     ) async throws -> PairingCredentials {
+        let probe: PairingOriginProbe
+        if let prefetchedProbe, prefetchedProbe.origin == origin {
+            probe = prefetchedProbe
+        } else {
+            probe = try await probePairingOrigin(
+                origin: origin,
+                payload: payload,
+                healthTimeout: healthTimeout,
+                deadline: deadline
+            )
+        }
+        return try await redeemPairingCredentials(
+            probe: probe,
+            payload: payload,
+            pairToken: pairToken,
+            deviceName: deviceName,
+            candidates: candidates,
+            redeemTimeout: redeemTimeout,
+            deadline: deadline
+        )
+    }
+
+ /// Pinned `/health` check for one origin: status/ok, leaf pin consistency
+ /// (payload pin wins; TOFU only when the payload has no pin) and CA pin check.
+    private func probePairingOrigin(
+        origin: URL,
+        payload: PairingPayload,
+        healthTimeout: TimeInterval,
+        deadline: Date?
+    ) async throws -> PairingOriginProbe {
         guard let host = origin.host, !host.isEmpty else {
             throw LinkError.transport(L10n.f("配对 origin 缺少 host: %@", origin.absoluteString))
         }
         guard origin.scheme?.lowercased() == "https" else {
             throw LinkError.transport(L10n.t("配对 origin 必须是 https"))
         }
-
-        pairStep = "校验桌面端证书"
+        let timeout = try Self.boundedTimeout(cap: healthTimeout, deadline: deadline)
         let requestedPin = payload.tlsLeafPinHex
         let health = try await HTTPSClient.json(
             origin: origin,
             method: "GET",
             path: "/health",
             leafPin: requestedPin,
-            timeout: 15
+            timeout: timeout
         )
         guard health.status == 200, health.json["ok"]?.boolValue == true else {
             throw LinkError.transport(L10n.f("link 插件 /health 不可用（HTTP %lld）", health.status))
@@ -347,6 +464,84 @@ final class LinkService: ObservableObject {
             throw LinkError.transport(L10n.t("配对载荷 CA 指纹与 link 插件不一致"))
         }
         discoveredLeafPin = effectivePin
+        return PairingOriginProbe(origin: origin, healthJSON: health.json, effectivePin: effectivePin)
+    }
+
+ /// Parallel `/health` probe of the LAN/direct group (spec §3 A2): every origin
+ /// gets a 1.5 s timeout, the whole group never exceeds `budget`, and the first
+ /// success wins (cancelling the remaining probes). Returns per-host failures so
+ /// the aggregated message can still say *why* every address failed.
+    private func probeLANGroup(
+        _ attempts: [PairingDialAttempt],
+        payload: PairingPayload,
+        budget: TimeInterval
+    ) async -> (pick: PairingLANGroupPick?, failures: [String]) {
+        guard !attempts.isEmpty else { return (nil, []) }
+        let probeTimeout = min(PairingDialPolicy.lanProbeTimeout, max(0.2, budget))
+        var pick: PairingLANGroupPick?
+        var failures: [String] = []
+        await withTaskGroup(
+            of: (index: Int, origin: URL, probe: PairingOriginProbe?, failure: String?).self
+        ) { group in
+            for (index, attempt) in attempts.enumerated() {
+                group.addTask { [self] in
+                    do {
+                        let probe = try await probePairingOrigin(
+                            origin: attempt.url,
+                            payload: payload,
+                            healthTimeout: probeTimeout,
+                            deadline: nil
+                        )
+                        return (index, attempt.url, probe, nil)
+                    } catch {
+                        return (index, attempt.url, nil, Self.attemptSummary(origin: attempt.url, error: error))
+                    }
+                }
+            }
+            for await result in group {
+                if let probe = result.probe {
+                    pick = PairingLANGroupPick(origin: result.origin, probe: probe)
+                    group.cancelAll()
+                    return
+                }
+                if let failure = result.failure {
+                    failures.append(failure)
+                }
+            }
+        }
+        return (pick, failures)
+    }
+
+ /// One host-level line for the aggregated pairing failure. Deliberately has no
+ /// "LAN / relay / 直连 / 中继" wording (link type stays silent).
+    private nonisolated static func attemptSummary(origin: URL, error: Error) -> String {
+        let host = origin.host ?? origin.absoluteString
+        return host + "：" + NetworkErrorInterpreter.message(for: error)
+    }
+
+ /// Attempt timeout clamped to the remaining total pairing budget.
+    private static func boundedTimeout(cap: TimeInterval, deadline: Date?) throws -> TimeInterval {
+        guard let deadline else { return cap }
+        guard let timeout = PairingDialPolicy.attemptTimeout(cap: cap, deadline: deadline) else {
+            throw LinkError.transport(L10n.t("配对超时，请重试"))
+        }
+        return timeout
+    }
+
+ /// Redeems device credentials on an origin whose `/health` just passed.
+    private func redeemPairingCredentials(
+        probe: PairingOriginProbe,
+        payload: PairingPayload,
+        pairToken: String,
+        deviceName: String,
+        candidates: [URL],
+        redeemTimeout: TimeInterval,
+        deadline: Date?
+    ) async throws -> PairingCredentials {
+        let origin = probe.origin
+        let healthJSON = probe.healthJSON
+        let effectivePin = probe.effectivePin
+        let timeout = try Self.boundedTimeout(cap: redeemTimeout, deadline: deadline)
 
  // Device identity: the plugin binds the credential to this P-256 key and
  // requires a signature for every /auth/challenge afterwards.
@@ -364,7 +559,7 @@ final class LinkService: ObservableObject {
             path: "/pair/redeem",
             body: redeemBody,
             leafPin: effectivePin,
-            timeout: 20
+            timeout: timeout
         )
         guard redeem.status == 200, redeem.json["ok"]?.boolValue == true else {
             let code = redeem.json["error"]?.stringValue ?? "unknown"
@@ -372,7 +567,7 @@ final class LinkService: ObservableObject {
             case "pair/invalid":
                 throw LinkError.transport(L10n.t("配对码无效或已被使用，请在 Mac 上刷新二维码"))
             case "pair/expired":
-                throw LinkError.transport(L10n.t("配对码已过期，请在 Mac 上刷新二维码"))
+                throw LinkError.transport(L10n.t("二维码已过期，请在 Mac 上刷新后重扫。"))
             case "pair/rate-limited":
                 throw LinkError.transport(L10n.t("配对尝试过于频繁，请稍后再试"))
             case "pair/invalid-key":
@@ -409,16 +604,16 @@ final class LinkService: ObservableObject {
         let learnedCandidates = Self.mergeOriginCandidates(
             currentOrigin: origin,
             payloadCandidates: candidates,
-            relayOrigin: payload.relay?.origin,
-            healthDeviceEndpoints: Self.healthDeviceEndpoints(from: health.json)
+            relayOrigin: nil,
+            healthDeviceEndpoints: Self.healthDeviceEndpoints(from: healthJSON)
         )
  // P1: remember the plugin's single-WSS capability + in-band auth tickets
  // at pairing time, so a cold start/reconnect can skip the "anonymous
  // upgrade -> 401 -> fallback" probe (design §4.3/§6).
         let p1Capable: Bool = {
-            if let flag = health.json["features"]?["muxRpc"]?.boolValue { return flag }
-            if let proto = health.json["proto"]?.stringValue { return proto.contains("dsh-m/2") }
-            if let protos = health.json["proto"]?.arrayValue {
+            if let flag = healthJSON["features"]?["muxRpc"]?.boolValue { return flag }
+            if let proto = healthJSON["proto"]?.stringValue { return proto.contains("dsh-m/2") }
+            if let protos = healthJSON["proto"]?.arrayValue {
                 return protos.contains { $0.stringValue == "dsh-m/2" }
             }
             return false
@@ -427,7 +622,7 @@ final class LinkService: ObservableObject {
         let credentials = PairingCredentials(
             origin: normalizedOrigin,
             leafPin: effectivePin,
-            caCertBase64: payload.tlsCACertBase64 ?? health.json["tls"]?["caCert"]?.stringValue,
+            caCertBase64: payload.tlsCACertBase64 ?? healthJSON["tls"]?["caCert"]?.stringValue,
             deviceId: deviceId,
             credential: credential,
             deviceName: deviceName,
@@ -441,9 +636,16 @@ final class LinkService: ObservableObject {
             hostId: payload.host?.id
         )
         adopt(credentials: credentials)
- // M2a: remember the relay server advertised by the Mac so public
- // lookup/reconnect works without a second server-config scan.
-        RelayConfigStore.capture(from: payload)
+ // M2a: remember the control-plane relay config advertised by the Mac so
+ // public lookup/reconnect works without a second server-config scan. The
+ // adoption ran right after signature verification (self-heal, spec §3 A3);
+ // repeating it here keeps the original "commit on success" semantics and
+ // is idempotent. Spec P2-2: an unsigned (manual) payload must never write
+ // the relay config; the store re-checks `payload.isSigned` as defence in
+ // depth, and validation rejects legacy bridge data origins.
+        if payload.isSigned {
+            RelayConfigStore.adoptControlPlane(from: payload)
+        }
         return credentials
     }
 
@@ -459,10 +661,17 @@ final class LinkService: ObservableObject {
  /// from the current origin (design §4.7);
  /// 2. the payload candidates in their existing order, so payload/code pairing
  /// keeps its exact candidate order and is not duplicated;
- /// 3. the payload's optional top-level `relay.origin` (design §5.4);
- /// 4. `/health.deviceEndpoints` — every origin the phone may dial.
+ /// 3. `/health.deviceEndpoints` — every origin the phone may dial.
  ///
- /// Learned origins (3/4) must be https and non-loopback, and are de-duplicated
+ /// Spec §3 A3: `relayOrigin` is **ignored** (parameter kept for source
+ /// compatibility). The payload's top-level `relay.origin` is the relay
+ /// *control plane* origin since D1's fix, not a Mac data-plane origin; the
+ /// Mac's relay bridge endpoint is already covered by `/health.deviceEndpoints`
+ /// (and by `endpoints[]` in payload candidates). Persisting the control
+ /// origin here used to make every reconnect dial the relay server with the
+ /// Mac certificate pin (TLS failure).
+ ///
+ /// Learned origins must be https and non-loopback, and are de-duplicated
  /// against everything before them: on a physical iPhone 127.0.0.1/localhost/
  ///1 point at the phone itself. The current origin is kept even when it is
  /// loopback (the iOS simulator shares the Mac's network namespace).
@@ -472,6 +681,7 @@ final class LinkService: ObservableObject {
         relayOrigin: String?,
         healthDeviceEndpoints: [String]
     ) -> [String] {
+        _ = relayOrigin
         var seen = Set<String>()
         var result: [String] = []
 
@@ -488,11 +698,7 @@ final class LinkService: ObservableObject {
         for candidate in payloadCandidates {
             append(candidate, allowLoopback: true)
         }
-        var learned = healthDeviceEndpoints
-        if let relayOrigin, !relayOrigin.isEmpty {
-            learned.insert(relayOrigin, at: 0)
-        }
-        for text in learned {
+        for text in healthDeviceEndpoints {
             let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
             guard let url = URL(string: trimmed) else { continue }
             append(url, allowLoopback: false)
