@@ -1,5 +1,28 @@
 import Foundation
 
+/// 一条「流式准备中」的工具调用（task-5）。
+///
+/// `session/follow` 的 process-local `assistant-stream` 会在磁盘事件落地
+/// （`tool/call`）之前就送来 `tool-call-delta`：App 用它提前渲染「正在调用 X /
+/// 正在生成参数」，否则一次长工具调用期间详情页只有思考文本、看不到工具步骤。
+///
+/// 同一轮 assistant 消息里的并行工具调用用 `index` 区分（流内稳定）；`id` 由
+/// `index` 派生，保证参数增长时 SwiftUI 的行身份不变（不重建行）。`callId` /
+/// `name` 可能晚于首个 `argumentsDelta` 到达，缺失时先按 `index` 合并、到达后补上。
+struct LiveToolPreparation: Equatable, Identifiable {
+ /// assistant 消息内的工具调用块序号（流内稳定，多工具并行时用于区分）。
+    var index: Int
+ /// Host 调用 id（`tool-call-delta.id`）；`tool/call` 落地时用于精确结算。
+    var callId: String? = nil
+ /// 工具名（`tool-call-delta.name`），可能晚到。
+    var name: String?
+ /// 已累积的 `argumentsDelta` 原文拼接（不保证是合法 JSON，UI 显示时应容错）。
+    var arguments: String
+
+ /// SwiftUI 行身份：按 `index` 稳定，参数增长不换行。
+    var id: String { "live-prep-\(index)" }
+}
+
 /// Applies session/follow frames to a local window.
 ///
 /// Implements the DSH browser client's journal alignment algorithm
@@ -78,6 +101,18 @@ final class SessionJournal {
 
  /// Latest live assistant text assembled from assistant-stream text deltas.
     private(set) var liveAssistantText: String = ""
+
+ /// task-5: 实时思考文本（`assistant-stream` 的 `reasoning-delta` 累积）。
+ ///
+ /// 与 `liveAssistantText` 同生命周期：start / 新 snapshot 时清空，
+ /// 持久事件 `assistant/message` / `turn/end` 结算时清空（磁盘消息是唯一真源）。
+    private(set) var liveReasoningText: String = ""
+
+ /// task-5: 实时「准备中」的工具调用（`tool-call-delta` 按 `index` 合并）。
+ ///
+ /// 持久 `tool/call` 到达时移除对应项；`assistant/message`/`turn/end`/
+ /// snapshot 结算时清空。列表按 `index` 升序（并行工具调用按调用顺序渲染）。
+    private(set) var liveToolPreparations: [LiveToolPreparation] = []
 
     var title: String? { projections["title"]?.stringValue }
     var permissionsValue: String? { projections["permissions"]?["currentValue"]?.stringValue }
@@ -166,7 +201,13 @@ final class SessionJournal {
         }
         markReachedOldestIfNeeded()
         snapshotCount += 1
+ // task-5: a (re)opened snapshot is authoritative — process-local previews
+ // can never be trusted across a window rebuild (the stream is re-opened
+ // from a baseline revision and the new window already has the committed
+ // messages the previews were standing in for).
         liveAssistantText = ""
+        liveReasoningText = ""
+        liveToolPreparations = []
         return .snapshotReplaced
     }
 
@@ -219,9 +260,21 @@ final class SessionJournal {
         }
  // process-local assistant-stream deltas are superseded by the committed
  // assistant/message (or the turn ending): clear them to avoid rendering
- // the same text twice.
+ // the same text twice. task-5: the reasoning preview and the tool-call
+ // preparations live on the same process-local timeline and are settled by
+ // the same durable events.
         if event.type == "assistant/message" || event.type == "turn/end" {
             liveAssistantText = ""
+            liveReasoningText = ""
+            liveToolPreparations = []
+        }
+ // task-5: the durable tool/call supersedes its streamed preparation.
+        if event.type == "tool/call" {
+            settleLiveToolPreparation(
+                callId: event.data?["callId"]?.stringValue,
+                name: event.data?["name"]?.stringValue,
+                arguments: event.data?["arguments"]?.stringValue
+            )
         }
         return .eventsApplied([event.seq])
     }
@@ -413,11 +466,23 @@ final class SessionJournal {
         switch frame.type {
         case "start":
             liveAssistantText = ""
+            liveReasoningText = ""
+            liveToolPreparations = []
         case "chunk":
+ // task-5: 一个 chunk 只携带一种增量；三路各自累积（思考/文本/工具参数）。
             if let text = Self.textDelta(from: frame.chunk) {
                 liveAssistantText += text
             }
+            if let reasoning = Self.reasoningDelta(from: frame.chunk) {
+                liveReasoningText += reasoning
+            }
+            if let toolCall = Self.toolCallDelta(from: frame.chunk) {
+                mergeLiveToolCallDelta(toolCall)
+            }
         case "end":
+ // task-5: 刻意保留两路实时预览（不清空）。`end` 只是流式帧的收尾，
+ // 真正的结算事件（`assistant/message` / `tool/call` / `turn/end`）
+ // 紧随其后；若在 end 就清空，UI 会在两帧之间闪一次空。
             break
         default:
             break
@@ -441,6 +506,108 @@ final class SessionJournal {
             }
             return nil
         }
+    }
+
+ // MARK: - 实时思考 / 工具参数（task-5）
+
+ /// 一条 `tool-call-delta` chunk（已验证的 Host 形状：
+ /// `{type:"tool-call-delta", index, id, name?, argumentsDelta}`）。
+    struct ToolCallDelta: Equatable {
+        var index: Int
+        var callId: String?
+        var name: String?
+        var argumentsDelta: String
+    }
+
+ /// 从 chunk 中提取思考（reasoning）增量；不是思考帧时返回 nil。
+ ///
+ /// 已验证的 chunk 类型是 `reasoning-delta{text}`；其余别名只是同一语义的
+ /// Provider 变体（与 `textDelta` 的容错策略一致）。
+    static func reasoningDelta(from chunk: JSONValue?) -> String? {
+        guard let chunk else { return nil }
+        let type = chunk["type"]?.stringValue ?? ""
+        switch type {
+        case "reasoning", "reasoning-delta", "thinking", "thinking-delta":
+            return chunk["text"]?.stringValue
+                ?? chunk["delta"]?.stringValue
+                ?? chunk["reasoning"]?.stringValue
+        default:
+            if let delta = chunk["delta"], delta["type"]?.stringValue != nil {
+                return reasoningDelta(from: delta)
+            }
+            return nil
+        }
+    }
+
+ /// 从 chunk 中提取工具调用增量；不是工具调用帧时返回 nil。
+    static func toolCallDelta(from chunk: JSONValue?) -> ToolCallDelta? {
+        guard let chunk else { return nil }
+        let type = chunk["type"]?.stringValue ?? ""
+        guard type == "tool-call-delta" || type == "tool_call_delta" else {
+            if let delta = chunk["delta"], delta["type"]?.stringValue != nil {
+                return toolCallDelta(from: delta)
+            }
+            return nil
+        }
+        guard let index = chunk["index"]?.int else { return nil }
+        return ToolCallDelta(
+            index: index,
+            callId: chunk["id"]?.stringValue,
+            name: chunk["name"]?.stringValue,
+            argumentsDelta: chunk["argumentsDelta"]?.stringValue
+                ?? chunk["arguments_delta"]?.stringValue
+                ?? ""
+        )
+    }
+
+ /// 把一条 `tool-call-delta` 按 `index` 合并进 `liveToolPreparations`：
+ /// 参数增量拼接，晚到的 `id` / `name` 补上。
+    private func mergeLiveToolCallDelta(_ delta: ToolCallDelta) {
+        if let position = liveToolPreparations.firstIndex(where: { $0.index == delta.index }) {
+            var preparation = liveToolPreparations[position]
+            preparation.arguments += delta.argumentsDelta
+            if let callId = delta.callId, !callId.isEmpty { preparation.callId = callId }
+            if let name = delta.name, !name.isEmpty { preparation.name = name }
+            liveToolPreparations[position] = preparation
+            return
+        }
+        let preparation = LiveToolPreparation(
+            index: delta.index,
+            callId: delta.callId.flatMap { $0.isEmpty ? nil : $0 },
+            name: delta.name.flatMap { $0.isEmpty ? nil : $0 },
+            arguments: delta.argumentsDelta
+        )
+ // 并行工具调用的 delta 会交错到达（0,1,0,…）：按 index 有序插入，
+ // UI 按调用顺序渲染而不是首个 delta 的到达顺序。
+        let insertion = liveToolPreparations.firstIndex { $0.index > delta.index }
+            ?? liveToolPreparations.endIndex
+        liveToolPreparations.insert(preparation, at: insertion)
+    }
+
+ /// 持久 `tool/call` 落地时结算对应的流式准备项。
+ ///
+ /// 匹配顺序：
+ /// 1. Host `callId` 精确匹配（`tool-call-delta.id` 已到达时最可靠）；
+ /// 2. 工具名 + 原始参数串匹配（Provider 先送参数、后送 identity 时 id 缺失）；
+ /// 3. 带 `callId` 却都匹配不上：整体清空。此时流式形状已偏离已验证契约，
+ /// 留下「准备中」行会永久渲染一个幽灵步骤；磁盘 `tool/call` 行才是权威。
+ /// 事件不带 `callId`（旧形状）时保守处理：匹配不上就保留，等 turn 结算清空。
+    private func settleLiveToolPreparation(callId: String?, name: String?, arguments: String?) {
+        guard !liveToolPreparations.isEmpty else { return }
+        if let callId,
+           let position = liveToolPreparations.firstIndex(where: { $0.callId == callId }) {
+            liveToolPreparations.remove(at: position)
+            return
+        }
+        if let name,
+           let position = liveToolPreparations.firstIndex(where: {
+               $0.name == name && $0.arguments == (arguments ?? "")
+           }) {
+            liveToolPreparations.remove(at: position)
+            return
+        }
+        guard callId != nil else { return }
+        liveToolPreparations.removeAll()
     }
 
     func event(type: String) -> SessionEvent? {

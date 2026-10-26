@@ -26,3 +26,14 @@ struct PinMark: View {
 
     private static let strokeStyle = StrokeStyle(lineWidth: 2.6, lineCap: .round, lineJoin: .round)
 }
+
+/// Vertical alignment guide for the pinned card's title baseline (design v6 §4).
+///
+/// The 15pt card-title line box sits ~14.67pt above its baseline, i.e. 5.67pt
+/// below the line-box centre; the pin mark centres its artwork in its box, so
+/// the mark needs its centre nudged 5.5pt down (rounded from 5.67) to share the
+/// title baseline. With the 13pt pin the guide is therefore 12.0. Pure so the
+/// value is unit-tested (SwipeAndPinArchiveTests).
+func pinTitleBaselineGuide(pinSize: CGFloat) -> CGFloat {
+    pinSize / 2 + 5.5
+}

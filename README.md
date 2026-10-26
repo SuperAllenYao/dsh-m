@@ -6,7 +6,7 @@ DSH-m 通过自托管、TLS 证书钉扎的桥接，把 iPhone App **DSH-m** 连
 
 ## 状态
 
-当前版本 **v2.14.0**（2026-10-26）。已交付的能力：
+当前版本 **v2.15.0**（2026-10-26）。已交付的能力：
 
 **导航**
 
@@ -26,12 +26,13 @@ DSH-m 通过自托管、TLS 证书钉扎的桥接，把 iPhone App **DSH-m** 连
 **会话与交互**
 
 - 工作区 / 会话浏览与实时流；会话列表轻量投影，首屏更快。
-- 会话卡片左滑快捷操作：置顶、归档（归档带二次确认弹窗）。
-- 分组「+」一键新建会话并直达；未发送输入自动存草稿，回到该工作区继续；新建空白会话布局与有消息会话一致。
+- 会话卡片左滑快捷操作：置顶、归档（归档带二次确认弹窗；按钮为纯图标，紧凑不占宽）。
+- 会话状态一眼看清：列表卡片状态行与详情右上角用同一套状态图标（等待审批 / 等待作答 / 进行中 / 出错 / 未开始 / 空闲 / 离线），等待类状态轻轻呼吸；某一轮开始或结束，列表卡片立刻变化并自动置顶，不需要下拉刷新。
+- 分组「+」一键新建会话并直达；未发送输入自动存草稿，回到该工作区继续；新建的草稿会话固定排在列表顶部，创建后立刻可见（与桌面端一致）；新建空白会话布局与有消息会话一致。
 - 顶栏品牌与版本信息重排：版本号下沉第二行，两行与 logo 等高。
-- 会话详情为一条平铺消息流（对齐 DSH 桌面端）：无 turn 卡片与按轮折叠；推理与工具调用按「过程组」折叠，文件变更卡在流尾；每行独立懒加载，长会话滚动更稳、下拉加载的新消息立即可见。
+- 会话详情为一条平铺消息流（对齐 DSH 桌面端）：无 turn 卡片与按轮折叠；推理与工具调用按「过程组」平铺展开——组头显示「N 步 · 运行中 / 已完成」，点一下收起整组，收起/展开时组头停在原位不动；模型思考时思考内容在组内逐字增长（点开可看全文），工具尚未开始先显示「准备运行命令…」；文件变更卡在流尾；每行独立懒加载，长会话滚动更稳、下拉加载的新消息立即可见。
 - 子代理与工具调用视图；子代理入口常驻数量，只有真实运行中才播放边框流光，运行期间新启动的子代理即时计入。
-- 审批与用户提问：底部交互面板强制作答，可向下折叠查看会话输出，右上角「等待审批 / 等待作答」徽标可重新展开；多题问答一题一页（上一题 / 下一题、进度、单选自动前进、返回保留草稿、跳过与提交校验）；支持锁屏推送直接处理。
+- 审批与用户提问：底部交互面板强制作答，可向下折叠查看会话输出，右上角状态图标指示这一刻的会话状态（等待审批 / 等待作答 / 进行中 / 出错 / 未开始 / 空闲 / 离线），等待审批或作答时可重新展开底部面板；多题问答一题一页（上一题 / 下一题、进度、单选自动前进、返回保留草稿、跳过与提交校验）；支持锁屏推送直接处理。
 - 统一底部弹层（模型 / 权限 / 子代理 / 文件变更 / 思考 / 工具详情）：从屏幕底部全宽弹出、高度随内容自适应并含底部安全区，按住顶部触摸条下滑即可收起。
 - 手机上切换会话权限预设（只读 ↔ 工作区可写 ↔ 完全访问）。
 - 手机上切换会话的模型与推理等级（下一次请求生效）；面板只列出桌面端真实可切换的模型；桌面端切换模型后手机端会话页实时跟随，无需重新进入会话。
@@ -150,7 +151,7 @@ DSH-m connects the iOS app **DSH-m** to your Mac's DSH desktop through a self-ho
 
 ## Status
 
-Current version **v0.2.3** (2026-10-23). What ships today:
+Current version **v2.15.0** (2026-10-26). What ships today:
 
 **Connection and pairing**
 
@@ -163,12 +164,13 @@ Current version **v0.2.3** (2026-10-23). What ships today:
 **Sessions and interaction**
 
 - Workspace / session browsing with live streams; a lite session-list projection makes the first screen faster.
-- Swipe a session card left to pin or archive it (archiving confirms first).
-- The「+」on a group header creates a new session and jumps straight in; unsent input is kept as a draft, and a brand-new empty session lays out like one with messages.
+- Swipe a session card left to pin or archive it (archiving confirms first; the actions are icon-only, so they stay compact).
+- Session status at a glance: the list's status line and the detail header share one icon set (waiting for approval / waiting for an answer / running / error / not started / idle / offline), and waiting states breathe gently. When a turn starts or ends, the list card changes immediately and moves to the top — no pull-to-refresh needed.
+- The「+」on a group header creates a new session and jumps straight in; unsent input is kept as a draft, and a newly created draft session stays at the top of the list (matching the desktop app). A brand-new empty session lays out like one with messages.
 - Header redesign: the version number sits on a second line level with the logo.
-- The session detail is a single flat message stream (matching the DSH desktop app): no turn cards or per-turn folding; reasoning and tool calls fold into process groups, the file-changes card sits at the end of the stream, and every row lazy-loads on its own, so long sessions stay smooth and newly paged-in messages appear immediately.
+- The session detail is a single flat message stream (matching the DSH desktop app): no turn cards or per-turn folding; reasoning and tool calls lay out flat inside process groups — the group header shows "N steps · running / done", one tap collapses the group, and collapsing or expanding keeps the header exactly in place. While the model thinks, the thinking text grows word by word inside the group (tap to read it all), and a tool that has not started yet shows "Preparing to run command…". The file-changes card sits at the end of the stream, and every row lazy-loads on its own, so long sessions stay smooth and newly paged-in messages appear immediately.
 - Subagent and tool-call views; the subagent entry keeps a persistent count, plays the border beam only while subagents are actually running, and counts subagents started while the session is open immediately.
-- Approvals and user questions: the bottom interaction panel makes answering mandatory, folds down so you can read the conversation output, and the top-right "waiting for approval / waiting for answer" badge re-opens it; multi-question prompts page one question at a time (previous / next, progress, auto-advance for single-select, drafts preserved, skip / submit validation); lock-screen push actions are supported.
+- Approvals and user questions: the bottom interaction panel makes answering mandatory, folds down so you can read the conversation output, and the top-right status icon shows this moment's session state (waiting for approval / waiting for an answer / running / error / not started / idle / offline) while a waiting state re-opens it; multi-question prompts page one question at a time (previous / next, progress, auto-advance for single-select, drafts preserved, skip / submit validation); lock-screen push actions are supported.
 - Unified bottom popups (models / permissions / subagents / file changes / reasoning / tool details): full-width sheets rise from the screen edge, size themselves to their content plus the bottom safe area, and dismiss by dragging the top grabber down.
 - Phone-switchable session permission presets (read-only ↔ workspace-write ↔ full access).
 - Phone-switchable model and reasoning effort for a session (applies from the next request); the panel lists only models the desktop can actually switch to, and model switches made on the desktop are reflected in the app in real time without reopening the session.

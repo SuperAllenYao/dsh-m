@@ -60,6 +60,13 @@ final class WorkspaceViewModel: ObservableObject {
  /// line). Refreshed on list appear / draft flush; the cards read from it so
  /// SessionCardView stays equatable on value identity.
     @Published private(set) var phoneCreatedDraftPreviews: [String: String] = [:]
+ /// Two-phase close-out guard: on returning from a
+ /// session page this list refreshes ~580 ms BEFORE the detail's onDisappear
+ /// flush reaches DraftStore, so a pending 500 ms draft debounce reads as "no
+ /// draft" and used to prune the blank for good. Missing-draft blanks are kept
+ /// for one refresh (hidden by isVisible) and pruned only if still missing on
+ /// the next one.
+    private var blankDraftMissIds: Set<String> = []
  /// Workspace whose plus button is currently minting a session (spinner state).
     @Published private(set) var creatingWorkspaceId: String?
  /// R3: the one session card whose swipe actions are revealed (single-card
@@ -73,6 +80,10 @@ final class WorkspaceViewModel: ObservableObject {
     private(set) var followState = WorkspaceFollowState()
 
     private var sessionsById: [String: SessionListItem] = [:]
+ /// 最近一次网络快照（overlay 前）的原始 running 值，按 sessionId。
+ /// live 运行态 overlay 必须能整体撤销：`$events` 流丢失/重连清空 live map 时，
+ /// 已写进 `allSessions` 的旧 overlay 要按这份快照真值回退。
+    private var snapshotRunningById: [String: Bool] = [:]
     private var sessionsLoaded = false
     private weak var link: LinkService?
     private var workspaceStream: RemoteStreamHandle?
@@ -241,6 +252,7 @@ final class WorkspaceViewModel: ObservableObject {
         }
         if let list = cached.payload.sessionList,
            let value = try? list.decode(SessionListValue.self) {
+            rememberSnapshotRunning(value.items)
             allSessions = value.items
             var byId: [String: SessionListItem] = [:]
             byId.reserveCapacity(value.items.count)
@@ -307,6 +319,7 @@ final class WorkspaceViewModel: ObservableObject {
         guard !sessionsLoaded else { return }
         lastSessionListJSON = raw
         sessionsLoaded = true
+        rememberSnapshotRunning(value.items)
         allSessions = value.items
         var byId: [String: SessionListItem] = [:]
         byId.reserveCapacity(value.items.count)
@@ -679,16 +692,28 @@ final class WorkspaceViewModel: ObservableObject {
     func refreshBlankCardState() {
         guard !phoneCreatedBlanks.isEmpty else {
             if !phoneCreatedDraftPreviews.isEmpty { phoneCreatedDraftPreviews = [:] }
+            blankDraftMissIds = []
             return
         }
         var survivors: Set<String> = []
         var previews: [String: String] = [:]
+        var stillMissingDraft: Set<String> = []
         for id in phoneCreatedBlanks {
             if let item = sessionsById[id], item.blank != true { continue }
-            guard let text = DraftStore.shared.text(for: id) else { continue }
+            guard let text = DraftStore.shared.text(for: id) else {
+ // First miss: the draft may still be in the 500 ms debounce window
+ // or waiting for the detail's onDisappear flush (which runs after
+ // this refresh). Keep the id; isVisible already keeps the card
+ // hidden until a draft exists.
+                if blankDraftMissIds.contains(id) { continue }
+                stillMissingDraft.insert(id)
+                survivors.insert(id)
+                continue
+            }
             survivors.insert(id)
             previews[id] = String(text.split(separator: "\n", omittingEmptySubsequences: true).first ?? "")
         }
+        blankDraftMissIds = stillMissingDraft
         if survivors != phoneCreatedBlanks {
             phoneCreatedBlanks = survivors
             persistPhoneCreatedBlanks()
@@ -1243,8 +1268,33 @@ final class WorkspaceViewModel: ObservableObject {
 
  /// Test seam: apply one `session/list` snapshot.
     func applySessions(_ items: [SessionListItem]) {
+        rememberSnapshotRunning(items)
+ // v6：列表快照落地后叠加 `$events` 的实时运行态，避免「请求在 emit 之前、
+ // 回包在 emit 之后」把刚变进行中的卡片打回旧状态。
+        let merged = Self.overlayLiveRunning(
+            items,
+            live: link?.liveSessionRunning ?? [:],
+            liveUpdatedAt: link?.liveSessionRunningUpdatedAt ?? [:]
+        )
+        installSessions(merged)
+    }
+
+ /// Records the pristine running flags of a network snapshot (before any live
+ /// overlay) so the overlay can be reverted later.
+    private func rememberSnapshotRunning(_ items: [SessionListItem]) {
+        var map: [String: Bool] = [:]
+        map.reserveCapacity(items.count)
+ // `running` 是可选字段：快照省略时按「未运行」记（nil 与 false 展示等价），
+ // 这样清空 live map 后所有会话都能回退，不会因 nil 丢键而残留 overlay。
+        for item in items { map[item.sessionId] = item.running ?? false }
+        snapshotRunningById = map
+    }
+
+ /// Publishes an already-overlaid session list (assignments + group rebuild).
+    private func installSessions(_ items: [SessionListItem]) {
         allSessions = items
         var byId: [String: SessionListItem] = [:]
+        byId.reserveCapacity(items.count)
         for item in items {
             byId[item.sessionId] = item
         }
@@ -1256,13 +1306,91 @@ final class WorkspaceViewModel: ObservableObject {
         maybeStartPrewarm()
     }
 
+ /// live 运行态覆盖快照的最大年龄（秒）。
+ ///
+ /// emit 的唯一职责是补「`session/list` 请求在途、emit 先到、旧回包后到」的
+ /// 短暂竞态窗；超出该窗口后 `session/list` 快照才是网络真值。这样即使某条
+ /// `running=false` emit 丢失（后台/断连/流丢失），错误状态也最多残留一个窗口，
+ /// 而不会在重连后无限期覆盖新快照。
+    static let liveRunningOverlayMaxAge: TimeInterval = 30
+
+ /// 纯函数：把 live 运行态叠加到列表行上（可单测，不依赖 LinkService）。
+ /// - Parameters:
+ /// - liveUpdatedAt: 每条 emit 的落库时间；缺时间戳的条目按新鲜处理（兼容旧调用）。
+    static func overlayLiveRunning(
+        _ items: [SessionListItem],
+        live: [String: Bool],
+        liveUpdatedAt: [String: Date] = [:],
+        now: Date = Date(),
+        maxAge: TimeInterval = liveRunningOverlayMaxAge
+    ) -> [SessionListItem] {
+        guard !live.isEmpty else { return items }
+        var changed = false
+        let result = items.map { item -> SessionListItem in
+            guard let running = live[item.sessionId], item.running != running else { return item }
+            if let updatedAt = liveUpdatedAt[item.sessionId],
+               now.timeIntervalSince(updatedAt) > maxAge {
+                return item
+            }
+            var copy = item
+            copy.running = running
+            changed = true
+            return copy
+        }
+        return changed ? result : items
+    }
+
+ /// `$events` 运行态变化：不重新拉列表，直接就地更新卡片并重排（running 置顶）。
+    func applyLiveSessionRunning() {
+        guard let link else { return }
+        applyLiveSessionRunning(
+            live: link.liveSessionRunning,
+            liveUpdatedAt: link.liveSessionRunningUpdatedAt
+        )
+    }
+
+ /// Re-derives the list running flags from the pristine snapshot + the current
+ /// live map (test seam, no LinkService dependency).
+ ///
+ /// Every entry first falls back to its network-snapshot value, then fresh live
+ /// emits are applied on top. This makes an emptied/stale live map self-healing:
+ /// clearing it (full teardown / `$events` stream loss) reverts cards that were
+ /// previously overlaid, instead of leaving them stuck in 「进行中」.
+    func applyLiveSessionRunning(live: [String: Bool], liveUpdatedAt: [String: Date]) {
+        guard sessionsLoaded else { return }
+        let now = Date()
+        var changed = false
+        let merged = allSessions.map { item -> SessionListItem in
+            var target = snapshotRunningById[item.sessionId] ?? item.running
+            if let running = live[item.sessionId] {
+                let fresh = liveUpdatedAt[item.sessionId].map {
+                    now.timeIntervalSince($0) <= Self.liveRunningOverlayMaxAge
+                } ?? true
+                if fresh { target = running }
+            }
+            guard target != item.running else { return item }
+            var copy = item
+            copy.running = target
+            changed = true
+            return copy
+        }
+        guard changed else { return }
+        installSessions(merged)
+    }
+
     private func rebuildGroups() {
         let archived = followState.archivedSessionIds
         let pinnedRank = Dictionary(
             followState.pinnedSessionIds.enumerated().map { ($0.element, $0.offset) },
             uniquingKeysWith: { first, _ in first }
         )
-        let comparator = Self.sessionComparator(pinnedRank: pinnedRank)
+ // v6.1: a phone-created draft card must sit at the
+ // top of its workspace group, exactly like the DSH desktop sidebar. The
+ // Host reuses an existing empty session for "+" (so its server-side
+ // updatedAt can be days old) — recency alone therefore ranks a brand-new
+ // draft far down the list, sometimes a full screen below the fold.
+        let draftBlankIds = Set(phoneCreatedBlanks.filter { DraftStore.shared.hasDraft($0) })
+        let comparator = Self.sessionComparator(pinnedRank: pinnedRank, draftBlankIds: draftBlankIds)
 
         var rebuilt: [WorkspaceGroup] = []
         rebuilt.reserveCapacity(followState.workspaces.count)
@@ -1325,11 +1453,16 @@ final class WorkspaceViewModel: ObservableObject {
     }
 
  /// Sort order inside one workspace: running first, then pinned (most recently
- /// pinned first), then by last activity; sessionId keeps ties deterministic.
-    static func sessionComparator(pinnedRank: [String: Int]) -> (SessionListItem, SessionListItem) -> Bool {
+ /// pinned first), then the phone-created draft cards (desktop parity: a brand
+ /// new draft stays at the top of its group until it sends its first message),
+ /// then by last activity; sessionId keeps ties deterministic.
+    static func sessionComparator(
+        pinnedRank: [String: Int],
+        draftBlankIds: Set<String> = []
+    ) -> (SessionListItem, SessionListItem) -> Bool {
         { lhs, rhs in
-            let leftRank = sessionRank(lhs, pinnedRank: pinnedRank)
-            let rightRank = sessionRank(rhs, pinnedRank: pinnedRank)
+            let leftRank = sessionRank(lhs, pinnedRank: pinnedRank, draftBlankIds: draftBlankIds)
+            let rightRank = sessionRank(rhs, pinnedRank: pinnedRank, draftBlankIds: draftBlankIds)
             if leftRank != rightRank { return leftRank < rightRank }
             if leftRank == 1 {
                 let leftPin = pinnedRank[lhs.sessionId] ?? Int.max
@@ -1343,10 +1476,15 @@ final class WorkspaceViewModel: ObservableObject {
         }
     }
 
-    static func sessionRank(_ session: SessionListItem, pinnedRank: [String: Int]) -> Int {
+    static func sessionRank(
+        _ session: SessionListItem,
+        pinnedRank: [String: Int],
+        draftBlankIds: Set<String> = []
+    ) -> Int {
         if session.isRunning { return 0 }
         if pinnedRank[session.sessionId] != nil { return 1 }
-        return 2
+        if draftBlankIds.contains(session.sessionId) { return 2 }
+        return 3
     }
 
     static func activity(of item: SessionListItem) -> Int64 {

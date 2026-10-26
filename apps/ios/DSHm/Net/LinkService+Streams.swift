@@ -211,6 +211,11 @@ extension LinkService {
         ForwardedWaterfallQueue.apply(event, approvals: &approvals, questions: &questions)
         if approvals != pendingApprovals { pendingApprovals = approvals }
         if questions != pendingUserQuestions { pendingUserQuestions = questions }
+ // v6：实时运行态 emit → 列表卡片状态即时刷新。
+        if case .emit(let name, let args) = event,
+           let live = LiveSessionStatusEmit.parse(name: name, args: args) {
+            applyLiveSessionStatus(live)
+        }
     }
 
  /// Answers a pending approval waterfall via the unary `$events/result` method.

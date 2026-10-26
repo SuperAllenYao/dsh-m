@@ -337,6 +337,16 @@ struct SessionMessageListView: View {
  /// 首屏定位完成、内容可以显示。
     @State private var isContentReady = false
     @State private var metrics = ScrollMetrics()
+ /// 过程组步骤内容高度（key = FlowRowGroup.id，来自 ProcessGroupStepsHeightKey）：
+ /// 点击组头瞬间据此预测行高 Δ，同事务反向补偿 contentOffset（组头定住）。
+    @State private var groupStepsHeights: [String: CGFloat] = [:]
+ /// 过程组展开/收起的显式驱动动画（行高与 offset 同帧插值，组头逐帧定住）。
+    @State private var groupToggleRun: GroupToggleRun?
+ /// 动画中的步骤内容高度覆盖（key = FlowRowGroup.id；缺省 = 自然高度）。
+    @State private var groupToggleOverride: [String: CGFloat] = [:]
+    @State private var groupToggleTask: Task<Void, Never>?
+ /// Reduce Motion：补偿跟随系统——高度与 offset 都走瞬时切换（终态一致）。
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
  /// 自绘滚动条数据镜像（@Published 驱动指示条重算；与 metrics 分离避免列表 body 重算）。
     @StateObject private var indicatorModel = ScrollIndicatorModel()
     @State private var lastScrollToBottomToken: Int = 0
@@ -484,6 +494,10 @@ struct SessionMessageListView: View {
                 metrics.contentHeight = height
                 layoutDidChange()
             }
+ // 过程组步骤内容高度（折叠态由隐藏副本持续上报）：组头点击补偿的数据源。
+            .onPreferenceChange(ProcessGroupStepsHeightKey.self) { heights in
+                groupStepsHeights = heights
+            }
  // viewport frame 测量：挂在 scale/position 外层（layout frame 不受
  // 翻转影响），供探针 bottomMaxY/viewportMaxY 输出（E2E 契约）。
             .background(
@@ -558,6 +572,10 @@ struct SessionMessageListView: View {
             }
             .onDisappear {
                 metrics.windowExpansionScheduled = false
+                groupToggleTask?.cancel()
+                groupToggleTask = nil
+                groupToggleRun = nil
+                groupToggleOverride = [:]
             }
             .overlay(alignment: .topLeading) { scrollProbeElement }
             .overlay(alignment: .top) { scrollHUD }
@@ -582,11 +600,11 @@ struct SessionMessageListView: View {
                 subagentLabels: subagentLabels,
                 isNewestGroupRunning: isNewest,
                 mode: mode,
+                animatedStepsHeight: groupToggleOverride[group.id],
                 windowHeight: processGroupWindowHeight,
                 onToggleMode: {
-                    withAnimation(.easeInOut(duration: 0.15)) {
-                        onToggleGroupMode?(group.id, ProcessGroupModeResolver.toggled(mode))
-                    }
+ // 显式驱动动画：行高与 offset 每帧同一次提交（组头逐帧定住）。
+                    handleGroupModeToggle(groupID: group.id, currentMode: mode)
                 },
                 onOpenReasoning: onOpenReasoning,
                 onOpenTool: onOpenTool
@@ -606,6 +624,141 @@ struct SessionMessageListView: View {
         case .actionError(let message):
             InlineErrorView(message: message)
         }
+    }
+
+ // MARK: - 过程组显示态切换：手驱动行高 + offset（组头逐帧定住）
+
+ /// 一次展开/收起动画的参数：行高与 offset 用**同一条 easeInOut 曲线**插值。
+    private struct GroupToggleRun {
+        var groupID: String
+        var targetMode: ProcessGroupMode
+        var fromStepsHeight: CGFloat
+        var toStepsHeight: CGFloat
+        var fromOffset: CGFloat
+        var targetOffset: CGFloat
+ /// true = 收起（展开态保持到终帧再落实 collapsed）。
+        var isCollapse: Bool
+        var start: CFTimeInterval
+    }
+
+    private static let groupToggleDuration: Double = 0.15
+ /// Reduce Motion 下的驱动时长（2 帧，≈瞬时但避免单帧 clamp 跳变）。
+    private static let groupToggleReducedDuration: Double = 0.033
+ /// 逐帧驱动间隔（≈60fps；SwiftUI 会按屏幕刷新合并提交）。
+    private static let groupToggleTickNanos: UInt64 = 16_000_000
+
+ /// easeInOut（smoothstep，与 150ms ease-in-out 曲线观感一致，中段更快）。
+    private static func groupToggleProgress(_ linear: CGFloat) -> CGFloat {
+        let p = min(1, max(0, linear))
+        return p * p * (3 - 2 * p)
+    }
+
+ /// 点击过程组头：手驱动「步骤内容高度 + contentOffset」同帧插值，组头逐帧定住。
+ ///
+ /// inverted 列表几何：组头屏幕位置 = 视口底 + offset −
+ /// 组行内容坐标 maxY；组行高度变化 Δ 时组头反向漂移 Δ。步骤内容高度是行高
+ /// 唯一变化的量（组头与间距不变），offset 同量移动 Δ 即可定住组头。
+ ///
+ /// 为什么不用「模式变化 + withAnimation(scrollTo)」隐式动画（首版实测）：
+ /// 展开时目标 offset = from + Δ 超出**当前**内容高度的 maxOffset（内容还没长
+ /// 出来），ScrollPosition 被 clamp（取证：off=485=maxOff，target=833 未生效，
+ /// 组头跳 348）。手驱动每帧把「高度 override + offset」写进同一次状态提交，
+ /// 目标恒在当帧可滚动范围内，两者插值参数相同 ⇒ 组头不动。
+ /// Reduce Motion：整段动画压成两帧瞬时提交（终态一致、无过渡）。
+    private func handleGroupModeToggle(groupID: String, currentMode: ProcessGroupMode) {
+ // 动画进行中忽略再次点击（150ms 窗口；避免出现两个锚点/中途反向）。
+        guard groupToggleRun == nil else { return }
+        let targetMode = ProcessGroupModeResolver.toggled(currentMode)
+        let facts = metrics.facts
+        let stepsHeight = max(0, groupStepsHeights[groupID] ?? 0)
+        let delta = ScrollFollowPolicy.toggleHeightDelta(
+            from: currentMode,
+            to: targetMode,
+            stepsHeight: stepsHeight
+        )
+        let targetOffset = ScrollFollowPolicy.anchoredOffset(
+            offset: facts.offset,
+            delta: delta,
+            maxOffset: facts.maxOffset
+        )
+ // 没有测量值 / 无可滚动余量：保持旧行为（直接切态，不做补偿）。
+        guard abs(delta) > ScrollFollowPolicy.compensationTolerance,
+              abs(targetOffset - facts.offset) > ScrollFollowPolicy.compensationTolerance
+        else {
+            onToggleGroupMode?(groupID, targetMode)
+            return
+        }
+        let isCollapse = delta < 0
+        let run = GroupToggleRun(
+            groupID: groupID,
+            targetMode: targetMode,
+            fromStepsHeight: isCollapse ? stepsHeight : 0,
+            toStepsHeight: isCollapse ? 0 : stepsHeight,
+            fromOffset: facts.offset,
+            targetOffset: targetOffset,
+            isCollapse: isCollapse,
+            start: CACurrentMediaTime()
+        )
+        metrics.lastScrollCommand = "toggle-anchor"
+ // 展开：立即切显示态（内容出现但被 override=0 裁掉），随后逐帧长出；
+ // 收起：动画期间保持展开态（逐帧裁矮），终帧再落实 collapsed。
+        groupToggleOverride[groupID] = run.fromStepsHeight
+        if !isCollapse { onToggleGroupMode?(groupID, targetMode) }
+        groupToggleRun = run
+        scrollDebug("toggle enter group=\(groupID) \(currentMode.rawValue)->\(targetMode.rawValue) stepsH=\(fmt(stepsHeight)) off=\(fmt(facts.offset)) maxOff=\(fmt(facts.maxOffset)) target=\(fmt(targetOffset)) collapse=\(isCollapse ? 1 : 0) reduce=\(reduceMotion ? 1 : 0)")
+ // Reduce Motion：压成 2 帧（≈33ms）的逐帧提交——仍保证「高度 + offset
+ // 同帧生效」，避免单帧跳变时滚动被 clamp；终态与常规动画一致。
+        startGroupToggleTicker(
+            run,
+            duration: reduceMotion ? Self.groupToggleReducedDuration : Self.groupToggleDuration
+        )
+    }
+
+    private func startGroupToggleTicker(_ run: GroupToggleRun, duration: Double) {
+        groupToggleTask?.cancel()
+        groupToggleTask = Task { @MainActor in
+            while !Task.isCancelled {
+                let elapsed = CACurrentMediaTime() - run.start
+                let linear = min(1, max(0, elapsed / max(0.001, duration)))
+                if linear >= 1 { break }
+                let eased = Self.groupToggleProgress(linear)
+                self.applyGroupToggleFrame(run, eased: eased)
+                try? await Task.sleep(nanoseconds: Self.groupToggleTickNanos)
+            }
+            guard !Task.isCancelled else { return }
+            self.finishGroupToggle(run)
+        }
+    }
+
+ /// 一帧：步骤内容高度 override 与 offset 在**同一次状态提交**里更新（无动画）。
+    private func applyGroupToggleFrame(_ run: GroupToggleRun, eased: CGFloat) {
+        let height = run.fromStepsHeight + (run.toStepsHeight - run.fromStepsHeight) * eased
+        let offset = run.fromOffset + (run.targetOffset - run.fromOffset) * eased
+        groupToggleOverride[run.groupID] = height
+        withAnimation(nil) { scrollPosition.scrollTo(y: offset) }
+    }
+
+ /// 终帧：高度归位、offset 落终值、收起态落实 collapsed（同一次提交）。
+    private func finishGroupToggle(_ run: GroupToggleRun) {
+        if run.isCollapse {
+            groupToggleOverride[run.groupID] = 0
+        } else {
+            groupToggleOverride[run.groupID] = nil
+        }
+        withAnimation(nil) { scrollPosition.scrollTo(y: run.targetOffset) }
+        if run.isCollapse {
+            onToggleGroupMode?(run.groupID, run.targetMode)
+            groupToggleOverride[run.groupID] = nil
+        }
+ // 补偿把视口推离最新端（展开 = 推开下方更新内容）＝不再贴底；
+ // 回到底部仍由用户手势 settle 判定恢复（不在这里抢手势语义）。
+        if pinnedToBottom, run.targetOffset > ScrollFollowPolicy.compensationTolerance {
+            pinnedToBottom = false
+            onNearBottomChange(false)
+        }
+        scrollDebug("toggle end group=\(run.groupID) offset=\(fmt(run.targetOffset)) \(scrollGeometrySummary())")
+        groupToggleRun = nil
+        groupToggleTask = nil
     }
 
     private func isNewest(_ item: SessionMessageItem) -> Bool {
@@ -1217,6 +1370,32 @@ enum ScrollFollowPolicy {
  /// 手势结束后的 pinned 判定：距底 <= 12pt 视为贴底。
     static func pinnedAfterGesture(distanceFromBottom: CGFloat) -> Bool {
         distanceFromBottom <= settlePinTolerance
+    }
+
+ /// 过程组显示态切换引起的组行高度变化 Δ（inverted：行高 +Δ ⇒ 组头屏幕位移 −Δ）。
+ /// 只有「展开⇄收起」改变行高，变化量 = 步骤内容高度；旧 window/full 之间切换
+ /// 行高不变，不补偿。
+    static func toggleHeightDelta(from current: ProcessGroupMode,
+                                  to target: ProcessGroupMode,
+                                  stepsHeight: CGFloat) -> CGFloat {
+        guard stepsHeight.isFinite else { return 0 }
+        let height = max(0, stepsHeight)
+        switch (current, target) {
+        case (.expanded, .collapsed), (.full, .collapsed):
+            return -height
+        case (.collapsed, .expanded), (.collapsed, .full):
+            return height
+        default:
+            return 0
+        }
+    }
+
+ /// 过程组行高变化的滚动锚定目标 offset：offset 同量移动 Δ，clamp 到
+ /// [0, maxOffset + Δ]（Δ 同时改变内容高度与 maxOffset）。
+ /// 内容余量不足时物理上滚不满，退化为部分补偿（clamp 感知，不额外跳动）。
+    static func anchoredOffset(offset: CGFloat, delta: CGFloat, maxOffset: CGFloat) -> CGFloat {
+        guard offset.isFinite, delta.isFinite, maxOffset.isFinite else { return offset }
+        return min(max(offset + delta, 0), max(0, maxOffset + delta))
     }
 }
 

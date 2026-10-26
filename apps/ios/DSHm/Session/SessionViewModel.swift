@@ -266,9 +266,23 @@ final class SessionViewModel: ObservableObject {
     @Published private(set) var flow = SessionFlow()
  /// 渲染行速记（视图/单测读它，等价于 `flow.rows`）。
     var rows: [FlowRow] { flow.rows }
+ /// task-5: 空白会话（窗口里没有任何事件且不在加载）——空态/状态图标派生用。
+ /// computed：事件与 `isLoading` 都是 @Published，视图会跟着重算。
+    var isBlankSession: Bool { journal.events.isEmpty && !isLoading }
     @Published private(set) var isLoading = true
     @Published private(set) var isRunning = false
     @Published private(set) var liveAssistantText: String = ""
+ /// task-5: 实时思考文本（`assistant-stream` 的 reasoning-delta，10Hz 节流发布）。
+ /// 与 `liveAssistantText` 同生命周期：持久 `assistant/message` / `turn/end` /
+ /// snapshot 结算后清空（空串 = 没有可展示的思考）。
+    @Published private(set) var liveReasoningText: String = ""
+ /// task-5: 实时「准备中」的工具调用（`tool-call-delta` 按 index 合并）。
+ /// 持久 `tool/call` / `assistant/message` / `turn/end` / snapshot 结算后清空。
+    @Published private(set) var liveToolPreparations: [LiveToolPreparation] = []
+ /// task-5: 上一轮 turn 是否失败（状态图标用）。`turn/end.reason.kind` ∈
+ /// interrupted/blocked/error → true；completed/aborted（或无 reason）→ false；
+ /// 新 `turn/start` → false；snapshot 重建后按窗口内最后一条 turn 边界重算。
+    @Published private(set) var lastTurnFailed: Bool = false
     @Published private(set) var streamErrorText: String?
     @Published private(set) var title: String?
     @Published private(set) var permissionsValue: String?
@@ -1898,6 +1912,13 @@ final class SessionViewModel: ObservableObject {
                 dbg("event: " + event.type + " seq=" + String(event.seq))
                 let update = journal.apply(event: event)
                 applyJournalUpdate(update)
+ // task-5: 状态图标的「上一轮失败」派生只依赖 turn 边界事件；
+ // 其它事件不动它（避免每个事件都重扫窗口）。
+                if event.type == "turn/start" || event.type == "turn/end" {
+                    if case .eventsApplied = update {
+                        refreshLastTurnFailedFromWindow()
+                    }
+                }
  // Window cache: debounced write of the newest 4 screens (only events
  // the journal actually appended keep the payload contiguous).
                 if case .eventsApplied = update {
@@ -1928,6 +1949,8 @@ final class SessionViewModel: ObservableObject {
         switch update {
         case .snapshotReplaced:
             scrollDbg("journal snapshotReplaced")
+ // task-5: 新窗口是权威，按窗口重算「上一轮失败」派生。
+            refreshLastTurnFailedFromWindow()
             pendingRebuild = true
             scheduleRebuild()
         case .eventsApplied:
@@ -1939,14 +1962,14 @@ final class SessionViewModel: ObservableObject {
  // end did not. An empty result (defensive) has nothing to re-render.
             scrollDbg("journal olderPrepended n=\(seqs.count) fillState=\(historyFillState.rawValue)")
             if seqs.isEmpty {
-                publishLiveAssistantText()
+                publishLiveStreamText()
             } else {
                 pendingHistoryBatch = true
                 pendingRebuild = true
                 scheduleRebuild()
             }
         case .duplicate, .ignored, .assistantStreamProgress:
-            publishLiveAssistantText()
+            publishLiveStreamText()
         case .gap, .assistantRevisionGap:
  // MVP policy: discard the local window and rebuild from a new
  // snapshot (session/page hole patching is M2, protocol §4.3).
@@ -1956,24 +1979,53 @@ final class SessionViewModel: ObservableObject {
         checkHistoryFillWatchdog()
     }
 
- /// 流式文本最多 10Hz 发布；`flush` 用于 turn 结束/重建，立即同步到最新文本。
-    private func publishLiveAssistantText(flush: Bool = false) {
-        let latest = journal.liveAssistantText
+ /// task-5: 三路实时预览（文本 / 思考 / 工具参数）共用 10Hz 节流发布；
+ /// `flush` 用于 turn 结束/重建，立即同步到最新值。
+    private func publishLiveStreamText(flush: Bool = false) {
         if flush {
             liveTextThrottleTask?.cancel()
             liveTextThrottleTask = nil
-            if liveAssistantText != latest { liveAssistantText = latest }
+            syncLiveStreamValues()
             return
         }
         if liveTextThrottleTask != nil { return }
-        if liveAssistantText != latest { liveAssistantText = latest }
+        syncLiveStreamValues()
         liveTextThrottleTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: 100_000_000)
             guard let self, !Task.isCancelled else { return }
             self.liveTextThrottleTask = nil
-            let newest = self.journal.liveAssistantText
-            if self.liveAssistantText != newest { self.liveAssistantText = newest }
+            self.syncLiveStreamValues()
         }
+    }
+
+ /// 三路预览共用一次发布：任一值真的变了才写 @Published（不触发无意义重绘）。
+    private func syncLiveStreamValues() {
+        let latestText = journal.liveAssistantText
+        if liveAssistantText != latestText { liveAssistantText = latestText }
+        let latestReasoning = journal.liveReasoningText
+        if liveReasoningText != latestReasoning { liveReasoningText = latestReasoning }
+        let latestPreparations = journal.liveToolPreparations
+        if liveToolPreparations != latestPreparations { liveToolPreparations = latestPreparations }
+    }
+
+ /// task-5: 按窗口内最后一条 turn 边界重算 `lastTurnFailed`。
+ /// 增量事件只可能在 turn/start / turn/end 处变化（调用方只在边界事件时触发）；
+ /// snapshot 重建（重连/窗口替换）后按窗口重算，避免把旧窗口的失败状态带进来。
+    private func refreshLastTurnFailedFromWindow() {
+        for event in journal.events.reversed() {
+            switch event.type {
+            case "turn/end":
+                let kind = event.data?["reason"]?["kind"]?.stringValue
+                lastTurnFailed = kind == "interrupted" || kind == "blocked" || kind == "error"
+                return
+            case "turn/start":
+                lastTurnFailed = false
+                return
+            default:
+                continue
+            }
+        }
+        lastTurnFailed = false
     }
 
  /// Drops a pending debounced rebuild and rebuilds now. Used for the first
@@ -2066,7 +2118,7 @@ final class SessionViewModel: ObservableObject {
         let wasRunning = lastKnownRunning
         isRunning = flow.isRunning
         lastKnownRunning = isRunning
-        publishLiveAssistantText(flush: true)
+        publishLiveStreamText(flush: true)
         approvalPolicy = journal.events.last(where: { $0.type == "approval/policy" })?.data?["policy"]?.stringValue
         sandboxMode = journal.events.last(where: { $0.type == "sandbox/mode" })?.data?["mode"]?.stringValue
  // One parse feeds both surfaces: the strip/catalog display the durable

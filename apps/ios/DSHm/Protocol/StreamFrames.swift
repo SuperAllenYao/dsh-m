@@ -194,6 +194,24 @@ enum ForwardedRemoteEvent {
     }
 }
 
+/// Live per-session status carried by the `$events` emit stream
+/// (`{"type":"emit","event":"api-session/status","args":[sessionId, running]}`).
+/// The session list only refreshes `running` on `session/list` responses, so the
+/// phone used to show a stale card until the next list fetch; these emits are the
+/// real-time source for the list card status.
+struct LiveSessionStatusEmit: Equatable {
+    var sessionId: String
+    var running: Bool
+
+    static func parse(name: String, args: [JSONValue]) -> LiveSessionStatusEmit? {
+        guard name == "api-session/status", args.count >= 2,
+              let sessionId = args[0].stringValue,
+              let running = args[1].boolValue,
+              !sessionId.isEmpty else { return nil }
+        return LiveSessionStatusEmit(sessionId: sessionId, running: running)
+    }
+}
+
 // MARK: - Approval outcome vocabulary (§3.7)
 
 enum ApprovalOutcome: String {

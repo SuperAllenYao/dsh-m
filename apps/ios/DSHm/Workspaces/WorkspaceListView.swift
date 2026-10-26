@@ -56,12 +56,24 @@ struct WorkspaceListView: View {
             app.link.handlePageEnter()
             viewModel.attach(link: app.link)
             viewModel.start()
+ // v6：进列表先叠一次 `$events` 实时运行态（详情页里发生的变化，
+ // 返回列表时立刻生效，不等下一次 session/list）。
+            viewModel.applyLiveSessionRunning()
         }
         .onAppear {
  // R2 (design 2.3/2.4): returning from a session page re-reads the
  // draft store — the blank card appears with its preview, or closes
  // out when the draft is gone (2.3 b).
             viewModel.refreshBlankCardState()
+            viewModel.applyLiveSessionRunning()
+ // Edge-swipe back has no back-button hook: its flush runs in the
+ // detail's onDisappear, which lands ~580 ms after this onAppear
+ // (probe-measured). Refresh once more after the pop settles so the
+ // draft card appears instead of staying hidden.
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 800_000_000)
+                viewModel.refreshBlankCardState()
+            }
         }
         .onDisappear {
  // Leaving the list: stop consuming the workspace stream (protocol §3.13).
@@ -97,7 +109,13 @@ struct WorkspaceListView: View {
         }
         .onChange(of: app.link.phase) { _ in
             viewModel.handleConnectionChange()
+            viewModel.applyLiveSessionRunning()
             autoOpenFirstSessionIfNeeded()
+        }
+        .onChange(of: app.link.liveSessionStatusRevision) { _ in
+ // v6：`$events` 的 api-session/status emit 实时刷新卡片状态（进行中/空闲），
+ // 不用等下一次 session/list；从会话详情返回列表时也靠这里立刻收敛。
+            viewModel.applyLiveSessionRunning()
         }
         .onReceive(app.$silentPushRefreshVersion.dropFirst()) { _ in
  // M4 §4: a silent push passed AppModel's ≥2s throttle while the list
@@ -613,18 +631,23 @@ struct WorkspaceListView: View {
             Button {
                 handlePinToggle(session)
             } label: {
-                Label(pinned ? L10n.t("取消置顶") : L10n.t("置顶"), systemImage: pinned ? "pin.slash" : "pin")
+ // v6 §4: system swipe buttons render the glyph only (no title
+ // text); the accessibility label keeps the wording for E2E.
+                Image(systemName: pinned ? "pin.slash" : "pin")
             }
  // Pinned = accent fill; unpin = neutral raised fill (tokens only).
             .tint(pinned ? Theme.Palette.borderStrong : Theme.Palette.accent)
             .accessibilityIdentifier("swipe-pin-" + session.sessionId)
+            .accessibilityLabel(pinned ? L10n.t("取消置顶") : L10n.t("置顶"))
             Button {
                 handleArchiveRequest(session)
             } label: {
-                Label(L10n.t("归档"), systemImage: "archivebox")
+ // v6 §4: glyph-only swipe action; text lives in the a11y label.
+                Image(systemName: "archivebox")
             }
             .tint(Theme.Palette.warning)
             .accessibilityIdentifier("swipe-archive-" + session.sessionId)
+            .accessibilityLabel(L10n.t("归档"))
         }
     }
 
@@ -727,7 +750,11 @@ struct SessionCardView: View, Equatable {
                     if isPinned {
                         PinMark()
                             .alignmentGuide(.firstTextBaseline) { dimension in
-                                dimension.height / 2 + 4
+ // v6 §4: guide = 12.0 for the 13pt pin (was 10.5,
+ // 1.27pt low). The title line box centre is
+ // 14.67 - 9 = 5.67pt below the baseline; 5.5 is
+ // the rounded constant and keeps row height intact.
+                                pinTitleBaselineGuide(pinSize: dimension.height)
                             }
                     }
                     Text(session.title?.isEmpty == false
@@ -761,10 +788,13 @@ struct SessionCardView: View, Equatable {
                     }
                 } else {
                     HStack(spacing: Theme.Spacing.xs) {
-                        StatusDot(color: status.color, size: 6, pulsing: status.isPulsing)
+ // v6: the same A-form linear icon as the detail header,
+ // 14pt; icon and status word share the semantic color
+ // (design mockup 04).
+                        SessionStatusIcon(kind: status.kind, size: 14)
                         Text(status.localizedLabel)
                             .font(Theme.Typography.caption)
-                            .foregroundStyle(status.color)
+                            .foregroundStyle(status.kind.color)
                         Spacer(minLength: 0)
                     }
                 }
