@@ -1286,6 +1286,12 @@ final class SessionViewModel: ObservableObject {
  // scrollPosition(id:anchor:) 锚定保证，插入本身不改变可见内容。
                 rebuildNowForHistoryBatch()
                 syncFillDiagnostics()
+ // 冻结修复（用户真机）：补齐批次之间让出主线程一拍。
+ // 页与页之间本来没有任何间隔，解码/重建/发布挤成一条连续的主线程
+ // 占空比 → pan 帧与 header 返回按钮的触摸投递被饿死，表现为「进度
+ // 条走完之前整页卡住」。yield 保证 queued 的触摸事件与 SwiftUI 提交
+ // 在批与批之间拿到执行机会（不引入人为延时，不改变补齐总量）。
+                await Task.yield()
  // 卡顿修复：补齐期间不再逐批写窗口缓存。
  // 单次写盘要编码 ~4MB JSON（实测每批 ~59ms），即便挪到后台也会和滑动抢 CPU；
  // 最终状态由 markHistoryFillCompleted() 统一写，中途被杀最多重拉一次历史。
