@@ -71,6 +71,13 @@ final class LinkService: ObservableObject {
     private(set) var liveSessionRunningUpdatedAt: [String: Date] = [:]
     @Published private(set) var lastErrorText: String?
     @Published private(set) var lastConnectedAt: Date?
+ /// 重连提速（最快 1s / 最迟 2s）：最近一次「网络切换信号 → 连接
+ /// 成功」的耗时（毫秒）。只有 `handleNetworkPathChanged` 锚定的重连链会写入
+ /// （切换→多轮退避重试→最终连上都算同一链）；其它来源的重连（前台恢复 /
+ /// 看门狗 / 翻页）不覆盖它，E2E 与真机手动切换验收据此断言真实重连时长。
+    @Published private(set) var lastSwitchReconnectMs: Int?
+ /// 上一个切换锚定链的起点；连接成功时结算成 `lastSwitchReconnectMs` 后清空。
+    private var switchReconnectStartedAt: Date?
  /// P0: E2E-gated `connect-metrics` summary of the last bring-up round.
     @Published private(set) var connectionMetricsValue: String?
  /// task-2 (reconnect): E2E-gated one-line `[RECONNECT]...` summary of the last
@@ -1099,6 +1106,17 @@ final class LinkService: ObservableObject {
         ScrollHitchProbe.mark("e2ePathChanged", ["phase": String(describing: phase)])
         #endif
         ReconnectMetrics.markPathChange()
+ // 真机验收根因：池化 HTTPS 连接是旧网络上拨的——5G→WiFi 后
+ // 蜂窝接口不立刻死（socket 仍 ESTABLISHED），但路由已切走：连接静默黑洞
+ // 化。新拨号的鉴权复用它，烧满 1.5s 首字节看门狗（真机 4895ms 复盘：
+ // `/auth/challenge 首字节超时 1558ms`）。WiFi→5G 不踩坑是因 WiFi 接口
+ // 断开时 socket 立刻报错、直接走新连接。路径一变就清池：新网络一律新
+ // 连接（与 WSS 的 TLS 并行建立，不增长关键路径）。
+        HTTPConnectionPool.shared.closeAll()
+ // 切换锚定链起点：后面所有退避重试都归到这条链，直到连接成功结算。
+ // （手动真实切换验收时 e2ePathChanged → e2eSwitchReconnect 两个 mark 的
+ // 差值就是 App 侧真实重连耗时，直接从 hitch jsonl 可读。）
+        switchReconnectStartedAt = Date()
  // 网络已变：旧端点顺序作废，下一轮必须重新发现（mDNS）+ 并行探测。
         endpointsDirty = true
         guard credentials != nil, !manuallyDisconnected else { return }
@@ -1278,6 +1296,9 @@ final class LinkService: ObservableObject {
             return
         }
         isConnecting = true
+ // 轮起点：mux 冲突重试的等待基准（插件 1.5s 静默接管窗口从旧连接最后
+ // 一帧起算 ≈ 本时刻）。
+        let roundStartedAt = Date()
         let silentResume = p1SilentResume
         teardownTransport(keepP1Resume: silentResume)
  // A silent resume keeps `phase ==.connected` on purpose: no view model
@@ -1320,34 +1341,33 @@ final class LinkService: ObservableObject {
  // /health，两项都带预算（≤1.2–1.5s）。网络刚变时这一步把"按旧顺序串行盲试"
  // 变成一次并行收敛，第一拨就落在可达地址上。
  //
- // 冷启动 <1s（用户人工验收）：跨网（5G）时 relay 是第一且唯一可能
- // 立即可达的候选，而发现+探测真机实测约 1.58s（connect-metrics 的 candidateMs
- // 1577–1614ms 就是这一段）。它只用于「首拨失败后换地址」，绝不能挡在第一次
- // 拨号前：relay-first 路径改为**立刻拨 relay**，发现/探测在后台并发，只有首拨
- // 失败时才 await 结果重排剩余候选；其它路径（同网段 LAN-first / 单候选）保持
- // 原行为（它们的预算里含真实选路价值）。
-        let relayFirstFastPath = Self.shouldDialRelayImmediately(
+ // 冷启动 <1s：跨网（5G）时 relay 是第一且唯一可能立即可达的候选，
+ // 而发现+探测真机实测约 1.58s（connect-metrics 的 candidateMs 1577–1614ms
+ // 就是这一段）。它只用于「首拨失败后换地址」，绝不能挡在第一次拨号前。
+ //
+ // 重连提速（用户目标：最快 1s、最迟 2s）：dial-first 从 relay
+ // 泛化到所有首候选可信的路径。真机探针复盘（hitch-1793096527）：
+ // - 模拟切换（LAN 有效）整轮重连 392ms，其中发现+探测占了大头；
+ // - 自发重连（firstByteTimeout 路径）整轮 ~1.5s，几乎全是阻塞发现；
+ // 同网段 LAN 首拨健康时 ≈100–300ms，把 1.5–2s 的发现挪到后台并发后，
+ // LAN 侧重连从 ~1.9–2.4s 降到 ~0.3–0.5s。陈旧 LAN 地址（Mac 换 IP）由
+ // speculative 紧上限兜底：最多烧 1.2s 就转后台收敛结果，不劣于旧的
+ // 「先发现 1.5–2s 再拨」。
+        let dialPolicy = Self.dialFirstPolicy(
             prefersRelay: prefersRelay,
             orderedCandidates: orderedCandidates,
-            local: localNetwork
+            local: localNetwork,
+            shouldDiscover: endpointsDirty || candidates.count > 1
         )
         var dialCandidates = orderedCandidates
         var convergenceConsumed = false
         var convergenceTask: Task<(origins: [String], observations: [EndpointHealing.ProbeObservation]), Never>?
-        if relayFirstFastPath {
-            convergenceTask = Task { [weak self] in
-                guard let self else { return ([], []) }
-                return await self.discoverAndProbe(
-                    candidates: orderedCandidates,
-                    local: localNetwork,
-                    credentials: credentials
-                )
-            }
-            linkDebug("round: relay-first fast path (dial now, convergence in background)")
-        } else {
+        switch dialPolicy {
+        case .none:
             let discovery = await discoverAndProbe(
                 candidates: orderedCandidates,
                 local: localNetwork,
+                prefersRelay: prefersRelay,
                 credentials: credentials
             )
             dialCandidates = Self.dialOrder(
@@ -1358,6 +1378,25 @@ final class LinkService: ObservableObject {
                 prefersRelay: prefersRelay
             )
             convergenceConsumed = true
+        case .fullBudget, .speculative:
+            let convergenceStartedAt = Date()
+            convergenceTask = Task { [weak self] in
+                guard let self else { return ([], []) }
+                let result = await self.discoverAndProbe(
+                    candidates: orderedCandidates,
+                    local: localNetwork,
+                    prefersRelay: prefersRelay,
+                    credentials: credentials
+                )
+                #if DEBUG
+                ScrollHitchProbe.mark("e2eConvergenceDone", [
+                    "ms": Int(Date().timeIntervalSince(convergenceStartedAt) * 1000),
+                    "origins": result.origins.count
+                ])
+                #endif
+                return result
+            }
+            linkDebug("round: dial-first \(dialPolicy) (dial now, convergence in background)")
         }
         defer { convergenceTask?.cancel() }
         let hasSameSubnetLAN = dialCandidates.contains {
@@ -1388,11 +1427,26 @@ final class LinkService: ObservableObject {
         var attemptedOriginKeys = Set<String>()
         var queue = dialCandidates
         var queueIndex = 0
+ // 瞬态快失败原地重试：首个候选 <1s 的网络层 unreachable 多为
+ // 中继/隧道在旧连接关闭后的短暂拒绝窗口（真机实测模拟切换后中继首拨
+ // 100% 在 ~480ms 被拒、~1–5s 后恢复；同构建手动复现则 374ms 干净连上，
+ // 证明是服务侧瞬态而非拨号路径问题）。原地重试一次 + 350ms 等待，比走完
+ // 兜底队列再退避回来快数秒。
+        var fastRetryUsed = false
+ // 蜂窝下 LAN 候选每轮最多尝试个数：跨网 RFC1918 必然不可达（仅 VPN 边缘
+ // 有戏），1.2s 上限 × 无上限个数仍会把整轮拖满（真机实测 3 个烧 4.6s，
+ // 挤掉中继重试窗口）。保留 2 个最后一线，其余留到下一轮。
+        var cellularLANAttempts = 0
         while queueIndex < queue.count {
             let origin = queue[queueIndex]
             queueIndex += 1
             let originKey = PairingOriginSelector.normalizedOriginString(origin).lowercased()
             guard attemptedOriginKeys.insert(originKey).inserted else { continue }
+            if prefersRelay, localNetwork == nil,
+               Self.candidateRole(host: origin.host, local: localNetwork) != .relay,
+               cellularLANAttempts >= Self.maxCellularLANAttemptsPerRound {
+                continue
+            }
  // Budget semantics keep the original meaning: "index 0" is the first
  // distinct candidate actually attempted in this round.
             let attemptIndex = attemptedOriginKeys.count - 1
@@ -1402,7 +1456,7 @@ final class LinkService: ObservableObject {
                 return
             }
             let remaining = roundDeadline.timeIntervalSinceNow
-            guard let attemptTimeout = Self.attemptBudget(
+            guard var attemptTimeout = Self.attemptBudget(
                 baseTimeout: Self.candidateTimeoutSeconds(
                     index: attemptIndex,
                     count: attemptCount,
@@ -1412,6 +1466,19 @@ final class LinkService: ObservableObject {
             ) else {
                 roundBudgetExhausted = true
                 break
+            }
+ // dial-first 的首轮是「投机拨号」，蜂窝下的 LAN 候选跨网必然不可达：
+ // 两类都只值一个紧上限（健康 LAN 拨号 ~100–300ms，1.2s 是 4–12 倍余量），
+ // 超时即转后台收敛结果/下一候选，不烧整档候选超时（真机实测蜂窝下
+ // LAN 兜底白烧 2679ms）。
+            if let cap = Self.attemptTimeoutCap(
+                attemptIndex: attemptIndex,
+                policy: dialPolicy,
+                origin: origin,
+                local: localNetwork,
+                prefersRelay: prefersRelay
+            ) {
+                attemptTimeout = min(attemptTimeout, cap)
             }
  // authenticateToken() reads `credentials.origin`, so point it at the
  // origin under test before every attempt.
@@ -1427,11 +1494,29 @@ final class LinkService: ObservableObject {
                 teardownTransport(keepP1Resume: p1SilentResume)
             }
             let host = origin.host ?? origin.absoluteString
+            if prefersRelay, localNetwork == nil,
+               Self.candidateRole(host: origin.host, local: localNetwork) != .relay {
+                cellularLANAttempts += 1
+            }
             ConnectionMetrics.markCandidate(host)
             let candidateStartedAt = ReconnectMetrics.clock()
+            #if DEBUG
+            ScrollHitchProbe.mark("e2eDialStart", [
+                "origin": Self.originLabel(origin),
+                "timeout": Double(attemptTimeout),
+                "index": attemptIndex
+            ])
+            #endif
             switch await attemptConnection(origin: origin, leafPin: credentials.leafPin, timeout: attemptTimeout) {
             case .connected(let bumpGeneration):
                 linkDebug("round: connected " + Self.originLabel(origin))
+                #if DEBUG
+                ScrollHitchProbe.mark("e2eDialResult", [
+                    "origin": Self.originLabel(origin),
+                    "ms": Int((ReconnectMetrics.clock() - candidateStartedAt) * 1000),
+                    "result": "connected"
+                ])
+                #endif
                 ReconnectMetrics.markCandidateAttempt(
                     host: host,
                     milliseconds: (ReconnectMetrics.clock() - candidateStartedAt) * 1000,
@@ -1451,6 +1536,16 @@ final class LinkService: ObservableObject {
                 #if DEBUG
                 ScrollHitchProbe.mark("e2eReconnected", ["bump": bumpGeneration, "generation": generation])
                 #endif
+ // 切换锚定链结算：网络切换信号 → 此刻连接成功的真实耗时。
+                if let started = switchReconnectStartedAt {
+                    switchReconnectStartedAt = nil
+                    let ms = max(0, Int(Date().timeIntervalSince(started) * 1000))
+                    lastSwitchReconnectMs = ms
+                    #if DEBUG
+                    ScrollHitchProbe.mark("e2eSwitchReconnect", ["ms": ms])
+                    #endif
+                    linkDebug("switch reconnect settled in \(ms)ms")
+                }
                 ReconnectMetrics.markConnected()
                 ConnectionMetrics.markConnected()
                 connectionMetricsValue = connectionMetricsSummary()
@@ -1465,6 +1560,13 @@ final class LinkService: ObservableObject {
                 refreshEndpointsAfterConnect(origin: origin)
                 return
             case .credentialRejected(let reason):
+                #if DEBUG
+                ScrollHitchProbe.mark("e2eDialResult", [
+                    "origin": Self.originLabel(origin),
+                    "ms": Int((ReconnectMetrics.clock() - candidateStartedAt) * 1000),
+                    "result": "credentialRejected"
+                ])
+                #endif
                 ReconnectMetrics.markCandidateAttempt(
                     host: host,
                     milliseconds: (ReconnectMetrics.clock() - candidateStartedAt) * 1000,
@@ -1477,6 +1579,13 @@ final class LinkService: ObservableObject {
  // Keep walking: only an all-candidates rejection means re-pairing.
             case .fastRejected(let reason, let failureClass):
                 linkDebug("round: fastRejected " + Self.originLabel(origin) + " " + reason)
+                #if DEBUG
+                ScrollHitchProbe.mark("e2eDialResult", [
+                    "origin": Self.originLabel(origin),
+                    "ms": Int((ReconnectMetrics.clock() - candidateStartedAt) * 1000),
+                    "result": "fastRejected:" + failureClass.rawValue
+                ])
+                #endif
                 ReconnectMetrics.markCandidateAttempt(
                     host: host,
                     milliseconds: (ReconnectMetrics.clock() - candidateStartedAt) * 1000,
@@ -1492,6 +1601,14 @@ final class LinkService: ObservableObject {
                     : L10n.t("该地址被服务端拒绝，正在尝试其他地址…")
             case .failed(let reason):
                 linkDebug("round: failed " + Self.originLabel(origin) + " " + reason)
+                #if DEBUG
+                ScrollHitchProbe.mark("e2eDialResult", [
+                    "origin": Self.originLabel(origin),
+                    "ms": Int((ReconnectMetrics.clock() - candidateStartedAt) * 1000),
+                    "result": "failed:" + Self.classifyFailureMessage(reason).rawValue,
+                    "reason": reason
+                ])
+                #endif
                 let failureClass = Self.classifyFailureMessage(reason)
                 ReconnectMetrics.markCandidateAttempt(
                     host: host,
@@ -1501,13 +1618,38 @@ final class LinkService: ObservableObject {
                 failureClasses.append(failureClass)
                 failures.append(host + ": " + reason)
                 lastErrorText = reason
+ // 瞬态快失败原地重试（见 fastRetryUsed 声明处的取证）：只对首轮、
+ // 网络层 unreachable 且 <1s 的失败生效；服务端拒绝（fastRejected）
+ // 是确定性状态，不重试。
+                if attemptIndex == 0, !fastRetryUsed, failureClass == .unreachable,
+                   (ReconnectMetrics.clock() - candidateStartedAt) < 1.0 {
+                    fastRetryUsed = true
+ // 等待对齐插件的 mux 接管窗口（见 muxConflictRetryAlignSeconds）：
+ // 409 冲突的静默判定从旧连接最后一帧起算 ≈ 轮起点，1.7s 后
+ // 重试可越过窗口；普通瞬态 unreachable 也至少等 350ms。
+                    let sinceRoundStart = Date().timeIntervalSince(roundStartedAt)
+                    let waitSeconds = max(0.35, Self.muxConflictRetryAlignSeconds - sinceRoundStart)
+                    try? await Task.sleep(nanoseconds: UInt64(waitSeconds * 1_000_000_000))
+                    guard !Task.isCancelled else { break }
+                    attemptedOriginKeys.remove(originKey)
+                    queueIndex = 0
+                    queue.insert(origin, at: 0)
+                    linkDebug("round: fast-retry " + Self.originLabel(origin))
+                    continue
+                }
             }
  // Relay-first fast path: the first dial failed, so now pay for the
  // background convergence exactly once and rebuild the remaining queue in
  // its preferred order (newly discovered LAN/relay endpoints included).
             if !convergenceConsumed, let convergenceTask {
                 convergenceConsumed = true
+                let convergenceAwaitStartedAt = Date()
                 let discovery = await convergenceTask.value
+                #if DEBUG
+                ScrollHitchProbe.mark("e2eConvergenceConsumed", [
+                    "waitMs": Int(Date().timeIntervalSince(convergenceAwaitStartedAt) * 1000)
+                ])
+                #endif
                 let reordered = Self.dialOrder(
                     discovered: discovery.origins,
                     observations: discovery.observations,
@@ -2171,6 +2313,18 @@ final class LinkService: ObservableObject {
         }
         mux?.onClose = nil
         mux = nil
+ // 重连提速根因修复：旧 mux socket 必须真正关闭（WS close 帧 +
+ // TCP FIN），而不是置 nil 后遗弃。遗弃的 socket 让插件端
+ // `device.downstream` 保持占用，新升级在「静默 1.5s 接管窗口」内一律被
+ // 409 拒绝（真机实测 `HTTP 409: mux 升级被拒绝`，把重连拖到 2.8–8.4s
+ // 甚至 31s 风暴）。插件在 WS close 事件里立即清 downstream，主动关闭
+ // 后新升级（~百 ms 后）就无冲突。选 ws.close() 而非 mux.close()：
+ // 绕过 per-stream onClose 回调，副作用面与原「遗弃」路径完全一致，
+ // 只多一次干净的挥手；真实跨网切换（旧网已死发不出 close）仍由插件的
+ // stale-takeover 兜底。
+        if let ws {
+            ws.close()
+        }
         ws = nil
     }
 
@@ -2255,25 +2409,37 @@ final class LinkService: ObservableObject {
 
  // MARK: - 运行时端点自愈（用户：任何网络都要连得上，且极致快）
 
- /// 一轮连接前的并行发现：mDNS 拿 Mac **当前** 端点 + 对所有候选并行打 `/health`。
+ /// 一轮连接前的并行发现：mDNS 拿 Mac **当前** 端点 + 对候选并行打 `/health`。
  ///
  /// 两项都带硬预算（≤1.5s）且并发执行：即便发现全部失败，也只让这一轮多等一次
  /// 预算，随后回落到原有的串行拨号。
+ ///
+ /// 跨网去浪费：
+ /// 手机在蜂窝（无本地 LAN 接口）时——
+ /// - mDNS 是链路本地多播，物理上不可能看到 Mac 的广播：浏览预算纯浪费
+ /// （实测 heal mdns=0 仍白等预算）→ 跳过；
+ /// - LAN 候选跨网必然不可达，探测它们只会把收敛时间钉死在探测超时上
+ /// （实测 7 候选全部 unreachable@1590ms，把 relay 失败后的收敛等待拖到
+ /// 2.2s）→ 只探测 relay 候选，relay 探测健康时收敛 ~150ms 即完成。
     private func discoverAndProbe(
         candidates: [URL],
         local: LocalIPv4Network?,
+        prefersRelay: Bool,
         credentials: PairingCredentials
     ) async -> (origins: [String], observations: [EndpointHealing.ProbeObservation]) {
  // 单候选且端点不脏：没有可切换目标、地址也不可能过时，直接拨（省掉预算）。
         let shouldDiscover = endpointsDirty || candidates.count > 1
-        let shouldProbe = EndpointHealing.shouldProbe(candidateCount: candidates.count)
-        guard shouldDiscover || shouldProbe else { return ([], []) }
+        let probeTargets = Self.probeTargets(candidates: candidates, local: local, prefersRelay: prefersRelay)
+        let shouldProbe = EndpointHealing.shouldProbe(candidateCount: probeTargets.count)
+ // mDNS 只在手机自己有 LAN 接口时才有可能命中（见上）；蜂窝下跳过。
+        let shouldBrowse = shouldDiscover && local != nil
+        guard shouldBrowse || shouldProbe else { return ([], []) }
         let hasLANCandidate = candidates.contains {
             Self.candidateRole(host: $0.host, local: local) != .relay
         }
         let discoveryBudget = EndpointHealing.discoveryBudget(hasLANCandidate: hasLANCandidate)
-        let probeTimeout = EndpointHealing.probeTimeout(candidateCount: candidates.count)
-        async let discovered: LANEndpointDiscovery.Result = shouldDiscover
+        let probeTimeout = EndpointHealing.probeTimeout(candidateCount: probeTargets.count)
+        async let discovered: LANEndpointDiscovery.Result = shouldBrowse
             ? LANEndpointDiscovery.discover(
                 hostId: credentials.hostId,
                 leafPin: credentials.leafPin,
@@ -2282,7 +2448,7 @@ final class LinkService: ObservableObject {
             )
             : LANEndpointDiscovery.Result()
         async let probed: [EndpointHealing.ProbeObservation] = shouldProbe
-            ? probeCandidateHealth(candidates, timeout: probeTimeout)
+            ? probeCandidateHealth(probeTargets, timeout: probeTimeout)
             : []
         let (mdns, observations) = await (discovered, probed)
         var origins = mdns.origins
@@ -2548,13 +2714,109 @@ extension LinkService {
         return candidates
     }
 
- /// 冷启动 <1s：跨网（relay-first）时是否跳过"拨号前串行发现+探测"直接拨
+ /// 首拨策略：拨号前**绝不串行等**
+ /// mDNS 发现 + /health 探测。
+ ///
+ /// - `.fullBudget`：首候选是 relay——健康 relay 拨号本身可达 ~1.6s（受 RTT
+ /// 物理下限约束），保持整档候选超时，立即拨号；发现/探测后台并发，首拨
+ /// 失败才消费结果重排剩余候选。 的 relay fast path 原样泛化，
+ /// 并放开「≥2 候选」限制（单 relay 候选同样不该先付 0.6s mDNS）。
+ /// - `.speculative(1.2)`：首候选是**当前同网段 LAN** 地址——健康 LAN 拨号
+ /// ~100–300ms，立即拨号但只给 1.2s 紧上限（陈旧地址最多烧这么多就转
+ /// 后台收敛结果）。真实 5G→WiFi 切换、WiFi 侧重连都走这条路径，从
+ /// 「先发现 1.5–2s 再拨」变成 ~0.3–0.5s 直连。
+ /// - `.none`：首候选是跨网段陈旧 LAN（lanOther）或本轮没有发现/探测要做——
+ /// 保持先发现再拨：lanOther 的拨号大概率超时（白烧 2.5s），发现先行真有
+ /// 选路价值；无发现需求时本来就直拨。
+    enum DialFirstPolicy: Equatable, CustomStringConvertible {
+        case none
+        case fullBudget
+        case speculative(TimeInterval)
+
+        var description: String {
+            switch self {
+            case .none: return "none(discovery-first)"
+            case .fullBudget: return "fullBudget"
+            case .speculative(let cap): return "speculative(\(String(format: "%.1f", cap))s)"
+            }
+        }
+    }
+
+ /// LAN 投机首拨的紧上限：健康 LAN 拨号 ~100–300ms（本地 RTT 1–5ms ×
+ /// TLS+auth+upgrade 约 5–8 个 RTT），1.2s 是 4–12 倍余量；再慢基本说明
+ /// 地址已陈旧，不值得继续烧整档候选超时。
+    static let speculativeLANDialCapSeconds: TimeInterval = 1.2
+
+ /// 蜂窝下 LAN 候选每轮最多尝试个数（超出留到下一轮）：跨网 RFC1918 必然
+ /// 不可达，只保留 VPN 边缘路由的最后一线，不把整轮预算烧在必然失败上。
+    static let maxCellularLANAttemptsPerRound = 2
+
+ /// mux 冲突重试的等待对齐：插件 `MUX_TAKEOVER_STALE_MS = 1500ms`——真实
+ /// 跨网切换（旧网已死，发不出 WS close 帧）只能等插件把静默旧连接判死后
+ /// 接管。重试安排在轮起点 +1.7s（窗口 +200ms 余量），命不中的代价只是一次
+ /// 拨号超时。同网重连已由 teardown 主动 close 消除 409，此参数只兜真实切换。
+    static let muxConflictRetryAlignSeconds: TimeInterval = 1.7
+
+    nonisolated static func dialFirstPolicy(
+        prefersRelay: Bool,
+        orderedCandidates: [URL],
+        local: LocalIPv4Network?,
+        shouldDiscover: Bool
+    ) -> DialFirstPolicy {
+        guard shouldDiscover, let top = orderedCandidates.first else { return .none }
+        switch candidateRole(host: top.host, local: local) {
+        case .relay:
+            return .fullBudget
+        case .lanSameSubnet:
+            return .speculative(speculativeLANDialCapSeconds)
+        case .lanOther:
+            return .none
+        }
+    }
+
+ /// 一次候选拨号的超时紧上限（纯函数，可单测）。命中即返回上限值，调用方
+ /// `min(attemptTimeout, cap)`：
+ /// - dial-first 首轮投机拨号（`.speculative`）：发现/探测还没回来，陈旧
+ /// LAN 地址最多值 1.2s；
+ /// - 蜂窝（无本地 LAN 接口）下的 LAN 候选：跨网 RFC1918 必然不可达，只有
+ /// VPN 之类边缘路由有戏——保留最后一线但同样只给 1.2s(真机
+ /// 实测：relay 失败后 LAN 兜底按整档 2.5s 白烧 2679ms，把整轮拖进
+ /// roundBudgetExhausted）。这是配对策略「蜂窝不拨 LAN」的软化版。
+    nonisolated static func attemptTimeoutCap(
+        attemptIndex: Int,
+        policy: DialFirstPolicy,
+        origin: URL,
+        local: LocalIPv4Network?,
+        prefersRelay: Bool
+    ) -> TimeInterval? {
+        if attemptIndex == 0, case .speculative(let cap) = policy { return cap }
+        if prefersRelay, local == nil,
+           candidateRole(host: origin.host, local: local) != .relay {
+            return speculativeLANDialCapSeconds
+        }
+        return nil
+    }
+
+ /// 并行健康探测的目标集合（纯函数，可单测）。蜂窝（`prefersRelay && 无本地
+ /// LAN 接口`）下 LAN 候选必然不可达，探测它们只会把收敛时间钉死在探测
+ /// 超时上——只探测 relay 候选；
+ /// relay 探测健康时收敛 ~150ms 即完成，失败后的重排等待也从 ~1.5s 降到
+ /// relay 探测实际耗时。
+    nonisolated static func probeTargets(
+        candidates: [URL],
+        local: LocalIPv4Network?,
+        prefersRelay: Bool
+    ) -> [URL] {
+        guard prefersRelay, local == nil else { return candidates }
+        let relays = candidates.filter { candidateRole(host: $0.host, local: local) == .relay }
+ // 没有 relay 候选（异常配置）：退回全量探测，不让收敛变空转。
+        return relays.isEmpty ? candidates : relays
+    }
+
+ /// 冷启动 <1s（已被 `dialFirstPolicy` 泛化取代，保留给单测锚定
+ /// 原语义）：跨网（relay-first）时是否跳过"拨号前串行发现+探测"直接拨
  /// 第一个候选。真机实测这段串行收敛 1577–1614ms（connect-metrics candidateMs），
  /// 而 relay 拨号本身约 700ms——它是冷启动最大的可消除浪费。
- ///
- /// 条件刻意保守：只有 (a) 当前路径判断要求 relay 优先，(b) 至少两个候选（发现才有
- /// 意义），且 (c) 首候选确实是 relay 时才走快路径。同网段 LAN-first 与单候选保持
- /// 原行为（后者的发现预算本来就是 0）。
     nonisolated static func shouldDialRelayImmediately(
         prefersRelay: Bool,
         orderedCandidates: [URL],
