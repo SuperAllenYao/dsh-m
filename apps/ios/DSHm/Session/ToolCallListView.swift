@@ -46,27 +46,28 @@ struct ToolCallListView: View {
 }
 
 /// 36pt single-line tool row: glyph · name · mono summary (middle ellipsis) ·
-/// status dot + text · chevron.
+/// 6pt status dot · chevron.
+///
+/// v7 task-9（用户口径）：右侧不再出现「成功 / 失败 / 运行中 / 待审批」文案，
+/// 状态只用彩色圆点表达（成功绿 / 失败红 / 运行中蓝 / 待审批黄）；运行中的行
+/// 整行复用实时思考行的浅蓝底（liveStepHighlight）。状态文案只保留在无障碍
+/// 标签里，VoiceOver 仍能读出结果。
 struct ToolCallCompactRow: View {
     var item: ToolCallItem
     var pendingApproval: Bool
     var onTap: () -> Void
 
-    private var statusColor: Color {
-        if item.isError { return Theme.Palette.danger }
-        if pendingApproval { return Theme.Palette.warning }
-        if item.isRunning { return Theme.Palette.accent }
-        return Theme.Palette.textTertiary
+ /// 状态判定纯逻辑（失败 > 待审批 > 运行中 > 成功）。
+    private var tone: StepStatusTone {
+        StepStatusTone.resolve(item: item, pendingApproval: pendingApproval)
     }
 
-    private var statusText: String {
-        if item.isError { return L10n.t("失败") }
-        if pendingApproval { return L10n.t("待审批") }
-        if item.isRunning { return L10n.t("运行中") }
-        return L10n.t("成功")
+ /// 视觉已无状态文案（v7 task-9）；状态拼进 a11y 标签，VoiceOver 可读。
+    private var rowAccessibilityLabel: String {
+        [ToolGlyph.displayName(for: item.name), StepRowPreview.singleLine(item.summary), tone.accessibilityText]
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
     }
-
-    private var pulsating: Bool { item.isRunning || pendingApproval }
 
     var body: some View {
         Button(action: onTap) {
@@ -87,13 +88,8 @@ struct ToolCallCompactRow: View {
                     .lineLimit(1)
                     .truncationMode(.middle)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                HStack(spacing: 4) {
-                    StatusDot(color: statusColor, size: 6, pulsing: pulsating)
-                    Text(statusText)
-                        .font(.system(size: 12))
-                        .foregroundStyle(item.isError ? Theme.Palette.danger : (item.isRunning ? Theme.Palette.accent : Theme.Palette.textTertiary))
-                }
-                .fixedSize()
+ // v7 task-9：只留 6pt 状态圆点（颜色见 StepStatusTone），不再有文案。
+                StatusDot(color: tone.dotColor, size: 6, pulsing: tone.isPulsing)
                 Image(systemName: "chevron.right")
                     .font(.system(size: 8, weight: .semibold))
                     .foregroundStyle(Theme.Palette.textTertiary)
@@ -104,7 +100,17 @@ struct ToolCallCompactRow: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+ // 运行中的步骤行整行复用实时思考行的浅蓝底（同一 token，非新颜色）。
+        .liveStepHighlight(tone == .running)
         .accessibilityIdentifier("tool-row-\(item.name)")
+        .accessibilityLabel(rowAccessibilityLabel)
+    }
+}
+
+extension StepStatusTone {
+ /// 由「工具调用 + 是否待审批」推导（步骤行圆点与组内分隔线共用同一判定）。
+    static func resolve(item: ToolCallItem, pendingApproval: Bool) -> StepStatusTone {
+        resolve(isError: item.isError, pendingApproval: pendingApproval, isRunning: item.isRunning)
     }
 }
 

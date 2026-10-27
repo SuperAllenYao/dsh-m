@@ -38,6 +38,21 @@ extension SessionRowBuilder {
                 text: source?["summary"]?.stringValue ?? text,
                 kind: kind
             )), event, "notice-settled")
+        case "working-directory":
+ // Host 注入的「工作目录已切换」合成用户消息（正文形如
+ // The working directory changed from "/old" to "/new".）。
+ // 旧实现落到 default 分支：卡片标题被直接写成英文 kind
+ // "working-directory"（用户报障截图里那块独立卡）。
+ // v7：保留成 notice 行（kind 不变），由 SessionFlowGrouping 映射成
+ // 组内紧凑步骤；标题兜底成本地化的「工作目录」。
+            let summary = source?["summary"]?.stringValue
+            let body = text.isEmpty ? (summary ?? "") : text
+            guard !body.isEmpty else { return }
+            appendRow(.notice(NoticeCard(
+                title: "工作目录",
+                text: body,
+                kind: kind
+            )), event, "notice-working-directory")
         case "tool-jobs":
             appendRow(.notice(NoticeCard(title: "后台任务", text: source?["summary"]?.stringValue ?? text, kind: kind)), event, "notice-jobs")
         case "repeat-tool-reminder":

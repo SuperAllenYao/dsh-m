@@ -36,6 +36,8 @@ struct UserQuestionCardView: View {
     @State private var model: UserQuestionPagerModel
  /// question.id set whose long detail is expanded.
     @State private var expandedDetails: Set<String> = []
+ /// UIKit 列表后端：由列表层逐帧驱动行高动画（用户点击上报）。
+    @Environment(\.userToggleReporter) private var userToggleReporter
  /// True after a submit attempt bounced back because a question was left blank.
     @State private var showsIncompleteNotice = false
  /// Measured natural height of the current page's stem (question + detail). The
@@ -243,12 +245,18 @@ struct UserQuestionCardView: View {
                 .lineLimit(isLong && !isExpanded ? 4 : nil)
             if isLong {
                 Button(isExpanded ? L10n.t("收起") : L10n.t("展开")) {
-                    withAnimation(.easeInOut(duration: 0.15)) {
+                    let apply = {
                         if isExpanded {
                             expandedDetails.remove(question.id)
                         } else {
                             expandedDetails.insert(question.id)
                         }
+                    }
+                    if let userToggleReporter {
+                        userToggleReporter()
+                        apply()
+                    } else {
+                        withAnimation(.easeInOut(duration: 0.15)) { apply() }
                     }
                 }
                 .font(Theme.Typography.label)

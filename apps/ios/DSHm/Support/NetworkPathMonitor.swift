@@ -177,6 +177,9 @@ final class NetworkPathMonitor {
     @discardableResult
     func simulateMeaningfulChangeForE2E() -> Int {
         changeGeneration += 1
+        #if DEBUG
+        ScrollHitchProbe.mark("e2eNetChangeSim", ["changeGeneration": changeGeneration])
+        #endif
         onMeaningfulChange?()
         return changeGeneration
     }

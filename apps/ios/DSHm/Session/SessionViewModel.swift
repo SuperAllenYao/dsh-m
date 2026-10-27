@@ -42,6 +42,62 @@ enum DeferredStreamOpenPolicy {
     }
 }
 
+/// task-2：「打开详情页」是否要立刻踢一次重连（纯函数，单测覆盖）。
+///
+/// 用户报障「有时进入会话详情后要等很多秒进度条才开始加载」。列表页有
+/// LinkService.handlePageEnter()——链路处于.reconnecting /.disconnected 时取
+/// 消退避等待、立即重连（该入口注释原文：an explicit page enter is a user-visible
+/// resume and must not wait for it）。详情页原本没有这个入口：用户在退避窗口
+/// （0.5–10 s，scheduleReconnect 的指数退避）里点进会话时，首窗与历史补齐只能
+/// 等下一次退避，恰好就是「等很多秒」的形态。
+///
+/// 判定口径（与列表页一致，避免重启正在进行的握手）：
+/// -.reconnecting /.disconnected → true：取消退避，立即重连；
+/// -.connecting → false：重启会把正要成功的 TLS/WSS 轮次取消（P0-5 教训）；
+/// -.connected → false：复用现有链路（P0-5 reuse-first）；
+/// -.unpaired /.needsRepair → false：重连无意义，走配对/修复流程。
+enum DetailOpenReconnectPolicy {
+    static func shouldReconnectNow(_ phase: LinkService.Phase) -> Bool {
+        switch phase {
+        case .reconnecting, .disconnected:
+            return true
+        case .unpaired, .connecting, .connected, .needsRepair:
+            return false
+        }
+    }
+}
+
+/// task-2：历史补齐第一页的「并行预取」判定（纯函数，单测覆盖）。
+///
+/// 用户报障「进度条加载速度太慢 / 首屏后很久才开始加载」。缓存命中时，第一页
+/// `session/page` 原本要等「缓存读盘 → 合成快照应用 → rows 重建」全部做完才发出；
+/// 这三步都是主线程/本地工作，而翻页只依赖缓存 payload 里的 cursor + oldestSeq。
+/// 因此在应用缓存**之前**就把第一页请求发出去，让网络与本地恢复并行。
+///
+/// 只在「缓存 payload 确实还有更早历史、详情页在屏、链路可用、journal 还空」时预取；
+/// 任何条件不满足都不发额外请求（零浪费口径）。
+enum FillPagePrefetchPolicy {
+    static func shouldPrefetch(
+        payloadOldestSeq: Int?,
+        payloadHasMore: Bool?,
+        journalIsEmpty: Bool,
+        detailOnScreen: Bool,
+        transportAvailable: Bool
+    ) -> Bool {
+        guard payloadHasMore == true, journalIsEmpty, detailOnScreen, transportAvailable else {
+            return false
+        }
+        guard let oldest = payloadOldestSeq else { return false }
+        return oldest > 0
+    }
+
+ /// 预取结果只能用于它当初请求的 beforeSeq；journal 前沿变了就必须丢弃重取。
+    static func shouldConsume(prefetchedBeforeSeq: Int?, requestedBeforeSeq: Int) -> Bool {
+        guard let prefetched = prefetchedBeforeSeq else { return false }
+        return prefetched == requestedBeforeSeq
+    }
+}
+
 /// Retry policy for the exact `/api/changes.summary` fetch (task-2: cross-end
 /// file-change consistency, handoff §2.4).
 ///
@@ -486,6 +542,14 @@ final class SessionViewModel: ObservableObject {
     private(set) var firstWindowMessages: Int
     private var cacheSaveTask: Task<Void, Never>?
     private var firstPaintCacheTask: Task<Void, Never>?
+ /// task-2：缓存恢复期间并行发出的第一页历史预取（见 FillPagePrefetchPolicy）。
+    private struct FillPagePrefetch {
+        let beforeSeq: Int
+ /// nil = 预取失败（正常网络路径会按原语义重试，不把失败当结果用）。
+        let value: JSONValue?
+    }
+    private var fillPagePrefetchTask: Task<Void, Never>?
+    private var fillPagePrefetch: FillPagePrefetch?
     private var cachedChunksTask: Task<Void, Never>?
     private(set) var didRestoreFirstPaintCache = false
  /// Compatibility alias for older tests/E2E (same value).
@@ -670,6 +734,15 @@ final class SessionViewModel: ObservableObject {
                 self.dbg("first-paint cache miss")
                 return
             }
+ // task-2：缓存 payload 已在手，第一页 session/page 只依赖它的
+ // cursor/oldestSeq。先发请求、让出主线程一拍（让请求真正上线），再应用缓存
+ // 与重建 rows —— 网络与本地恢复并行，补齐第一页提前一段本地恢复时间
+ // 。
+            self.startFirstFillPagePrefetch(loaded.payload)
+            await Task.yield()
+ // 让出期间 live 快照可能先到：journal 前沿已不是 payload 的 oldestSeq，
+ // 预取结果不会被消费——立即取消，避免白拉一页大 payload。
+            if !self.journal.events.isEmpty { self.cancelFillPagePrefetch() }
             self.applyFirstPaintCache(loaded)
         }
     }
@@ -677,6 +750,71 @@ final class SessionViewModel: ObservableObject {
  /// Test seam: wait for the off-main first-paint cache restore (hit or miss).
     func awaitFirstPaintCacheForTesting() async {
         await firstPaintCacheTask?.value
+    }
+
+ // MARK: - 首屏缓存恢复期间的历史页预取
+
+ /// 缓存 payload 一读回来就发第一页 session/page（不等待 journal 应用/rows 重建）。
+ /// 只在 payload 确实还有更早历史时调用；结果由 fetchHistoryPage 按 beforeSeq 消费。
+    private func startFirstFillPagePrefetch(_ payload: SessionWindowCachePayload) {
+        guard FillPagePrefetchPolicy.shouldPrefetch(
+            payloadOldestSeq: payload.oldestSeq,
+            payloadHasMore: payload.hasMore,
+            journalIsEmpty: journal.events.isEmpty,
+            detailOnScreen: detailOnScreen,
+            transportAvailable: historyFillTransportAvailable()
+        ) else { return }
+        guard fillPagePrefetchTask == nil, fillPagePrefetch == nil else { return }
+        guard let beforeSeq = payload.oldestSeq else { return }
+        let args = Self.historyPageRequestArgs(
+            address: address,
+            throughSeq: payload.cursor,
+            beforeSeq: beforeSeq,
+            maxMessages: historyPageMessages
+        )
+        let loader = historyPageLoader
+        let link = link
+        fillPagePrefetchTask = Task { [weak self] in
+            #if DEBUG
+            let started = CACurrentMediaTime()
+            #endif
+            var prefetched: JSONValue?
+            do {
+                if let loader {
+                    prefetched = try await loader(args)
+                } else if let link, link.phase.isConnected {
+                    prefetched = try await link.unary("session/page", args: args)
+                }
+            } catch {
+                prefetched = nil
+            }
+            #if DEBUG
+            PerfProbe.shared.record("pageNetwork", ms: (CACurrentMediaTime() - started) * 1000)
+            #endif
+            guard let self, !Task.isCancelled else { return }
+            self.fillPagePrefetch = FillPagePrefetch(beforeSeq: beforeSeq, value: prefetched)
+            self.fillPagePrefetchTask = nil
+        }
+    }
+
+ /// 消费与本次请求 beforeSeq 匹配的预取页；失败/不匹配时返回 nil，由正常网络路径重取。
+    private func takePrefetchedHistoryPage(beforeSeq: Int) -> JSONValue? {
+        guard let prefetch = fillPagePrefetch else { return nil }
+        guard FillPagePrefetchPolicy.shouldConsume(
+            prefetchedBeforeSeq: prefetch.beforeSeq,
+            requestedBeforeSeq: beforeSeq
+        ) else {
+            fillPagePrefetch = nil
+            return nil
+        }
+        fillPagePrefetch = nil
+        return prefetch.value
+    }
+
+    private func cancelFillPagePrefetch() {
+        fillPagePrefetchTask?.cancel()
+        fillPagePrefetchTask = nil
+        fillPagePrefetch = nil
     }
 
     private func applyFirstPaintCache(_ loaded: SessionWindowCacheStore.Loaded) {
@@ -977,6 +1115,14 @@ final class SessionViewModel: ObservableObject {
  // changes, and a stop()/start() cycle clears the local cache.
         applyPendingUserQuestionWaterfalls(link.pendingUserQuestionWaterfalls(forSession: sessionId))
         detailOnScreen = true
+ // task-2：打开详情 = 用户可见的恢复入口。链路正在退避等待
+ // （.reconnecting /.disconnected）时立即重连，否则首窗与历史补齐要等下一次
+ // 退避（0.5–10 s），用户看到的就是「进详情后很多秒进度条才开始加载」。
+ // 只对等待中的链路生效：.connecting 不重启（会把正要成功的握手取消），
+ // .connected 复用（P0-5 reuse-first）。判定见 DetailOpenReconnectPolicy。
+        if DetailOpenReconnectPolicy.shouldReconnectNow(link.phase) {
+            link.reconnectNow()
+        }
         openStream()
         startHistoryFillIfPossible()
         checkHistoryFillWatchdog()
@@ -993,6 +1139,7 @@ final class SessionViewModel: ObservableObject {
         cachedChunksTask = nil
         firstPaintCacheTask?.cancel()
         firstPaintCacheTask = nil
+        cancelFillPagePrefetch()
         pendingHistoryBatch = false
  // P0: leaving the screen retires the deferred-open wait; a late phase flip
  // must not open a stream for a detail that is gone.
@@ -1040,6 +1187,7 @@ final class SessionViewModel: ObservableObject {
  // A reopen is itself a recovery attempt: keep the watchdog from beating the
  // snapshot restart, but still self-heal if that snapshot never arrives.
         lastHistoryFillWatchdogAt = Date()
+        cancelFillPagePrefetch()
         pendingHistoryBatch = false
  // An explicit reopen supersedes any pending deferred open; `openStream()`
  // re-arms the wait when the link is still down.
@@ -1389,49 +1537,127 @@ final class SessionViewModel: ObservableObject {
         try? await Task.sleep(nanoseconds: UInt64(scaled * 1_000_000_000))
     }
 
+ // MARK: - 历史页解码
+
+ /// 直接由页面 JSONValue 构造 `SessionPage`（跳过 JSONValue → JSON 编码 →
+ /// JSONDecoder 的第二次全量解析/序列化）。
+ ///
+ /// 用户报障「进度条加载速度太慢」。真实长会话（4053 事件 / ~12 MB journal）在
+ /// LAN 上单页可含 1400+ 事件、3.5–4.9 MB JSON；relay 上约 500 事件/页、1.4 MB。
+ /// 旧路径 `decodeOffMain` 先 `JSONEncoder` 把整棵 JSONValue 树重新序列化，再
+ /// `JSONDecoder` 解成 `SessionPage`——每页固定多一次全量 encode + parse，是补齐
+ /// 串行链上一段纯开销（不改变任何数据/协议）。
+ ///
+ /// 容错口径与旧的 Decodable 解码一致：`records` / `hasMore` / 每条 `event` 的
+ /// `type`+`seq` 缺失都视为整页解码失败（保持「坏页不 merge」的旧语义）；
+ /// 其余字段沿用 SessionEvent 的宽容解码（不认识就置 nil，绝不因一个字段丢整页）。
+    nonisolated static func sessionPage(from value: JSONValue) -> SessionPage? {
+        guard let object = value.objectValue,
+              let hasMore = object["hasMore"]?.boolValue,
+              let rawRecords = object["records"]?.arrayValue else {
+            return nil
+        }
+        var records: [SnapshotRecord] = []
+        records.reserveCapacity(rawRecords.count)
+        for raw in rawRecords {
+            guard let recordObject = raw.objectValue,
+                  let type = recordObject["type"]?.stringValue else {
+                return nil
+            }
+            var event: SessionEvent?
+            if let rawEvent = recordObject["event"], rawEvent != .null {
+                guard let eventObject = rawEvent.objectValue,
+                      let eventType = eventObject["type"]?.stringValue,
+                      let eventSeq = eventObject["seq"]?.intValue else {
+                    return nil
+                }
+                event = SessionEvent(
+                    type: eventType,
+                    seq: Int(eventSeq),
+                    time: eventObject["time"]?.intValue,
+                    data: eventObject["data"],
+                    surfaceOp: eventObject["surfaceOp"],
+                    sourceEventSeqs: eventObject["sourceEventSeqs"]?.arrayValue?
+                        .compactMap { $0.intValue.map(Int.init) }
+                )
+            }
+            records.append(SnapshotRecord(
+                type: type,
+                event: event,
+                seq: recordObject["seq"]?.intValue.map(Int.init)
+            ))
+        }
+        return SessionPage(records: records, hasMore: hasMore)
+    }
+
+ /// 在后台队列执行上面的直接构造（大页构造仍需数组/字符串分配，放主线程会拖住
+ /// 补齐批次间让出的那一拍）。DEBUG 下沿用 `pageDecodeBG` 探针名，便于和旧路径
+ /// 的 double-conversion 耗时直接对比。
+    private nonisolated static func historyPageOffMain(_ value: JSONValue) async -> SessionPage? {
+        #if DEBUG
+        let started = CACurrentMediaTime()
+        #endif
+        let page: SessionPage? = await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                continuation.resume(returning: Self.sessionPage(from: value))
+            }
+        }
+        #if DEBUG
+        PerfProbe.shared.record("pageDecodeBG", ms: (CACurrentMediaTime() - started) * 1000)
+        #endif
+        return page
+    }
+
     private func fetchHistoryPage(beforeSeq: Int) async -> HistoryPageOutcome {
+        #if DEBUG
+        let pageMainThreadStart = CACurrentMediaTime()
+        #endif
+        ScrollHitchProbe.mark("pageFetchBegin", ["beforeSeq": beforeSeq])
         let args = Self.historyPageRequestArgs(
             address: address,
             throughSeq: journal.cursor,
             beforeSeq: beforeSeq,
             maxMessages: historyPageMessages
         )
-        #if DEBUG
-        let fetchStart = CACurrentMediaTime()
-        #endif
         let value: JSONValue
-        do {
-            if let historyPageLoader {
-                value = try await historyPageLoader(args)
-            } else if let link {
-                value = try await link.unary("session/page", args: args)
-            } else {
-                return .failed
-            }
-        } catch {
+        if let prefetched = takePrefetchedHistoryPage(beforeSeq: beforeSeq) {
+ // task-2：缓存恢复期间并行预取的第一页已到，跳过第二次网络请求。
             if Task.isCancelled { return .cancelled }
-            dbg("history page fetch failed: " + NetworkErrorInterpreter.message(for: error))
+            value = prefetched
+        } else {
+            #if DEBUG
+            let fetchStart = CACurrentMediaTime()
+            #endif
+            do {
+                if let historyPageLoader {
+                    value = try await historyPageLoader(args)
+                } else if let link {
+                    value = try await link.unary("session/page", args: args)
+                } else {
+                    return .failed
+                }
+            } catch {
+                if Task.isCancelled { return .cancelled }
+                dbg("history page fetch failed: " + NetworkErrorInterpreter.message(for: error))
  // Real link failures are transient (5G/relay hiccups); retrying with a
  // bounded budget is what makes "unconditional full history" hold. The
  // test-only loader keeps the old semantics (count as terminal failure)
  // so the filler unit tests can still drive the failure path deterministically.
-            return historyPageLoader == nil ? .retryTransient : .failed
+                return historyPageLoader == nil ? .retryTransient : .failed
+            }
+            if Task.isCancelled { return .cancelled }
+            #if DEBUG
+            PerfProbe.shared.record("pageNetwork", ms: (CACurrentMediaTime() - fetchStart) * 1000)
+            #endif
         }
-        if Task.isCancelled { return .cancelled }
-        #if DEBUG
-        PerfProbe.shared.record("pageNetwork", ms: (CACurrentMediaTime() - fetchStart) * 1000)
-        #endif
-        let page: SessionPage
-        do {
- // A payload/contract break is deterministic: retrying would spin forever.
- // 卡顿修复：JSONValue.decode 内部是
- // JSONEncoder(JSONValue) + JSONDecoder(目标类型) 的双重转换，多 MB 历史页
- // 在 main actor 上做是数百毫秒级卡死（用户实测每批 ~0.5s）。改到后台队列。
-            page = try await Self.decodeOffMain(value, SessionPage.self, name: "pageDecodeBG")
-        } catch {
-            dbg("history page decode failed: " + String(describing: error))
+ // task-2：直接由 JSONValue 构造页面，跳过
+ // JSONEncoder(JSONValue)+JSONDecoder 的双重转换（多 MB 页的整页二次
+ // 序列化/解析是补齐串行链上的纯开销）。坏页语义不变：形状不符整页失败。
+        guard let page = await Self.historyPageOffMain(value) else {
+            dbg("history page decode failed: unexpected payload shape")
             return .failed
         }
+        ScrollHitchProbe.mark("pageDecoded", ["records": page.records.count])
  // 真机：Host 偶发回空页（瞬时）时，旧代码直接 terminal →
  // completed，补齐永久停在 hasMoreOlder=1。空页绝不能进 journal.prepend
  // （它会把空页当「到底」并把 hasMoreOlder 置 false），交给退避重试；
@@ -1453,6 +1679,18 @@ final class SessionViewModel: ObservableObject {
         applyJournalUpdate(update)
         #endif
         let oldestAfter = journal.oldestSeq
+        #if DEBUG
+        PerfProbe.shared.record(
+            "historyBatchMain",
+            ms: (CACurrentMediaTime() - pageMainThreadStart) * 1000,
+            ["records": page.records.count, "pages": historyFillPages]
+        )
+        #endif
+        ScrollHitchProbe.mark("pageApplied", [
+            "records": page.records.count,
+            "oldest": oldestAfter ?? -1,
+            "pages": historyFillPages,
+        ])
         let merged: Bool = {
             guard let before = oldestBefore, let after = oldestAfter else { return false }
             return after < before
@@ -1489,6 +1727,7 @@ final class SessionViewModel: ObservableObject {
         }
         historyFillTask?.cancel()
         historyFillTask = nil
+        cancelFillPagePrefetch()
         historyFillWatchdogTask?.cancel()
         historyFillWatchdogTask = nil
         syncFillDiagnostics()
@@ -1524,6 +1763,12 @@ final class SessionViewModel: ObservableObject {
 
  /// E2E-only filler probe (e2e-history-fill hidden element).
     private func syncFillDiagnostics() {
+ // 被上一层详情覆盖（不可见）时暂停进度/诊断发布：省掉父页在被子会话
+ // 覆盖期间的无谓 body 重算；恢复 topmost 时由 setDetailCovered 补发。
+        if detailCovered {
+            fillDiagnosticsDirty = true
+            return
+        }
  // First: deterministic 2pt bar state (design r2). Must run for every user
  // independent of the E2E-only diagnostics gate below.
         refreshHistoryFillProgress()
@@ -1566,8 +1811,11 @@ final class SessionViewModel: ObservableObject {
         #endif
         return true
     }()
- /// Reveal delay: sessions that finish quickly must not flash a 0→100 bar.
-    private static let historyFillProgressRevealDelay: TimeInterval = 0.3
+ /// Reveal delay：设计稿 §5 的默认 300ms 防闪；
+ /// 长会话（预计补齐页数 ≥ 2，见 HistoryFillRevealPolicy）缩短到 120ms，
+ /// 因为这种会话还要补多页，不存在「条闪一下就没」的风险（Lead 已批准）。
+    private var fillProgressRevealDelay: TimeInterval = HistoryFillRevealPolicy.standardDelay
+    private var fillProgressRevealDelayResolved = false
  /// Completion linger (200 ms at 100% + 250 ms fade) before the view is removed.
     private static let historyFillProgressCompletionLinger: TimeInterval = 0.6
  /// A bar that completed almost immediately after appearing gets a quick fade.
@@ -1581,6 +1829,16 @@ final class SessionViewModel: ObservableObject {
             fillProgressTracker.armIfNeeded(
                 oldestSeq: journal.oldestSeq,
                 hasMoreOlder: journal.hasMoreOlder
+            )
+        }
+ // task-2：O0 确定后算一次本次进入的 reveal 延迟（长会话 120ms / 短会话 300ms）。
+        if fillProgressTracker.isArmed, !fillProgressRevealDelayResolved {
+            fillProgressRevealDelayResolved = true
+            fillProgressRevealDelay = HistoryFillRevealPolicy.revealDelay(
+                originSeq: journal.oldestSeq,
+                loadedEvents: journal.events.count,
+                loadedMessages: Self.messageCount(in: journal.events),
+                pageMessages: historyPageMessages
             )
         }
  // Slow cache restore landing after the live snapshot: widen the denominator
@@ -1626,10 +1884,20 @@ final class SessionViewModel: ObservableObject {
         if historyFillProgress != nil { historyFillProgress = nil }
     }
 
+ /// 窗口里 user/assistant 消息条数（reveal 延迟的密度估计用，纯计数）。
+    nonisolated static func messageCount(in events: [SessionEvent]) -> Int {
+        events.reduce(into: 0) { count, event in
+            if event.type == "user/message" || event.type == "assistant/message" {
+                count += 1
+            }
+        }
+    }
+
     private func scheduleHistoryFillProgressReveal() {
         guard fillProgressRevealTask == nil else { return }
+        let delay = fillProgressRevealDelay
         fillProgressRevealTask = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: UInt64(Self.historyFillProgressRevealDelay * 1_000_000_000))
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
             guard let self, !Task.isCancelled else { return }
             self.fillProgressRevealTask = nil
             self.fillProgressRevealed = true
@@ -1644,7 +1912,7 @@ final class SessionViewModel: ObservableObject {
         let visibleFor = fillProgressRevealedAt.map { Date().timeIntervalSince($0) }
             ?? TimeInterval.greatestFiniteMagnitude
         let linger = visibleFor < Self.historyFillProgressMinVisible
-            ? Self.historyFillProgressRevealDelay
+            ? fillProgressRevealDelay
             : Self.historyFillProgressCompletionLinger
         fillProgressHideTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: UInt64(linger * 1_000_000_000))
@@ -1665,6 +1933,8 @@ final class SessionViewModel: ObservableObject {
         fillProgressRevealed = false
         fillProgressRevealedAt = nil
         fillProgressSawCacheRestore = false
+        fillProgressRevealDelay = HistoryFillRevealPolicy.standardDelay
+        fillProgressRevealDelayResolved = false
         fillProgressTracker.reset()
         historyFillProgress = nil
     }
@@ -1850,28 +2120,6 @@ final class SessionViewModel: ObservableObject {
         }
     }
 
- /// 把 JSONValue.decode（内部是 JSONValue→JSON 编码→目标类型解码 的双重转换）
- /// 挪到后台队列执行；主线程只做一次 await，不阻塞渲染。
-    private nonisolated static func decodeOffMain<T: Decodable>(
-        _ value: JSONValue,
-        _ type: T.Type,
-        name: String
-    ) async throws -> T {
-        try await withCheckedThrowingContinuation { continuation in
-            DispatchQueue.global(qos: .userInitiated).async {
-                let started = CACurrentMediaTime()
-                do {
-                    let decoded = try value.decode(type)
-                    #if DEBUG
-                    PerfProbe.shared.record(name, ms: (CACurrentMediaTime() - started) * 1000)
-                    #endif
-                    continuation.resume(returning: decoded)
-                } catch {
-                    continuation.resume(throwing: error)
-                }
-            }
-        }
-    }
 
     private func processFrame(_ frame: SessionStreamFrame) {
         switch frame {
@@ -1910,8 +2158,19 @@ final class SessionViewModel: ObservableObject {
                 startHistoryFillIfPossible()
             case .event(let event):
                 dbg("event: " + event.type + " seq=" + String(event.seq))
+                #if DEBUG
+                let eventApplyStart = CACurrentMediaTime()
+                let update = journal.apply(event: event)
+                PerfProbe.shared.record(
+                    "journalApply",
+                    ms: (CACurrentMediaTime() - eventApplyStart) * 1000,
+                    ["type": event.type]
+                )
+                applyJournalUpdate(update)
+                #else
                 let update = journal.apply(event: event)
                 applyJournalUpdate(update)
+                #endif
  // task-5: 状态图标的「上一轮失败」派生只依赖 turn 边界事件；
  // 其它事件不动它（避免每个事件都重扫窗口）。
                 if event.type == "turn/start" || event.type == "turn/end" {
@@ -1935,8 +2194,18 @@ final class SessionViewModel: ObservableObject {
                     scheduleSubagentRefreshFromActivity()
                 }
             case .assistantStream(let frame):
+                #if DEBUG
+                let streamApplyStart = CACurrentMediaTime()
+                let update = journal.apply(assistantStream: frame)
+                PerfProbe.shared.record(
+                    "journalApplyStream",
+                    ms: (CACurrentMediaTime() - streamApplyStart) * 1000
+                )
+                applyJournalUpdate(update)
+                #else
                 let update = journal.apply(assistantStream: frame)
                 applyJournalUpdate(update)
+                #endif
         case .unknown:
             break
         }
@@ -1946,20 +2215,33 @@ final class SessionViewModel: ObservableObject {
  // task-2: a network-path change (Wi-Fi ⇄ cellular) invalidates the exact
  // fetch that failed on the old path; reset + refetch on the new one.
         checkFileChangeNetworkGeneration()
+        ScrollHitchProbe.mark("journalUpdate")
         switch update {
         case .snapshotReplaced:
+            ScrollHitchProbe.mark("journalSnapshotReplaced")
             scrollDbg("journal snapshotReplaced")
  // task-5: 新窗口是权威，按窗口重算「上一轮失败」派生。
             refreshLastTurnFailedFromWindow()
             pendingRebuild = true
             scheduleRebuild()
         case .eventsApplied:
+            ScrollHitchProbe.mark("journalEventsApplied")
             scrollDbg("journal eventsApplied")
+ // 读历史（视图侧尾部新行本来就被冻结）：把「尾部 live 更新」的派生重建
+ // 推迟到用户回到底部，**journal/补齐/网络加载全部继续**。
+ // 继续 250ms 一次的整表重建只会和滚动抢主线程（实测滚动长帧与
+ // messageItems 重建同现）。回贴底时 setReadingHistory(false) 立即补发。
+            if readingHistory {
+                pendingRebuild = true
+                deferredTailPublish = true
+                break
+            }
             pendingRebuild = true
             scheduleRebuild()
         case .olderPrepended(let seqs):
  // Front merge: the rows above the current position changed, the newest
  // end did not. An empty result (defensive) has nothing to re-render.
+            ScrollHitchProbe.mark("journalOlderPrepended", ["n": seqs.count])
             scrollDbg("journal olderPrepended n=\(seqs.count) fillState=\(historyFillState.rawValue)")
             if seqs.isEmpty {
                 publishLiveStreamText()
@@ -1969,6 +2251,11 @@ final class SessionViewModel: ObservableObject {
                 scheduleRebuild()
             }
         case .duplicate, .ignored, .assistantStreamProgress:
+            if readingHistory {
+ // 读历史时尾部 live 预览不可见：先记一笔，回贴底时 flush。
+                deferredTailPublish = true
+                break
+            }
             publishLiveStreamText()
         case .gap, .assistantRevisionGap:
  // MVP policy: discard the local window and rebuild from a new
@@ -1985,13 +2272,25 @@ final class SessionViewModel: ObservableObject {
         if flush {
             liveTextThrottleTask?.cancel()
             liveTextThrottleTask = nil
+            deferredTailPublish = false
             syncLiveStreamValues()
+            return
+        }
+        if readingHistory {
+ // 读历史：尾部 live 预览在视图侧被冻结，发布只会制造整表重算。
+ // 数据仍在 journal 里增长，回贴底后一次 flush 补上。
+            deferredTailPublish = true
             return
         }
         if liveTextThrottleTask != nil { return }
         syncLiveStreamValues()
+ // 读历史时尾部 live 预览在视图侧被冻结，10Hz 发布只制造整表重算；
+ // 降到 4Hz（数据不丢，回到底部立即 flush）。贴底跟随仍保持 10Hz 实时感。
+        let throttle: UInt64 = detailCovered
+            ? 1_000_000_000
+            : (readingHistory ? 250_000_000 : 100_000_000)
         liveTextThrottleTask = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 100_000_000)
+            try? await Task.sleep(nanoseconds: throttle)
             guard let self, !Task.isCancelled else { return }
             self.liveTextThrottleTask = nil
             self.syncLiveStreamValues()
@@ -2000,12 +2299,29 @@ final class SessionViewModel: ObservableObject {
 
  /// 三路预览共用一次发布：任一值真的变了才写 @Published（不触发无意义重绘）。
     private func syncLiveStreamValues() {
+        var changed = false
         let latestText = journal.liveAssistantText
-        if liveAssistantText != latestText { liveAssistantText = latestText }
+        if liveAssistantText != latestText {
+            liveAssistantText = latestText
+            changed = true
+        }
         let latestReasoning = journal.liveReasoningText
-        if liveReasoningText != latestReasoning { liveReasoningText = latestReasoning }
+        if liveReasoningText != latestReasoning {
+            liveReasoningText = latestReasoning
+            changed = true
+        }
         let latestPreparations = journal.liveToolPreparations
-        if liveToolPreparations != latestPreparations { liveToolPreparations = latestPreparations }
+        if liveToolPreparations != latestPreparations {
+            liveToolPreparations = latestPreparations
+            changed = true
+        }
+        if changed {
+            ScrollHitchProbe.mark("liveStreamPublish", [
+                "text": liveAssistantText.count,
+                "reasoning": liveReasoningText.count,
+                "preps": liveToolPreparations.count,
+            ])
+        }
     }
 
  /// task-5: 按窗口内最后一条 turn 边界重算 `lastTurnFailed`。
@@ -2031,6 +2347,7 @@ final class SessionViewModel: ObservableObject {
  /// Drops a pending debounced rebuild and rebuilds now. Used for the first
  /// content paint and for history batches (the view anchors on the token).
     private func rebuildNowForHistoryBatch() {
+        ScrollHitchProbe.mark("rebuildBatch", ["events": journal.events.count])
         rebuildTask?.cancel()
         rebuildTask = nil
         pendingRebuild = false
@@ -2045,11 +2362,64 @@ final class SessionViewModel: ObservableObject {
         #endif
     }
 
+ /// 用户正在读历史（视口不贴底）：此时尾部新内容在视图侧被冻结，展示不需要
+ /// 40ms 级实时性。把「派生行发布」的防抖拉长，可把流式期间的整表重建频率降一个
+ /// 数量级——**数据加载（journal/fill/网络页）完全不受影响**，只是 UI 发布节奏
+ /// 变缓（回到贴底后立刻恢复 40ms，并会立即补一次发布）。
+    private var readingHistory = false
+
+ /// 详情页是否被上一层（子会话）覆盖、不在导航栈顶。
+ /// 被覆盖时页面不可见：暂停派生行重建/进度条发布（纯开销），**数据加载与
+ /// journal/stream 订阅完全不动**；重新成为 topmost 时立即补一次发布。
+    private var detailCovered = false
+ /// 覆盖期间被压下的进度条发布（恢复 topmost 时补发）。
+    private var fillDiagnosticsDirty = false
+
+ /// 导航栈可视性变化时调用（RootView 的 sessionDetailIsTopmost 环境值）。
+    func setDetailCovered(_ value: Bool) {
+        guard detailCovered != value else { return }
+        detailCovered = value
+        if !value {
+            if pendingRebuild {
+                scheduleRebuild()
+            }
+            if fillDiagnosticsDirty {
+                fillDiagnosticsDirty = false
+                syncFillDiagnostics()
+            }
+        }
+    }
+
+ /// 读历史期间被推迟的尾部 live 发布（数据在 journal 里，回贴底补发）。
+    private var deferredTailPublish = false
+
+ /// 视图侧贴底状态变化时调用（onNearBottomChange 链路）。只影响发布节奏，不暂停加载。
+    func setReadingHistory(_ value: Bool) {
+        guard readingHistory != value else { return }
+        readingHistory = value
+        if !value {
+ // 回到底部：立即补一次派生重建 + live 预览（不等下一个防抖窗口）。
+            if pendingRebuild || deferredTailPublish {
+                deferredTailPublish = false
+                rebuildNowForHistoryBatch()
+                publishLiveStreamText(flush: true)
+            }
+        }
+    }
+
+ /// 派生行发布防抖（秒）：贴底跟随用 40ms（流式实时感），读历史时 250ms。
+    private var rebuildDebounceNanoseconds: UInt64 {
+ // 被子会话覆盖（不可见）：1s 级合并；读历史：250ms；贴底跟随：40ms。
+        if detailCovered { return 1_000_000_000 }
+        return readingHistory ? 250_000_000 : 40_000_000
+    }
+
     private func scheduleRebuild() {
         guard pendingRebuild else { return }
         guard rebuildTask == nil else { return }
+        let debounce = rebuildDebounceNanoseconds
         rebuildTask = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 40_000_000)
+            try? await Task.sleep(nanoseconds: debounce)
             guard let self, !Task.isCancelled else { return }
             self.rebuildTask = nil
             guard self.pendingRebuild else { return }
@@ -2108,6 +2478,12 @@ final class SessionViewModel: ObservableObject {
         }
         flow = renderState.flow
         flowGroups = renderState.groups
+        ScrollHitchProbe.mark("rebuildRows", [
+            "branch": branch,
+            "events": events.count,
+            "rows": flow.rows.count,
+            "groups": renderState.groups.count,
+        ])
         scrollDbg("rebuild branch=\(branch) events=\(events.count) rows=\(flow.rows.count) oldest=\(journal.oldestSeq ?? -1) hasMore=\(journal.hasMoreOlder ? 1 : 0)")
         dbg("rebuild: events=" + String(events.count) + " rows=" + String(flow.rows.count) + " hasMoreOlder=" + String(journal.hasMoreOlder) + " oldest=" + String(journal.oldestSeq ?? -1) + " pendingEchoes=" + String(pendingUserEchoes.count) + (retiredEchoes > 0 ? " retired=" + String(retiredEchoes) : "") + (flow.isRunning ? " running" : " idle"))
         syncFillDiagnostics()

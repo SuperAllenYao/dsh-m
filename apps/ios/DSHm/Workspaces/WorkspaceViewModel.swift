@@ -9,6 +9,19 @@ import Foundation
 /// metadata (title/running/blank/updatedAt) still comes from `session/list` and is
 /// joined by session id.
 ///
+/// Live sync with the desktop (task-1): because membership and
+/// metadata come from two different sources, a desktop-side change is only
+/// visible after BOTH are fresh. The Host pushes membership on
+/// `workspace/follow` and session-list hints on `$events`
+/// (`api-session/added`/`activity`/`removed`), so this model
+/// - refreshes `session/list` (debounced) when a follow frame introduces a
+/// sessionId the joined snapshot has never seen — the actual root cause of
+/// "desktop-created session never appears on the phone";
+/// - refreshes on the forwarded `$events` hints (first message flips
+/// `blank`, materialises the title, reorders by activity);
+/// - runs one low-frequency fallback snapshot while the list page is on screen
+/// (desktop-side rename broadcasts nothing at all: probe-verified).
+///
 /// Visibility mirrors the desktop sidebar (`sessionVisible()` in
 /// dsh-client-ui-workspace):
 /// - subagent sessions are hidden;
@@ -141,6 +154,45 @@ final class WorkspaceViewModel: ObservableObject {
  /// 请求挂起 >1.2s 时允许**并行重发**（更高 requestID 胜出），避免 20s unary
  /// 超时把「缓存刷新」拖到 10s+。
     private var lastListRequestStartedAt: Date?
+
+ // MARK: - 桌面端实时同步（task-1）
+
+ /// 列表页是否在屏（`start()` 与 `stop()` 之间）：宿主事件与兜底快照只在
+ /// 此时工作；进详情/离屏立即停，不做后台轮询。
+    private var isListPageActive = false
+ /// `$events` 元数据失效信号观察者（见 LinkService+Streams 的
+ /// HostSessionListInvalidation）。
+    private var hostSessionListHintObserver: NSObjectProtocol?
+ /// 去抖后的补刷任务：follow 未知 sessionId 与 `$events` 信号合并成一次快照。
+    private var hostDrivenRefreshTask: Task<Void, Never>?
+ /// 低频兜底快照循环（桌面端改名没有广播，只能靠快照收敛）。
+    private var fallbackRefreshTask: Task<Void, Never>?
+ /// 补刷落地后 follow 仍缺元数据时的有界重试计数（Host list work-slice 竞态）。
+    private var missingFollowSessionRetries = 0
+
+ /// 失效信号去抖窗口（ms）：新建会话时 follow upsert 与 api-session/added
+ /// 几乎同时到，合并成一次 `session/list`。
+    static let hostDrivenRefreshDelayMs: Int = 350
+ /// 兜底快照间隔（ms）。桌面端改名不会广播任何帧，只能低频收敛；15s 是
+ /// 「桌面端改成什么样，手机稍后跟到」与「禁止轮询风暴」的折中（只在列表页
+ /// 在屏时跑）。E2E 可用 `DSHM_LIST_FALLBACK_REFRESH_MS` 缩短（DEBUG 环境变量，
+ /// 与既有 DSHM_* 脚手架同族）；单测直接改这个 static。
+    static var fallbackRefreshIntervalMs: Int = fallbackRefreshIntervalFromEnvironment()
+ /// 兜底跳过窗口（ms）：刚发过列表请求就不重复发，由去抖/重连路径合并。
+    static let fallbackRefreshMinGapMs: Int = 4_000
+ /// follow 出现未知 id 但快照仍不含时的有界重试（最多 2 次、间隔 1.2s）。
+    static let missingFollowSessionRetryLimit = 2
+    static let missingFollowSessionRetryDelayMs = 1_200
+ /// 测试 seam：替换真实 `session/list` 请求，观察「何时会补刷」。
+    var sessionListRefreshOverride: (() -> Void)?
+
+ /// 兜底间隔的默认值：15s，E2E 可用 env 缩短（夹在 0.5s–10min，避免误配置
+ /// 把真实用户变成轮询风暴）。
+    nonisolated static func fallbackRefreshIntervalFromEnvironment() -> Int {
+        guard let raw = ProcessInfo.processInfo.environment["DSHM_LIST_FALLBACK_REFRESH_MS"],
+              let value = Int(raw) else { return 15_000 }
+        return min(max(value, 500), 600_000)
+    }
 
  /// DEBUG 冷启动埋点：连接/列表各阶段耗时用。
     private func coldStartDebug(_ message: String) {
@@ -428,6 +480,7 @@ final class WorkspaceViewModel: ObservableObject {
  /// Entering the list: keep the workspace stream open and load session metadata.
     func start() {
         guard let link else { return }
+        beginHostDrivenListSync()
         coldStartDebug("start phase=\(link.phase) cached=\(loadedFromCache) sessionsLoaded=\(sessionsLoaded) networkApplied=\(networkApplied)")
         observedGeneration = link.generation
  // The cached list was applied in `init`; SwiftUI's `.onChange` only observes
@@ -476,6 +529,7 @@ final class WorkspaceViewModel: ObservableObject {
 
  /// Leaving the list: stop consuming the workspace stream.
     func stop() {
+        endHostDrivenListSync()
         workspaceStream?.cancel()
         workspaceStream = nil
         loadTask?.cancel()
@@ -619,6 +673,147 @@ final class WorkspaceViewModel: ObservableObject {
         }
     }
 
+ // MARK: - 桌面端实时同步（task-1）
+
+ /// 列表页在屏：订阅 `$events` 的列表元数据失效信号，并启动低频兜底快照。
+ /// 由 `start()` 调用（`stop()` 对称撤销）。
+    private func beginHostDrivenListSync() {
+        isListPageActive = true
+        missingFollowSessionRetries = 0
+        guard hostSessionListHintObserver == nil else { return }
+        hostSessionListHintObserver = NotificationCenter.default.addObserver(
+            forName: HostSessionListInvalidation.notification,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            let event = notification.userInfo?["event"] as? String ?? "unknown"
+            Task { @MainActor [weak self] in
+                self?.scheduleHostDrivenRefresh(reason: "events/" + event)
+            }
+        }
+        startFallbackRefreshLoop()
+    }
+
+ /// 列表页离屏：撤销订阅与后台任务；回列表时 `start()` 重新装上。
+    private func endHostDrivenListSync() {
+        isListPageActive = false
+        if let observer = hostSessionListHintObserver {
+            NotificationCenter.default.removeObserver(observer)
+            hostSessionListHintObserver = nil
+        }
+        hostDrivenRefreshTask?.cancel()
+        hostDrivenRefreshTask = nil
+        fallbackRefreshTask?.cancel()
+        fallbackRefreshTask = nil
+        missingFollowSessionRetries = 0
+    }
+
+ /// Test seam：无 LinkService 时安装宿主同步（生产由 `start()` 安装）。
+    func beginHostDrivenListSyncForTests() {
+        beginHostDrivenListSync()
+    }
+
+ /// Test seam：卸载宿主同步（否则异步任务会跨测试泄漏）。
+    func endHostDrivenListSyncForTests() {
+        endHostDrivenListSync()
+    }
+
+ /// 把一次宿主信号/follow 缺行合并进同一条去抖补刷。
+    private func scheduleHostDrivenRefresh(reason: String, delayMs: Int? = nil) {
+        guard isListPageActive else { return }
+        hostDrivenRefreshTask?.cancel()
+        let delay = delayMs ?? Self.hostDrivenRefreshDelayMs
+        hostDrivenRefreshTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(max(delay, 0)) * 1_000_000)
+            guard !Task.isCancelled, let self else { return }
+            self.performHostDrivenRefresh(reason: reason)
+        }
+    }
+
+ /// 执行一次宿主驱动的静默快照。
+    private func performHostDrivenRefresh(reason: String) {
+        guard isListPageActive else { return }
+ // 断线期间不补刷（宿主信号本身也随 $events 流消失）：重连与前台恢复
+ // 路径会统一 loadSessions，这里发只会得到一次必败的请求。
+        if let link, !link.phase.isConnected { return }
+        if let startedAt = lastListRequestStartedAt,
+           Date().timeIntervalSince(startedAt) * 1000 < 1_200 {
+ // 已有一份刚发出的快照在飞：它落地后会在
+ // `noteListSnapshotApplied` 里再检查缺行，这里不叠加请求。
+            coldStartDebug("host-driven refresh skipped (\(reason)): in-flight request")
+            return
+        }
+        coldStartDebug("host-driven list refresh reason=\(reason)")
+        refreshSessionListFromHost()
+    }
+
+ /// 发一次静默 `session/list`（测试注入 override，避免真实网络）。
+    private func refreshSessionListFromHost() {
+        if let override = sessionListRefreshOverride {
+            override()
+            return
+        }
+        loadSessions(silent: true)
+    }
+
+ /// 低频兜底：桌面端改名没有任何广播帧，只改 `session/list` 的 title，
+ /// 只能靠这个循环收敛（仅在列表页在屏且链路已连时发请求）。
+    private func startFallbackRefreshLoop() {
+        fallbackRefreshTask?.cancel()
+        fallbackRefreshTask = Task { [weak self] in
+            while !Task.isCancelled {
+                let interval = max(Self.fallbackRefreshIntervalMs, 50)
+                try? await Task.sleep(nanoseconds: UInt64(interval) * 1_000_000)
+                guard !Task.isCancelled, let self else { return }
+                self.fallbackRefreshTick()
+            }
+        }
+    }
+
+    private func fallbackRefreshTick() {
+        guard isListPageActive, sessionsLoaded else { return }
+ // 生产路径 start() 先 guard 了 link；无 link 只可能是测试 seam。
+        if let link, !link.phase.isConnected { return }
+        if let startedAt = lastListRequestStartedAt,
+           Date().timeIntervalSince(startedAt) * 1000 < Double(Self.fallbackRefreshMinGapMs) {
+            return
+        }
+        coldStartDebug("fallback list refresh")
+        refreshSessionListFromHost()
+    }
+
+ /// `workspace/follow` 已有成员关系、但 `session/list` 快照还没有行的
+ /// sessionId（桌面端新建会话的正常竞态：follow 先到、元数据快照未取）。
+ /// 列表按 id join 元数据，这种 id 会被 `rebuildGroups` 静默丢弃。
+    private func hasFollowSessionMissingFromSnapshot() -> Bool {
+        guard sessionsLoaded else { return false }
+        for workspace in followState.workspaces {
+            for sessionId in workspace.sessionIds where sessionsById[sessionId] == nil {
+                return true
+            }
+        }
+        return false
+    }
+
+ /// 快照落地后：follow 仍带来未知 id 时（Host list work-slice 尚未合并）
+ /// 有界重试，收敛后清零。
+    private func noteListSnapshotApplied() {
+        guard isListPageActive else { return }
+        guard hasFollowSessionMissingFromSnapshot() else {
+            missingFollowSessionRetries = 0
+            return
+        }
+        guard missingFollowSessionRetries < Self.missingFollowSessionRetryLimit else {
+            coldStartDebug("follow session still missing after retries; stop retrying")
+            return
+        }
+        missingFollowSessionRetries += 1
+        scheduleHostDrivenRefresh(
+            reason: "follow/missing-session#\(missingFollowSessionRetries)",
+            delayMs: Self.missingFollowSessionRetryDelayMs
+        )
+    }
+
  // MARK: - Stream / snapshot application
 
     private func handleWorkspaceItem(_ value: JSONValue?) {
@@ -649,6 +844,13 @@ final class WorkspaceViewModel: ObservableObject {
         closeOutPhoneCreatedBlanks(knownWorkspaceIds: knownIds, archivedBefore: archivedBefore)
         errorText = nil
         rebuildGroups()
+ // task-1：桌面端新建会话时，follow 的 upsert 会先
+ // 带来新 sessionId，而卡片要 join `session/list` 的元数据——快照里没有这
+ // 一行时 rebuildGroups 会静默丢弃，列表永远不出现。发现未知 id 就补刷。
+        if hasFollowSessionMissingFromSnapshot() {
+            coldStartDebug("follow frame introduced unknown sessionId; scheduling list refresh")
+            scheduleHostDrivenRefresh(reason: "follow/unknown-session")
+        }
         maybeStartPrewarm()
         scheduleListCacheSave()
     }
@@ -931,6 +1133,9 @@ final class WorkspaceViewModel: ObservableObject {
     private func applyDecodedSessionListResponse(_ value: JSONValue, list: SessionListValue) {
         lastSessionListJSON = value
         applySessions(list.items)
+ // task-1：快照落地后若 follow 仍有未知 id（Host list work-slice 合并
+ // 竞态），有界重试；正常情况这里为零成本空跑。
+        noteListSnapshotApplied()
         errorText = nil
         lastLoadedAt = Date()
         lastNetworkListAppliedAt = Date()

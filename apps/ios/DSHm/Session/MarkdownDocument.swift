@@ -54,6 +54,30 @@ enum MarkdownRenderPolicy {
     static func shouldParse(_ text: String) -> Bool {
         text.utf8.count <= maxParseBytes
     }
+
+ // MARK: 方案①单视图富文本
+
+ /// 超长消息切「一个预构建 AttributedString + 单 Text」渲染（方案①），
+ /// 普通消息保持块级渲染。真机归因：回填期 fast fling 的 50–230ms 长帧
+ /// 全部落在超长 Markdown 行首次物化（mdAppear）；block 解析已缓存，
+ /// 贵在几十个 block 的 SwiftUI 视图树构建 + 两次布局。
+ /// 阈值依据真机数据：长帧行 chars 1000–1800 / blocks 10–19。
+    static let flattenCharThreshold = 800
+    static let flattenBlockThreshold = 10
+
+ /// 默认开启；DEBUG 下 `DSHM_MD_SINGLEVIEW=0` 关闭（before/after 取证用）。
+    static let isFlattenEnabled: Bool = {
+        #if DEBUG
+        return ProcessInfo.processInfo.environment["DSHM_MD_SINGLEVIEW"] != "0"
+        #else
+        return true
+        #endif
+    }()
+
+    static func shouldFlatten(text: String, blockCount: Int) -> Bool {
+        guard isFlattenEnabled, !text.isEmpty, shouldParse(text) else { return false }
+        return text.count > flattenCharThreshold || blockCount >= flattenBlockThreshold
+    }
 }
 
 // MARK: - Parser
@@ -61,9 +85,9 @@ enum MarkdownRenderPolicy {
 /// Minimal block-level Markdown parser (pure Swift, no dependencies).
 ///
 /// Supported blocks: ATX headings, paragraphs, unordered/ordered lists with one
-/// level of nesting, task lists, fenced code blocks, blockquotes, thematic breaks
-/// and pipe tables. Deliberately tolerant: malformed input degrades to paragraph
-/// text instead of throwing.
+/// level of nesting, task lists, fenced code blocks (含嵌套在列表项里的深层缩进围栏),
+/// indented code blocks, blockquotes, thematic breaks and pipe tables. Deliberately
+/// tolerant: malformed input degrades to paragraph text instead of throwing.
 enum MarkdownParser {
 
     static func parse(_ text: String) -> [MarkdownBlock] {
@@ -81,6 +105,14 @@ enum MarkdownParser {
             if let fence = parseFenceStart(line) {
                 let consumed = consumeFencedCode(lines, from: index, fence: fence)
                 blocks.append(.codeBlock(language: fence.language, code: consumed.code))
+                index = consumed.nextIndex
+                continue
+            }
+ // 缩进代码块只在「文档开头或空行之后」起始：CommonMark 里它不能打断段落；
+ // 紧跟围栏/列表项的行保留原语义（避免把列表里的缩进说明文字误渲染成代码）。
+            if index == 0 || isBlank(lines[index - 1]),
+               let consumed = consumeIndentedCode(lines, from: index) {
+                blocks.append(.codeBlock(language: nil, code: consumed.code))
                 index = consumed.nextIndex
                 continue
             }
@@ -207,28 +239,55 @@ enum MarkdownParser {
         var character: Character
         var length: Int
         var language: String?
+ /// 围栏起始行的缩进列数（tab 记 4 列）。用于闭合围栏匹配与内容去缩进。
+        var indent: Int = 0
     }
 
+ /// 识别围栏起始行。
+ ///
+ /// 桌面端（CommonMark）允许围栏嵌在列表项/引用里，这时其缩进会 ≥4 列，
+ /// 例如 `1. 步骤：` 下面 5 空格缩进的 ```yaml。App 的列表模型是「一行一项」
+ /// 的扁平结构，无法承载嵌套块，所以这里放宽为**任意缩进都识别为围栏**，
+ /// 由主循环把它提级渲染成代码块（内容按围栏缩进去缩）；否则这类内容会
+ /// 被列表的惰性续行吞成普通文本（用户问题 6）。
     private static func parseFenceStart(_ line: String) -> Fence? {
-        guard let chars = indentStripped(line), let first = chars.first else { return nil }
+        let chars = Array(line)
+        var indent = 0
+        var cursor = 0
+        while cursor < chars.count, chars[cursor] == " " || chars[cursor] == "\t" {
+            indent += chars[cursor] == "\t" ? 4 : 1
+            cursor += 1
+        }
+        guard cursor < chars.count else { return nil }
+        let first = chars[cursor]
         guard first == "`" || first == "~" else { return nil }
         var run = 0
-        while run < chars.count, chars[run] == first { run += 1 }
+        while cursor + run < chars.count, chars[cursor + run] == first { run += 1 }
         guard run >= 3 else { return nil }
-        let rest = run < chars.count ? String(chars[run...]).trimmingCharacters(in: .whitespaces) : ""
+        let rest = cursor + run < chars.count
+            ? String(chars[(cursor + run)...]).trimmingCharacters(in: .whitespaces)
+            : ""
  // A backtick info string may not contain backticks (CommonMark).
         if first == "`", rest.contains("`") { return nil }
         let language = rest.isEmpty
             ? nil
             : rest.split(whereSeparator: { $0 == " " || $0 == "\t" }).first.map(String.init)
-        return Fence(character: first, length: run, language: language)
+        return Fence(character: first, length: run, language: language, indent: indent)
     }
 
     private static func isFenceClose(_ line: String, fence: Fence) -> Bool {
         let chars = Array(line)
         var index = 0
-        while index < chars.count, index < 4, chars[index] == " " { index += 1 }
-        guard index <= 3, index < chars.count, chars[index] == fence.character else { return false }
+        var columns = 0
+ // 闭合围栏允许的缩进：顶格围栏沿用 CommonMark 的「至多 3 空格」；深层围栏
+ // 则允许缩进到与起始行齐平（列表里嵌套的围栏，闭合行同样带缩进）。
+        let allowance = max(3, fence.indent)
+        while index < chars.count, columns < allowance,
+              chars[index] == " " || chars[index] == "\t" {
+            columns += chars[index] == "\t" ? 4 : 1
+            index += 1
+        }
+        guard index < chars.count, chars[index] == fence.character else { return false }
         var run = 0
         while index + run < chars.count, chars[index + run] == fence.character { run += 1 }
         guard run >= fence.length else { return false }
@@ -246,11 +305,77 @@ enum MarkdownParser {
             if isFenceClose(lines[index], fence: fence) {
                 return (codeLines.joined(separator: "\n"), index + 1)
             }
-            codeLines.append(lines[index])
+            codeLines.append(dedent(lines[index], by: fence.indent))
             index += 1
         }
  // Unterminated fence: consume everything that is left.
         return (codeLines.joined(separator: "\n"), lines.count)
+    }
+
+ /// 去掉至多 `columns` 列前导空白（tab 记 4 列）。围栏缩进多深，就把它内容的
+ /// 同量缩进去掉，这样提级渲染后代码块左侧不会留下一大段空白。
+    private static func dedent(_ line: String, by columns: Int) -> String {
+        guard columns > 0 else { return line }
+        let chars = Array(line)
+        var index = 0
+        var consumed = 0
+        while index < chars.count, consumed < columns,
+              chars[index] == " " || chars[index] == "\t" {
+            let width = chars[index] == "\t" ? 4 : 1
+            if consumed + width > columns { break }
+            consumed += width
+            index += 1
+        }
+        guard index > 0 else { return line }
+        return index < chars.count ? String(chars[index...]) : ""
+    }
+
+ // MARK: Indented code
+
+ /// 缩进代码块（4 空格或 1 个 tab 起）：桌面端（CommonMark）渲染为代码块，
+ /// App 之前会把它当普通段落（缩进被 trim），用户问题 6 的另一类形态。
+ ///
+ /// 只在「块起始处」调用（主循环已跳过空行），因此不会把段落里的续行
+ /// 误判成代码块 —— CommonMark 里缩进代码块也不能打断段落。
+    private static func consumeIndentedCode(
+        _ lines: [String],
+        from start: Int
+    ) -> (code: String, nextIndex: Int)? {
+        guard indentedCodeLine(lines[start]) != nil else { return nil }
+        var index = start
+        var codeLines: [String] = []
+        while index < lines.count {
+            let line = lines[index]
+            if isBlank(line) {
+ // 空行只有后面还跟着缩进行时才算代码内容；块末尾的空行丢掉。
+                var lookahead = index + 1
+                while lookahead < lines.count, isBlank(lines[lookahead]) { lookahead += 1 }
+                if lookahead < lines.count, indentedCodeLine(lines[lookahead]) != nil {
+                    codeLines.append("")
+                    index = lookahead
+                    continue
+                }
+                break
+            }
+            guard let stripped = indentedCodeLine(line) else { break }
+            codeLines.append(stripped)
+            index += 1
+        }
+        while let last = codeLines.last, last.isEmpty { codeLines.removeLast() }
+        guard !codeLines.isEmpty else { return nil }
+        return (codeLines.joined(separator: "\n"), index)
+    }
+
+ /// 4 空格（或 1 个 tab）缩进行返回去掉这层缩进后的内容，否则 nil。
+    private static func indentedCodeLine(_ line: String) -> String? {
+        let chars = Array(line)
+        if chars.first == "\t" {
+            return String(chars.dropFirst())
+        }
+        var index = 0
+        while index < chars.count, index < 4, chars[index] == " " { index += 1 }
+        guard index >= 4 else { return nil }
+        return index < chars.count ? String(chars[index...]) : ""
     }
 
  // MARK: Blockquote
