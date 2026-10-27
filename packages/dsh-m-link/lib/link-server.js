@@ -91,8 +91,10 @@ const PUSH_TITLE_TTL_MS = 5000;
  * 有任何帧；此时新连接必须能**接管**旧 socket，而不是用 409 让手机白等到心跳
  * 超时（用户 要求：任何网络都要连得上，且极致快）。
  * 活跃连接（窗口内有帧）仍按 409 拒绝，防止两个客户端抢流。
+ * L1：1500→800（砍掉网络切换重连的尾延迟，F12）；实际值经
+ * `/health` 的 `features.takeoverWindowMs` 广播，App 据此动态对齐冲突重试。
  */
-export const MUX_TAKEOVER_STALE_MS = 1500;
+export const MUX_TAKEOVER_STALE_MS = 800;
 
 const ENDPOINT_RE = /^\/api\/[A-Za-z0-9_$.-]+\/[A-Za-z0-9_$.-]+$/;
 const MAX_BODY_BYTES = 32 * 1024 * 1024;
@@ -200,6 +202,11 @@ const DEFAULTS = {
     muxRpcTicketTtlMs: P1_LIMITS.ticketTtlMs,
     muxRpcTicketReplayGraceMs: P1_LIMITS.ticketReplayGraceMs,
     muxRpcMaxPendingUpgrades: 8,
+ // L3a: downstream gzip on the P1 phone hop. The App
+ // negotiates it per socket with `hello.caps.gzip`; this flag is the
+ // plugin-side rollback switch (false → welcome.caps.gzip stays false).
+    muxGzip: true,
+    muxGzipThresholdBytes: P1_LIMITS.gzipThresholdBytes,
  // P1.5-A (<internal-doc>): honor the opt-in "lite"
  // `session/list` projection trim (header `x-dshm-list-lite: 1` or the
  // legacy-shaped body hint `_request.listMode=lite`). DEFAULT ON, but it
@@ -303,6 +310,12 @@ export function resolveConfig(raw) {
   merged.features = mergeConfig(DEFAULTS.features, merged.features);
   merged.features.muxRpc = merged.features.muxRpc === true;
   merged.features.listLite = merged.features.listLite !== false;
+  merged.features.muxGzip = merged.features.muxGzip !== false;
+ // L3a: the threshold is floored at 1024 — below that compression wastes more
+ // per-frame overhead than it saves (design L3a: default 4096).
+  merged.features.muxGzipThresholdBytes = Number.isInteger(merged.features.muxGzipThresholdBytes)
+    ? Math.max(1024, merged.features.muxGzipThresholdBytes)
+    : DEFAULTS.features.muxGzipThresholdBytes;
   for (const key of ['muxRpcResumeWindowMs', 'muxRpcReplayBytes', 'muxRpcReplayFrames', 'muxRpcRpcMaxInFlight', 'muxRpcRpcTimeoutMs', 'muxRpcHelloTimeoutMs', 'muxRpcTicketTtlMs', 'muxRpcTicketReplayGraceMs', 'muxRpcMaxPendingUpgrades']) {
     const fallback = DEFAULTS.features[key];
     merged.features[key] = Number.isInteger(merged.features[key]) && merged.features[key] > 0 ? merged.features[key] : fallback;
@@ -637,6 +650,11 @@ export class LinkServer {
       p1ReplayFrames: 0,
       p1ProtocolErrors: 0,
       p1UpstreamClosed: 0,
+ // L3a: downstream gzip (design §7.3 — the raw↔wire ratio is the AC-06
+ // evidence, aggregated from per-channel stats by syncP1Counters).
+      p1GzipFrames: 0,
+      p1GzipRawBytes: 0,
+      p1GzipWireBytes: 0,
     };
  // Port hand-off bookkeeping: a later start of this plugin (same process) can
  // reclaim the TLS port from this instance even if its dispose is cut short.
@@ -1422,7 +1440,14 @@ export class LinkServer {
  // `?proto=2`, so a v2 plugin is detected without paying a 401 first. The
  // App accepts either a legacy string or this array; no ticket/secret here.
       proto: this.config.features.muxRpc === true ? [PROTOCOL, 'dsh-m/2'] : [PROTOCOL],
-      features: { muxRpc: this.config.features.muxRpc === true },
+ // L1: takeoverWindowMs lets the App align its conflict retry to the real
+ // window (missing field → the old 1700ms fallback, so old plugins are not
+ // degraded); L3a: muxGzip advertises the compression policy.
+      features: {
+        muxRpc: this.config.features.muxRpc === true,
+        takeoverWindowMs: MUX_TAKEOVER_STALE_MS,
+        muxGzip: this.config.features.muxGzip === true,
+      },
       ready: this.ready,
       inactive: this.disposed || !this.ctxActive(),
       startupError: this.startupError ?? null,
@@ -2982,6 +3007,13 @@ export class LinkServer {
       if (frameAudit !== undefined) frameAudit.toDevice(device?.deviceId, text, delivered);
       if (delivered) downstream.send(text);
     };
+ // L3a: gzip-compressed frames go out as binary WebSocket frames
+ // (`[0x01][gzip]` from mux-rpc.js sendText); only used once negotiated.
+    const sendBinary = (data) => {
+      const delivered = downstream.readyState === 1;
+      if (frameAudit !== undefined) frameAudit.toDevice(device?.deviceId, data, delivered, true);
+      if (delivered) downstream.send(data, { binary: true });
+    };
     const close = (code, reason) => {
       try {
         downstream.close(code, String(reason ?? '').slice(0, 120));
@@ -3066,7 +3098,7 @@ export class LinkServer {
           }
         }
         try {
-          channel = this.openP1Channel(device, downstream, send, close);
+          channel = this.openP1Channel(device, downstream, send, sendBinary, close);
         } catch (error) {
  // A racing reconnect/duplicate hello must not escape the socket handler
  // (EventEmitter would treat it as an uncaught exception); fail closed.
@@ -3184,6 +3216,9 @@ export class LinkServer {
       resumes: 0,
       resumeResets: 0,
       protocolErrors: 0,
+      gzipFrames: 0,
+      gzipRawBytes: 0,
+      gzipWireBytes: 0,
     };
     const resumes = Number(stats.resumes) || 0;
     const resumeResets = Number(stats.resumeResets) || 0;
@@ -3195,6 +3230,11 @@ export class LinkServer {
     this.counters.p1ResumeOk += Math.max(0, (resumes - resumeResets) - (previous.resumes - previous.resumeResets));
     this.counters.p1ResumeReset += Math.max(0, resumeResets - previous.resumeResets);
     this.counters.p1ProtocolErrors += Math.max(0, (Number(stats.protocolErrors) || 0) - previous.protocolErrors);
+ // L3a: gzip counters use the same diff pattern (a channel synced twice or
+ // disposed after the resume window never double counts).
+    this.counters.p1GzipFrames += Math.max(0, (Number(stats.gzipFrames) || 0) - (previous.gzipFrames || 0));
+    this.counters.p1GzipRawBytes += Math.max(0, (Number(stats.gzipRawBytes) || 0) - (previous.gzipRawBytes || 0));
+    this.counters.p1GzipWireBytes += Math.max(0, (Number(stats.gzipWireBytes) || 0) - (previous.gzipWireBytes || 0));
     channel.counterSnapshot = {
       rpcOk: Number(stats.rpcOk) || 0,
       rpcFailed: Number(stats.rpcFailed) || 0,
@@ -3202,6 +3242,9 @@ export class LinkServer {
       resumes,
       resumeResets,
       protocolErrors: Number(stats.protocolErrors) || 0,
+      gzipFrames: Number(stats.gzipFrames) || 0,
+      gzipRawBytes: Number(stats.gzipRawBytes) || 0,
+      gzipWireBytes: Number(stats.gzipWireBytes) || 0,
     };
   }
 
@@ -3222,13 +3265,13 @@ export class LinkServer {
  * replay log and epoch) without touching the upstream peer; otherwise a new
  * channel/epoch is created and the phone's `resume` is answered with a reset.
  */
-  openP1Channel(device, downstream, send, close) {
+  openP1Channel(device, downstream, send, sendBinary, close) {
     if (!this.ctxActive()) return undefined;
     const existing = this.p1Channels.get(device.deviceId);
     if (existing !== undefined && existing.disposed !== true) {
       clearTimeout(existing.disposeTimer);
       existing.disposeTimer = undefined;
-      existing.attachTransport({ send, close });
+      existing.attachTransport({ send, sendBinary, close });
       device.downstream = downstream;
       device.lastDownstreamActivityAt = Date.now();
       device.p1Channel = existing;
@@ -3254,13 +3297,19 @@ export class LinkServer {
         replayBytes: this.config.features.muxRpcReplayBytes,
         replayFrames: this.config.features.muxRpcReplayFrames,
       },
+ // L3a: plugin-side gzip policy; the channel still only compresses after
+ // the socket negotiates it with `hello.caps.gzip`.
+      gzip: {
+        enabled: this.config.features.muxGzip === true,
+        thresholdBytes: this.config.features.muxGzipThresholdBytes,
+      },
       log,
     });
     this.p1Channels.set(device.deviceId, channel);
     device.downstream = downstream;
     device.lastDownstreamActivityAt = Date.now();
     device.p1Channel = channel;
-    channel.attachTransport({ send, close });
+    channel.attachTransport({ send, sendBinary, close });
     this.counters.p1Channels += 1;
     log('device ' + device.deviceId + ': P1 channel opened (epoch ' + channel.epoch.slice(0, 8) + '…)');
     this.audit.record('p1.channel-open', { deviceId: device.deviceId, epoch: channel.epoch });
