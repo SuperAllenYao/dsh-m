@@ -31,6 +31,10 @@ struct HistoryLoadTimeline: Equatable {
     private(set) var lastPageArriveAt: CFTimeInterval?
  /// 最近一次「页 N 到手即发页 N+1 预取」的决策点（L3c）。
     private(set) var lastNextPageRequestAt: CFTimeInterval?
+ /// 最近一次有效的「页到手→下页预取」段（毫秒）。必须在 `markNextPageRequest`
+ /// 当刻冻结：末页也会 `markPageArrive` 但没有下一请求，若按两个最新锚点现算，
+ /// 末页的 arrive 会晚于最后一次 request，把有效段算成 nil。
+    private(set) var lastPageArriveToNextPageRequestMs: Double?
  /// 补齐完成（总耗时口径 = detailEnter→fillComplete，覆盖缓存恢复段）。
     private(set) var fillCompleteAt: CFTimeInterval?
  /// 补齐完成时累计合并的页数（与 historyFillPages 同源）。
@@ -58,7 +62,11 @@ struct HistoryLoadTimeline: Equatable {
     }
 
     mutating func markNextPageRequest() {
-        lastNextPageRequestAt = CACurrentMediaTime()
+        let now = CACurrentMediaTime()
+        lastNextPageRequestAt = now
+        if let arrive = lastPageArriveAt, arrive <= now {
+            lastPageArriveToNextPageRequestMs = (now - arrive) * 1000
+        }
     }
 
     mutating func markFillComplete(pages: Int) {
@@ -73,11 +81,13 @@ struct HistoryLoadTimeline: Equatable {
         segment(from: detailEnterAt, to: firstPageRequestAt)
     }
 
- /// AC-05 无缓存路径硬线段（≤300ms）。cursor 到达必须先于首页请求才有值：
- /// 有缓存路径预取先发、cursor 后到，本段为 nil、不参与判定。
+ /// AC-05 无缓存路径硬线段（≤300ms）。cursor 到达必须先于（或同帧于）首页请求
+ /// 才有值：有缓存路径预取先发、cursor 后到（严格晚于），本段为 nil、不参与判定。
+ /// 允许 `cursor == first`：冷入口两锚点可能落在同一 runloop tick（0ms 段合法，
+ /// 不能用严格小于误判成「未取证」）。
     var cursorArriveToFirstPageRequestMs: Double? {
         guard let cursor = cursorArriveAt, let first = firstPageRequestAt,
-              cursor < first else { return nil }
+              cursor <= first else { return nil }
         return (first - cursor) * 1000
     }
 
@@ -88,7 +98,7 @@ struct HistoryLoadTimeline: Equatable {
 
  /// L3c 流水线决策开销：页 N 到手 → 页 N+1 预取发出。
     var pageArriveToNextPageRequestMs: Double? {
-        segment(from: lastPageArriveAt, to: lastNextPageRequestAt)
+        lastPageArriveToNextPageRequestMs
     }
 
  /// 补齐总耗时（进入详情 → 补齐完成）。

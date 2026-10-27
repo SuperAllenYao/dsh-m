@@ -698,10 +698,11 @@ final class P1Channel {
         guard let source = socket else { return }
         let maxBytes = maxFrameBytes
         Self.inboundDecodeQueue.async { [weak self] in
-            let text: String
-            let decoded: Result<P1ServerFrame, P1ProtocolError>
+            var rawText: String?
+            var decoded: Result<P1ServerFrame, P1ProtocolError>
             do {
-                text = try produceText()
+                let text = try produceText()
+                rawText = text
                 #if DEBUG
  // Device evidence hook (`DSHM_PERFDBG=1`): confirms the history
  // page decode really runs off the main actor and how long one
@@ -730,7 +731,8 @@ final class P1Channel {
                     guard self.state == .connecting || self.state == .ready else { return }
                     switch decoded {
                     case .success(let frame):
-                        self.applyFrame(frame, rawText: text)
+ // Success implies produceText() completed and rawText was set.
+                        self.applyFrame(frame, rawText: rawText ?? "")
                     case .failure(let error):
                         self.violate(error)
                     }

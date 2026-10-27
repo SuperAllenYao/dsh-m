@@ -663,8 +663,8 @@ final class LinkService: ObservableObject {
             connectTickets: seededTickets,
             p1Epoch: nil,
             p1Sid: nil,
-            hostId: payload.host?.id,
-            takeoverWindowMs: p1Capabilities.takeoverWindowMs
+            takeoverWindowMs: p1Capabilities.takeoverWindowMs,
+            hostId: payload.host?.id
         )
         adopt(credentials: credentials)
  // M2a: remember the control-plane relay config advertised by the Mac so
