@@ -1370,7 +1370,6 @@ final class LinkService: ObservableObject {
  // 本轮 transportRoute 即可生效）。探测的 ≤500ms 计入轮起点之后，
  // fast-retry 对齐等待按「轮起点 + 对齐值」自校正，不改变 AC-01 口径；
  // 重连/网络切换轮次绝不探测。
-        await probeP1CapabilityIfColdStart()
  // Cross-network requirement: order candidates by the phone's *current*
  // network. Same subnet -> LAN first; cellular / a different network ->
  // relay first with the stale LAN address only as a bounded fallback. This
@@ -1383,6 +1382,10 @@ final class LinkService: ObservableObject {
             local: localNetwork,
             pathChanged: pathChanged
         )
+ // P1 能力探测（设计 §3-L2）：打**主候选**（按当前网络排序后的首个 origin；
+ // 跨网冷启动时陈旧 LAN/relay 地址候选可能不可达——打错 origin 会白付
+ // 500ms 且本周期窗口值刷新失败）。单个 origin、不遍历、有界。
+        await probeP1CapabilityIfColdStart(primaryOrigin: orderedCandidates.first)
  // 冷启动 <1s（列表侧）：预热共享 HTTPS 池，让 t0+~100ms 就发出的
  // early session/list 复用已建好的 TLS，而不是再付一次 ~300ms 握手。
         warmHTTPSPoolIfColdStart(prefersRelay: prefersRelay, local: localNetwork)
@@ -1798,10 +1801,13 @@ final class LinkService: ObservableObject {
  ///
  /// 单测注入 `p1ColdStartProbeFetch`/`p1ColdStartProbePersist` 后不触网络与
  /// Keychain（测试宿主与 E2E App 共享两者）。
-    func probeP1CapabilityIfColdStart() async {
+    func probeP1CapabilityIfColdStart(primaryOrigin: URL?) async {
         guard !p1ColdStartProbeConsumed else { return }
         p1ColdStartProbeConsumed = true
-        guard var current = credentials, let origin = current.originURL else { return }
+        guard var current = credentials else { return }
+ // 主候选优先；无候选时退回持久化的 origin（旧调用语义）。
+        guard let origin = primaryOrigin ?? current.originURL else { return }
+        linkDebug("cold-probe: target=" + (origin.host ?? "?"))
         do {
             let status: Int
             let json: JSONValue
