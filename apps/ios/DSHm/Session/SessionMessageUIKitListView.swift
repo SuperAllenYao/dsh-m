@@ -959,7 +959,7 @@ private struct MessageTableRepresentable: UIViewRepresentable {
             rowHostSerials.removeAll(keepingCapacity: false)
             rowHeightEstimates.removeAll(keepingCapacity: false)
             giantRevealedSteps.removeAll(keepingCapacity: false)
-            pendingMeasureIDs.removeAll(keepingCapacity: false)
+            pendingMeasure.removeAll()
             stopMeasureDrainTimer()
             heightAnimator?.stopAnimation(true)
             heightAnimator = nil
@@ -1416,16 +1416,20 @@ private struct MessageTableRepresentable: UIViewRepresentable {
  /// 已加载但从未测量的行（估算粗 → UIKit offset 调整/插入补偿漂移 + 滚动
  /// 到达时同步测量卡顿）。静止时每 tick 实测一行：estimatedHeightForRowAt
  /// 逐步变精确，滚动到达时宿主/高度已就绪。
-        private var pendingMeasureIDs: [String] = []
+        private var pendingMeasure = PendingMeasureQueue()
         private var measureDrainTimer: DispatchSourceTimer?
 
         private func queueUnmeasuredRowsForIdleMeasure(_ items: [SessionMessageItem]) {
-            var queued = false
+ // v6.2 冻结修复：未测量行先去重再入队。旧实现
+ // 每次 apply 全量追加且不去重——流式会话 10-25Hz 的 apply 把队列以
+ // 每秒上千条推大，drain 只消化 ~60 条/秒 → 队列爆炸后重排比较器
+ // O(队列 × 行数) 直接烧死主线程（真机 CPU Resource 报告 23:51:41：
+ // 92% CPU × 97s，栈为 apply → queueUnmeasured → prioritize → id 拷贝）。
+            var unmeasured: [String] = []
             for item in items where rowHosts[item.id] == nil && rowHeightEstimates[item.id] == nil {
-                pendingMeasureIDs.append(item.id)
-                queued = true
+                unmeasured.append(item.id)
             }
-            guard queued else { return }
+            guard pendingMeasure.enqueue(unmeasured) else { return }
             prioritizePendingMeasureByProximity()
             startMeasureDrainTimer()
         }
@@ -1434,17 +1438,22 @@ private struct MessageTableRepresentable: UIViewRepresentable {
  /// 预算全花在远处行——用户向上滚动时即将到达的是「视口上方紧邻」的行，
  /// 就近排序让短暂停顿的 drain 都花在刀刃上（回填期滚动卡顿的主源之一
  /// 是新页行被滚动追上时的现场物化，真机 rowAppear 间隙 35-511ms）。
+ ///
+ /// v6.2 冻结修复：位置表一次 O(n) 构建后排序只做 O(1) 查表。旧实现每个
+ /// 比较都做两次 displayedItems.firstIndex 线性扫描并现算行 id（组 id 需
+ /// 拷贝 ProcessStep/JSONValue 负载），复杂度 O(m log m × n)，队列一大多
+ /// 即主线程爆炸。
         private func prioritizePendingMeasureByProximity() {
-            guard let tableView, let dataSource,
+            guard pendingMeasure.count > 1, let tableView, let dataSource,
                   let first = tableView.indexPathsForVisibleRows?.first,
-                  let anchorID = dataSource.itemIdentifier(for: first),
-                  let anchorIdx = displayedItems.firstIndex(where: { $0.id == anchorID }) else { return }
-            let ids = pendingMeasureIDs
-            pendingMeasureIDs = ids.sorted { a, b in
-                let da = displayedItems.firstIndex(where: { $0.id == a }).map { abs($0 - anchorIdx) } ?? .max
-                let db = displayedItems.firstIndex(where: { $0.id == b }).map { abs($0 - anchorIdx) } ?? .max
-                return da < db
-            }
+                  let anchorID = dataSource.itemIdentifier(for: first) else { return }
+            var positions: [String: Int] = [:]
+            positions.reserveCapacity(displayedItems.count)
+            for (idx, item) in displayedItems.enumerated() { positions[item.id] = idx }
+            guard let anchor = positions[anchorID] else { return }
+            pendingMeasure.reorder(
+                MeasureProximityPolicy.ordered(pendingMeasure.ids, positions: positions, anchor: anchor)
+            )
         }
 
         private func startMeasureDrainTimer() {
@@ -1466,11 +1475,11 @@ private struct MessageTableRepresentable: UIViewRepresentable {
                     || self.heightAnimationActive || self.userIsScrolling {
                     return
                 }
-                if self.pendingMeasureIDs.isEmpty {
+                if self.pendingMeasure.isEmpty {
                     self.stopMeasureDrainTimer()
                     return
                 }
-                let id = self.pendingMeasureIDs.removeFirst()
+                guard let id = self.pendingMeasure.removeFirst() else { return }
                 if let item = self.item(for: id) {
  // rowHost 构建路径内部会把 (签名, 高度) 写入 rowHeightEstimates。
                     _ = self.rowHost(for: item, isNewest: self.isNewest(item))
@@ -3188,4 +3197,81 @@ final class UILListSharedModel: ObservableObject {
     var maxIdleDistance: CGFloat = 0
     var idleDriftCount = 0
     var lastScrollCommand = "-"
+}
+
+// MARK: - 待测量队列（v6.2 冻结修复， 真机 P0）
+
+/// 行高**闲置预测量**的有界去重队列。
+///
+/// 背景：旧实现用一个裸 `[String]` 累积待测量行，
+/// 每次 `apply()`（SwiftUI updateUIView 触发，流式会话下 10-25Hz）把窗口内所有
+/// 「未测量」行**重复追加**；而排空器只在静止时以 1 行/16ms 消化（~60 行/秒）。
+/// 流式大会话里未测量行持续再生 → 队列以每秒上千条膨胀 → 重排比较器对每次比较
+/// 做两次 `displayedItems.firstIndex`（O(n)）并现算行 id（组 id 需拷贝
+/// ProcessStep/JSONValue 负载）→ 单次排序可达数十秒，主线程 92% 占空比连续
+/// 97 秒（系统 CPU Resource 报告 DSHm.cpu_resource--235141：栈为
+/// SwiftUI 布局 → Coordinator.apply → queueUnmeasuredRowsForIdleMeasure →
+/// prioritizePendingMeasureByProximity → FlowRowGroup.id / JSONValue 拷贝），
+/// 用户表现为「无法滚动、动效卡死」。
+///
+/// 修复：成员 `Set` 去重 + 封顶 `cap` + 重排（见 `MeasureProximityPolicy`）
+/// 改为 O(m log m) 排序 + O(1) 位置查表。
+struct PendingMeasureQueue {
+    private(set) var ids: [String] = []
+    private var members: Set<String> = []
+    let cap: Int
+
+    init(cap: Int = 512) {
+        self.cap = max(1, cap)
+    }
+
+    var isEmpty: Bool { ids.isEmpty }
+    var count: Int { ids.count }
+
+ /// 追加待测量行 id（去重 + 封顶）。返回是否真的入队了新行。
+    @discardableResult
+    mutating func enqueue(_ newIDs: [String]) -> Bool {
+        var queued = false
+        for id in newIDs where !members.contains(id) {
+            guard ids.count < cap else { break }
+            members.insert(id)
+            ids.append(id)
+            queued = true
+        }
+        return queued
+    }
+
+ /// 按给定顺序重排（成员集合不变，仅调整排空优先级）。
+    mutating func reorder(_ ordered: [String]) {
+        guard ordered.count == ids.count, Set(ordered) == members else { return }
+        ids = ordered
+    }
+
+    mutating func removeFirst() -> String? {
+        guard !ids.isEmpty else { return nil }
+        let id = ids.removeFirst()
+        members.remove(id)
+        return id
+    }
+
+    mutating func removeAll() {
+        ids.removeAll(keepingCapacity: false)
+        members.removeAll(keepingCapacity: false)
+    }
+}
+
+/// 待测量队列的就近排序（纯逻辑，可单测）：按「距视口锚点行」由近到远。
+///
+/// 旧实现把位置查找塞进 `sorted(by:)` 比较器（每比较 O(n) 线性扫描 + 现算 id），
+/// 与队列长度相乘即主线程爆炸源。这里要求调用方先一次 O(n) 构建位置表，
+/// 比较器只做字典查表。
+enum MeasureProximityPolicy {
+    static func ordered(_ ids: [String], positions: [String: Int], anchor: Int) -> [String] {
+        guard ids.count > 1 else { return ids }
+        return ids.sorted { a, b in
+            let da = positions[a].map { abs($0 - anchor) } ?? Int.max
+            let db = positions[b].map { abs($0 - anchor) } ?? Int.max
+            return da < db
+        }
+    }
 }
