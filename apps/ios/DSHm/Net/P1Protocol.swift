@@ -197,6 +197,10 @@ enum P1ClientFrame: Equatable {
             "v": .int(Int64(hello.v)),
             "client": .object(client),
             "auth": .object(auth),
+ // link-perf L3a（DEC-A）：广播下行 gzip 能力；旧插件
+ // onHello 忽略未知 caps 键（不 protocolViolation），welcome 不
+ // 回显 gzip → App 不预期压缩帧（错配窗口安全网的前提）。
+            "caps": .object(["gzip": .bool(true)]),
         ]
         if let resume = hello.resume {
             guard !resume.logEpoch.isEmpty else {
@@ -284,6 +288,10 @@ struct P1Caps: Decodable, Equatable {
     var resume: Bool
     var maxInFlight: Int
     var replayBytes: Int
+ /// link-perf L3a（DEC-A）：下行 gzip 协商位。旧插件不回显
+ /// （nil）——此时 App 不预期压缩帧，收到 binary 帧 = 协议违规（设计
+ /// §3-L1 兼容矩阵「新 App × 旧插件」错配行的安全网）。
+    var gzip: Bool?
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
@@ -303,10 +311,11 @@ struct P1Caps: Decodable, Equatable {
         self.resume = resume
         self.maxInFlight = maxInFlight
         self.replayBytes = replayBytes
+        self.gzip = try container.decodeIfPresent(Bool.self, forKey: .gzip)
     }
 
     private enum CodingKeys: String, CodingKey {
-        case unary, resume, maxInFlight, replayBytes
+        case unary, resume, maxInFlight, replayBytes, gzip
     }
 }
 
@@ -649,6 +658,30 @@ enum P1FrameCodec {
         } catch {
             throw P1ProtocolError.violation(error.localizedDescription)
         }
+    }
+
+ /// link-perf L3a（DEC-A）：binary WS 帧线格式
+ /// `[1B 版本号=0x01][gzip 字节]` → 解压后的 JSON 文本。与 legacy HTTP
+ /// 单响通道复用同一个 gunzip（libcompression，`HTTPCompression`）。任何
+ /// 失败（空帧/版本不符/gunzip 失败/非 UTF-8）= 协议违规——对端只能在
+ /// 协商 gzip 后发 binary，且字节必须是合法 gzip。
+    static func inflateBinaryFrame(_ data: Data) throws -> String {
+        guard let version = data.first else {
+            throw P1ProtocolError.violation("binary 空帧")
+        }
+        guard version == 0x01 else {
+            throw P1ProtocolError.violation("binary 帧版本不支持: \(version)")
+        }
+        let inflated: Data
+        do {
+            inflated = try HTTPCompression.gunzip(Data(data.dropFirst()))
+        } catch {
+            throw P1ProtocolError.violation("binary 帧 gunzip 失败: \(error.localizedDescription)")
+        }
+        guard let text = String(data: inflated, encoding: .utf8) else {
+            throw P1ProtocolError.violation("binary 帧解压后不是 UTF-8 JSON")
+        }
+        return text
     }
 
     private static func checkSize(_ bytes: Int, limit: Int, direction: String) throws {

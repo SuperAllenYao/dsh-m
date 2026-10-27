@@ -159,6 +159,27 @@ final class LinkService: ObservableObject {
     var p1SilentResume = false
  /// Timestamp of the socket loss, for the `recoverMs` replay metric.
     var p1LostAt: Date?
+ /// link-perf L2（DEC-D，设计变更二审）：冷启动能力探测是否已
+ /// 消费——本 App 运行周期首次连接轮次探测一次（**不绑定 supportsMuxRPC**：
+ /// 每周期都要重读 takeoverWindowMs 并探测插件回退，否则持久化的 true 会让
+ /// 桌面端重启后的新窗口值永远读不到）；重连/网络切换轮次绝不探测。
+ /// 409 保守升级会重置一次（见 `muxConflictAlignEscalated`）。
+    private var p1ColdStartProbeConsumed = false
+ /// 本周期 /health 观测到的接管窗口：nil = 无有效观测值（探测未跑/失败，
+ /// 或旧插件无字段——后者同时清空 credentials 缓存）。
+    private var sessionTakeoverWindowMs: Int?
+ /// 本周期是否已有一次成功的 /health 观测（含「旧插件无字段」结论）——
+ /// true 后 credentials 缓存不再参与对齐（优先级：会话观测 > 缓存 > 兜底）。
+    private var sessionTakeoverWindowObserved = false
+ /// link-perf L1（设计变更二审兜底）：按已知窗口对齐的快重试
+ /// 仍收到 409 → 后续重试一律保守 1.7s 对齐，并触发一次能力刷新。
+    private var muxConflictAlignEscalated = false
+ /// 单测 seam：探测的 /health 取数（nil = 生产路径 `HTTPSClient.json`）。
+ /// hosted 单测与 E2E App 共享网络栈，注入后探测不触真实 origin。
+    var p1ColdStartProbeFetch: (@MainActor (URL) async throws -> (status: Int, json: JSONValue))?
+ /// 单测 seam：探测结果持久化（nil = 生产路径 `store.save`）。hosted 单测
+ /// 与 E2E App 共享同一 Keychain，注入后探测不写真实凭据。
+    var p1ColdStartProbePersist: ((PairingCredentials) -> Void)?
     var eventsStream: RemoteStreamHandle?
     var connectTask: Task<Void, Never>?
     var retryTask: Task<Void, Never>?
@@ -626,14 +647,7 @@ final class LinkService: ObservableObject {
  // P1: remember the plugin's single-WSS capability + in-band auth tickets
  // at pairing time, so a cold start/reconnect can skip the "anonymous
  // upgrade -> 401 -> fallback" probe (design §4.3/§6).
-        let p1Capable: Bool = {
-            if let flag = healthJSON["features"]?["muxRpc"]?.boolValue { return flag }
-            if let proto = healthJSON["proto"]?.stringValue { return proto.contains("dsh-m/2") }
-            if let protos = healthJSON["proto"]?.arrayValue {
-                return protos.contains { $0.stringValue == "dsh-m/2" }
-            }
-            return false
-        }()
+        let p1Capabilities = Self.p1HealthCapabilities(from: healthJSON)
         let seededTickets = redeem.json["connectTickets"]?.arrayValue?.compactMap { $0.stringValue }
         let credentials = PairingCredentials(
             origin: normalizedOrigin,
@@ -645,10 +659,11 @@ final class LinkService: ObservableObject {
             pairedAt: Int64(Date().timeIntervalSince1970 * 1000),
             keyId: redeem.json["keyId"]?.stringValue,
             originCandidates: learnedCandidates,
-            supportsMuxRPC: p1Capable,
+            supportsMuxRPC: p1Capabilities.supportsMuxRPC,
             connectTickets: seededTickets,
             p1Epoch: nil,
             p1Sid: nil,
+            takeoverWindowMs: p1Capabilities.takeoverWindowMs,
             hostId: payload.host?.id
         )
         adopt(credentials: credentials)
@@ -728,6 +743,27 @@ final class LinkService: ObservableObject {
         (healthJSON["deviceEndpoints"]?.arrayValue ?? []).compactMap { $0.stringValue }
     }
 
+ /// /health → P1 能力与接管窗口。
+ /// 配对路径与冷启动能力探测共用；muxRpc/proto 解析口径与原配对路径逐字
+ /// 一致，`takeoverWindowMs` 只接受正值（防御畸形 /health，正常值 800/1500）。
+    nonisolated static func p1HealthCapabilities(
+        from healthJSON: JSONValue
+    ) -> (supportsMuxRPC: Bool, takeoverWindowMs: Int?) {
+        let supportsMuxRPC: Bool
+        if let flag = healthJSON["features"]?["muxRpc"]?.boolValue {
+            supportsMuxRPC = flag
+        } else if let proto = healthJSON["proto"]?.stringValue {
+            supportsMuxRPC = proto.contains("dsh-m/2")
+        } else if let protos = healthJSON["proto"]?.arrayValue {
+            supportsMuxRPC = protos.contains { $0.stringValue == "dsh-m/2" }
+        } else {
+            supportsMuxRPC = false
+        }
+        let takeoverWindowMs = healthJSON["features"]?["takeoverWindowMs"]?.intValue
+            .flatMap { $0 > 0 ? Int($0) : nil }
+        return (supportsMuxRPC, takeoverWindowMs)
+    }
+
  /// Persists freshly minted pairing credentials and (re)starts the connection
  /// loop. Shared by QR/manual pairing and the M2a pairing-code redeem flow.
     @discardableResult
@@ -753,6 +789,12 @@ final class LinkService: ObservableObject {
         p1FellBackToLegacy = false
         p1SilentResume = false
         p1LostAt = nil
+ // link-perf L2/L1：重新配对 = 全新能力语境，冷启动探测与
+ // 409 保守升级状态一并复位（新插件/新窗口值立即重学）。
+        p1ColdStartProbeConsumed = false
+        sessionTakeoverWindowObserved = false
+        sessionTakeoverWindowMs = nil
+        muxConflictAlignEscalated = false
         p1Resume.discard()
  // 新配对 = 全新端点语境：下一轮必须重新发现（mDNS + /health 探测）。
         endpointsDirty = true
@@ -1322,6 +1364,12 @@ final class LinkService: ObservableObject {
             phase = .needsRepair(L10n.t("配对凭据没有可用的服务器地址，请重新配对"))
             return
         }
+ // link-perf L2（DEC-D + 设计变更二审）：本 App 运行周期首次
+ // 连接轮次**无条件**先对主候选 origin 做一次有界 /health 探测再拨号
+ // （每周期重读 takeoverWindowMs + 探测插件回退；supportsMuxRPC 写回后
+ // 本轮 transportRoute 即可生效）。探测的 ≤500ms 计入轮起点之后，
+ // fast-retry 对齐等待按「轮起点 + 对齐值」自校正，不改变 AC-01 口径；
+ // 重连/网络切换轮次绝不探测。
  // Cross-network requirement: order candidates by the phone's *current*
  // network. Same subnet -> LAN first; cellular / a different network ->
  // relay first with the stale LAN address only as a bounded fallback. This
@@ -1334,6 +1382,10 @@ final class LinkService: ObservableObject {
             local: localNetwork,
             pathChanged: pathChanged
         )
+ // P1 能力探测（设计 §3-L2）：打**主候选**（按当前网络排序后的首个 origin；
+ // 跨网冷启动时陈旧 LAN/relay 地址候选可能不可达——打错 origin 会白付
+ // 500ms 且本周期窗口值刷新失败）。单个 origin、不遍历、有界。
+        await probeP1CapabilityIfColdStart(primaryOrigin: orderedCandidates.first)
  // 冷启动 <1s（列表侧）：预热共享 HTTPS 池，让 t0+~100ms 就发出的
  // early session/list 复用已建好的 TLS，而不是再付一次 ~300ms 握手。
         warmHTTPSPoolIfColdStart(prefersRelay: prefersRelay, local: localNetwork)
@@ -1618,6 +1670,16 @@ final class LinkService: ObservableObject {
                 failureClasses.append(failureClass)
                 failures.append(host + ": " + reason)
                 lastErrorText = reason
+ // link-perf L1（设计变更二审兜底）：按已知窗口对齐的
+ // 快重试仍收到 409 → 真实接管窗口比已知值宽（插件回退/配置变更）。
+ // 后续重试一律保守 1.7s 对齐，并触发一次能力刷新（重置探测标记，
+ // 下一轮 connectOnce 重新 /health 探测；每 App 周期最多一次）。
+                let isMuxConflict = Self.isMuxConflictRejection(reason)
+                if isMuxConflict, fastRetryUsed, !muxConflictAlignEscalated {
+                    muxConflictAlignEscalated = true
+                    p1ColdStartProbeConsumed = false
+                    linkDebug("mux-conflict: aligned retry still 409 → conservative 1.7s align + capability refresh")
+                }
  // 瞬态快失败原地重试（见 fastRetryUsed 声明处的取证）：只对首轮、
  // 网络层 unreachable 且 <1s 的失败生效；服务端拒绝（fastRejected）
  // 是确定性状态，不重试。
@@ -1625,16 +1687,44 @@ final class LinkService: ObservableObject {
                    (ReconnectMetrics.clock() - candidateStartedAt) < 1.0 {
                     fastRetryUsed = true
  // 等待对齐插件的 mux 接管窗口（见 muxConflictRetryAlignSeconds）：
- // 409 冲突的静默判定从旧连接最后一帧起算 ≈ 轮起点，1.7s 后
- // 重试可越过窗口；普通瞬态 unreachable 也至少等 350ms。
+ // 409 冲突的静默判定从旧连接最后一帧起算 ≈ 轮起点，对齐值
+ // （窗口 + 120ms 边距，取自本周期 /health 观测或 credentials
+ // 缓存）后重试可越过窗口。
+ // 下限分档（设计变更三审）：409 冲突用 max(0, align − 轮内已
+ // 耗时)——350ms 下限会让「首拨+409 > 570ms」（蜂窝 0.3-0.9s
+ // 常见）时重试推迟到 1.0-1.35s，超 AC-01 硬线①（冲突重试
+ // 等待段 ≤1.0s）；纯瞬态 unreachable 无窗口语义，保持 350ms
+ // 防抖下限。
                     let sinceRoundStart = Date().timeIntervalSince(roundStartedAt)
-                    let waitSeconds = max(0.35, Self.muxConflictRetryAlignSeconds - sinceRoundStart)
+                    let align = muxConflictRetryAlignSeconds
+                    let waitSeconds = max(isMuxConflict ? 0 : 0.35, align - sinceRoundStart)
+ // 409 取证（设计变更三审，AC-01 验收）：首拨时长 / 409 收到
+ // 时刻（轮起点起算）/ 重试预计发出时刻 / 对齐值。
+                    let dialMs = Int((ReconnectMetrics.clock() - candidateStartedAt) * 1000)
+                    #if DEBUG
+                    ScrollHitchProbe.mark("e2eFastRetry", [
+                        "origin": Self.originLabel(origin),
+                        "conflict": isMuxConflict ? 1 : 0,
+                        "dialMs": dialMs,
+                        "conflictAtMs": Int(sinceRoundStart * 1000),
+                        "retryAtMs": Int((sinceRoundStart + waitSeconds) * 1000),
+                        "alignMs": Int(align * 1000),
+                        "reason": reason
+                    ])
+                    #endif
+                    linkDebug(
+                        "round: fast-retry " + Self.originLabel(origin)
+                            + " conflict=" + (isMuxConflict ? "1" : "0")
+                            + " dialMs=" + String(dialMs)
+                            + " conflictAtMs=" + String(Int(sinceRoundStart * 1000))
+                            + " retryAtMs=" + String(Int((sinceRoundStart + waitSeconds) * 1000))
+                            + " alignMs=" + String(Int(align * 1000))
+                    )
                     try? await Task.sleep(nanoseconds: UInt64(waitSeconds * 1_000_000_000))
                     guard !Task.isCancelled else { break }
                     attemptedOriginKeys.remove(originKey)
                     queueIndex = 0
                     queue.insert(origin, at: 0)
-                    linkDebug("round: fast-retry " + Self.originLabel(origin))
                     continue
                 }
             }
@@ -1694,6 +1784,81 @@ final class LinkService: ObservableObject {
         scheduleReconnect()
     }
 
+ /// 冷启动 P1 能力探测。
+ ///
+ /// 背景（设计 F3 + 二审修正）：`supportsMuxRPC`/`takeoverWindowMs` 原本只在
+ /// 配对时学得——桌面端后来开启 muxRpc 的存量设备永远不会自动升 P1；且
+ /// `supportsMuxRPC` 持久化为 true 后，桌面端重启换新窗口值永远读不到、
+ /// 插件回退旧版（窗口 1500）时旧缓存 800 会用 920ms 对齐去撞 409。因此
+ /// 探测条件是**本 App 运行周期第一次连接轮次，无条件**（不绑定
+ /// supportsMuxRPC）：对主候选 origin（单个，不遍历）发一次有界（500ms）
+ /// GET /health（复用 HTTPSClient 共享连接池）：
+ /// - 成功：`features.muxRpc`/`proto` 写回 supportsMuxRPC（存量设备自动升
+ /// P1），`takeoverWindowMs` 覆盖/清空缓存（无字段 = 旧插件 → 存 nil，
+ /// 走 1.7s 兜底对齐；不字面存 1500——那是新插件显式广播值的语义）；
+ /// - 失败/非 200：不动缓存、不阻塞本轮（按缓存值对齐，409 升级路径兜底），
+ /// 本生命周期不再重试——重连/网络切换的 <1s 关键路径绝不付这 500ms。
+ ///
+ /// 单测注入 `p1ColdStartProbeFetch`/`p1ColdStartProbePersist` 后不触网络与
+ /// Keychain（测试宿主与 E2E App 共享两者）。
+    func probeP1CapabilityIfColdStart(primaryOrigin: URL?) async {
+        guard !p1ColdStartProbeConsumed else { return }
+        p1ColdStartProbeConsumed = true
+        guard var current = credentials else { return }
+ // 主候选优先；无候选时退回持久化的 origin（旧调用语义）。
+        guard let origin = primaryOrigin ?? current.originURL else { return }
+        linkDebug("cold-probe: target=" + (origin.host ?? "?"))
+        do {
+            let status: Int
+            let json: JSONValue
+            if let fetch = p1ColdStartProbeFetch {
+                let response = try await fetch(origin)
+                status = response.status
+                json = response.json
+            } else {
+                let response = try await HTTPSClient.json(
+                    origin: origin,
+                    method: "GET",
+                    path: "/health",
+                    leafPin: current.leafPin,
+                    caCertBase64: current.caCertBase64,
+                    timeout: Self.p1ColdStartProbeTimeoutSeconds
+                )
+                status = response.status
+                json = response.json
+            }
+            guard status == 200 else {
+                throw LinkError.httpStatus(status, "cold-probe /health")
+            }
+            let capabilities = Self.p1HealthCapabilities(from: json)
+ // 本周期观测结论（对齐优先级高于 credentials 缓存）：旧插件无字段
+ // = 观测到「无窗口」，缓存同步清空（存 nil，设计变更二审拍板）。
+            sessionTakeoverWindowObserved = true
+            sessionTakeoverWindowMs = capabilities.takeoverWindowMs
+ // 能力与窗口写回（存量设备升 P1 的 F3 路径 + 下一周期缓存）。
+            guard current.supportsMuxRPC != capabilities.supportsMuxRPC
+                || current.takeoverWindowMs != capabilities.takeoverWindowMs else { return }
+            current.supportsMuxRPC = capabilities.supportsMuxRPC
+            current.takeoverWindowMs = capabilities.takeoverWindowMs
+            credentials = current
+            if let persist = p1ColdStartProbePersist {
+                persist(current)
+            } else {
+                try? store.save(current)
+            }
+            linkDebug(
+                "cold-probe: supportsMuxRPC=" + (capabilities.supportsMuxRPC ? "1" : "0")
+                    + " takeoverWindowMs=" + (capabilities.takeoverWindowMs.map(String.init) ?? "-")
+            )
+        } catch {
+ // 探测失败：不动缓存、不阻塞本轮（按缓存值继续），本生命周期不再探测。
+            linkDebug("cold-probe: 失败（不阻塞，按已知值继续）: " + NetworkErrorInterpreter.message(for: error))
+        }
+    }
+
+ /// 冷启动探测的有界超时（设计 §3-L2：500ms）。
+    static let p1ColdStartProbeTimeoutSeconds: TimeInterval = 0.5
+
     private enum ConnectAttemptOutcome {
  /// `bumpGeneration` is false only for a silent replay (streams retained).
         case connected(bumpGeneration: Bool)
@@ -1723,6 +1888,9 @@ final class LinkService: ObservableObject {
  /// dsh-m/2 path first. A fallback-class failure degrades this app session to
  /// the unchanged legacy M1 path, which then runs on the same candidate.
     private func attemptConnection(origin: URL, leafPin: String, timeout: TimeInterval) async -> ConnectAttemptOutcome {
+ // link-perf L2：flag 语义反转后 `AppSettings.remoteProtocolV2`
+ // 默认 on（env/UserDefaults 显式覆盖优先）；能否走 P1 由 supportsMuxRPC
+ // （配对/冷启动探测/welcome 缓存）与会话级回退状态把关。
         if Self.transportRoute(
             flagEnabled: AppSettings.remoteProtocolV2,
             supportsMuxRPC: credentials?.supportsMuxRPC,
@@ -1987,6 +2155,9 @@ final class LinkService: ObservableObject {
                     }
                 }
                 P1ResumeMetrics.record(plan: plan, welcome: welcome, recoverMs: recoverMs)
+ // link-perf L3a：压缩协商结果取证（linkDebug；与插件侧
+ // /health counters.p1Gzip* 对照；welcome 无回显 = 旧插件错配窗口）。
+                linkDebug("p1 welcome: gzip=" + (channel.welcome?.caps.gzip == true ? "1" : "0"))
                 ConnectionMetrics.markP1(authMode: authMode, resumeMode: welcome.resume.mode.rawValue)
                 ConnectionMetrics.markReady()
                 return .connected(bumpGeneration: plan.bumpGeneration)
@@ -2114,6 +2285,12 @@ final class LinkService: ObservableObject {
     func setConfirmedEventsClientIdForTesting(_ id: String?) {
         clientId = id
         eventsClientIdConfirmed = id != nil
+    }
+
+ /// 单测 seam：直接设定凭据（不走 `adopt` 的 Keychain 写入与
+ /// `startConnecting`；hosted 单测与 E2E App 共享 Keychain）。
+    func setCredentialsForTesting(_ value: PairingCredentials?) {
+        credentials = value
     }
 
  /// Persists the live channel's resume cursor into the Keychain credential.
@@ -2751,11 +2928,40 @@ extension LinkService {
  /// 不可达，只保留 VPN 边缘路由的最后一线，不把整轮预算烧在必然失败上。
     static let maxCellularLANAttemptsPerRound = 2
 
- /// mux 冲突重试的等待对齐：插件 `MUX_TAKEOVER_STALE_MS = 1500ms`——真实
+ /// mux 冲突重试的等待对齐：插件 `MUX_TAKEOVER_STALE_MS`——真实
  /// 跨网切换（旧网已死，发不出 WS close 帧）只能等插件把静默旧连接判死后
- /// 接管。重试安排在轮起点 +1.7s（窗口 +200ms 余量），命不中的代价只是一次
- /// 拨号超时。同网重连已由 teardown 主动 close 消除 409，此参数只兜真实切换。
-    static let muxConflictRetryAlignSeconds: TimeInterval = 1.7
+ /// 接管。重试安排在 轮起点 + 对齐值，命不中的代价只是一次拨号超时。同网
+ /// 重连已由 teardown 主动 close 消除 409，此参数只兜真实切换。
+ ///
+ /// link-perf L1（DEC-E + 设计变更二审）：
+ /// - 观测档：插件经 /health 广播 `features.takeoverWindowMs`，对齐 = 窗口
+ /// + 120ms 安全边距。800ms 窗口 → 920ms（原 200ms 边距会让对齐值恰好
+ /// 等于 AC-01 硬线 1.0s，调度抖动必然判失败；120ms 覆盖轮起点锚点与
+ /// 插件静默钟的偏差，且插件侧静默检查发生在拨号+TLS+RTT 之后，天然还
+ /// 有 ≥1 RTT 余量）。
+ /// - 兜底档：无任何已知窗口（旧插件无字段 / 缓存被观测清空 / 409 保守
+ /// 升级）一律 1.7s = 历史值（1500 窗口 + 200ms），等价现状（设计
+ /// §3-L1 兼容矩阵第一行，AC-02 不劣化）。
+    static let muxConflictRetryAlignFallbackSeconds: TimeInterval = 1.7
+    static let muxConflictRetryAlignMarginSeconds: TimeInterval = 0.12
+
+ /// 纯函数（可单测）：无已知窗口 → 1.7s；观测到 800 → 0.92s。
+    nonisolated static func muxConflictRetryAlignSeconds(takeoverWindowMs: Int?) -> TimeInterval {
+        guard let takeoverWindowMs, takeoverWindowMs > 0 else {
+            return muxConflictRetryAlignFallbackSeconds
+        }
+        return TimeInterval(takeoverWindowMs) / 1000 + muxConflictRetryAlignMarginSeconds
+    }
+
+ /// 本实例当前对齐值（设计变更二审的优先级）：409 保守升级 > 本周期
+ /// /health 观测 > credentials 缓存 > 1.7s 兜底。
+    var muxConflictRetryAlignSeconds: TimeInterval {
+        if muxConflictAlignEscalated { return Self.muxConflictRetryAlignFallbackSeconds }
+        let window = sessionTakeoverWindowObserved
+            ? sessionTakeoverWindowMs
+            : credentials?.takeoverWindowMs
+        return Self.muxConflictRetryAlignSeconds(takeoverWindowMs: window)
+    }
 
     nonisolated static func dialFirstPolicy(
         prefersRelay: Bool,
@@ -2934,6 +3140,15 @@ extension LinkService {
             return .gatewayRejected
         }
         return .unreachable
+    }
+
+ /// mux 接管冲突类失败（409/4409）：接管窗口未过、旧连接仍被插件持有。
+ /// 文本判定与 `classifyFailureMessage` 同风格（legacy 真机实测文案
+ /// "HTTP 409: mux 升级被拒绝"；P1 侧 4409 的 userMessage 含「冲突」）。
+ /// link-perf L1：驱动 fast-retry 的下限分档与 409 保守升级。
+    nonisolated static func isMuxConflictRejection(_ message: String) -> Bool {
+        let lower = message.lowercased()
+        return lower.contains("409") || lower.contains("冲突")
     }
 
  /// One-line user-facing reason after a failed round — the UI must never show

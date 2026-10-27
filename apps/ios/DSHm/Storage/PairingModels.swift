@@ -29,6 +29,13 @@ struct PairingCredentials: Codable, Equatable {
  /// P1: resume cursor for `hello{resume}` — epoch + last applied server sid.
     var p1Epoch: String?
     var p1Sid: Int?
+ /// link-perf L1（DEC-E）：插件 /health 广播的 mux 接管窗口
+ /// （`features.takeoverWindowMs`，毫秒）。配对与冷启动探测解析写入，随
+ /// `supportsMuxRPC` 同路径持久化；nil = 无已知窗口（旧插件无字段 / 探测
+ /// 观测到无字段而清空），冲突重试对齐走 1.7s 兜底档（历史等价，设计
+ /// §3-L1 兼容矩阵第一行）。默认 nil 使既有构造点（PairingCodeProtocol
+ /// 等）无需连带改动。
+    var takeoverWindowMs: Int? = nil
  /// Mac 的稳定 hostId（配对载荷 `host.id` / 配对码兑换响应的 hostId）。
  /// 运行期 mDNS 自愈用它确认「广播的是同一台 Mac」；旧凭据为 nil。
     var hostId: String? = nil
@@ -288,14 +295,33 @@ enum AppSettings {
         set { defaults.set(newValue, forKey: "showSystemMessages") }
     }
 
- /// P1 (single-WSS transport) rollout switch. Default **off** = legacy dual-TLS.
- /// `DSHM_PROTO_V2` env override for E2E/bench: "1"/"true" force on, "0" force
- /// off (explicit rollback without a rebuild).
+ /// P1 (single-WSS transport) rollout switch.
+ ///
+ /// link-perf L2 语义反转（设计 §3-L2）：**默认 on**——旧插件由
+ /// `supportsMuxRPC == false` 挡住，不会误入 P1。优先级：`DSHM_PROTO_V2`
+ /// env 显式 on/off > UserDefaults 显式设置 > 默认 on。`bool(forKey:)`
+ /// 无法区分「未设置」与「显式 false」，未设置判定用
+ /// `object(forKey:) == nil`——旧 key 残留的显式 false 继续生效（正确的
+ /// 回滚语义，回滚路径见设计 §5）。
     static var remoteProtocolV2: Bool {
-        if let raw = ProcessInfo.processInfo.environment["DSHM_PROTO_V2"]?.lowercased() {
+        remoteProtocolV2Resolved()
+    }
+
+ /// 三态解析（纯函数，可单测）。env 与 defaults 均可注入：hosted 单测与
+ /// E2E App 共享同一份 `UserDefaults.standard`，测试必须用独立 suite 注入，
+ /// 不得污染真实偏好。
+    static func remoteProtocolV2Resolved(
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        defaults: UserDefaults = .standard
+    ) -> Bool {
+ // env 显式优先："1"/"true"/"on" 强制开，其余值（含 "0"）强制关。
+        if let raw = environment["DSHM_PROTO_V2"]?.lowercased() {
             return raw == "1" || raw == "true" || raw == "on"
         }
-        return defaults.bool(forKey: "remoteProtocolV2")
+        guard defaults.object(forKey: "remoteProtocolV2") == nil else {
+            return defaults.bool(forKey: "remoteProtocolV2")
+        }
+        return true
     }
 
     static func setRemoteProtocolV2(_ enabled: Bool) {

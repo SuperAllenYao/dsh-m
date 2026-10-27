@@ -19,6 +19,11 @@
  * `resume{logEpoch,sid}`. The envelope is additive: `frame` is the exact
  * upstream frame object.
  *
+ * Downstream gzip: when `hello.caps.gzip` is
+ * negotiated and echoed in `welcome.caps.gzip`, a text frame at/above the
+ * threshold is sent as a binary WebSocket frame `[1B 0x01][gzip-6 payload]`
+ * instead of text; the replay log still stores the text envelope.
+ *
  * Design: <internal-doc> (this file is the
  * prototype behind `config.features.muxRpc`; default false = M1 behaviour).
  *
@@ -28,6 +33,8 @@
  */
 
 import { createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
+import { performance } from 'node:perf_hooks';
+import { gzipSync } from 'node:zlib';
 
 /** Wire protocol id negotiated in `hello` / echoed in `welcome`. */
 export const P1_PROTO = 'dsh-m/2';
@@ -58,7 +65,19 @@ export const P1_LIMITS = {
   ticketTtlMs: 10 * 60_000,
  /** A used ticket jti may be replayed once within this window (lost welcome). */
   ticketReplayGraceMs: 10_000,
+ /** Downstream text frames at/above this size are gzip-compressed (L3a). */
+  gzipThresholdBytes: 4096,
 };
+
+/**
+ * Downstream gzip wire format: a compressed frame is
+ * one binary WebSocket frame `[1B version][gzip-6 payload]`. Compression is
+ * negotiated per socket (`hello.caps.gzip` → `welcome.caps.gzip`) and only
+ * applied plugin→phone; upstream traffic stays text JSON.
+ */
+export const GZIP_FRAME_VERSION = 0x01;
+/** zlib level for downstream gzip (gzip-6: F11 measured 4.64x; gzip-9 only 4.72x). */
+const GZIP_LEVEL = 6;
 
 /** Protocol violation carrying an explicit close code for the transport. */
 export class MuxProtocolError extends Error {
@@ -285,15 +304,24 @@ export class TicketUseGuard {
  * Injected dependencies:
  * - forwardUnary({deviceId, endpoint, bodyText}): Promise<{status, contentType, bytes}>
  * - issueTicket(epoch): string | undefined (resume ticket for the welcome frame)
+ * - gzip {enabled, thresholdBytes}: downstream compression policy from
+ * `config.features.muxGzip*`; negotiation still needs `hello.caps.gzip`.
  */
 export class MuxRpcChannel {
-  constructor({ deviceId, forwardUnary, issueTicket, limits = {}, log = () => {}, now = () => Date.now(), epoch = randomUUID() }) {
+  constructor({ deviceId, forwardUnary, issueTicket, limits = {}, gzip = {}, log = () => {}, now = () => Date.now(), epoch = randomUUID() }) {
     if (typeof deviceId !== 'string' || deviceId.length === 0) throw new Error('MuxRpcChannel requires a deviceId');
     if (typeof forwardUnary !== 'function') throw new Error('MuxRpcChannel requires forwardUnary()');
     this.deviceId = deviceId;
     this.forwardUnary = forwardUnary;
     this.issueTicket = typeof issueTicket === 'function' ? issueTicket : () => undefined;
     this.limits = { ...P1_LIMITS, ...limits };
+ /** Downstream gzip policy (link-server config.features.muxGzip / muxGzipThresholdBytes). */
+    this.gzip = {
+      enabled: gzip.enabled === true,
+      thresholdBytes: Number.isInteger(gzip.thresholdBytes) && gzip.thresholdBytes > 0 ? gzip.thresholdBytes : P1_LIMITS.gzipThresholdBytes,
+    };
+ /** Per-socket negotiated gzip; only `onHello` may set it, `attachTransport` resets it. */
+    this.gzipEnabled = false;
     this.log = log;
     this.now = now;
     this.epoch = epoch;
@@ -302,7 +330,7 @@ export class MuxRpcChannel {
     this.replay = new ReplayLog({ maxBytes: this.limits.replayBytes, maxFrames: this.limits.replayFrames });
  /** @type {'awaiting-hello' | 'ready' | 'closed'} */
     this.phase = 'awaiting-hello';
- /** @type {{send: (text: string) => void, close: (code: number, reason: string) => void} | undefined} */
+ /** @type {{send: (text: string) => void, sendBinary?: (data: Buffer) => void, close: (code: number, reason: string) => void} | undefined} */
     this.transport = undefined;
     this.transportGen = 0;
     this.helloGen = -1;
@@ -327,6 +355,12 @@ export class MuxRpcChannel {
       resumeResets: 0,
       protocolErrors: 0,
       upstreamForwarded: 0,
+ // L3a: compressed downstream frames (counted when produced, like `down`).
+      gzipFrames: 0,
+      gzipRawBytes: 0,
+      gzipWireBytes: 0,
+ /** Cumulative gzipSync wall time (ms, perf_hooks precision; P4-5). */
+      gzipMs: 0,
     };
   }
 
@@ -336,6 +370,10 @@ export class MuxRpcChannel {
     if (this.transport !== undefined) throw new Error('MuxRpcChannel already has a transport');
     this.transport = transport;
     this.transportGen += 1;
+ // gzip is negotiated per socket via `hello.caps.gzip`: a reconnecting phone
+ // (or an older App that never asks) must not inherit the previous
+ // transport's negotiation and receive binary frames it cannot parse.
+    this.gzipEnabled = false;
   }
 
  /** The downstream socket is gone: keep epoch/log for a while, stop sending. */
@@ -439,16 +477,13 @@ export class MuxRpcChannel {
     if ((frame.type === 'end' || frame.type === 'error') && typeof frame.streamId === 'string') this.openStreams.delete(frame.streamId);
     this.sid += 1;
     const envelope = JSON.stringify({ type: 'down', sid: this.sid, frame });
+ // The replay log keeps the text envelope (memory accounting, design C4);
+ // the wire may compress it — sendText applies the negotiated gzip policy.
     this.replay.append(this.sid, envelope);
     this.stats.down += 1;
-    if (this.transport !== undefined) {
-      try {
-        this.transport.send(envelope);
-      } catch (error) {
-        this.log('device ' + this.deviceId + ': downstream send failed: ' + String(error?.message ?? error));
-      }
-    }
- // else: phone is away — the frame stays in the replay log for resume.
+    this.sendText(envelope);
+ // sendText no-ops without a transport: the frame stays in the replay log
+ // above and is re-sent (re-compressed) on the next resume instead.
   }
 
  // ------------------------------------------------------------------ hello ---
@@ -460,6 +495,13 @@ export class MuxRpcChannel {
     const reconnecting = this.helloGen !== -1;
     this.helloGen = this.transportGen;
     this.phase = 'ready';
+ // L3a: downstream gzip is per-socket — the client must ask
+ // (`hello.caps.gzip`), the plugin policy must allow it and the transport
+ // must accept binary frames; `welcome.caps.gzip` echoes the outcome so the
+ // phone knows the wire format before the first frame. Unknown caps keys are
+ // ignored on purpose (forward compatibility with future App versions).
+    const clientCaps = frame.caps !== null && typeof frame.caps === 'object' && !Array.isArray(frame.caps) ? frame.caps : {};
+    this.gzipEnabled = this.gzip.enabled === true && clientCaps.gzip === true && typeof this.transport.sendBinary === 'function';
     if (reconnecting && frame.resume === undefined) {
  // The phone reconnected without a resume cursor: it dropped its stream
  // state, so cancelling the old upstream streams and starting a new epoch
@@ -480,6 +522,7 @@ export class MuxRpcChannel {
       caps: {
         unary: true,
         resume: true,
+        gzip: this.gzipEnabled,
         maxInFlight: this.limits.rpcMaxInFlight,
         replayBytes: this.limits.replayBytes,
       },
@@ -657,6 +700,34 @@ export class MuxRpcChannel {
 
   sendText(text) {
     if (this.transport === undefined) return;
+    const rawBytes = Buffer.byteLength(text, 'utf8');
+ // L3a: negotiated + at/above the threshold → one binary frame
+ // `[0x01][gzip-6]`. Counters observe the compression itself so /health can
+ // report the raw↔wire ratio; they are produced-frame counters like `down`.
+ //
+ // Synchronous by design (P4-5): a multi-MB snapshot page can take tens of
+ // ms in gzipSync, briefly blocking the event loop during history backfill —
+ // accepted because frame/replay ordering must be preserved (AC-06 latency
+ // budget spends the time on the wire, not on reordering). `gzipMs` makes
+ // the blocking visible per channel. Compression and counting stay inside
+ // the try/catch (P4-6): a gzip failure must never escape into the caller's
+ // (onUpstreamMessage/send) EventEmitter context.
+    if (this.gzipEnabled === true && rawBytes >= this.gzip.thresholdBytes) {
+      try {
+        const startedAt = performance.now();
+        const wire = Buffer.concat([Buffer.from([GZIP_FRAME_VERSION]), gzipSync(text, { level: GZIP_LEVEL })]);
+        this.stats.gzipMs += performance.now() - startedAt;
+        this.stats.gzipFrames += 1;
+ // rawBytes = UTF-8 size of the text frame; wireBytes = bytes actually
+ // sent, i.e. the 1B version prefix IS included (P4-6 口径说明).
+        this.stats.gzipRawBytes += rawBytes;
+        this.stats.gzipWireBytes += wire.length;
+        this.transport.sendBinary(wire);
+      } catch (error) {
+        this.log('device ' + this.deviceId + ': downstream send failed: ' + String(error?.message ?? error));
+      }
+      return;
+    }
     try {
       this.transport.send(text);
     } catch (error) {
@@ -693,6 +764,7 @@ export class MuxRpcChannel {
       upstream: this.upstream !== undefined,
       replayFrames: this.replay.entries.length,
       replayBytes: this.replay.bytes,
+      gzip: this.gzipEnabled,
       inflight: this.inflight.size,
       disposed: this.disposed,
       stats: { ...this.stats },

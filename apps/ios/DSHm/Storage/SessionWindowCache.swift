@@ -67,8 +67,14 @@ enum SessionWindowPolicy {
  /// range, so on tool-heavy sessions a page is several times larger than its
  /// message count. LAN gets bigger pages (fewer round trips); relay/cellular gets
  /// smaller ones (bounded decode/paint cost per batch).
-    static let historyPageMessagesLAN = 160
-    static let historyPageMessagesRelay = 60
+ ///
+ /// (task-3, design <internal-doc> L3b):
+ /// LAN 160→320 / relay 60→240。单页变大的解码/内存风险由下行 gzip（~4.6x，
+ /// 设计 F11 实测）对冲；收益是蜂窝 RTT 轮次近乎减半（F13：relay 8+ 页串行
+ /// 是用户 7-8s 报障的主构成，且 L3c 页间流水线让「单页更大、页数更少」的
+ /// 收益直接叠加）。初始值，实施段按 U2 bench 校准；回滚＝常量改回。
+    static let historyPageMessagesLAN = 320
+    static let historyPageMessagesRelay = 240
 
     nonisolated static func historyPageMessages(isRelay: Bool) -> Int {
         isRelay ? historyPageMessagesRelay : historyPageMessagesLAN

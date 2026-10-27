@@ -76,6 +76,9 @@ enum DetailOpenReconnectPolicy {
 ///
 /// 只在「缓存 payload 确实还有更早历史、详情页在屏、链路可用、journal 还空」时预取；
 /// 任何条件不满足都不发额外请求（零浪费口径）。
+///
+/// task-3：`shouldConsume` 同时约束页间流水线的下页预取
+/// （`runHistoryFillLoop` 每页消费）——预取结果只能用于它当初请求的 beforeSeq。
 enum FillPagePrefetchPolicy {
     static func shouldPrefetch(
         payloadOldestSeq: Int?,
@@ -469,6 +472,8 @@ final class SessionViewModel: ObservableObject {
     private var historyFillStartedAt: Date?
     private var historyFillCompletedAt: Date?
     private var historyFillPages = 0
+ /// L3e：详情加载时间线（AC-05/AC-06 取证，只记录不设门）。
+    private(set) var historyLoadTimeline = HistoryLoadTimeline()
     private var historyFillBytes = 0
     private var historyFillFailures = 0
  /// Consecutive *transient* (link/transport) page failures. Reset on any progress;
@@ -536,6 +541,11 @@ final class SessionViewModel: ObservableObject {
  /// Test seam: rows rebuilds since init. The 300-message cache restore must
  /// rebuild exactly once (no per-chunk rebuild/scroll flash).
     private(set) var rebuildRowsCountForTesting = 0
+ /// task-3 test seam（L3c 流水线时序取证）：每页「原始 JSONValue 到手」与
+ /// 「合入完成」的单调钟时刻。断言「页 N+1 的请求先于页 N 的合入」用
+ /// （请求时刻由测试 loader 自己记录，同一 CACurrentMediaTime 时钟）。
+    private(set) var historyFillPageArrivedAtForTesting: [CFTimeInterval] = []
+    private(set) var historyFillPageMergedAtForTesting: [CFTimeInterval] = []
     #endif
     private let windowCache: SessionWindowCacheStore
  /// Phone-sized first session/follow window (12-20 messages).
@@ -543,6 +553,7 @@ final class SessionViewModel: ObservableObject {
     private var cacheSaveTask: Task<Void, Never>?
     private var firstPaintCacheTask: Task<Void, Never>?
  /// task-2：缓存恢复期间并行发出的第一页历史预取（见 FillPagePrefetchPolicy）。
+ /// task-3（L3c）：同一单槽被页间流水线循环复用（页 N 到手即预取页 N+1）。
     private struct FillPagePrefetch {
         let beforeSeq: Int
  /// nil = 预取失败（正常网络路径会按原语义重试，不把失败当结果用）。
@@ -550,6 +561,8 @@ final class SessionViewModel: ObservableObject {
     }
     private var fillPagePrefetchTask: Task<Void, Never>?
     private var fillPagePrefetch: FillPagePrefetch?
+ /// task-3（L3c）：在途预取的 beforeSeq——任务落地前 take 也要能匹配判定。
+    private var fillPagePrefetchInFlightBeforeSeq: Int?
     private var cachedChunksTask: Task<Void, Never>?
     private(set) var didRestoreFirstPaintCache = false
  /// Compatibility alias for older tests/E2E (same value).
@@ -668,6 +681,8 @@ final class SessionViewModel: ObservableObject {
  // M2b-2c: t0 for the detail in-app metric (init entry = first in-app work
  // after the tap). E2E-gated; no product behavior.
         DetailMetrics.begin(sessionId: address.sessionId)
+ // L3e：加载时间线的同口径 t0（不受 E2E 门限制，纯记录）。
+        historyLoadTimeline.markDetailEnter()
         self.address = address
         self.sessionId = address.sessionId
         self.subagentContext = subagentContext
@@ -753,6 +768,7 @@ final class SessionViewModel: ObservableObject {
     }
 
  // MARK: - 首屏缓存恢复期间的历史页预取
+ // MARK: - 页间流水线预取
 
  /// 缓存 payload 一读回来就发第一页 session/page（不等待 journal 应用/rows 重建）。
  /// 只在 payload 确实还有更早历史时调用；结果由 fetchHistoryPage 按 beforeSeq 消费。
@@ -764,16 +780,31 @@ final class SessionViewModel: ObservableObject {
             detailOnScreen: detailOnScreen,
             transportAvailable: historyFillTransportAvailable()
         ) else { return }
-        guard fillPagePrefetchTask == nil, fillPagePrefetch == nil else { return }
         guard let beforeSeq = payload.oldestSeq else { return }
+ // journal 此时还是空的（cursor=-1）：首页预取的 throughSeq 必须用 payload.cursor。
+        startFillPagePrefetch(beforeSeq: beforeSeq, throughSeq: payload.cursor)
+    }
+
+ /// 发一页 session/page 预取进单槽：首页缓存预取（task-2）与页间流水线
+ /// （task-3 L3c：页 N 的 JSONValue 到手即发页 N+1）共用。槽位被占
+ /// （在途/未消费）时跳过——流水深度恒为 1；取消/暂停路径由
+ /// cancelFillPagePrefetch 统一清理。失败语义不变：槽内 value=nil，
+ /// 消费方按正常网络路径重取。
+ /// `throughSeq` 缺省用当前 journal.cursor；首页缓存预取时 journal 还空，
+ /// 必须显式传 payload.cursor（翻旧页只受 beforeSeq 上界约束，throughSeq
+ /// 的新旧不影响页内容——见 SessionJournal.prepend 的语义注释）。
+    private func startFillPagePrefetch(beforeSeq: Int, throughSeq: Int? = nil) {
+        guard fillPagePrefetchTask == nil, fillPagePrefetch == nil else { return }
+        guard historyFillTransportAvailable() else { return }
         let args = Self.historyPageRequestArgs(
             address: address,
-            throughSeq: payload.cursor,
+            throughSeq: throughSeq ?? journal.cursor,
             beforeSeq: beforeSeq,
             maxMessages: historyPageMessages
         )
         let loader = historyPageLoader
         let link = link
+        fillPagePrefetchInFlightBeforeSeq = beforeSeq
         fillPagePrefetchTask = Task { [weak self] in
             #if DEBUG
             let started = CACurrentMediaTime()
@@ -781,8 +812,11 @@ final class SessionViewModel: ObservableObject {
             var prefetched: JSONValue?
             do {
                 if let loader {
+ // L3e：请求真正发出的时刻才是 firstPageRequest 锚点。
+                    self?.markPageRequestIssued(beforeSeq: beforeSeq, source: "prefetch")
                     prefetched = try await loader(args)
                 } else if let link, link.phase.isConnected {
+                    self?.markPageRequestIssued(beforeSeq: beforeSeq, source: "prefetch")
                     prefetched = try await link.unary("session/page", args: args)
                 }
             } catch {
@@ -794,19 +828,46 @@ final class SessionViewModel: ObservableObject {
             guard let self, !Task.isCancelled else { return }
             self.fillPagePrefetch = FillPagePrefetch(beforeSeq: beforeSeq, value: prefetched)
             self.fillPagePrefetchTask = nil
+            self.fillPagePrefetchInFlightBeforeSeq = nil
+        }
+    }
+
+ /// L3e：session/page 请求发出的统一时间线锚点。
+ /// 首页只记一次（AC-05 硬线段的终点）；之后的发出只进 ScrollHitchProbe
+ /// （帧归因用，env 门控零开销）。
+    private func markPageRequestIssued(beforeSeq: Int, source: String) {
+        let isFirst = !historyLoadTimeline.hasFirstPageRequest
+        historyLoadTimeline.markFirstPageRequest()
+        if isFirst {
+            ScrollHitchProbe.mark("fillFirstPageRequest", ["beforeSeq": beforeSeq, "source": source])
+        } else {
+            ScrollHitchProbe.mark("fillPageRequest", ["beforeSeq": beforeSeq, "source": source])
         }
     }
 
  /// 消费与本次请求 beforeSeq 匹配的预取页；失败/不匹配时返回 nil，由正常网络路径重取。
-    private func takePrefetchedHistoryPage(beforeSeq: Int) -> JSONValue? {
-        guard let prefetch = fillPagePrefetch else { return nil }
-        guard FillPagePrefetchPolicy.shouldConsume(
-            prefetchedBeforeSeq: prefetch.beforeSeq,
-            requestedBeforeSeq: beforeSeq
-        ) else {
+ ///
+ /// task-3（L3c）：槽里可能是「在途」的下页预取——循环处理完页 N 的
+ /// 解码/合入时，页 N+1 的请求通常还在路上。beforeSeq 匹配时等它落地再消费
+ /// （等价于循环自己发出的那条请求，不重复发）；失败（槽内 value=nil）与
+ /// 不匹配照旧返回 nil 走正常网络路径，退避/重试语义不变。
+    private func takePrefetchedHistoryPage(beforeSeq: Int) async -> JSONValue? {
+        if let prefetch = fillPagePrefetch {
             fillPagePrefetch = nil
-            return nil
+            guard FillPagePrefetchPolicy.shouldConsume(
+                prefetchedBeforeSeq: prefetch.beforeSeq,
+                requestedBeforeSeq: beforeSeq
+            ) else { return nil }
+            return prefetch.value
         }
+        guard let task = fillPagePrefetchTask,
+              let inFlightBeforeSeq = fillPagePrefetchInFlightBeforeSeq,
+              FillPagePrefetchPolicy.shouldConsume(
+                  prefetchedBeforeSeq: inFlightBeforeSeq,
+                  requestedBeforeSeq: beforeSeq
+              ) else { return nil }
+        await task.value
+        guard let prefetch = fillPagePrefetch else { return nil }
         fillPagePrefetch = nil
         return prefetch.value
     }
@@ -815,6 +876,7 @@ final class SessionViewModel: ObservableObject {
         fillPagePrefetchTask?.cancel()
         fillPagePrefetchTask = nil
         fillPagePrefetch = nil
+        fillPagePrefetchInFlightBeforeSeq = nil
     }
 
     private func applyFirstPaintCache(_ loaded: SessionWindowCacheStore.Loaded) {
@@ -1363,6 +1425,35 @@ final class SessionViewModel: ObservableObject {
         ]
     }
 
+ /// L3c：从页 N 的原始 JSONValue 里读「下页前沿」——
+ /// 页 N 到手即发页 N+1 预取的 beforeSeq。纯函数（单测覆盖）。
+ ///
+ /// 与 `SessionJournal.prepend` 的合并语义严格一致：journal 只收
+ /// `type=="event"` 且带 event 的记录、窗口前沿取最小事件 seq，所以这里
+ /// 扫到第一条能产出事件的记录就停（非 event 记录/缺 event 的记录跳过，
+ /// 与 prepend 的 compactMap 同口径）。
+ ///
+ /// 返回 nil（不发多余请求）的三种情况：
+ /// - `hasMore!= true`：Host 说没有更早历史（最后一页）；
+ /// - 页里没有可产出事件的记录（空页/形状不明）：循环按原退避语义处理；
+ /// - 前沿已到 seq 0：再往前没有事件（journal 侧 markReachedOldestIfNeeded
+ /// 同样会把 hasMoreOlder 钉死为 false）。
+    nonisolated static func nextFillPageCursor(_ value: JSONValue) -> Int? {
+        guard let object = value.objectValue,
+              object["hasMore"]?.boolValue == true,
+              let records = object["records"]?.arrayValue else { return nil }
+        for record in records {
+            guard let recordObject = record.objectValue,
+                  recordObject["type"]?.stringValue == "event",
+                  let event = recordObject["event"], event != .null,
+                  let eventObject = event.objectValue,
+                  let seq = eventObject["seq"]?.intValue else { continue }
+            guard seq > 0 else { return nil }
+            return Int(seq)
+        }
+        return nil
+    }
+
     private var historyPageMessages: Int {
         #if DEBUG
  // 自动化真机取证：允许把页调小，让补齐插入分成更多批次（只影响测试节奏）。
@@ -1620,8 +1711,10 @@ final class SessionViewModel: ObservableObject {
             maxMessages: historyPageMessages
         )
         let value: JSONValue
-        if let prefetched = takePrefetchedHistoryPage(beforeSeq: beforeSeq) {
+        if let prefetched = await takePrefetchedHistoryPage(beforeSeq: beforeSeq) {
  // task-2：缓存恢复期间并行预取的第一页已到，跳过第二次网络请求。
+ // task-3（L3c）：take 现在也会等待「在途且 beforeSeq 匹配」的
+ // 下页预取（循环处理完页 N 时，页 N+1 的请求通常还在路上）——不重复发请求。
             if Task.isCancelled { return .cancelled }
             value = prefetched
         } else {
@@ -1630,8 +1723,10 @@ final class SessionViewModel: ObservableObject {
             #endif
             do {
                 if let historyPageLoader {
+                    markPageRequestIssued(beforeSeq: beforeSeq, source: "loop")
                     value = try await historyPageLoader(args)
                 } else if let link {
+                    markPageRequestIssued(beforeSeq: beforeSeq, source: "loop")
                     value = try await link.unary("session/page", args: args)
                 } else {
                     return .failed
@@ -1649,6 +1744,21 @@ final class SessionViewModel: ObservableObject {
             #if DEBUG
             PerfProbe.shared.record("pageNetwork", ms: (CACurrentMediaTime() - fetchStart) * 1000)
             #endif
+        }
+ // L3c：页 N 的原始 JSONValue 到手，解码/合入还没开始。
+ // 立即算出下页前沿并发起页 N+1 预取——下一页的网络往返与当前页的
+ // 解码/合入/重建并行（流水深度 1）。hasMore=false、空页、形状不明或已到
+ // seq 0 时不发（nextFillPageCursor 返回 nil）；预取失败＝槽内 nil，循环照
+ // 原语义重取，退避/预算/watchdog 全部不变。
+        historyLoadTimeline.markPageArrive()
+        ScrollHitchProbe.mark("fillPageArrive", ["beforeSeq": beforeSeq])
+        #if DEBUG
+        historyFillPageArrivedAtForTesting.append(CACurrentMediaTime())
+        #endif
+        if let nextBeforeSeq = Self.nextFillPageCursor(value) {
+            historyLoadTimeline.markNextPageRequest()
+            ScrollHitchProbe.mark("fillNextPageRequest", ["beforeSeq": nextBeforeSeq])
+            startFillPagePrefetch(beforeSeq: nextBeforeSeq)
         }
  // task-2：直接由 JSONValue 构造页面，跳过
  // JSONEncoder(JSONValue)+JSONDecoder 的双重转换（多 MB 页的整页二次
@@ -1699,6 +1809,9 @@ final class SessionViewModel: ObservableObject {
  // that fits in one page used to report pages=0).
         if merged {
             historyFillPages += 1
+            #if DEBUG
+            historyFillPageMergedAtForTesting.append(CACurrentMediaTime())
+            #endif
             if Self.e2eFillDiagnosticsEnabled || Self.e2eFillDiagnosticsTestOverride {
                 historyFillBytes += CacheIO.encode(value)?.count ?? 0
             }
@@ -1725,6 +1838,13 @@ final class SessionViewModel: ObservableObject {
                 oldestSeq: journal.oldestSeq ?? -1
             )
         }
+ // L3e：补齐完成时间线（总耗时 + 页数；与既有 fillMs/
+ // fillPages 并存——这里从 detailEnter 起算，覆盖缓存恢复段）。
+        historyLoadTimeline.markFillComplete(pages: historyFillPages)
+        ScrollHitchProbe.mark("fillComplete", [
+            "pages": historyFillPages,
+            "oldest": journal.oldestSeq ?? -1,
+        ])
         historyFillTask?.cancel()
         historyFillTask = nil
         cancelFillPagePrefetch()
@@ -1741,6 +1861,9 @@ final class SessionViewModel: ObservableObject {
         guard historyFillState == .loading || historyFillState == .idle else { return }
         historyFillTask?.cancel()
         historyFillTask = nil
+ // task-3（L3c）：暂停时清掉在途页预取（单槽）；恢复后由循环按
+ // 原语义从当前前沿重取，离线期间那条请求本来也不可能成功。
+        cancelFillPagePrefetch()
  // Offline: the reconnect path resumes; a watchdog timer would only re-check
  // a transport that is known to be down.
         historyFillWatchdogTask?.cancel()
@@ -1799,6 +1922,20 @@ final class SessionViewModel: ObservableObject {
             + ";gen=" + String(link?.generation ?? -1)
             + ";lastProgressAt=" + String(lastProgressMilliseconds)
             + ";watchdogRestarts=" + String(historyFillWatchdogRestarts)
+ // L3e：AC-05/AC-06 分段取证（DEC-07 口径；未发生
+ // 的段记 -1）。firstReqMs=进入→首页请求；cursorToFirstMs=cursor 到达→
+ // 首页请求（冷入口硬线段）；enterToCursorMs=进入→cursor（物理段，只记录）；
+ // pageToNextMs=页到手→下页预取（流水线决策开销）；fillDoneMs=进入→补齐完成。
+            + ";firstReqMs=" + Self.timelineMsString(historyLoadTimeline.detailEnterToFirstPageRequestMs)
+            + ";cursorToFirstMs=" + Self.timelineMsString(historyLoadTimeline.cursorArriveToFirstPageRequestMs)
+            + ";enterToCursorMs=" + Self.timelineMsString(historyLoadTimeline.detailEnterToCursorArriveMs)
+            + ";pageToNextMs=" + Self.timelineMsString(historyLoadTimeline.pageArriveToNextPageRequestMs)
+            + ";fillDoneMs=" + Self.timelineMsString(historyLoadTimeline.detailEnterToFillCompleteMs)
+    }
+
+ /// L3e：时间线分段读数的 probe 串格式（nil 段 = -1，与上面的整型字段一致）。
+    private static func timelineMsString(_ value: Double?) -> String {
+        value.map { String(format: "%.1f", $0) } ?? "-1"
     }
 
  // MARK: - History fill progress (design: r2)
@@ -2065,6 +2202,19 @@ final class SessionViewModel: ObservableObject {
         await historyFillTask?.value
     }
 
+ /// Test seam（task-3）：生产里由视图 start() 设置的「详情在屏」标记——单测
+ /// 没有 link，start() 会在设置它之前早退。进入即取的时序测试需要在快照/
+ /// 缓存 payload 落地之前就把它置位（对应真机上 onAppear 先于网络首帧到达）。
+    func setDetailOnScreenForTesting() {
+        detailOnScreen = true
+    }
+
+ /// Test seam（task-3）：等待在途的历史页预取任务结束（断言「请求已发出/
+ /// 已落地」用；无在途预取时立即返回）。
+    func awaitFillPagePrefetchForTesting() async {
+        await fillPagePrefetchTask?.value
+    }
+
  /// Test seam: run the watchdog self-heal check and await a restart it triggers.
     func runHistoryFillWatchdogForTesting() async {
         detailOnScreen = true
@@ -2149,13 +2299,19 @@ final class SessionViewModel: ObservableObject {
                 scheduleCacheSave()
  // M2b-2c: live snapshot network cost (detail in-app metric).
                 markDetailNetworkApplied()
+ // L3d/L3e：冷入口「进入即取」。
+ // cursor/front 已随上面的 journal.apply 落地——时间线锚点记在这里，
+ // 补齐也在这一刻启动：不等首帧渲染（rebuildNow 在下）、不等 reveal
+ // 定时器；剩余的只有物理必要 guard（cursor/front/在屏/transport，
+ // 全部保留在 startHistoryFillIfPossible 里）。User decision
+ // 「进入详情即开始全量补齐」的语义不变，只是不再排在首帧重建之后。
+                historyLoadTimeline.markCursorArrive()
+                ScrollHitchProbe.mark("fillCursorArrive", ["cursor": snapshot.cursor])
+                startHistoryFillIfPossible()
                 if !detailFirstFrameMarked {
  // First content: paint without the 40ms rebuild debounce.
                     rebuildNowForHistoryBatch()
                 }
- // User decision: entering the detail starts the full-history
- // fill immediately; no user gesture, no visible indicator.
-                startHistoryFillIfPossible()
             case .event(let event):
                 dbg("event: " + event.type + " seq=" + String(event.seq))
                 #if DEBUG

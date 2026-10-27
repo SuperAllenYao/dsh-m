@@ -82,6 +82,11 @@ final class RemoteMux {
                 self.handleSocketClosed(error: error)
             case .opened, .pong:
                 break
+            case .binary:
+ // link-perf L3a：binary 帧只出现在 P1（gzip 协商后）
+ // 下行；legacy M1 mux 不存在该语义，防御性忽略（P1 通道侧才有
+ // 「未协商却收到 binary = 违规」的判定与协商态）。
+                break
             }
         }
     }
