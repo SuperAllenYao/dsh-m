@@ -45,6 +45,10 @@ final class WSSClient: @unchecked Sendable {
     enum Event {
         case opened
         case text(String)
+ /// link-perf L3a（DEC-A）：P1 下行载荷压缩走 binary WS 帧
+ /// （`[1B 版本 0x01][gzip]`），与 text 同一交付通道；发送侧不变
+ /// （上行不压缩）。
+        case binary(Data)
         case pong
         case closed(code: Int, reason: String)
         case failed(Error)
@@ -299,14 +303,29 @@ final class WSSClient: @unchecked Sendable {
             fragments.append(frame.payload)
             if frame.fin {
                 let payload = fragments.reduce(into: Data()) { $0.append($1) }
+                let opcode = fragmentedOpcode
                 fragments = []
                 fragmentedOpcode = nil
-                if let text = String(data: payload, encoding: .utf8) {
+ // link-perf L3a：分片重组按首帧 opcode 交付——
+ // binary 分片（大压缩页）与 text 分片同样处理。
+                if opcode == WSOpcode.binary {
+                    emit(.binary(payload))
+                } else if let text = String(data: payload, encoding: .utf8) {
                     emit(.text(text))
                 }
             }
         case WSOpcode.binary:
-            fail(WSFrameCodec.CodecError.protocolViolation("binary frame not allowed"))
+ // link-perf L3a（DEC-A）：P1 gzip 协商成功后的下行压缩
+ // 帧。解压与「未协商却收到 binary」的判定在 P1Channel 收帧路径
+ // （有 welcome.caps 协商态）；本层只按数据交付，不再视为协议违规。
+            if frame.fin {
+                fragmentedOpcode = nil
+                fragments = []
+                emit(.binary(frame.payload))
+            } else {
+                fragmentedOpcode = WSOpcode.binary
+                fragments = [frame.payload]
+            }
         case WSOpcode.ping:
             sendControlFrame(opcode: WSOpcode.pong, payload: frame.payload)
         case WSOpcode.pong:

@@ -17,15 +17,19 @@ struct P1SocketClose: Equatable {
 ///
 /// Production uses `P1WSSocket` (a thin adapter over the existing pinned-TLS
 /// `WSSClient`); tests inject `FakeSocket`. Contract:
-/// - `connect()` opens the pinned WS. It must NOT deliver `onText`/`onClose`
-/// synchronously from inside `connect()` (real transports deliver on the main
-/// queue after the await returns).
+/// - `connect()` opens the pinned WS. It must NOT deliver `onText`/`onBinary`/
+/// `onClose` synchronously from inside `connect()` (real transports deliver on
+/// the main queue after the await returns).
 /// - `send(text:)` is one text message; delivery may be synchronous (tests).
 /// - `close(code:reason:)` is idempotent and must not throw.
 /// - All callbacks are invoked on the main actor, in wire order.
+/// - `onBinary` delivers binary WS frames — only
+/// sent by the plugin after `welcome.caps.gzip` negotiation; the channel
+/// treats an un-negotiated binary frame as a protocol violation.
 @MainActor
 protocol P1Socket: AnyObject {
     var onText: ((String) -> Void)? { get set }
+    var onBinary: ((Data) -> Void)? { get set }
     var onClose: ((P1SocketClose) -> Void)? { get set }
     func connect() async throws
     func send(text: String) throws
@@ -46,6 +50,7 @@ final class P1WSSocket: P1Socket {
     private let connectTimeout: TimeInterval
 
     var onText: ((String) -> Void)?
+    var onBinary: ((Data) -> Void)?
     var onClose: ((P1SocketClose) -> Void)?
 
     init(
@@ -64,6 +69,9 @@ final class P1WSSocket: P1Socket {
             switch event {
             case .text(let text):
                 self.onText?(text)
+            case .binary(let data):
+ // link-perf L3a：gzip 协商后的下行压缩帧，按 data 透传。
+                self.onBinary?(data)
             case .closed(let code, let reason):
                 self.onClose?(P1SocketClose(code: code, reason: reason))
             case .failed(let error):
@@ -205,6 +213,9 @@ final class P1Channel {
     private(set) var state: P1ChannelState = .idle
  /// Last handshake result (nil before the first successful welcome).
     private(set) var welcome: P1Welcome?
+ /// link-perf L3a：本次 welcome 是否协商了下行 gzip（binary 收帧
+ /// 判定与诊断取证共用）。
+    var gzipNegotiated: Bool { welcome?.caps.gzip == true }
  /// Server channel epoch; changes force the caller to re-open every stream.
     private(set) var epoch: String?
  /// Last downstream `sid` this channel actually applied (resume cursor).
@@ -351,6 +362,10 @@ final class P1Channel {
         socket.onText = { [weak self] text in
             guard let self, self.socket === socket else { return }
             self.handleText(text)
+        }
+        socket.onBinary = { [weak self] data in
+            guard let self, self.socket === socket else { return }
+            self.handleBinary(data)
         }
         socket.onClose = { [weak self] close in
             guard let self, self.socket === socket else { return }
@@ -646,15 +661,47 @@ final class P1Channel {
             return
         }
         guard state == .connecting || state == .ready else { return }
+        decodeInboundLane { text }
+    }
+
+ /// link-perf L3a：binary 下行帧（gzip 协商成功后的压缩载荷）。
+ /// 未协商（welcome.caps.gzip!= true，含 welcome 未到）却收到 binary =
+ /// 协议违规——这是「新 App × 旧插件」错配窗口的安全网（设计 §3-L1 兼容
+ /// 矩阵第三行），走既有 violate 路径关连接，上层 useLegacy 会话级回退。
+    private func handleBinary(_ data: Data) {
+        guard gzipNegotiated else {
+            violate(P1ProtocolError.violation("未协商 gzip 却收到 binary 帧"))
+            return
+        }
+        guard state == .connecting || state == .ready else { return }
+        decodeInboundLane { try P1FrameCodec.inflateBinaryFrame(data) }
+    }
+
+ /// Inbound decode lane shared by text frames and (gzip-negotiated) binary
+ /// frames. `produceText` runs ON the decode lane
+ /// (identity for text; `[0x01][gzip]` → JSON text for binary), so one lane
+ /// task per wire frame keeps main-actor application in wire order (serial
+ /// queue + FIFO `main.async`) — a binary frame must NOT re-enter
+ /// `handleText` from the lane, or the following text frame could overtake it.
+    private func decodeInboundLane(_ produceText: @escaping @Sendable () throws -> String) {
         guard inboundDecoding == .offMain else {
+            let text: String
+            do {
+                text = try produceText()
+            } catch {
+                violate(error)
+                return
+            }
             decodeAndHandleInline(text)
             return
         }
         guard let source = socket else { return }
         let maxBytes = maxFrameBytes
         Self.inboundDecodeQueue.async { [weak self] in
+            let text: String
             let decoded: Result<P1ServerFrame, P1ProtocolError>
             do {
+                text = try produceText()
                 #if DEBUG
  // Device evidence hook (`DSHM_PERFDBG=1`): confirms the history
  // page decode really runs off the main actor and how long one
