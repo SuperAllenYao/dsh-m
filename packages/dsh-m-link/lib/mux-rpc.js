@@ -33,6 +33,7 @@
  */
 
 import { createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
+import { performance } from 'node:perf_hooks';
 import { gzipSync } from 'node:zlib';
 
 /** Wire protocol id negotiated in `hello` / echoed in `welcome`. */
@@ -358,6 +359,8 @@ export class MuxRpcChannel {
       gzipFrames: 0,
       gzipRawBytes: 0,
       gzipWireBytes: 0,
+ /** Cumulative gzipSync wall time (ms, perf_hooks precision; P4-5). */
+      gzipMs: 0,
     };
   }
 
@@ -701,12 +704,24 @@ export class MuxRpcChannel {
  // L3a: negotiated + at/above the threshold → one binary frame
  // `[0x01][gzip-6]`. Counters observe the compression itself so /health can
  // report the raw↔wire ratio; they are produced-frame counters like `down`.
+ //
+ // Synchronous by design (P4-5): a multi-MB snapshot page can take tens of
+ // ms in gzipSync, briefly blocking the event loop during history backfill —
+ // accepted because frame/replay ordering must be preserved (AC-06 latency
+ // budget spends the time on the wire, not on reordering). `gzipMs` makes
+ // the blocking visible per channel. Compression and counting stay inside
+ // the try/catch (P4-6): a gzip failure must never escape into the caller's
+ // (onUpstreamMessage/send) EventEmitter context.
     if (this.gzipEnabled === true && rawBytes >= this.gzip.thresholdBytes) {
-      const wire = Buffer.concat([Buffer.from([GZIP_FRAME_VERSION]), gzipSync(text, { level: GZIP_LEVEL })]);
-      this.stats.gzipFrames += 1;
-      this.stats.gzipRawBytes += rawBytes;
-      this.stats.gzipWireBytes += wire.length;
       try {
+        const startedAt = performance.now();
+        const wire = Buffer.concat([Buffer.from([GZIP_FRAME_VERSION]), gzipSync(text, { level: GZIP_LEVEL })]);
+        this.stats.gzipMs += performance.now() - startedAt;
+        this.stats.gzipFrames += 1;
+ // rawBytes = UTF-8 size of the text frame; wireBytes = bytes actually
+ // sent, i.e. the 1B version prefix IS included (P4-6 口径说明).
+        this.stats.gzipRawBytes += rawBytes;
+        this.stats.gzipWireBytes += wire.length;
         this.transport.sendBinary(wire);
       } catch (error) {
         this.log('device ' + this.deviceId + ': downstream send failed: ' + String(error?.message ?? error));

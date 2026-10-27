@@ -310,7 +310,12 @@ export function resolveConfig(raw) {
   merged.features = mergeConfig(DEFAULTS.features, merged.features);
   merged.features.muxRpc = merged.features.muxRpc === true;
   merged.features.listLite = merged.features.listLite !== false;
-  merged.features.muxGzip = merged.features.muxGzip !== false;
+ // P4-4 (回滚开关): explicit boolean whitelist, same calibre as muxRpc — only
+ // literal `true` keeps compression on; literal `false` turns it off; any other
+ // value (0/""/null/…) is rejected to OFF (fail-safe for a rollback switch).
+ // "Unconfigured" never reaches this line as garbage: mergeConfig above has
+ // already filled absent keys with the DEFAULT (true).
+  merged.features.muxGzip = merged.features.muxGzip === true;
  // L3a: the threshold is floored at 1024 — below that compression wastes more
  // per-frame overhead than it saves (design L3a: default 4096).
   merged.features.muxGzipThresholdBytes = Number.isInteger(merged.features.muxGzipThresholdBytes)
@@ -655,6 +660,8 @@ export class LinkServer {
       p1GzipFrames: 0,
       p1GzipRawBytes: 0,
       p1GzipWireBytes: 0,
+ /** Cumulative gzipSync wall time (ms, perf_hooks precision; P4-5). */
+      p1GzipMs: 0,
     };
  // Port hand-off bookkeeping: a later start of this plugin (same process) can
  // reclaim the TLS port from this instance even if its dispose is cut short.
@@ -3219,6 +3226,7 @@ export class LinkServer {
       gzipFrames: 0,
       gzipRawBytes: 0,
       gzipWireBytes: 0,
+      gzipMs: 0,
     };
     const resumes = Number(stats.resumes) || 0;
     const resumeResets = Number(stats.resumeResets) || 0;
@@ -3235,6 +3243,7 @@ export class LinkServer {
     this.counters.p1GzipFrames += Math.max(0, (Number(stats.gzipFrames) || 0) - (previous.gzipFrames || 0));
     this.counters.p1GzipRawBytes += Math.max(0, (Number(stats.gzipRawBytes) || 0) - (previous.gzipRawBytes || 0));
     this.counters.p1GzipWireBytes += Math.max(0, (Number(stats.gzipWireBytes) || 0) - (previous.gzipWireBytes || 0));
+    this.counters.p1GzipMs += Math.max(0, (Number(stats.gzipMs) || 0) - (previous.gzipMs || 0));
     channel.counterSnapshot = {
       rpcOk: Number(stats.rpcOk) || 0,
       rpcFailed: Number(stats.rpcFailed) || 0,
@@ -3245,6 +3254,7 @@ export class LinkServer {
       gzipFrames: Number(stats.gzipFrames) || 0,
       gzipRawBytes: Number(stats.gzipRawBytes) || 0,
       gzipWireBytes: Number(stats.gzipWireBytes) || 0,
+      gzipMs: Number(stats.gzipMs) || 0,
     };
   }
 

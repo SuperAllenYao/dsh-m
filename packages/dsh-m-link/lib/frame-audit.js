@@ -186,8 +186,10 @@ export class FrameAudit {
   toDevice(deviceId, text, sent, isBinary = false) {
     if (!this.active) return;
  // L3a: gzip frames are binary on the wire; record the anomaly marker
- // exactly like the other directions, never attempt to decode them.
-    if (isBinary === true) return this.record('to-device', deviceId, { type: 'binary', sent: sent === true });
+ // exactly like the other directions, never attempt to decode them. The
+ // wire size (P4-3) keeps the raw↔wire evidence without reading the payload
+ // (`text` carries the Buffer in the binary case).
+    if (isBinary === true) return this.record('to-device', deviceId, { type: 'binary', bytes: text?.length, sent: sent === true });
     this.record('to-device', deviceId, { ...outboundMetadata(text), sent: sent === true });
   }
 }
