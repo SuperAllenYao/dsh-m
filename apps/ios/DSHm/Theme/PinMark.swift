@@ -20,6 +20,12 @@ struct PinMark: View {
             SVGPath.path(from: Self.bodyPath)
                 .stroke(color, style: Self.strokeStyle)
         }
+ // v7 真机复验（置顶 icon 仍不居中）：路径是 24×24 viewBox 的绝对坐标，
+ // 若直接给 size×size 的 frame，图形会按 24 坐标系绘制；随后 scaleEffect
+ // 围绕 size 框中心缩放，会把 24 坐标系中心（12,12）放大成约 +3pt 的
+ // 右下偏移 —— 视觉上 pin 比标题低 ~2.8pt（像素级探针实测）。
+ // 先把布局框固定为 viewBox 尺寸再缩放，图形中心才与 frame 中心重合。
+        .frame(width: 24, height: 24)
         .scaleEffect(scale)
         .frame(width: size, height: size)
     }

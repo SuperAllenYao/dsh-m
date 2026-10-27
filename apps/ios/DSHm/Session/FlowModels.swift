@@ -2,6 +2,65 @@ import Foundation
 
 // MARK: - Flow row model (built purely from session events; see SessionRowBuilder)
 
+// MARK: - 过程组步骤内容签名（折叠组高度缓存 / 展开动画 Δ 的有效性校验）
+
+extension FlowRowGroup {
+ /// 步骤内容高度（不含组头）的**公式估算**：步骤行是固定行高——
+ /// 28pt 行 + 非高亮/非实时行前 1pt hairline（与 ProcessGroupView 的
+ /// stepRowHeight = 29 口径一致）。精确值仍由展开态 reader 测一次回写
+ /// GroupStepsHeightStore；公式只用于「缓存未命中时先给出 Δ」，
+ /// 避免为测量而把整组步骤再渲染一遍（超级组 291 步时是双倍布局成本）。
+    var estimatedStepsHeight: CGFloat {
+        estimatedStepsHeight(limit: Int.max)
+    }
+
+ /// 前 limit 步的步骤内容高度（巨型组首屏限量渲染时用于精确 offset 补偿）。
+    func estimatedStepsHeight(limit: Int) -> CGFloat {
+        guard case .process(let steps) = self else { return 0 }
+        guard limit > 0 else { return 0 }
+        var height: CGFloat = 0
+        for step in steps.prefix(limit) {
+            height += 28
+ // 实时行 / 运行中工具行自带底色与 accent 顶边，不再叠 hairline。
+            let highlighted = step.isLive || step.isRunning
+            if !highlighted { height += 1 }
+        }
+        return height
+    }
+
+ /// 过程组的步骤数（.single 行 = 1；非过程组 = 0）。
+    var stepCount: Int {
+        switch self {
+        case .single: return 1
+        case .process(let steps): return steps.count
+        }
+    }
+
+ /// 步骤内容的稳定签名。
+ ///
+ /// 为什么需要它：过程组 id 用**首 step**（流式追加时 id 不变，保证 diff 稳定），
+ /// 所以「折叠后组内又流入新步骤 / 实时思考文本变长」不会改 id——只按 id 缓存
+ /// 展开高度会命中过期值，展开动画的 Δ 就会错、组头会跳。签名把
+ /// 「步骤数 + 首/尾 step id + 组内实时行文本长度」拼进来，内容一变即失效。
+    var stepsContentSignature: String {
+        switch self {
+        case .single:
+            return "single"
+        case .process(let steps):
+            guard let first = steps.first, let last = steps.last else { return "process-empty" }
+            var liveBytes = 0
+            for step in steps where step.isLive {
+                switch step.kind {
+                case .reasoning(let text): liveBytes &+= text.count
+                case .preparing(_, let args): liveBytes &+= args.count
+                default: liveBytes &+= 1
+                }
+            }
+            return "process|\(steps.count)|\(first.id)|\(last.id)|\(liveBytes)"
+        }
+    }
+}
+
 struct ImageRef: Equatable, Hashable {
     var attachmentId: String?
     var mediaType: String?
@@ -256,6 +315,36 @@ struct NoticeCard: Equatable {
     var title: String
     var text: String
     var kind: String
+}
+
+/// 主会话里的「工作目录变更」行（v7 步骤块统一）。
+///
+/// 来源：`user/message` 且 `data.source.kind == "working-directory"` —— Host 注入的
+/// 合成用户消息，正文形如 `The working directory changed from "/old" to "/new".`。
+/// 桌面端把它当作一条普通步骤混在步骤块里；App 之前落到 `handleUserMessage` 的
+/// default 分支，被渲染成标题为 `working-directory` 的独立通知卡（用户报障：
+/// 把一大块步骤块割裂成几块）。现在由 `SessionFlowGrouping` 映射成组内紧凑步骤行。
+struct WorkingDirectoryChange: Equatable {
+ /// 事件正文原文（解析失败时兜底展示）。
+    var text: String
+ /// 从正文里解析出的新工作目录；解析不出为 nil。
+    var cwd: String?
+
+    init(text: String) {
+        self.text = text
+        self.cwd = Self.parseCwd(from: text)
+    }
+
+ /// 取正文里**最后一个** ASCII 双引号片段作为新工作目录：
+ /// `The working directory changed from "/old" to "/new".` → `/new`。
+ /// 解析不出（无引号/空串/宿主改了文案）时返回 nil，调用方退回原文展示。
+    static func parseCwd(from text: String) -> String? {
+        guard let close = text.range(of: "\"", options: .backwards) else { return nil }
+        let head = text[..<close.lowerBound]
+        guard let open = head.range(of: "\"", options: .backwards) else { return nil }
+        let value = String(text[open.upperBound..<close.lowerBound])
+        return value.isEmpty ? nil : value
+    }
 }
 
 struct FileChangeSummary: Equatable {

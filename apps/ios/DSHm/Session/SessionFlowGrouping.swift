@@ -8,6 +8,13 @@ struct ProcessStep: Identifiable, Equatable {
  /// v6：工具参数流式阶段（tool-call-delta）的「准备…」占位行；派发（tool/call）后
  /// 由真实.tool 行替换。name 可能尚未到达（nil）。
         case preparing(name: String?, args: String)
+ /// v7：子代理消息（主会话 `user/message` + `source.kind=="agent-message"`）。
+ /// 桌面端把它混在步骤块里；组内渲染成紧凑行，点击直接打开子代理会话。
+        case subagentMessage(RelayCard)
+ /// v7：子代理结算（`source.kind=="subagent-settled"`），组内纯展示紧凑行。
+        case subagentSettled(text: String)
+ /// v7：工作目录变更（`source.kind=="working-directory"`），组内纯展示紧凑行。
+        case workingDirectory(WorkingDirectoryChange)
     }
 
     var id: String
@@ -46,6 +53,24 @@ struct ProcessStep: Identifiable, Equatable {
         return false
     }
 
+ /// v7：子代理消息卡片（非 nil 表示本步骤是「子代理消息」行）。
+    var relayCard: RelayCard? {
+        if case .subagentMessage(let card) = kind { return card }
+        return nil
+    }
+
+ /// v7：子代理结算摘要（非 nil 表示本步骤是「子代理结算」行）。
+    var subagentSettledText: String? {
+        if case .subagentSettled(let text) = kind { return text }
+        return nil
+    }
+
+ /// v7：工作目录变更（非 nil 表示本步骤是「工作目录」行）。
+    var workingDirectoryChange: WorkingDirectoryChange? {
+        if case .workingDirectory(let change) = kind { return change }
+        return nil
+    }
+
     var isFailure: Bool { tool?.isError ?? false }
     var isRunning: Bool {
         if isPreparing { return true }
@@ -61,6 +86,10 @@ struct ProcessStep: Identifiable, Equatable {
             return SessionFlowGrouping.verb(for: item.name)
         case .preparing(let name, _):
             return SessionFlowGrouping.preparingVerb(for: name)
+        case .subagentMessage, .subagentSettled:
+            return "子代理"
+        case .workingDirectory:
+            return "工作目录"
         }
     }
 
@@ -74,11 +103,18 @@ struct ProcessStep: Identifiable, Equatable {
             return item.summary
         case .preparing(_, let args):
             return args
+        case .subagentMessage(let card):
+            return card.summary ?? card.text
+        case .subagentSettled(let text):
+            return text
+        case .workingDirectory(let change):
+            return change.cwd ?? change.text
         }
     }
 }
 
-/// Grouped rows for one turn: plain rows plus a folded process group.
+/// Grouped rows for one turn: plain rows plus a process group.
+/// v7：组内可以是 1 步（单步也成组，交互与多步组完全一致）。
 enum FlowRowGroup: Identifiable, Equatable {
     case single(FlowRow)
     case process([ProcessStep])
@@ -124,8 +160,19 @@ enum ProcessGroupMode: String, Equatable {
 /// - `collapsed`/`expanded` 覆盖在两种阶段都保留（用户收起状态不因阶段切换丢失）；
 /// - 旧 `window`/`full` 仅在运行中有效，结束后丢弃回落到 `expanded`。
 enum ProcessGroupModeResolver {
-    static func resolve(isRunning: Bool, override: ProcessGroupMode?) -> ProcessGroupMode {
-        guard let override else { return .expanded }
+    static func resolve(
+        isRunning: Bool,
+        override: ProcessGroupMode?,
+        stepCount: Int = 0
+    ) -> ProcessGroupMode {
+        guard let override else {
+ // 设计决策：巨型组默认折叠，只渲染组头；
+ // 普通组保持默认展开（v6 口径）。阈值/策略见 ProcessGroupStepsLayoutPolicy。
+            if ProcessGroupStepsLayoutPolicy.giantCollapsedByDefault(stepCount) {
+                return .collapsed
+            }
+            return .expanded
+        }
         switch override {
         case .window, .full:
             return isRunning ? override : .expanded
@@ -156,8 +203,9 @@ enum ProcessGroupModeResolver {
     }
 }
 
-/// v5.3 rule: consecutive reasoning + tool-call rows form one folded process
-/// group; everything else stays a normal row.
+/// 过程组规则（v7）：连续「步骤行」合成一个 process 组——reasoning / tool，
+/// 以及桌面端混在步骤里的子代理消息 / 子代理结算 / 工作目录变更（v7 新增）；
+/// **单步也成组**（统一组头交互，替换旧的独立思考块）。其余内容仍是普通行。
 enum SessionFlowGrouping {
  /// 全量分组（首帧 / 测试 oracle / 增量缓存的兜底）。
     static func groups(rows: [FlowRow]) -> [FlowRowGroup] {
@@ -169,38 +217,29 @@ enum SessionFlowGrouping {
     static func makeGroups(rows: [FlowRow], fromRow: Int) -> (groups: [FlowRowGroup], ranges: [Range<Int>]) {
         var groups: [FlowRowGroup] = []
         var ranges: [Range<Int>] = []
-        var pendingIndexes: [Int] = []
         var pendingSteps: [ProcessStep] = []
         var groupStart = max(fromRow, 0)
 
         func flush() {
             guard !pendingSteps.isEmpty else { return }
-            if pendingSteps.count >= 2 {
-                groups.append(.process(pendingSteps))
-                ranges.append(groupStart..<(groupStart + pendingSteps.count))
-            } else {
-                for index in pendingIndexes {
-                    groups.append(.single(rows[index]))
-                    ranges.append(index..<(index + 1))
-                }
-            }
-            pendingIndexes = []
+ // v7：**单步也成组**。v6 的「单步不成组」让孤立思考/工具行走独立的
+ // 单行渲染（思考是 `ReasoningRowView`：默认折叠、chevron right→down、
+ // 行内向下展开），与步骤块（默认展开、chevron up=收起）交互相反
+ // （用户问题 4：单独思考块的展开/折叠跟步骤块反过来）。统一进
+ // `ProcessGroupView` 后，组头/chevron/手势热区/滚动锚定动画与多步组
+ // 完全一致；组 id 仍是首 step，流式追加不换 id（v6 契约）。
+            groups.append(.process(pendingSteps))
+            ranges.append(groupStart..<(groupStart + pendingSteps.count))
             pendingSteps = []
         }
 
         let start = min(max(fromRow, 0), rows.count)
         for index in start..<rows.count {
             let row = rows[index]
-            switch row.content {
-            case .reasoning(let text):
+            if let step = processStep(from: row) {
                 if pendingSteps.isEmpty { groupStart = index }
-                pendingIndexes.append(index)
-                pendingSteps.append(ProcessStep(id: row.id, kind: .reasoning(text), seq: row.seq))
-            case .tool(let item):
-                if pendingSteps.isEmpty { groupStart = index }
-                pendingIndexes.append(index)
-                pendingSteps.append(ProcessStep(id: row.id, kind: .tool(item), seq: row.seq))
-            default:
+                pendingSteps.append(step)
+            } else {
                 flush()
                 groups.append(.single(row))
                 ranges.append(index..<(index + 1))
@@ -208,6 +247,34 @@ enum SessionFlowGrouping {
         }
         flush()
         return (groups, ranges)
+    }
+
+ /// 单个行 → 组内步骤的映射（v7）：reasoning/tool 之外，桌面端混在步骤块里的
+ /// 子代理消息 / 子代理结算 / 工作目录变更也进同一组；其余内容仍是普通行。
+    static func processStep(from row: FlowRow) -> ProcessStep? {
+        switch row.content {
+        case .reasoning(let text):
+            return ProcessStep(id: row.id, kind: .reasoning(text), seq: row.seq)
+        case .tool(let item):
+            return ProcessStep(id: row.id, kind: .tool(item), seq: row.seq)
+        case .relay(let card):
+            return ProcessStep(id: row.id, kind: .subagentMessage(card), seq: row.seq)
+        case .notice(let notice):
+            switch notice.kind {
+            case "subagent-settled":
+                return ProcessStep(id: row.id, kind: .subagentSettled(text: notice.text), seq: row.seq)
+            case "working-directory":
+                return ProcessStep(
+                    id: row.id,
+                    kind: .workingDirectory(WorkingDirectoryChange(text: notice.text)),
+                    seq: row.seq
+                )
+            default:
+                return nil
+            }
+        default:
+            return nil
+        }
     }
 
  /// Steps that may be folded: completed tools + reasoning.
@@ -233,7 +300,7 @@ enum SessionFlowGrouping {
         for step in steps {
             counts[step.verb, default: 0] += 1
         }
-        let canonicalOrder = ["运行命令", "读取", "编辑", "搜索", "联网", "计划", "交付", "子代理", "后台任务", "工具", "思考", "准备运行命令", "准备读取", "准备编辑", "准备搜索", "准备调用工具"]
+        let canonicalOrder = ["运行命令", "读取", "编辑", "搜索", "联网", "计划", "交付", "子代理", "工作目录", "后台任务", "工具", "思考", "准备运行命令", "准备读取", "准备编辑", "准备搜索", "准备调用工具"]
         let known = canonicalOrder.filter { counts[$0] != nil }
         let unknown = counts.keys.filter { !canonicalOrder.contains($0) }.sorted()
         return (known + unknown)
@@ -292,7 +359,7 @@ enum SessionFlowGrouping {
         guard !steps.isEmpty else { return "" }
         var counts: [String: Int] = [:]
         for step in steps { counts[step.verb, default: 0] += 1 }
-        let canonicalOrder = ["运行命令", "读取", "编辑", "搜索", "联网", "计划", "交付", "子代理", "后台任务", "工具", "思考", "准备运行命令", "准备读取", "准备编辑", "准备搜索", "准备调用工具"]
+        let canonicalOrder = ["运行命令", "读取", "编辑", "搜索", "联网", "计划", "交付", "子代理", "工作目录", "后台任务", "工具", "思考", "准备运行命令", "准备读取", "准备编辑", "准备搜索", "准备调用工具"]
         let known = canonicalOrder.filter { counts[$0] != nil }
         let unknown = counts.keys.filter { !canonicalOrder.contains($0) }.sorted()
         return (known + unknown)

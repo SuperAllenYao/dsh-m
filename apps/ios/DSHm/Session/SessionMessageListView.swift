@@ -1,4 +1,5 @@
 import Foundation
+import QuartzCore
 import SwiftUI
 
 /// 消息流的一行（groups 之后的尾部内容也作为可滚动行参与同一列表）。
@@ -286,7 +287,14 @@ enum MessageListUpdatePolicy {
 ///
 /// 行为契约保持：贴底跟随、读历史 prepend 阅读位置不变、窗口扩展、发送回底、
 /// 首屏贴底不闪顶帧、HUD/探针字段兼容（E2E 契约）。
-struct SessionMessageListView: View {
+/// **SwiftUI 消息列表（回退后端）**。
+///
+/// 设计决策方案 A 之后，生产默认走 UIKit 循环复用后端
+/// （`SessionMessageUIKitListView`，见 SessionMessageListBackend.swift 的 façade）；
+/// 本实现保留为回退路径（env `DSHM_LIST_BACKEND=swiftui`），验收通过前不删除。
+/// 两个后端共用本文件里的纯逻辑层（SessionMessageItem / MessageListUpdatePolicy /
+/// ScrollFacts / MessageListWindowPolicy / ScrollFollowPolicy 等）。
+struct SessionMessageSwiftUIListView: View {
     let items: [SessionMessageItem]
     let sessionId: String
     let attachments: AttachmentStore
@@ -305,6 +313,8 @@ struct SessionMessageListView: View {
  /// 点击过程组 header：回调目标态（页面写入覆盖）。
     var onToggleGroupMode: ((String, ProcessGroupMode) -> Void)? = nil
     var onOpenReasoning: ((String) -> Void)? = nil
+ /// v7：子代理消息步骤行点击 → 打开该子代理会话（nil = 行不可点）。
+    var onOpenRelay: ((RelayCard) -> Void)? = nil
     let onOpenTool: (ToolCallItem) -> Void
     let onOpenFileChanges: (TurnFileChanges) -> Void
     let onNearBottomChange: (Bool) -> Void
@@ -336,17 +346,30 @@ struct SessionMessageListView: View {
  // inverted：无首屏定位链（offset=0 天然贴最新），didInitialBottom 状态删除。
  /// 首屏定位完成、内容可以显示。
     @State private var isContentReady = false
+ /// 滚动测量真值（ScrollMetrics 是 class：写字段不会触发 SwiftUI 失效，
+ /// 只有 HUD/探针在 TimelineView 里读当前值）。
     @State private var metrics = ScrollMetrics()
  /// 过程组步骤内容高度（key = FlowRowGroup.id，来自 ProcessGroupStepsHeightKey）：
  /// 点击组头瞬间据此预测行高 Δ，同事务反向补偿 contentOffset（组头定住）。
-    @State private var groupStepsHeights: [String: CGFloat] = [:]
+ /// 用**非可观察引用**持有（不是 @State）：滚动中行物化会持续上报测量值，
+ /// 写成 @State 时每次上报都会让列表 body 整表重算。
+    @State private var groupStepsHeightStore = GroupStepsHeightStore()
  /// 过程组展开/收起的显式驱动动画（行高与 offset 同帧插值，组头逐帧定住）。
     @State private var groupToggleRun: GroupToggleRun?
  /// 动画中的步骤内容高度覆盖（key = FlowRowGroup.id；缺省 = 自然高度）。
     @State private var groupToggleOverride: [String: CGFloat] = [:]
-    @State private var groupToggleTask: Task<Void, Never>?
+ /// 展开/收起动画的帧时钟（CADisplayLink；与屏幕刷新对齐，替代 Task.sleep 非对齐唤醒）。
+    @State private var groupToggleTicker: GroupToggleTicker?
+ /// P0 真机取证：App 内自动连续滚动（DSHM_AUTOSCROLL=1）——不经过 XCUITest
+ /// 手势合成，因此没有 XCTest 无障碍快照（每次 90–290ms）污染，能测到真实的
+ /// 渲染/行物化掉帧。仅 DEBUG + env 开启，生产零影响。
+    @State private var autoScrollTicker: GroupToggleTicker?
  /// Reduce Motion：补偿跟随系统——高度与 offset 都走瞬时切换（终态一致）。
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+ /// 动态字号：步骤高度缓存按「宽度 + 字号」失效（行高随字号变化）。
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+ /// 语言：步骤行文案来自本地化库，切换语言后行高会变 ⇒ 缓存同样要失效。
+    @Environment(\.locale) private var locale
  /// 自绘滚动条数据镜像（@Published 驱动指示条重算；与 metrics 分离避免列表 body 重算）。
     @StateObject private var indicatorModel = ScrollIndicatorModel()
     @State private var lastScrollToBottomToken: Int = 0
@@ -368,6 +391,7 @@ struct SessionMessageListView: View {
          onToggleGroupMode: ((String, ProcessGroupMode) -> Void)? = nil,
          onOpenReasoning: ((String) -> Void)? = nil,
          onOpenTool: @escaping (ToolCallItem) -> Void,
+         onOpenRelay: ((RelayCard) -> Void)? = nil,
          onOpenFileChanges: @escaping (TurnFileChanges) -> Void,
          onNearBottomChange: @escaping (Bool) -> Void,
          onUserScrolled: @escaping () -> Void,
@@ -387,6 +411,7 @@ struct SessionMessageListView: View {
         self.currentTurnStartSeq = currentTurnStartSeq
         self.onToggleGroupMode = onToggleGroupMode
         self.onOpenReasoning = onOpenReasoning
+        self.onOpenRelay = onOpenRelay
         self.onOpenTool = onOpenTool
         self.onOpenFileChanges = onOpenFileChanges
         self.onNearBottomChange = onNearBottomChange
@@ -399,6 +424,9 @@ struct SessionMessageListView: View {
         _lastScrollToBottomToken = State(initialValue: scrollToBottomToken)
     }
 
+ /// 列表内容签名：**O(1)**（只看尾部有限行）。
+ /// body 每次更新都会求值它（含展开/收起动画的逐帧更新、流式更新），
+ /// 旧实现对 items 全量 reverse 遍历 + 字符串拼接，长会话下是每帧固定开销。
     private var signature: MessageListSignature {
         var newestStepCount = 0
         var newestGroupFingerprint = ""
@@ -418,9 +446,20 @@ struct SessionMessageListView: View {
         )
     }
 
+ /// 尾部签名扫描窗口：非 group 行（文件变更卡 / 流式文本 / 错误行）只出现在尾部，
+ /// 且尾部最多 4 条；16 行窗口足以覆盖，超出窗口的行变化由 count/firstID/lastID
+ /// 以及 newestGroupFingerprint 触发，不会漏更新。
+    private static let tailSignatureScanLimit = 16
+    private static let tailSignatureMaxParts = 8
+
     private var tailSignature: String {
         var parts: [String] = []
+        var scanned = 0
         for item in items.reversed() {
+            if scanned >= Self.tailSignatureScanLimit || parts.count >= Self.tailSignatureMaxParts {
+                break
+            }
+            scanned += 1
             switch item {
             case .group: break
             case .liveText(let text): parts.append("lt:\(text.count)")
@@ -434,7 +473,10 @@ struct SessionMessageListView: View {
     }
 
     private var liveTextValue: String? {
+        var scanned = 0
         for item in items.reversed() {
+            if scanned >= Self.tailSignatureScanLimit { return nil }
+            scanned += 1
             if case .liveText(let text) = item { return text }
         }
         return nil
@@ -448,6 +490,17 @@ struct SessionMessageListView: View {
  // items/displayedItems 数据层保持升序，只有渲染序列反转。
                     ForEach(displayedItems.reversed(), id: \.id) { item in
                         rowView(item, isNewest: isNewest(item))
+ // 帧级探针：标记「行进入视图层级（物化）」的瞬间 ——
+ // 滚动长帧归因用（巨型/多步骤行首次物化的布局成本）。
+                            .onAppear {
+                                guard ScrollHitchProbe.isEnabled else { return }
+                                ScrollHitchProbe.mark("rowAppear", [
+                                    "id": item.id,
+                                    "kind": item.rowKindForProbe,
+                                    "steps": item.stepCountForProbe,
+                                    "disp": displayedItems.count,
+                                ])
+                            }
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .padding(.horizontal, Theme.Spacing.pageInset)
                             .padding(.vertical, Self.rowVerticalPadding)
@@ -456,14 +509,11 @@ struct SessionMessageListView: View {
                             .id(item.id)
                     }
                 }
-                .background(
-                    GeometryReader { geo in
-                        Color.clear.preference(
-                            key: ListContentHeightPreferenceKey.self,
-                            value: geo.size.height
-                        )
-                    }
-                )
+ // P0：删除「内容高度 GeometryReader preference」。
+ // 它挂在每个布局都重新求值的 LazyVStack 上，真机实测在一次滚动里
+ // 可以自激成 866 次/秒的 onPreferenceChange（随后 3s 主线程卡死）。
+ // 内容高度已有官方 ScrollGeometry（onScrollGeometryChange 的
+ // contentSize）作为权威真值，不再需要额外测量链。
  // 无内容（无缓存会话拉取中）隐藏列表，骨架屏兜底。
                 .opacity(displayedItems.isEmpty ? 0 : 1)
             }
@@ -490,13 +540,18 @@ struct SessionMessageListView: View {
  // - edge 语义反转：.top = 布局顶 = 视觉底（最新）；.bottom = 最旧端。
             .scaleEffect(x: -1, y: -1)
             .scrollPosition($scrollPosition)
-            .onPreferenceChange(ListContentHeightPreferenceKey.self) { height in
-                metrics.contentHeight = height
-                layoutDidChange()
-            }
+
  // 过程组步骤内容高度（折叠态由隐藏副本持续上报）：组头点击补偿的数据源。
             .onPreferenceChange(ProcessGroupStepsHeightKey.self) { heights in
-                groupStepsHeights = heights
+ // 帧级探针：步骤组测量 preference 每次变化都意味着「组被重新测量」
+ // （滚动中行物化/折叠组隐藏副本）——是滚动卡顿的重点嫌疑点。
+                ScrollHitchProbe.mark("groupStepsHeights", [
+                    "count": heights.count,
+                    "changed": heights.count != groupStepsHeightStore.heights.count ? 1 : 0,
+                ])
+ // 只写非可观察存储：滚动中行物化时的测量上报不再触发整表 body 重算。
+ // 合并而不是替换（缓存命中的组不再上报，不能被冲掉）。
+                groupStepsHeightStore.update(heights)
             }
  // viewport frame 测量：挂在 scale/position 外层（layout frame 不受
  // 翻转影响），供探针 bottomMaxY/viewportMaxY 输出（E2E 契约）。
@@ -541,6 +596,18 @@ struct SessionMessageListView: View {
             }
             .onAppear {
                 metrics.viewportHeight = outer.size.height
+                groupStepsHeightStore.prepare(
+                    layoutSignature: Self.stepsCacheLayoutSignature(
+                        width: outer.size.width,
+                        dynamicTypeSize: dynamicTypeSize,
+                        locale: locale
+                    )
+                )
+ // 帧级卡顿探针：列表上屏即开始逐帧采样（DEBUG + DSHM_HITCHDBG=1 才生效）。
+                ScrollHitchProbe.start()
+                startAutoScrollIfNeeded()
+ // 首屏窗口文本行后台预解析（用户随时可能开始滑）。
+                MarkdownPrewarm.prewarm(items: displayedItems)
  // inverted：offset=0 天然贴最新，无初始定位链；已有内容直接显示。
                 if !displayedItems.isEmpty, !isContentReady {
                     isContentReady = true
@@ -550,6 +617,33 @@ struct SessionMessageListView: View {
             .onChange(of: outer.size.height) { _, height in
                 metrics.viewportHeight = height
  // 视口尺寸变化无需滚动指令：offset=0 恒贴最新；系统自动夹 maxOffset。
+            }
+            .onChange(of: outer.size.width) { _, width in
+                groupStepsHeightStore.prepare(
+                    layoutSignature: Self.stepsCacheLayoutSignature(
+                        width: width,
+                        dynamicTypeSize: dynamicTypeSize,
+                        locale: locale
+                    )
+                )
+            }
+            .onChange(of: dynamicTypeSize) { _, size in
+                groupStepsHeightStore.prepare(
+                    layoutSignature: Self.stepsCacheLayoutSignature(
+                        width: outer.size.width,
+                        dynamicTypeSize: size,
+                        locale: locale
+                    )
+                )
+            }
+            .onChange(of: locale) { _, newLocale in
+                groupStepsHeightStore.prepare(
+                    layoutSignature: Self.stepsCacheLayoutSignature(
+                        width: outer.size.width,
+                        dynamicTypeSize: dynamicTypeSize,
+                        locale: newLocale
+                    )
+                )
             }
             .onChange(of: signature) { _, _ in
                 applyItemsChange()
@@ -571,11 +665,14 @@ struct SessionMessageListView: View {
                 metrics.followCount += 1
             }
             .onDisappear {
+                ScrollHitchProbe.stop()
                 metrics.windowExpansionScheduled = false
-                groupToggleTask?.cancel()
-                groupToggleTask = nil
+                groupToggleTicker?.stop()
+                groupToggleTicker = nil
                 groupToggleRun = nil
                 groupToggleOverride = [:]
+                autoScrollTicker?.stop()
+                autoScrollTicker = nil
             }
             .overlay(alignment: .topLeading) { scrollProbeElement }
             .overlay(alignment: .top) { scrollHUD }
@@ -590,8 +687,26 @@ struct SessionMessageListView: View {
         case .group(let group):
             let mode = ProcessGroupModeResolver.resolve(
                 isRunning: isNewest,
-                override: processGroupModes[group.id]
+                override: processGroupModes[group.id],
+                stepCount: group.stepCount
             )
+ // 步骤内容签名 + 高度缓存：命中时折叠组不再渲染隐藏测量副本（见
+ // GroupStepsHeightStore / ProcessGroupView.cachedStepsHeight）。
+            let contentSignature = group.stepsContentSignature
+            let cachedStepsHeight = groupStepsHeightStore.height(
+                forGroup: group.id,
+                contentSignature: contentSignature
+            )
+ // 公式估算：缓存未命中时先给出 Δ（不再为测量而把整组步骤渲染一遍）。
+            let estimatedStepsHeight = group.estimatedStepsHeight
+            let stepCount = group.stepCount
+ // 巨型组展开态的首屏行高（initialSteps 步 + 可能存在的「展开其余」按钮行）：
+ // 巨型组不做逐帧动画，直接同帧切态 + 用这个 Δ 补偿 offset。
+            let giantExpandedHeight = group.estimatedStepsHeight(
+                limit: ProcessGroupStepsLayoutPolicy.initialSteps
+            ) + (stepCount > ProcessGroupStepsLayoutPolicy.initialSteps
+                ? ProcessGroupStepsLayoutPolicy.revealRowHeight
+                : 0)
             FlowRowGroupView(
                 group: group,
                 sessionId: sessionId,
@@ -601,13 +716,26 @@ struct SessionMessageListView: View {
                 isNewestGroupRunning: isNewest,
                 mode: mode,
                 animatedStepsHeight: groupToggleOverride[group.id],
+                cachedStepsHeight: cachedStepsHeight,
+                stepsContentSignature: contentSignature,
+                onStepsHeightDelta: { delta in
+                    handleGroupStepsHeightDelta(delta)
+                },
                 windowHeight: processGroupWindowHeight,
                 onToggleMode: {
  // 显式驱动动画：行高与 offset 每帧同一次提交（组头逐帧定住）。
-                    handleGroupModeToggle(groupID: group.id, currentMode: mode)
+                    handleGroupModeToggle(
+                        groupID: group.id,
+                        contentSignature: contentSignature,
+                        estimatedStepsHeight: estimatedStepsHeight,
+                        giantExpandedHeight: giantExpandedHeight,
+                        stepCount: stepCount,
+                        currentMode: mode
+                    )
                 },
                 onOpenReasoning: onOpenReasoning,
-                onOpenTool: onOpenTool
+                onOpenTool: onOpenTool,
+                onOpenRelay: onOpenRelay
             )
             .equatable()
         case .fileChanges(let changes):
@@ -628,7 +756,8 @@ struct SessionMessageListView: View {
 
  // MARK: - 过程组显示态切换：手驱动行高 + offset（组头逐帧定住）
 
- /// 一次展开/收起动画的参数：行高与 offset 用**同一条 easeInOut 曲线**插值。
+ /// 一次展开/收起动画的参数：行高与 offset 用**同一条 easeOutCubic 曲线**
+ /// （GroupToggleAnimation）插值，组头逐帧定住；同时累计逐帧主线程成本供取证。
     private struct GroupToggleRun {
         var groupID: String
         var targetMode: ProcessGroupMode
@@ -639,19 +768,13 @@ struct SessionMessageListView: View {
  /// true = 收起（展开态保持到终帧再落实 collapsed）。
         var isCollapse: Bool
         var start: CFTimeInterval
+ /// 逐帧主线程成本（DEBUG 探针：证明动画帧内没有重活）。
+        var frameCost = GroupToggleAnimation.FrameCost()
     }
 
-    private static let groupToggleDuration: Double = 0.15
- /// Reduce Motion 下的驱动时长（2 帧，≈瞬时但避免单帧 clamp 跳变）。
-    private static let groupToggleReducedDuration: Double = 0.033
- /// 逐帧驱动间隔（≈60fps；SwiftUI 会按屏幕刷新合并提交）。
-    private static let groupToggleTickNanos: UInt64 = 16_000_000
-
- /// easeInOut（smoothstep，与 150ms ease-in-out 曲线观感一致，中段更快）。
-    private static func groupToggleProgress(_ linear: CGFloat) -> CGFloat {
-        let p = min(1, max(0, linear))
-        return p * p * (3 - 2 * p)
-    }
+    private static let groupToggleDuration = GroupToggleAnimation.duration
+ /// Reduce Motion 下的驱动时长（≈2 帧，视觉瞬时但保持「高度 + offset 同帧」语义）。
+    private static let groupToggleReducedDuration = GroupToggleAnimation.reducedMotionDuration
 
  /// 点击过程组头：手驱动「步骤内容高度 + contentOffset」同帧插值，组头逐帧定住。
  ///
@@ -665,12 +788,38 @@ struct SessionMessageListView: View {
  /// 组头跳 348）。手驱动每帧把「高度 override + offset」写进同一次状态提交，
  /// 目标恒在当帧可滚动范围内，两者插值参数相同 ⇒ 组头不动。
  /// Reduce Motion：整段动画压成两帧瞬时提交（终态一致、无过渡）。
-    private func handleGroupModeToggle(groupID: String, currentMode: ProcessGroupMode) {
- // 动画进行中忽略再次点击（150ms 窗口；避免出现两个锚点/中途反向）。
+    private func handleGroupModeToggle(
+        groupID: String,
+        contentSignature: String,
+        estimatedStepsHeight: CGFloat,
+        giantExpandedHeight: CGFloat,
+        stepCount: Int,
+        currentMode: ProcessGroupMode
+    ) {
+ // 动画进行中忽略再次点击（280ms 窗口；避免出现两个锚点/中途反向）。
         guard groupToggleRun == nil else { return }
         let targetMode = ProcessGroupModeResolver.toggled(currentMode)
         let facts = metrics.facts
-        let stepsHeight = max(0, groupStepsHeights[groupID] ?? 0)
+ // 设计决策：巨型组不做逐帧高度动画（Δ 可能上万 pt）——
+ // 同帧切态 + 一次 offset 补偿，组头仍钉住；普通组继续走 easeOutCubic 280ms。
+        if ProcessGroupStepsLayoutPolicy.isGiant(stepCount) {
+            handleGiantGroupModeToggle(
+                groupID: groupID,
+                contentSignature: contentSignature,
+                estimatedStepsHeight: estimatedStepsHeight,
+                targetMode: targetMode,
+                giantExpandedHeight: giantExpandedHeight,
+                currentMode: currentMode
+            )
+            return
+        }
+ // 高度来源优先级：内容签名命中的实测缓存 > 公式估算（步骤行固定行高，
+ // 误差 ≤ 高亮行数）。缓存签名不一致（折叠期间内容变化）时**不用旧值**。
+        let stepsHeight = max(
+            0,
+            groupStepsHeightStore.height(forGroup: groupID, contentSignature: contentSignature)
+                ?? estimatedStepsHeight
+        )
         let delta = ScrollFollowPolicy.toggleHeightDelta(
             from: currentMode,
             to: targetMode,
@@ -700,6 +849,12 @@ struct SessionMessageListView: View {
             start: CACurrentMediaTime()
         )
         metrics.lastScrollCommand = "toggle-anchor"
+        ScrollHitchProbe.mark("toggleStart", [
+            "group": groupID,
+            "delta": Double(delta).rounded(),
+            "from": currentMode.rawValue,
+            "to": targetMode.rawValue,
+        ])
  // 展开：立即切显示态（内容出现但被 override=0 裁掉），随后逐帧长出；
  // 收起：动画期间保持展开态（逐帧裁矮），终帧再落实 collapsed。
         groupToggleOverride[groupID] = run.fromStepsHeight
@@ -714,26 +869,127 @@ struct SessionMessageListView: View {
         )
     }
 
-    private func startGroupToggleTicker(_ run: GroupToggleRun, duration: Double) {
-        groupToggleTask?.cancel()
-        groupToggleTask = Task { @MainActor in
-            while !Task.isCancelled {
-                let elapsed = CACurrentMediaTime() - run.start
-                let linear = min(1, max(0, elapsed / max(0.001, duration)))
-                if linear >= 1 { break }
-                let eased = Self.groupToggleProgress(linear)
-                self.applyGroupToggleFrame(run, eased: eased)
-                try? await Task.sleep(nanoseconds: Self.groupToggleTickNanos)
-            }
-            guard !Task.isCancelled else { return }
-            self.finishGroupToggle(run)
+ /// 巨型组展开/收起：**不做逐帧动画**（设计决策）。
+ ///
+ /// 原因：巨型组步骤数可达 291 步（展开高度上万 pt），逐帧插值 + 每帧布局
+ /// 反而会制造二次卡顿。这里在同一帧里完成「显示态切换 + contentOffset 补偿」，
+ /// 组头仍然钉住（inverted：行高 +Δ ⇒ 组头屏幕位置 −Δ，offset 同量 +Δ）。
+    private func handleGiantGroupModeToggle(
+        groupID: String,
+        contentSignature: String,
+        estimatedStepsHeight: CGFloat,
+        targetMode: ProcessGroupMode,
+        giantExpandedHeight: CGFloat,
+        currentMode: ProcessGroupMode
+    ) {
+        let facts = metrics.facts
+        let isCollapse = targetMode == .collapsed
+ // 收起 Δ：用实测缓存（巨型组展开态始终上报当前可见高度）；缓存未命中时
+ // 退化为整组公式估算（只会让补偿略大/略小，不会跳动到别的位置）。
+        let currentRenderedHeight = groupStepsHeightStore.height(
+            forGroup: groupID,
+            contentSignature: contentSignature
+        ) ?? estimatedStepsHeight
+        let delta: CGFloat = isCollapse ? -currentRenderedHeight : giantExpandedHeight
+        guard abs(delta) > ScrollFollowPolicy.compensationTolerance else {
+            onToggleGroupMode?(groupID, targetMode)
+            return
+        }
+        let targetOffset = ScrollFollowPolicy.anchoredOffset(
+            offset: facts.offset,
+            delta: delta,
+            maxOffset: facts.maxOffset
+        )
+        metrics.lastScrollCommand = "toggle-instant"
+        ScrollHitchProbe.mark("toggleStart", [
+            "group": groupID,
+            "delta": Double(delta).rounded(),
+            "from": currentMode.rawValue,
+            "to": targetMode.rawValue,
+            "giant": 1,
+        ])
+        onToggleGroupMode?(groupID, targetMode)
+        withAnimation(nil) { scrollPosition.scrollTo(y: targetOffset) }
+        if pinnedToBottom, targetOffset > ScrollFollowPolicy.compensationTolerance {
+            pinnedToBottom = false
+            onNearBottomChange(false)
+        }
+        ScrollHitchProbe.mark("toggleEnd", [
+            "group": groupID,
+            "collapse": isCollapse ? 1 : 0,
+            "giant": 1,
+            "delta": Double(delta).rounded(),
+            "target": Double(targetOffset).rounded(),
+        ])
+        scrollDebug("toggle instant group=\(groupID) delta=\(fmt(delta)) off=\(fmt(facts.offset)) target=\(fmt(targetOffset))")
+    }
+
+ /// 巨型组「展开其余 N 步」：行高增加 delta，同帧补偿 offset（组头不跳）。
+    private func handleGroupStepsHeightDelta(_ delta: CGFloat) {
+        guard delta.isFinite, abs(delta) > ScrollFollowPolicy.compensationTolerance else { return }
+        let facts = metrics.facts
+        let targetOffset = ScrollFollowPolicy.anchoredOffset(
+            offset: facts.offset,
+            delta: delta,
+            maxOffset: facts.maxOffset
+        )
+        metrics.lastScrollCommand = "giant-reveal"
+        ScrollHitchProbe.mark("giantReveal", ["delta": Double(delta).rounded()])
+        withAnimation(nil) { scrollPosition.scrollTo(y: targetOffset) }
+        if pinnedToBottom, targetOffset > ScrollFollowPolicy.compensationTolerance {
+            pinnedToBottom = false
+            onNearBottomChange(false)
         }
     }
 
- /// 一帧：步骤内容高度 override 与 offset 在**同一次状态提交**里更新（无动画）。
+ /// 用 CADisplayLink 逐帧驱动（与屏幕刷新同拍）。
+ ///
+ /// 旧实现用 Task.sleep(16ms) 是**非对齐唤醒**：唤醒点相对 vsync 漂移，会出现
+ /// 「一帧写两次 / 下一帧不写」的抖动；sleep 精度还受主线程负载影响（越忙越不匀）。
+ /// CADisplayLink 在每次刷新回调，进度用 targetTimestamp（该帧上屏时间）计算，
+ /// 逐帧严格单调、与刷新同拍。
+    private func startGroupToggleTicker(_ run: GroupToggleRun, duration: Double) {
+        groupToggleTicker?.stop()
+        let ticker = GroupToggleTicker()
+        groupToggleTicker = ticker
+ // 注意：SessionMessageListView 是 struct，不能用 weak self；这里捕获的是
+ // 视图值拷贝 + 共享 @State 存储，ticker.stop() 会释放闭包（无泄漏）。
+        ticker.start { presentationTime in
+            guard var current = self.groupToggleRun, current.groupID == run.groupID else {
+                ticker.stop()
+                return
+            }
+            let elapsed = presentationTime - current.start
+            let linear = min(1, max(0, elapsed / max(0.001, duration)))
+            if linear >= 1 {
+                ticker.stop()
+                self.groupToggleTicker = nil
+                self.finishGroupToggle(current)
+                return
+            }
+            let frameStarted = CACurrentMediaTime()
+            self.applyGroupToggleFrame(
+                current,
+                eased: CGFloat(GroupToggleAnimation.eased(linear))
+            )
+            current.frameCost.add((CACurrentMediaTime() - frameStarted) * 1000)
+            self.groupToggleRun = current
+        }
+    }
+
+ /// 一帧：步骤内容高度 override 与 offset 在**同一次状态提交**里更新（无动画），
+ /// 用同一条非线性曲线的同一个进度插值 ⇒ 组头逐帧定住。
     private func applyGroupToggleFrame(_ run: GroupToggleRun, eased: CGFloat) {
-        let height = run.fromStepsHeight + (run.toStepsHeight - run.fromStepsHeight) * eased
-        let offset = run.fromOffset + (run.targetOffset - run.fromOffset) * eased
+        let height = GroupToggleAnimation.interpolate(
+            from: run.fromStepsHeight,
+            to: run.toStepsHeight,
+            progress: eased
+        )
+        let offset = GroupToggleAnimation.interpolate(
+            from: run.fromOffset,
+            to: run.targetOffset,
+            progress: eased
+        )
         groupToggleOverride[run.groupID] = height
         withAnimation(nil) { scrollPosition.scrollTo(y: offset) }
     }
@@ -756,9 +1012,30 @@ struct SessionMessageListView: View {
             pinnedToBottom = false
             onNearBottomChange(false)
         }
+        ScrollHitchProbe.mark("toggleEnd", [
+            "group": run.groupID,
+            "target": Double(run.targetOffset).rounded(),
+            "collapse": run.isCollapse ? 1 : 0,
+            "frames": run.frameCost.frames,
+            "maxFrameMs": (run.frameCost.maxMilliseconds * 100).rounded() / 100,
+            "totalMs": (run.frameCost.totalMilliseconds * 100).rounded() / 100,
+        ])
+        #if DEBUG
+ // 逐帧主线程成本（不是布局成本）：证明动画帧内没有同步重活；
+ // 掉帧/布局成本由帧级探针的 toggleStart->toggleEnd 窗口判定。
+        PerfProbe.shared.record(
+            "groupToggle",
+            ms: run.frameCost.totalMilliseconds,
+            [
+                "frames": run.frameCost.frames,
+                "maxFrameMs": (run.frameCost.maxMilliseconds * 100).rounded() / 100,
+                "collapse": run.isCollapse ? 1 : 0,
+            ]
+        )
+        #endif
         scrollDebug("toggle end group=\(run.groupID) offset=\(fmt(run.targetOffset)) \(scrollGeometrySummary())")
         groupToggleRun = nil
-        groupToggleTask = nil
+        groupToggleTicker = nil
     }
 
     private func isNewest(_ item: SessionMessageItem) -> Bool {
@@ -799,8 +1076,55 @@ struct SessionMessageListView: View {
  /// 注意不能用 Transaction.disablesAnimations——iOS 26 实测它会把
  /// ScrollPosition.scrollTo 整个吞掉（offset 冻结取证）。记录指令来源（探针
  /// 输出 cmd=），跳动取证时区分「我们滚的」与「系统滚的」。
+ // MARK: - 自动连续滚动
+
+ /// 以固定速度连续滚动（到达一端后停顿 0.35s 反向），模拟用户「持续快速滑动」，
+ /// 但不经过 XCUITest 手势合成 → 没有 XCTest 无障碍快照的主线程占用，能测到
+ /// App 侧真实的掉帧/卡顿（用于回答「自动化测不出用户卡顿」的盲区）。
+    private func startAutoScrollIfNeeded() {
+        #if DEBUG
+        guard ProcessInfo.processInfo.environment["DSHM_AUTOSCROLL"] == "1" else { return }
+        guard autoScrollTicker == nil else { return }
+        let speed = ProcessInfo.processInfo.environment["DSHM_AUTOSCROLL_SPEED"]
+            .flatMap(Double.init) ?? 2600
+        let ticker = GroupToggleTicker()
+        autoScrollTicker = ticker
+ // 状态放在 metrics（class）里：逐帧写不会触发 SwiftUI 失效，测量本身不制造卡顿。
+        metrics.lastAutoScrollTime = 0
+        metrics.autoScrollTarget = -1
+        metrics.autoScrollDirection = 1
+        ScrollHitchProbe.feedPhase("autoscroll")
+        ScrollHitchProbe.mark("autoscrollStart", ["speed": speed])
+        ticker.start { presentationTime in
+            guard let current = autoScrollTicker, current === ticker else { return }
+            let now = presentationTime
+            let last = metrics.lastAutoScrollTime
+            metrics.lastAutoScrollTime = now
+            guard last > 0 else { return }
+            let dt = max(0, min(0.05, now - last))
+            let facts = metrics.facts
+            guard facts.maxOffset > 1 else { return }
+            var target = metrics.autoScrollTarget
+            if target < 0 { target = facts.offset }
+            target += metrics.autoScrollDirection * CGFloat(speed) * CGFloat(dt)
+            if target >= facts.maxOffset {
+                target = facts.maxOffset
+                metrics.autoScrollDirection = -1
+                ScrollHitchProbe.mark("autoscrollFlip", ["dir": -1])
+            } else if target <= 0 {
+                target = 0
+                metrics.autoScrollDirection = 1
+                ScrollHitchProbe.mark("autoscrollFlip", ["dir": 1])
+            }
+            metrics.autoScrollTarget = target
+            withAnimation(nil) { scrollPosition.scrollTo(y: target) }
+        }
+        #endif
+    }
+
     private func scrollWithoutAnimation(_ source: String, _ body: () -> Void) {
         metrics.lastScrollCommand = source
+        ScrollHitchProbe.mark("scrollCmd", ["source": source])
         withAnimation(nil) { body() }
     }
 
@@ -814,8 +1138,28 @@ struct SessionMessageListView: View {
     private func handleScrollFactsChange(old: ScrollFacts, new: ScrollFacts) {
         metrics.facts = new
         metrics.factsCalls += 1
-        indicatorModel.facts = new
-        indicatorModel.factsCalls = metrics.factsCalls
+ // 指示条更新节流到 30Hz（或位移 >4pt）：@Published 每帧写会带来每帧的
+ // SwiftUI 更新事务；指示条自身是 20Hz TimelineView，30Hz 输入足够顺滑。
+        let indicatorNow = CACurrentMediaTime()
+        if indicatorNow - metrics.lastIndicatorPublishAt >= 1.0 / 30.0
+            || !(abs(new.offset - metrics.lastIndicatorOffset) <= 4) {
+            metrics.lastIndicatorPublishAt = indicatorNow
+            metrics.lastIndicatorOffset = new.offset
+            indicatorModel.facts = new
+            indicatorModel.factsCalls = metrics.factsCalls
+        }
+ // 帧级卡顿探针（DEBUG + DSHM_HITCHDBG=1；未开启时 no-op）：
+ // 把逐帧滚动几何/列表规模喂给探针，与 mark 事件按时间对齐做卡顿归因。
+        ScrollHitchProbe.feedGeometry(
+            offset: new.offset,
+            contentHeight: new.contentHeight,
+            viewportHeight: metrics.viewportHeight
+        )
+        ScrollHitchProbe.feedRows(
+            displayed: displayedItems.count,
+            total: items.count,
+            pinned: pinnedToBottom
+        )
         traceGestureOffsetIfNeeded(offset: new.offset)
  // 指示条可见性用 offset 驱动（手势/惯性/程序滚动时 offset 必然逐帧变化）。
  // 不依赖 onScrollPhaseChange：该事件在 scaleEffect 翻转下未实证触发过，
@@ -825,6 +1169,25 @@ struct SessionMessageListView: View {
             indicatorModel.lastActiveAt = metrics.lastActiveAt
         }
         trackIdleBottomStability()
+ // 内容高度变化 = 行物化/估算收敛：窗口扩展检查改由官方 ScrollGeometry 驱动
+ // （旧实现是 LazyVStack 上的 GeometryReader preference，见列表背景注释）。
+        let heightDelta = new.contentHeight - old.contentHeight
+        if abs(heightDelta) > 0.5 || metrics.contentHeight <= 0 {
+            metrics.contentHeight = new.contentHeight
+            if abs(heightDelta) >= 2 {
+                ScrollHitchProbe.mark("contentSizeChange", [
+                    "height": Double(new.contentHeight).rounded(),
+                    "delta": Double(heightDelta).rounded(),
+                ])
+            }
+            layoutDidChange()
+        }
+    }
+
+ /// 探针相位馈入：App 内自动连续滚动（DSHM_AUTOSCROLL=1）期间统一记 autoscroll，
+ /// 避免程序的 scrollTo 被记为.animating/.idle 导致分析器把压测帧算成非滚动。
+    private func feedProbePhase(_ phase: String) {
+        ScrollHitchProbe.feedPhase(autoScrollTicker != nil ? "autoscroll" : phase)
     }
 
  // MARK: - 官方滚动相位（替代 isDragging/isDecelerating + settle 轮询）
@@ -840,16 +1203,20 @@ struct SessionMessageListView: View {
             metrics.isDragging = true
             metrics.interactingUntil = CACurrentMediaTime() + 0.12
             metrics.panSeen = true
+            feedProbePhase(new == .tracking ? "tracking" : "interacting")
             markUserScrolledIfNeeded()
         case .decelerating:
             metrics.panDecelSeen = true
             metrics.interactingUntil = CACurrentMediaTime() + 0.55
+            feedProbePhase("decelerating")
         case .animating:
  // 程序化滚动（我们的 scrollTo 意图）执行中：不视为用户交互。
+            feedProbePhase("animating")
             break
         case .idle:
             metrics.isDragging = false
             metrics.panTrackingSeen = metrics.panTrackingSeen || old == .tracking
+            feedProbePhase("idle")
             settleAfterGesture()
         @unknown default:
             break
@@ -860,6 +1227,7 @@ struct SessionMessageListView: View {
  /// 距最新 <= 12pt 视为用户想贴底（repin），否则 unpin。
     private func settleAfterGesture() {
         let distance = currentDistanceFromBottom()
+        ScrollHitchProbe.mark("settle", ["distance": Double(distance).rounded()])
         let next = ScrollFollowPolicy.pinnedAfterGesture(distanceFromBottom: distance)
         if next != pinnedToBottom {
             pinnedToBottom = next
@@ -885,6 +1253,14 @@ struct SessionMessageListView: View {
  /// - 读历史中（offset>0）：头部 insert 只在 pinned 视口（offset≈0）可见，
  /// 对当前阅读位置零影响。
     private func applyItemsChange() {
+        #if DEBUG
+        let applyStart = CACurrentMediaTime()
+        #endif
+        ScrollHitchProbe.mark("applyItemsChangeStart", [
+            "displayed": displayedItems.count,
+            "incoming": items.count,
+            "pinned": pinnedToBottom ? 1 : 0,
+        ])
         let allItems = items
         guard !allItems.isEmpty else { return }
  // 固定起点失效（快照替换/裁剪）时回到默认「最近 N 行」窗口。
@@ -921,6 +1297,20 @@ struct SessionMessageListView: View {
             onFirstContent()
         }
         scrollDebug("apply displayed=\(displayedItems.count) incoming=\(newItems.count) pinned=\(pinnedToBottom ? 1 : 0) \(scrollGeometrySummary())")
+        ScrollHitchProbe.mark("applyItemsChangeEnd", [
+            "displayed": displayedItems.count,
+            "incoming": newItems.count,
+        ])
+        #if DEBUG
+        PerfProbe.shared.record(
+            "applyItemsChange",
+            ms: (CACurrentMediaTime() - applyStart) * 1000,
+            ["displayed": displayedItems.count, "incoming": newItems.count]
+        )
+        #endif
+ // 后台预解析窗口内文本行的 Markdown（block + inline token）：
+ // 主线程首次物化只做布局/绘制（P0 滚动长帧修复）。
+        MarkdownPrewarm.prewarm(items: displayedItems)
         scheduleWindowExpansionCheck()
     }
 
@@ -950,6 +1340,11 @@ struct SessionMessageListView: View {
  /// 无锚点回位、无滚动指令（旧实现的 prepend 补偿链已全部删除）。
     private func maybeExpandWindow() {
         guard let oldest = displayedItems.first else { return }
+        ScrollHitchProbe.feedRows(
+            displayed: displayedItems.count,
+            total: items.count,
+            pinned: pinnedToBottom
+        )
         guard MessageListWindowPolicy.shouldExpandNearTail(
             offset: metrics.facts.offset,
             contentHeight: metrics.facts.contentHeight,
@@ -966,6 +1361,9 @@ struct SessionMessageListView: View {
     }
 
     private func performWindowExpansion(newStart: Int) {
+        #if DEBUG
+        let expandStart = CACurrentMediaTime()
+        #endif
         guard newStart >= 0, newStart < items.count else { return }
         var expanded = Array(items[newStart...])
  // 读历史冻结一致：扩展批次同样截掉尾部新行（与 applyItemsChange 同语义，
@@ -979,6 +1377,20 @@ struct SessionMessageListView: View {
             displayedItems = expanded
         }
         metrics.prependCount += 1
+        ScrollHitchProbe.mark("windowExpand", [
+            "start": newStart,
+            "displayed": expanded.count,
+            "total": items.count,
+        ])
+        #if DEBUG
+        PerfProbe.shared.record(
+            "windowExpand",
+            ms: (CACurrentMediaTime() - expandStart) * 1000,
+            ["displayed": expanded.count, "total": items.count]
+        )
+        #endif
+ // 向旧端扩展 = 马上要滚到的历史行：提前后台预解析这些文本行。
+        MarkdownPrewarm.prewarm(items: Array(expanded.prefix(120)))
         scrollDebug("window expand start=\(newStart) displayed=\(expanded.count)/\(items.count)")
     }
 
@@ -1032,9 +1444,22 @@ struct SessionMessageListView: View {
         #endif
     }
 
+
     private func fmt(_ value: CGFloat) -> String {
         let tenths = (value * 10).rounded() / 10
         return String(describing: tenths)
+    }
+
+ /// 步骤高度缓存的布局签名：容器宽度（取整）+ 动态字号 + 语言。
+ /// 任一变化 ⇒ 行高会变 ⇒ 缓存必须整体失效重测。
+    private static func stepsCacheLayoutSignature(
+        width: CGFloat,
+        dynamicTypeSize: DynamicTypeSize,
+        locale: Locale
+    ) -> String {
+ // CGFloat→Int 前必须判有限：.infinity/.nan 会 fatalError。
+        let roundedWidth = width.isFinite ? Int(width.rounded()) : 0
+        return "\(roundedWidth)|\(dynamicTypeSize)|\(locale.identifier)"
     }
 
  /// 几何快照：facts/坐标/distance/offset/contentHeight 全量打印，真机可直接对照。
@@ -1452,7 +1877,7 @@ private struct InvertedScrollIndicator: View {
                     .opacity(0.02)
                     .allowsHitTesting(false)
                     .accessibilityIdentifier("scroll-indicator-diag")
-                    .accessibilityValue("mid=\(model.uuid);maxOff=\(Int(f.maxOffset));track=\(Int(track));ch=\(Int(f.contentHeight));calls=\(model.factsCalls);off=\(Int(f.offset))")
+                    .accessibilityValue("mid=\(model.uuid);maxOff=\(sessionSafeInt(f.maxOffset));track=\(sessionSafeInt(track));ch=\(sessionSafeInt(f.contentHeight));calls=\(model.factsCalls);off=\(sessionSafeInt(f.offset))")
                 if f.maxOffset > 1, track > 40, f.contentHeight > 1 {
                     let base = ScrollIndicatorGeometry.thumbLength(track: track, contentHeight: f.contentHeight, viewportHeight: f.viewportHeight)
                     let y = ScrollIndicatorGeometry.thumbY(track: track, contentHeight: f.contentHeight, viewportHeight: f.viewportHeight, offset: f.offset, maxOffset: f.maxOffset)
@@ -1485,7 +1910,7 @@ private struct InvertedScrollIndicator: View {
                         .position(x: geo.size.width - Self.trailingInset - 1,
                                   y: geo.size.height - 1)
                         .accessibilityIdentifier("scroll-indicator")
-                        .accessibilityValue("visible=\(visible ? 1 : 0);maxOff=\(Int(f.maxOffset));off=\(Int(f.offset));track=\(Int(track));len=\(Int(len))")
+                        .accessibilityValue("visible=\(visible ? 1 : 0);maxOff=\(sessionSafeInt(f.maxOffset));off=\(sessionSafeInt(f.offset));track=\(sessionSafeInt(track));len=\(sessionSafeInt(len))")
                 }
             }
         }
@@ -1539,13 +1964,113 @@ private final class ScrollMetrics {
     var windowExpansionScheduled = false
  /// 最近一次程序化滚动指令来源（跳动取证：cmd 有值且时间近 = 我们滚的）。
     var lastScrollCommand: String = "-"
+ /// 指示条 @Published 更新节流（30Hz 或位移 >4pt）。
+    var lastIndicatorPublishAt: CFTimeInterval = 0
+    var lastIndicatorOffset: CGFloat = .nan
+ /// App 内自动连续滚动（DSHM_AUTOSCROLL=1）的帧时钟/目标/方向。
+    var lastAutoScrollTime: CFTimeInterval = 0
+    var autoScrollTarget: CGFloat = -1
+    var autoScrollDirection: CGFloat = 1
+}
+
+
+/// CGFloat→Int 的安全转换（HUD/探针/日志读取滚动几何真值时使用）。
+/// 直接 Int(.infinity)/Int(.nan) 会 fatalError —— 真机在 SwiftUI unspecified
+/// proposal 下踩过一次 EXC_BREAKPOINT，所有浮点转整型都必须先判有限。
+private func sessionSafeInt(_ value: CGFloat, fallback: Int = 0) -> Int {
+    guard value.isFinite else { return fallback }
+    let rounded = value.rounded()
+    guard rounded >= CGFloat(Int.min), rounded <= CGFloat(Int.max) else { return fallback }
+    return Int(rounded)
 }
 
 // MARK: - PreferenceKeys（SwiftUI 原生测量）
 
-private struct ListContentHeightPreferenceKey: PreferenceKey {
-    static var defaultValue: CGFloat = 0
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
+
+/// 帧探针用：行类型 / 步骤数（只读，无副作用；DEBUG 探针用）。
+extension SessionMessageItem {
+    var rowKindForProbe: String {
+        switch self {
+        case .group(let group):
+            switch group {
+            case .process: return "process"
+            case .single: return "single"
+            }
+        case .fileChanges: return "fileChanges"
+        case .liveText: return "liveText"
+        case .streamError: return "streamError"
+        case .actionError: return "actionError"
+        }
+    }
+
+    var stepCountForProbe: Int {
+        if case .group(let group) = self {
+            return group.stepCount
+        }
+        return 0
+    }
+}
+
+/// 过程组「步骤内容高度」存储（key = FlowRowGroup.id）。
+///
+/// 刻意做成**非可观察引用**：ScrollView 内容里每个过程组的 stepsHeightReader
+/// 会在行物化/布局变化时上报测量值，如果回写成 @State，每次上报都会让整个
+/// 消息列表 body 重算（长会话快速滚动时 = 周期性丢帧）。只有点击组头时才读取它，
+/// 因此不需要参与视图依赖。
+@MainActor
+final class GroupStepsHeightStore {
+    private(set) var heights: [String: ProcessGroupStepsHeight] = [:]
+ /// 布局签名（容器宽度 + 动态字号）：变化时所有缓存失效（行高会变）。
+    private(set) var layoutSignature: String = ""
+
+ /// 布局签名变化时整体失效（旋转 / 分屏 / 字号变化后重新测量）。
+    func prepare(layoutSignature: String) {
+        guard self.layoutSignature != layoutSignature else { return }
+        self.layoutSignature = layoutSignature
+        heights.removeAll(keepingCapacity: true)
+    }
+
+ /// 缓存命中：内容签名一致才可用（折叠期间内容变化 → 签名变化 → 未命中重测）。
+    func height(forGroup id: String, contentSignature: String) -> CGFloat? {
+        guard let entry = heights[id], entry.signature == contentSignature, entry.height > 0 else {
+            return nil
+        }
+        return entry.height
+    }
+
+ /// 合并上报值（不是整体替换：命中缓存的组不再上报，不能把已有缓存冲掉）。
+    func update(_ reported: [String: ProcessGroupStepsHeight]) {
+        for (id, entry) in reported {
+            heights[id] = entry
+        }
+    }
+}
+
+/// 展开/收起动画的帧时钟：CADisplayLink（主 runloop common mode，与滚动手势并存）。
+///
+/// 回调参数是 targetTimestamp——该帧被上屏的时间，用它算动画进度可以抵消一帧的
+/// 提交延迟，逐帧严格单调；替代旧 Task.sleep(16ms) 的相对漂移 / 一帧写两次的抖动。
+@MainActor
+final class GroupToggleTicker: NSObject {
+    private var link: CADisplayLink?
+    private var onFrame: ((CFTimeInterval) -> Void)?
+
+    func start(onFrame: @escaping (CFTimeInterval) -> Void) {
+        self.onFrame = onFrame
+        let link = CADisplayLink(target: self, selector: #selector(handleFrame(_:)))
+        link.add(to: .main, forMode: .common)
+        self.link = link
+    }
+
+    func stop() {
+        link?.invalidate()
+        link = nil
+        onFrame = nil
+    }
+
+    @objc private func handleFrame(_ link: CADisplayLink) {
+        onFrame?(link.targetTimestamp)
+    }
 }
 
 /// ScrollView 自身的全局 frame（挂在 scale 外层，测量不受翻转影响；探针输出用）。

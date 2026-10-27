@@ -47,6 +47,35 @@ enum Theme {
         static let codeBackground = Color(hex: 0x070B11)
  /// Success keeps the single-accent rule: no extra green.
         static let success = Color(hex: 0x22D3EE)
+ /// 步骤「成功」圆点绿（v7 task-9 用户口径：成功执行的步骤点必须显示成绿色）。
+ /// **例外于单一 accent 基线**（baseline §1：accent 只用于 live/CTA）——用户点名要绿，
+ /// 取 GitHub Primer dark 的 fgColor-success #3FB950（与 Theme.Diff.addMark 同源，
+ /// 不另造新色）：深底对比度够，且与失败红 #F87171 成对不刺眼。
+        static let stepSuccess = Color(hex: 0x3FB950)
+ /// 运行中行（实时思考 / 运行中的普通步骤行）共用的浅蓝底 = accent 5%。
+ /// 沿用 v6 LiveReasoningStepRow 的既有取值（用户点名「那个浅蓝色非常好看」），
+ /// 抽成 token 后由两处共用同一份透明度，避免各自写 opacity 漂移。
+        static let liveStepFill = Color(hex: 0x22D3EE).opacity(0.05)
+
+ // MARK: desktop parity — Markdown 行内代码 / 围栏代码块（v7 task-6）
+ //
+ // 取值来自桌面端 app.asar 解包核对（dark theme）：
+ // · CSS：@deepseek-ai/dsh-web-frontend/dist/assets/index-*.css
+ // `._markdown_1ypvv_5:not(pre)>code`（行内代码）与 `._block_7gxqk_4`（围栏块）；
+ // · 变量值：@deepseek-ai/dsh-client-ui-theme/lib/client.js 的
+ // `body[data-ds-dark-theme]` 段。
+ /// 行内代码 chip 底色 = --dsw-alias-markdown-inline-code（dark: neutral-800 #292929）。
+        static let inlineCodeBackground = Color(hex: 0x292929)
+ /// 行内代码 chip 描边 = --dsw-alias-border-l1（dark: #ffffff0f，白 6%）。
+        static let inlineCodeBorder = Color.white.opacity(0.06)
+ /// 行内代码 chip 文字色 = --dsw-alias-label-primary（dark: neutral-bluish-50 #f9fafb）。
+ /// 桌面端行内代码文字不染色（旧实现用 accent，v7 task-6/7 改）。
+        static let inlineCodeText = Color(hex: 0xF9FAFB)
+ /// 围栏代码块底色 = --dsw-alias-markdown-code-block（dark: neutral-bluish-900 #1b1b1c）。
+        static let codeBlockBackground = Color(hex: 0x1B1B1C)
+ /// 围栏代码块信息栏（语言标签行）底色 =
+ /// --dsw-alias-markdown-code-block-banner（dark: neutral-bluish-850 #2c2c2e）。
+        static let codeBlockBanner = Color(hex: 0x2C2C2E)
     }
 
  // MARK: - GitHub diff palette (task-2: unified diff rendering)
@@ -104,6 +133,26 @@ enum Theme {
         static let lg: CGFloat = 14   // r-md (cards, inputs)
         static let sm: CGFloat = 10   // r-sm (chips, inner blocks)
         static let pill: CGFloat = 999
+ /// 行内代码 chip 圆角（桌面 --dsw-radius-sm = 8px；v7 task-6 desktop parity）
+        static let inlineCode: CGFloat = 8
+ /// 围栏代码块圆角（桌面 --dsw-radius-lg = 16px；v7 task-6 desktop parity）
+        static let codeBlock: CGFloat = 16
+    }
+
+ // MARK: - 行内代码 chip 度量（v7 task-7 desktop parity）
+
+ /// 桌面端行内代码（实测量自 app.asar CSS）：
+ /// font: 12px/19px 等宽；padding 0 5px；border.5px；border-radius 8px（--dsw-radius-sm）。
+ /// 桌面 chip 可视高度 = 行高 19px + 边框 1px ≈ 20px，8/20 = 0.4 的圆角/高度比。
+ /// app 侧按 pt 1:1 对齐：桌面「行高 19px + 上下边框 1px = 20px 高」，
+ /// 我们的描边是内描边（strokeBorder），所以背景框高度取 20pt，
+ /// 使 chip 可视高度/圆角 = 8/20 = 0.4，与桌面端同比例。
+ /// 圆角用.circular：CSS border-radius 是正圆角，而.continuous 的 squircle
+ /// 在同数值下视觉更圆。
+    enum MarkdownInlineChip {
+        static let horizontalPadding: CGFloat = 5
+        static let contentMinHeight: CGFloat = 20
+        static let borderWidth: CGFloat = 0.5
     }
 
  // MARK: - Spacing tokens (4/8/12/16/20/24/32 grid, page inset 20)
@@ -171,6 +220,76 @@ enum Theme {
  /// Workspace folder glyph morph: the front cover swings open/closed and
  /// the tint cross-fades (single icon, both directions;).
         static let folder = Animation.timingCurve(0.2, 0.8, 0.2, 1, duration: 0.24)
+    }
+}
+
+// MARK: - 步骤行状态视觉（v7 task-9：只用彩色圆点，不出现状态文案）
+
+/// 组内步骤行的状态视觉。用户口径：
+/// 步骤行不再显示「成功 / 失败 / 运行中」文案，改成 6pt 圆点——
+/// 成功=绿、失败=红、运行中=蓝；运行中的整行复用实时思考行的浅蓝底。
+///
+/// 颜色一律取 Palette token（stepSuccess / danger / accent / warning），
+/// 视图里不硬编码色值；状态文案只剩无障碍用途（VoiceOver 仍需读出结果）。
+enum StepStatusTone: Equatable {
+    case success
+    case failure
+    case running
+    case pendingApproval
+
+ /// 由工具调用的三个状态位推导（纯函数，单测覆盖）。
+ /// 优先级 = 旧 statusColor/statusText 的判定顺序：失败 > 待审批 > 运行中 > 成功
+ /// （待审批的调用 result 仍为 nil，isRunning 同样为 true，必须先判审批）。
+    static func resolve(isError: Bool, pendingApproval: Bool, isRunning: Bool) -> StepStatusTone {
+        if isError { return .failure }
+        if pendingApproval { return .pendingApproval }
+        if isRunning { return .running }
+        return .success
+    }
+
+ /// 圆点颜色：成功=绿（需求的例外 token）/ 失败=红 / 运行中=蓝 / 待审批=黄。
+ /// 运行中直接用 accent（#22D3EE，baseline 把 accent 定义为 live 状态专用色，
+ /// 与实时思考行的点/文字/底色同一个 token，不再另造一套蓝）。
+    var dotColor: Color {
+        switch self {
+        case .success: return Theme.Palette.stepSuccess
+        case .failure: return Theme.Palette.danger
+        case .running: return Theme.Palette.accent
+        case .pendingApproval: return Theme.Palette.warning
+        }
+    }
+
+ /// 只在「没有定论」时脉冲：运行中 / 待审批；成功 / 失败静止。
+    var isPulsing: Bool {
+        self == .running || self == .pendingApproval
+    }
+
+ /// 视觉上已删除状态文案；这段文字只供 VoiceOver（步骤行 a11y 标签拼接用）。
+    var accessibilityText: String {
+        switch self {
+        case .success: return L10n.t("成功")
+        case .failure: return L10n.t("失败")
+        case .running: return L10n.t("运行中")
+        case .pendingApproval: return L10n.t("待审批")
+        }
+    }
+}
+
+extension View {
+ /// 「运行中」行共用的浅蓝底 + 顶部 accent 细边：v6 LiveReasoningStepRow 的既有样式，
+ /// 不是新颜色——底色 Palette.liveStepFill（accent 5%）+ 顶边 Palette.accentBorder（accent 28%）。
+ /// 圆角与内边距不归本样式管：底色块由宿主卡片裁切（分组卡片 Radius.lg），
+ /// 行内水平内边距统一 Theme.Spacing.s，与实时思考行同一条款。
+    @ViewBuilder
+    func liveStepHighlight(_ active: Bool = true) -> some View {
+        if active {
+            background(Theme.Palette.liveStepFill)
+                .overlay(alignment: .top) {
+                    Rectangle().fill(Theme.Palette.accentBorder).frame(height: 1)
+                }
+        } else {
+            self
+        }
     }
 }
 

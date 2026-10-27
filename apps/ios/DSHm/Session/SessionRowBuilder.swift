@@ -1,4 +1,7 @@
 import Foundation
+#if DEBUG
+import QuartzCore
+#endif
 
 /// Builds the conversation flow (one flat stream of rows) from a session event log.
 ///
@@ -329,12 +332,27 @@ enum SessionRowBuilder {
                 latestFileChanges: SessionRowBuilder.aggregateFileChanges(rows: rows, from: aggregateStart)
             )
             guard computeGroups else { return }
+            #if DEBUG
+            let groupStart = CACurrentMediaTime()
             switch change {
             case .tail:
                 groupCache.refreshTail(rows: rows)
             case .full:
                 groupCache.rebuild(rows: rows)
             }
+            PerfProbe.shared.record(
+                change == .full ? "groupCacheRebuild" : "groupCacheTail",
+                ms: (CACurrentMediaTime() - groupStart) * 1000,
+                ["rows": rows.count, "groups": groupCache.groups.count]
+            )
+            #else
+            switch change {
+            case .tail:
+                groupCache.refreshTail(rows: rows)
+            case .full:
+                groupCache.rebuild(rows: rows)
+            }
+            #endif
             groups = groupCache.groups
         }
 

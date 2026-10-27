@@ -305,7 +305,9 @@ final class AppModel: ObservableObject {
  // E2E: 在运行中模拟一次网络切换（Wi-Fi↔蜂窝/断网恢复），验证即时重连。
         if let raw = ProcessInfo.processInfo.environment["DSHM_E2E_SIMULATE_PATH_CHANGE_AFTER_MS"],
            let milliseconds = Int(raw), milliseconds >= 0 {
-            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(milliseconds)) { [weak self] in
+ //与 push tap 同理等「基线会话就绪」再计延迟，否则首屏
+ // 打开慢于注入延迟时，切换发生在测试基线之前，generation 断言假红。
+            scheduleE2EAfterBaselineReady(delayMs: milliseconds) { [weak self] in
                 self?.link.simulateNetworkPathChangeForE2E()
             }
         }
@@ -861,7 +863,21 @@ final class AppModel: ObservableObject {
  /// `nav-debug` accessibility marker (empty outside E2E).
     @Published var navDebugLog: String = ""
 
+    #if DEBUG
+ /// E2E 注入闸门：基线会话（DSHM_E2E_OPEN_SESSION）的详情页
+ /// 已经出现（SessionDetailView.task 上报）。只升不降；产品行为无涉。
+    private var e2eBaselineDetailAppeared = false
+
+    func noteE2EDetailAppeared(sessionId: String) {
+        guard isE2EMode,
+              sessionId == ProcessInfo.processInfo.environment["DSHM_E2E_OPEN_SESSION"] else { return }
+        e2eBaselineDetailAppeared = true
+        pushDbg("e2e baseline detail appeared session=" + sessionId)
+    }
+    #endif
+
     func openSession(_ address: SessionFollowAddress) {
+        NavDiagnostics.log("route openSession subagent=0")
         navWriteAt = Date()
  // 瞬时直写（见 applyDeepLinkNavigation 注释）。
         withTransaction(Self.instantNavTransaction) {
@@ -882,6 +898,7 @@ final class AppModel: ObservableObject {
             childSessionId: entry.id,
             modeRaw: entry.mode
         )
+        NavDiagnostics.log("route openSubagent child=(context.childSessionId)")
         navWriteAt = Date()
  // 瞬时直写（见 applyDeepLinkNavigation 注释）。
         withTransaction(Self.instantNavTransaction) {
@@ -894,6 +911,7 @@ final class AppModel: ObservableObject {
  /// session -> workspace list. Drives the NavigationStack pop (:
  /// system push/pop transition).
     func backFromSession() {
+        NavDiagnostics.log("route backFromSession")
         navWriteAt = Date()
         withAnimation(.default) {
             switch SessionBackNavigation.destination(subagentParent: subagentRoute?.parentAddress) {
@@ -941,10 +959,18 @@ final class AppModel: ObservableObject {
  /// after a model-driven nav write are ignored: UIKit cannot start a user
  /// pop during another transition, so nothing legitimate is lost.
     func applySessionNavPath(_ newPath: [SessionNavTarget]) {
-        guard Date().timeIntervalSince(navWriteAt) > navEchoWindowSeconds else { return }
+        guard Date().timeIntervalSince(navWriteAt) > navEchoWindowSeconds else {
+            NavDiagnostics.log("pathApply ignored(echo) depth=\(newPath.count)")
+            return
+        }
         let current = sessionNavPath()
         guard newPath != current else { return }
-        switch newPath.count {
+        NavDiagnostics.log("pathApply depth=\(newPath.count) current=\(current.count)")
+ // P0：pop 回写的模型更新走**瞬时无动画事务**。
+ // 崩溃栈：pop 转场中 SwiftUI 以 animated 方式再次 setViewControllers
+ // → UINavigationController 断言 → SIGABRT。无动画更新不会与转场竞争。
+        withTransaction(Self.instantNavTransaction) {
+            switch newPath.count {
         case 0:
  // Legit only from depth 1: popping the top-level session to the list.
             if current.count == 1 {
@@ -962,6 +988,7 @@ final class AppModel: ObservableObject {
         default:
  // Depth stays 2; nothing to reconcile.
             break
+            }
         }
     }
 
@@ -1018,11 +1045,43 @@ final class AppModel: ObservableObject {
             }
         }
         guard waitForReady else { return post(afterDelay: delayMs) }
+        scheduleE2EAfterBaselineReady(delayMs: delayMs, minimumDelayMs: 1_200, fire: {
+            post(afterDelay: 0)
+        })
+    }
+
+ /// E2E 注入统一就绪闸门：链路 isConnected 只说明能拉
+ /// 数据，不说明「测试基线」已建立——首屏打开基线会话可能超过注入延迟，注入
+ /// 事件早于基线会让后续断言假红（push tap 已把 app 带走 / generation 已前进）。
+ /// 就绪 = 链路连通 **且** route 已停在启动基线会话（DSHM_E2E_OPEN_SESSION）；
+ /// 无基线 env 时退回仅链路判定。90s 兜底后强制注入。
+    private func scheduleE2EAfterBaselineReady(
+        delayMs: Int,
+        minimumDelayMs: Int = 0,
+        fire: @escaping () -> Void
+    ) {
         var polls = 0
         func poll() {
-            if link.phase.isConnected || polls >= 900 {
- // 链路就绪后再给首屏渲染一点余量（最少 1.2s）。
-                return post(afterDelay: max(delayMs, 1_200))
+            let baselineId = ProcessInfo.processInfo.environment["DSHM_E2E_OPEN_SESSION"]
+            var onBaseline = true
+            if let baselineId, !baselineId.isEmpty {
+                if case .session(let address) = route, address.sessionId == baselineId {
+                    onBaseline = true
+                } else {
+                    onBaseline = false
+                }
+            }
+ // 二次真机复现：route 到位 ≠ 测试基线已取到——真机上详情
+ // 渲染 + 测试轮询到 session-title 可能超过注入延迟，注入仍早于基线
+ // （tap 已把 app 带走 / generation 已前进）。必须等**基线会话的详情页
+ // 实际出现**（SessionDetailView.task 回调）再计延迟。
+            if (link.phase.isConnected && onBaseline && e2eBaselineDetailAppeared) || polls >= 900 {
+ // 就绪后再给首屏渲染一点余量。
+                return DispatchQueue.main.asyncAfter(
+                    deadline: .now() + .milliseconds(max(delayMs, minimumDelayMs))
+                ) {
+                    fire()
+                }
             }
             polls += 1
             DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(100)) { poll() }

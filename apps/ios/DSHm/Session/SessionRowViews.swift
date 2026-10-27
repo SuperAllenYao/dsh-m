@@ -120,6 +120,8 @@ struct RelayCardView: View {
  /// `subagentCatalog` label for the sender child session (falls back to id prefix).
     var agentLabel: String? = nil
     @State private var isExpanded = false
+ /// UIKit 列表后端：由列表层逐帧驱动行高动画（用户点击上报）。
+    @Environment(\.userToggleReporter) private var userToggleReporter
 
     private var senderLabel: String {
         if let agentLabel, !agentLabel.isEmpty { return agentLabel }
@@ -130,7 +132,14 @@ struct RelayCardView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: Theme.Spacing.xs) {
             Button {
-                withAnimation(.easeInOut(duration: 0.15)) { isExpanded.toggle() }
+ // UIKit 后端：上报用户点击，行高动画交给列表层（入口行固定 + 150ms）；
+ // SwiftUI 回退后端（reporter 为 nil）保持原隐式动画。
+                if let userToggleReporter {
+                    userToggleReporter()
+                    isExpanded.toggle()
+                } else {
+                    withAnimation(.easeInOut(duration: 0.15)) { isExpanded.toggle() }
+                }
             } label: {
                 HStack(spacing: 6) {
                     Image(systemName: "person.2")
@@ -220,11 +229,18 @@ struct NoticeCardView: View {
 struct ReasoningRowView: View {
     var text: String
     @State private var expanded = false
+ /// UIKit 列表后端：由列表层逐帧驱动行高动画（用户点击上报）。
+    @Environment(\.userToggleReporter) private var userToggleReporter
 
     var body: some View {
         VStack(alignment: .leading, spacing: Theme.Spacing.xs) {
             Button {
-                withAnimation(.easeInOut(duration: 0.15)) { expanded.toggle() }
+                if let userToggleReporter {
+                    userToggleReporter()
+                    expanded.toggle()
+                } else {
+                    withAnimation(.easeInOut(duration: 0.15)) { expanded.toggle() }
+                }
             } label: {
                 HStack(spacing: Theme.Spacing.xs) {
                     Image(systemName: "sparkles")
@@ -245,13 +261,12 @@ struct ReasoningRowView: View {
             .accessibilityIdentifier("reasoning-row")
             .accessibilityValue(expanded ? "expanded" : "collapsed")
             if expanded {
-                Text(text)
-                    .font(Theme.Typography.caption)
-                    .foregroundStyle(Theme.Palette.textTertiary)
-                    .lineSpacing(3)
+ // v7（用户问题 6）：思考正文与桌面端一致走 Markdown（compact 字号档），
+ // 代码块/列表/标题不再退化成纯文本。主消息流已统一进步骤块，本行仅作
+ // 回退/其它入口的兜底渲染路径。
+                MarkdownDocumentView(text: text, color: Theme.Palette.textTertiary, variant: .compact)
                     .padding(.horizontal, Theme.Spacing.s)
                     .padding(.bottom, Theme.Spacing.s)
-                    .textSelection(.enabled)
                     .accessibilityIdentifier("reasoning-full-text")
             }
         }

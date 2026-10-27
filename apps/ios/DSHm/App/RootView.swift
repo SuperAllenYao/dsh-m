@@ -20,10 +20,14 @@ struct RootView: View {
                     WorkspaceListView()
                         .toolbar(.hidden, for: .navigationBar)
                         .navigationDestination(for: SessionNavTarget.self) { target in
+ // P0：只有栈顶详情参与渲染/发布；被上层子会话覆盖的父页
+ // 暂停派生更新（数据加载与订阅不暂停，见 setDetailCovered）。
+                            let isTopmost = app.sessionNavPath().last == target
                             SessionDetailView(
                                 address: target.address,
                                 subagentContext: target.subagentContext
                             )
+                            .environment(\.sessionDetailIsTopmost, isTopmost)
  // Identity must change between sessions (
  // device regression): when a deep link REPLACES the
  // top path element, the destination slot survives and
@@ -75,6 +79,9 @@ struct RootView: View {
     private var navPath: Binding<[SessionNavTarget]> {
         Binding(
             get: { app.sessionNavPath() },
+ // P0：用户 pop 回写模型必须**瞬时无动画**（见 AppModel
+ // applySessionNavPath）——转场进行中带 animated 的 setViewControllers
+ // 会触发 NavigationStackCoordinator 断言崩溃（两步真机 ips）。
             set: { app.applySessionNavPath($0) }
         )
     }

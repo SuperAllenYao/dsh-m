@@ -29,6 +29,7 @@ struct SystemEdgePopBridge: UIViewRepresentable {
         let view = WireView()
         view.wire = { nav in
             context.coordinator.navigationController = nav
+            NavTransitionGate.shared.navigationController = nav
             nav.interactivePopGestureRecognizer?.delegate = context.coordinator
             nav.interactivePopGestureRecognizer?.isEnabled = true
             NavDiagnostics.log("gate wired depth=\(nav.viewControllers.count) enabled=\(nav.interactivePopGestureRecognizer?.isEnabled ?? false)")
@@ -50,6 +51,10 @@ struct SystemEdgePopBridge: UIViewRepresentable {
             let count = navigationController?.viewControllers.count ?? 0
             let allowed = count > 1
             NavDiagnostics.log("shouldBegin depth=\(count) -> \(allowed ? 1 : 0) state=\(gestureRecognizer.state.rawValue)")
+            if allowed {
+ // P0：interactive pop 即将开始 —— AppModel 的模型回写要等转场结束。
+                NavTransitionGate.shared.noteTransitionStarted()
+            }
             return allowed
         }
 
@@ -85,6 +90,7 @@ struct SystemEdgePopBridge: UIViewRepresentable {
         override func didMoveToWindow() {
             super.didMoveToWindow()
             guard window != nil else { return }
+            NavDiagnostics.log("wireView in window")
             var responder: UIResponder? = next
             while let current = responder {
                 if let nav = current as? UINavigationController {

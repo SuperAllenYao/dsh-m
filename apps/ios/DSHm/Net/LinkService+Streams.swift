@@ -22,6 +22,32 @@ enum ChangesDebugLog {
     }
 }
 
+/// Host-forwarded `$events` hints that make the list's joined metadata stale.
+///
+/// 现场探针（task-1, isolated stack，真 Host + 真插件）：
+/// - 桌面端新建会话 → `workspace/follow` 立即推 `upsert`（成员关系，含新
+/// sessionId），`$events` 同时推 `api-session/added`（完整 summary）；
+/// - 会话首条消息 → `$events` 推 `api-session/activity`；`session/list` 的
+/// `blank` 翻成 false 并给出 title；
+/// - 删除 → `api-session/removed`；改名 → **两路都没有**任何帧（只有
+/// `session/list` 的 title 变了，见 WorkspaceViewModel 的低频兜底快照）。
+///
+/// 列表 = follow 成员关系 ⨝ `session/list` 元数据：只应用 follow 不会让新卡片
+/// 出现（join 缺行）。这里把「元数据已失效」转成一条通知，由列表视图模型去抖后
+/// 补一次快照；`api-session/status` 仍走已有的实时运行态 overlay，不触发整表刷新。
+enum HostSessionListInvalidation {
+    static let notification = Notification.Name("dshmHostSessionListInvalidated")
+
+ /// 已确认会被 Host 转发、且改变列表元数据的 emit。
+    static let events: Set<String> = [
+        "api-session/added",
+        "api-session/activity",
+        "api-session/removed",
+    ]
+
+    static func matches(_ eventName: String) -> Bool { events.contains(eventName) }
+}
+
 /// Bound for the alternate-channel exact-fetch attempt: a LAN probe on a
 /// cellular path must not double the primary 20 s timeout.
 private let exactFetchAlternateTimeout: TimeInterval = 8
@@ -215,6 +241,16 @@ extension LinkService {
         if case .emit(let name, let args) = event,
            let live = LiveSessionStatusEmit.parse(name: name, args: args) {
             applyLiveSessionStatus(live)
+        }
+ // task-1：桌面端新建/首条消息/删除会改 `session/list` 的
+ // 元数据（title/blank/updatedAt），但既不会重放快照、也不会让 follow 的
+ // join 凭空多出一行。转发失效信号，列表视图模型去抖后补一次静默快照。
+        if case .emit(let name, _) = event, HostSessionListInvalidation.matches(name) {
+            NotificationCenter.default.post(
+                name: HostSessionListInvalidation.notification,
+                object: self,
+                userInfo: ["event": name]
+            )
         }
     }
 

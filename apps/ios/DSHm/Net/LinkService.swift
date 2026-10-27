@@ -1095,6 +1095,9 @@ final class LinkService: ObservableObject {
  /// The OS keeps the old socket open across Wi-Fi -> cellular until the TCP
  /// timeout; invalidating it here is what turns a 10s+ wait into a <1s reconnect.
     func handleNetworkPathChanged() {
+        #if DEBUG
+        ScrollHitchProbe.mark("e2ePathChanged", ["phase": String(describing: phase)])
+        #endif
         ReconnectMetrics.markPathChange()
  // 网络已变：旧端点顺序作废，下一轮必须重新发现（mDNS）+ 并行探测。
         endpointsDirty = true
@@ -1445,6 +1448,9 @@ final class LinkService: ObservableObject {
                 p1SilentResume = false
                 phase = .connected
                 if bumpGeneration { generation += 1 }
+                #if DEBUG
+                ScrollHitchProbe.mark("e2eReconnected", ["bump": bumpGeneration, "generation": generation])
+                #endif
                 ReconnectMetrics.markConnected()
                 ConnectionMetrics.markConnected()
                 connectionMetricsValue = connectionMetricsSummary()

@@ -57,6 +57,8 @@ struct SessionDetailView: View {
     let sessionId: String
  /// v5.4 task-13: non-nil when this detail is a child subagent session.
     let subagentContext: SubagentSessionContext?
+ /// 是否在导航栈顶（RootView 注入）：被上层详情覆盖时暂停派生发布（P0）。
+    @Environment(\.sessionDetailIsTopmost) private var sessionDetailIsTopmost
 
     @StateObject private var viewModel: SessionViewModel
     @StateObject private var attachments: AttachmentStore
@@ -124,6 +126,9 @@ struct SessionDetailView: View {
             attachments.attach(link: app.link)
             viewModel.start()
             #if DEBUG
+ // E2E 注入闸门：基线会话详情页实际出现（push tap / 网络切换
+ // 注入以此为 t0 计延迟，杜绝「注入早于测试基线」的假红）。
+            app.noteE2EDetailAppeared(sessionId: sessionId)
  // task-4 E2E seam: inject a synthetic exact changes summary
  // (DSHM_E2E=1 + DSHM_E2E_CHANGES_SUMMARY) so the cross-end title口径
  // (Host total=50 vs files.length=18) is assertable on a real device.
@@ -214,6 +219,8 @@ struct SessionDetailView: View {
                 NSLog("[NAVLIFE] detail appear session=%@ sub=%d", sessionId, subagentContext != nil ? 1 : 0)
             }
             #endif
+ // P0：被子会话覆盖时父页暂停派生发布（数据加载/订阅不暂停）。
+            viewModel.setDetailCovered(!sessionDetailIsTopmost)
  // 壳优先：header/返回/输入框/消息区骨架这一帧就上屏（幂等）。
             viewModel.markDetailShellFrame()
  // M2b-2c: detail in-app first-frame mark (idempotent).
@@ -222,6 +229,10 @@ struct SessionDetailView: View {
             if !viewModel.rows.isEmpty {
                 markFirstContentAfterLayout()
             }
+        }
+        .onChange(of: sessionDetailIsTopmost) { _, topmost in
+ // 回到栈顶：立即补一次发布（setDetailCovered 内部 flush pending rebuild）。
+            viewModel.setDetailCovered(!topmost)
         }
         .overlay(alignment: .topLeading) {
             VStack(spacing: 0) {
@@ -800,17 +811,24 @@ struct SessionDetailView: View {
  /// 消息流渲染单元：groups（历史+live）+ 尾部内容（文件变更/流式文本/错误）统一进列表。
     private var messageItems: [SessionMessageItem] {
         #if DEBUG
-        PerfProbe.shared.measure("messageItems", ["groups": viewModel.flowGroups.count]) {
-            buildMessageItems()
+        let groups = viewModel.flowGroups.count
+        return PerfProbe.shared.measure("messageItems", ["groups": groups]) {
+            let items = buildMessageItems()
+ // 帧级卡顿探针：父视图 body 每次重算都会重建 items（O(groups)），
+ // 这是「滚动期间是否有整表重算」的直接计数点。
+            ScrollHitchProbe.mark("messageItems", ["groups": groups, "items": items.count])
+            return items
         }
         #else
-        buildMessageItems()
+        return buildMessageItems()
         #endif
     }
 
     private func buildMessageItems() -> [SessionMessageItem] {
  // v6 E2E：注入合成步骤组时不叠加样本会话行，保证几何/模式断言稳定。
         if e2eProcessHistoryPreview { return e2eProcessHistoryItems }
+ // 方案① E2E：注入超长 Markdown 行（单视图渲染视觉冒烟/取证）。
+        if e2eMarkdownSingleViewPreview { return e2eMarkdownSingleViewItems }
         return SessionMessageItemsBuilder.build(
             groups: viewModel.flowGroups,
             isRunning: isRunningForMessageItems,
@@ -876,11 +894,25 @@ struct SessionDetailView: View {
                     },
                     onOpenReasoning: { present(.reasoning($0)) },
                     onOpenTool: { present(.tool($0)) },
+ // v7：步骤块里的「子代理消息」行点击 → 打开该子代理会话
+ // （与子代理半层同一路径；sender 不在 catalog 时用裸 id 兜底）。
+                    onOpenRelay: { card in
+                        guard let sender = card.senderSessionId, !sender.isEmpty else { return }
+                        let entry = subagentListEntries.first { $0.id == sender }
+                            ?? SubagentCatalogEntry(id: sender)
+                        app.openSubagentSession(entry, parentAddress: address, parentSessionId: sessionId)
+                    },
                     onOpenFileChanges: { present(.fileChanges($0)) },
-                    onNearBottomChange: { isNearBottom = $0 },
+                    onNearBottomChange: {
+                        isNearBottom = $0
+ // 读历史（不贴底）时降低派生行发布频率：加载/补齐不受影响，
+ // 只是尾部冻结内容的 UI 发布不再和滑动手势抢主线程。
+                        viewModel.setReadingHistory(!$0)
+                    },
                     onUserScrolled: {
                         userHasScrolled = true
                         isNearBottom = false
+                        viewModel.setReadingHistory(true)
                     },
                     onFirstContent: {
                         markFirstContentAfterLayout()
@@ -1027,9 +1059,18 @@ struct SessionDetailView: View {
  // 垫 10 个 2 步组 ≈ 1100pt，给「组头定住」的 offset 补偿留出余量。
  // 垫高组用 reasoning 步骤（行高同样 29pt，但 AX id 是 process-reasoning-row，
  // 不污染 E2E 的 `tool-row-` 计数断言）。
-        var items: [SessionMessageItem] = [
-            .group(.process(Self.e2eHistorySteps(count: 12, idPrefix: "e2e-hist"))),
-        ]
+ // 步数可注入（DSHM_E2E_PROCGROUP_STEPS，默认 12）：>40 即巨型组路径，
+ // 用于复现真机 90 步巨型组的展开/「展开其余」缺陷。
+        let giantSteps = Int(ProcessInfo.processInfo.environment["DSHM_E2E_PROCGROUP_STEPS"] ?? "") ?? 12
+ // 主组上方垫高（DSHM_E2E_PROCGROUP_PAD_ABOVE， v4）：复现真机
+ // 「长会话中段、组上方还有大量历史」的几何——组头钉住必须扛住上方内容的
+ // 行高估算漂移；主组在内容顶部时钉住是平凡成立的，测不出该缺陷。
+        let padAbove = Int(ProcessInfo.processInfo.environment["DSHM_E2E_PROCGROUP_PAD_ABOVE"] ?? "") ?? 0
+        var items: [SessionMessageItem] = []
+        for index in 0..<max(0, padAbove) {
+            items.append(.group(.process(Self.e2eReasoningSteps(count: 2, idPrefix: "e2e-above\(index)"))))
+        }
+        items.append(.group(.process(Self.e2eHistorySteps(count: giantSteps, idPrefix: "e2e-hist"))))
         for index in 0..<10 {
             items.append(.group(.process(Self.e2eReasoningSteps(count: 2, idPrefix: "e2e-pad\(index)"))))
         }
@@ -1066,6 +1107,76 @@ struct SessionDetailView: View {
             return ProcessStep(id: "\(idPrefix)-\(index)", kind: .tool(item), seq: Int.max / 2 + index)
         }
     }
+
+ // MARK: - 方案① E2E：超长 Markdown 单视图渲染注入（仅 DEBUG + E2E）
+
+ /// `DSHM_E2E=1` + `DSHM_E2E_MD_SINGLEVIEW=1` 注入一条 ~1700 字符、覆盖全部
+ /// block 类型的超长 Markdown 行（命中 `MarkdownRenderPolicy.shouldFlatten`），
+ /// 用于单视图渲染的视觉冒烟与滚动取证。不叠加样本会话行，无产品行为。
+    private var e2eMarkdownSingleViewPreview: Bool {
+        #if DEBUG
+        guard app.isE2EMode else { return false }
+        return ProcessInfo.processInfo.environment["DSHM_E2E_MD_SINGLEVIEW"] == "1"
+        #else
+        return false
+        #endif
+    }
+
+    private var e2eMarkdownSingleViewItems: [SessionMessageItem] {
+        var items: [SessionMessageItem] = []
+        for index in 0..<4 {
+            items.append(.group(.single(FlowRow(
+                id: "e2e-md-pad-\(index)",
+                seq: 100 + index,
+                content: .text("垫高短消息 \(index)：方案①单视图渲染 E2E 注入样本。")
+            ))))
+        }
+        items.append(.group(.single(FlowRow(
+            id: "e2e-md-long",
+            seq: 200,
+            content: .text(Self.e2eLongMarkdown)
+        ))))
+        for index in 0..<2 {
+            items.append(.group(.single(FlowRow(
+                id: "e2e-md-tail-\(index)",
+                seq: 300 + index,
+                content: .text("尾部最新消息 \(index)：超长行上方（更新侧）的垫高内容。")
+            ))))
+        }
+        return items
+    }
+
+ /// 全 block 类型超长 Markdown（标题/行内代码/列表/任务/引用/代码块/表格/分隔线 + 拉长段落）。
+    private static let e2eLongMarkdown: String = {
+        let head = """
+        ## 方案①单视图渲染验收样本
+
+        正文段落：这是一条超长 Markdown 消息，验证「单视图富文本渲染」的视觉效果；正文混排行内代码 `inlineChip()`、加粗 **重点内容**、斜体 _强调文本_ 与链接 [示例链接](https://example.com)。
+
+        - 列表项：第一项内容
+        - 列表项：第二项含行内代码 `count > 800`
+        - [x] 已完成任务项
+        - [ ] 未完成任务项
+
+        > 引用块第一行：引用内容样本
+        > 引用块第二行：继续引用
+
+        ```swift
+        let value = 42
+        func render() -> Text { Text(flattened) }
+        ```
+
+        | 列A | 列B | 列C |
+        | --- | --- | --- |
+        | 值1 | 值2 | 值3 |
+
+        ---
+        """
+        let filler = (1...12).map {
+            "补充段落 \($0)：继续填充字符数以超过 800 字符阈值，确保命中单视图渲染分支；每一段都计入真实的文本测量与渲染成本。"
+        }.joined(separator: "\n\n")
+        return head + "\n" + filler
+    }()
 
  // MARK: - v5.5 status-strip entry points
 
@@ -1349,10 +1460,22 @@ struct FlowRowGroupView: View, Equatable {
     var mode: ProcessGroupMode = .expanded
  /// 展开/收起手驱动动画的步骤内容高度覆盖（nil = 自然高度，见 SessionMessageListView）。
     var animatedStepsHeight: CGFloat? = nil
+ /// 「展开后步骤内容高度」缓存命中值（见 GroupStepsHeightStore）：命中时折叠组
+ /// 跳过隐藏测量副本，滚动期行物化成本减半。
+    var cachedStepsHeight: CGFloat? = nil
+ /// 步骤内容签名（缓存校验用，随组内容变化）。
+    var stepsContentSignature: String = ""
+ /// 巨型组「展开其余 N 步」追加后，行高增加了多少（列表同帧补偿 offset）。
+    var onStepsHeightDelta: ((CGFloat) -> Void)? = nil
+ /// v7.1：巨型组已渲染步数的外部真值 + 变化回调（UIKit 后端持有；nil = 内部 @State）。
+    var revealedStepsOverride: Int? = nil
+    var onRevealStepsChange: ((Int) -> Void)? = nil
     var windowHeight: CGFloat = 300
     var onToggleMode: (() -> Void)? = nil
     var onOpenReasoning: ((String) -> Void)? = nil
     var onOpenTool: ((ToolCallItem) -> Void)? = nil
+ /// v7：子代理消息步骤行点击 → 打开该子代理会话（nil = 该行不可点）。
+    var onOpenRelay: ((RelayCard) -> Void)? = nil
 
  /// 只比较影响渲染的值：流式更新时未变化的组直接跳过 body 重算
  /// 。回调闭包与 attachments 不参与比较。
@@ -1364,6 +1487,9 @@ struct FlowRowGroupView: View, Equatable {
             && lhs.isNewestGroupRunning == rhs.isNewestGroupRunning
             && lhs.mode == rhs.mode
             && lhs.animatedStepsHeight == rhs.animatedStepsHeight
+            && lhs.cachedStepsHeight == rhs.cachedStepsHeight
+            && lhs.stepsContentSignature == rhs.stepsContentSignature
+            && lhs.revealedStepsOverride == rhs.revealedStepsOverride
     }
 
     private var axIdentifier: String {
@@ -1394,10 +1520,17 @@ struct FlowRowGroupView: View, Equatable {
                     mode: mode,
                     measurementID: group.id,
                     animatedStepsHeight: animatedStepsHeight,
+                    cachedStepsHeight: cachedStepsHeight,
+                    measurementSignature: stepsContentSignature,
                     windowHeight: windowHeight,
                     onToggleMode: onToggleMode,
                     onOpenTool: onOpenTool,
-                    onOpenReasoning: onOpenReasoning
+                    onOpenReasoning: onOpenReasoning,
+                    subagentLabels: subagentLabels,
+                    onOpenRelay: onOpenRelay,
+                    revealedStepsOverride: revealedStepsOverride,
+                    onRevealStepsChange: onRevealStepsChange,
+                    onStepsHeightDelta: onStepsHeightDelta
                 )
             }
         }
