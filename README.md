@@ -6,7 +6,7 @@ DSH-m 通过自托管、TLS 证书钉扎的桥接，把 iPhone App **DSH-m** 连
 
 ## 状态
 
-当前版本 **v2.16.0**（2026-10-27）。已交付的能力：
+当前版本 **v2.17.0**（2026-10-27）。已交付的能力：
 
 **导航**
 
@@ -21,7 +21,7 @@ DSH-m 通过自托管、TLS 证书钉扎的桥接，把 iPhone App **DSH-m** 连
 - 配对一次即可长期使用：手机以插件自签 CA 证书为信任锚，插件升级、证书重签（局域网 IP 变化 / 到期续期 / 手动轮换）、桌面端重启、切换网络都不需要重新配对；只有主动吊销设备或显式轮换 CA 才需要。
 - 连接稳定：首次启动链路就绪即进入；断线自动恢复（单 WSS 传输与断线恢复 `dsh-m/2`、按 origin 复用的 keep-alive 连接池）；待处理卡片在重连时不清空，重连后按事件 ID 幂等重投。
 - 公网访问：在桌面设置页一键部署自托管 relay，部署后进程内激活隧道（无需重载插件）。
-- 网络自适应：配对与连接都自动按当前网络选路径（直连优先、2 秒不通切中继）；连接成功后自动学习 Mac 的最新端点；网络环境变化（Wi-Fi / 蜂窝 / 热点 / Mac 局域网 IP 变更）时自动换路，收不到旧连接时由新连接接管，重连约 0.4s；同一 Wi-Fi 下冷启动约 1.6s 连上。
+- 网络自适应：配对与连接都自动按当前网络选路径（直连优先、2 秒不通切中继）；连接成功后自动学习 Mac 的最新端点；网络环境变化（Wi-Fi / 蜂窝 / 热点 / Mac 局域网 IP 变更）时自动换路并即时重拨，Wi-Fi↔蜂窝双向切换约 1 秒内恢复连接；同一 Wi-Fi 下冷启动约 1.6s 连上。
 
 **会话与交互**
 
@@ -151,7 +151,7 @@ DSH-m connects the iOS app **DSH-m** to your Mac's DSH desktop through a self-ho
 
 ## Status
 
-Current version **v2.15.0** (2026-10-26). What ships today:
+Current version **v2.17.0** (2026-10-27). What ships today:
 
 **Connection and pairing**
 
@@ -159,7 +159,7 @@ Current version **v2.15.0** (2026-10-26). What ships today:
 - Pair once and keep working: the phone anchors trust on the plugin's self-signed CA certificate, so plugin upgrades, certificate re-issues (LAN IP changes / expiry renewal / manual rotation), desktop restarts and network changes no longer require re-pairing; only revoking the device or explicitly rotating the CA does.
 - Reliable connection: the app enters as soon as the link is ready on first launch; automatic recovery after disconnects (single-WSS transport with resume `dsh-m/2`, per-origin keep-alive connection pooling); pending cards are not cleared on reconnect and are re-delivered idempotently by event ID.
 - Public access: deploy a self-hosted relay with one click from the desktop settings page; the tunnel activates in-process (no plugin reload).
-- Network-aware: after every successful connect the app learns the Mac's current endpoints; when the network environment changes (Wi-Fi / cellular / hotspot / Mac LAN IP change) it automatically picks the fastest reachable path and a new connection takes over from a silent stale one — a reconnect takes about 0.4s, and a same-Wi-Fi cold start connects in about 1.6s.
+- Network-aware: after every successful connect the app learns the Mac's current endpoints; when the network environment changes (Wi-Fi / cellular / hotspot / Mac LAN IP change) it automatically picks the fastest reachable path and redials immediately — switching between Wi-Fi and cellular recovers the connection in about a second, and a same-Wi-Fi cold start connects in about 1.6s.
 
 **Sessions and interaction**
 
