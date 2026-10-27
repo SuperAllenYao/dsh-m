@@ -241,6 +241,7 @@ struct SessionDetailView: View {
                 e2eHistoryFillElement
                 e2eFollowProbeElement
                 e2eLinkDebugElement
+                e2ePathChangeTriggerElement
             }
         }
         .onChange(of: app.link.generation) { generation in
@@ -657,13 +658,16 @@ struct SessionDetailView: View {
 
  /// 隐藏元素：链路相位 + 连接代号。网络切换用例用它区分「已经重连成功」和
  /// 「只是旧内容还留在屏上」，并给出可测的重连耗时（轮询到 connected=1）。
- /// 格式：`connected=0|1;phase=<文案>;generation=<n>`。
+ /// 格式：`connected=0|1;phase=<文案>;generation=<n>;switchMs=<n>`。
+ /// `switchMs` = 最近一次网络切换信号 → 连接成功的 App 侧真实耗时（毫秒，
+ /// -1 表示本进程还没有切换锚定的重连），E2E 断言与手动切换验收都读它。
     @ViewBuilder
     private var e2eLinkDebugElement: some View {
         if app.isE2EMode {
             let value = "connected=" + (app.link.phase.isConnected ? "1" : "0")
                 + ";phase=" + app.link.phase.label
                 + ";generation=" + String(app.link.generation)
+                + ";switchMs=" + String(app.link.lastSwitchReconnectMs ?? -1)
             Text("e2e-link")
                 .font(.system(size: 1))
                 .frame(width: 2, height: 2)
@@ -672,6 +676,27 @@ struct SessionDetailView: View {
                 .accessibilityIdentifier("e2e-link")
                 .accessibilityLabel(value)
                 .accessibilityValue(value)
+        }
+    }
+
+ /// E2E 隐藏触发器：网络切换用例在**读完基线后**由测试 tap 它，
+ /// 走与真实切换完全相同的 `simulateNetworkPathChangeForE2E` 路径。
+ /// 取代旧的 `DSHM_E2E_SIMULATE_PATH_CHANGE_AFTER_MS` 定时注入——设备繁忙时
+ /// 测试侧基线读取慢于注入延迟，generation 基线读到切换后的值，断言假红
+ /// 。测试驱动 = 零竞态，测试时长也省 ~25s。
+    @ViewBuilder
+    private var e2ePathChangeTriggerElement: some View {
+        if app.isE2EMode {
+            Button {
+                app.link.simulateNetworkPathChangeForE2E()
+            } label: {
+ // Color.clear 本身不渲染也不挡视觉；不能用.opacity —— 低透明度
+ // 会禁用 SwiftUI 命中测试，tap 打不中。
+                Color.clear
+            }
+            .frame(width: 24, height: 24)
+            .contentShape(Rectangle())
+            .accessibilityIdentifier("e2e-path-change-trigger")
         }
     }
 
