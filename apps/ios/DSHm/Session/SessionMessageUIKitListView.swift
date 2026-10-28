@@ -241,6 +241,7 @@ struct SessionMessageUIKitListView: View {
             isRunning: isRunning,
             historyBatchToken: historyBatchToken,
             scrollToBottomToken: scrollToBottomToken,
+            isFillingHistory: isFillingHistory,
             processGroupModes: processGroupModes,
             processGroupWindowHeight: processGroupWindowHeight,
             currentTurnStartSeq: currentTurnStartSeq,
@@ -440,6 +441,12 @@ private struct MessageTableRepresentable: UIViewRepresentable {
     let isRunning: Bool
     let historyBatchToken: Int
     let scrollToBottomToken: Int
+ /// 历史补齐进行中：回填期所有「重主线程的显示侧工作」（闲置行高测量 / 面板扩窗 /
+ /// 自动扩窗 / 行高精确测量）都必须让路，否则会与「逐帧合入」抢主线程，把
+ /// fullHistory 从 <1s 拖到数秒(真机归因：page1 leg 1664ms /
+ /// page2 leg 2787ms，两段主线程空档全部由行宿主物化造成）。
+ /// **必须由 body 显式接线**（不给默认值：漏接线会静默失去全部让路）。
+    let isFillingHistory: Bool
     var processGroupModes: [String: ProcessGroupMode] = [:]
     var processGroupWindowHeight: CGFloat = 300
     var currentTurnStartSeq: Int = Int.min
@@ -892,7 +899,7 @@ private struct MessageTableRepresentable: UIViewRepresentable {
                     return UITableViewCell()
                 }
                 cell.coordinator = self   // 点击展开后上报内容高度 → 触发自撑高重测
-                let host = self.rowHost(for: item, isNewest: self.isNewest(item))
+                let host = self.rowHost(for: item, isNewest: self.isNewest(item), reason: "cell")
                 cell.attach(rowID: itemID, hostView: host.hosting.view, coordinator: self, host: host)
                 #if DEBUG
                 ScrollJitterProbe.shared?.register(rowID: itemID, view: cell)
@@ -1194,7 +1201,7 @@ private struct MessageTableRepresentable: UIViewRepresentable {
 
  /// 取（必要时构建）一行的内容宿主。**每行只布局一次**：命中缓存直接返回，
  /// 不再有自撑高测量；未命中则用 UIHostingController 做一次离屏布局并记住高度。
-        func rowHost(for item: SessionMessageItem, isNewest: Bool) -> RowHost {
+        func rowHost(for item: SessionMessageItem, isNewest: Bool, reason: String = "-") -> RowHost {
             let width = max(1, tableView?.bounds.width ?? UIScreen.main.bounds.width)
             if abs(width - rowHostWidth) > 0.5 {
  // 宽度变化（旋转/分屏/首次布局）：所有行高度失效，整体重建，
@@ -1266,6 +1273,7 @@ private struct MessageTableRepresentable: UIViewRepresentable {
             host.lastUsed = CACurrentMediaTime()
             #if DEBUG
             ScrollHitchProbe.mark("rowHostBuild", [
+                "from": reason,
                 "id": item.id,
                 "kind": item.rowKindForProbe,
                 "steps": item.stepCountForProbe,
@@ -1382,7 +1390,7 @@ private struct MessageTableRepresentable: UIViewRepresentable {
             let oldRowHeight = tableView.rectForRow(at: indexPath).height
  // 按已写入的新揭示值重建宿主 → 目标行高实测（字典已先行写入）。
             invalidateRowHosts([groupID])
-            let newRowHeight = rowHost(for: item, isNewest: isNewest(item)).height
+            let newRowHeight = rowHost(for: item, isNewest: isNewest(item), reason: "reconfigure").height
             guard abs(newRowHeight - oldRowHeight) > ScrollFollowPolicy.compensationTolerance else {
                 reconfigureRow(groupID: groupID, tableView: tableView)
                 return
@@ -1418,6 +1426,10 @@ private struct MessageTableRepresentable: UIViewRepresentable {
  /// 逐步变精确，滚动到达时宿主/高度已就绪。
         private var pendingMeasure = PendingMeasureQueue()
         private var measureDrainTimer: DispatchSourceTimer?
+ /// 回填期 drain 让路的状态（仅在状态翻转时打一个探针点）。
+        private var measureDrainSkipMarked = false
+ /// 回填期伺服让路状态（仅在状态翻转时打一个探针点）。
+        private var servoFillSkipMarked = false
 
         private func queueUnmeasuredRowsForIdleMeasure(_ items: [SessionMessageItem]) {
  // v6.2 冻结修复：未测量行先去重再入队。旧实现
@@ -1471,9 +1483,27 @@ private struct MessageTableRepresentable: UIViewRepresentable {
  // 【v6.1 复盘】曾在拖拽/惯性中测轻行（12ms/帧预算）——实测**有害**
  // （滚动帧 >50ms 6→13、p95 17→21：任何构建工作进入滚动帧都直接
  // 变成卡顿，SwiftUI 构建不可抢占）。滚动/动画期间一律让路。
+ // 【 回填期让路】历史补齐进行中同样一律让路：单行 SwiftUI
+ // 测量 20-40ms，逐帧合入期间每 16ms 一拍会把主线程占满，实测让
+ // relay 档 page1/page2 的合入各停摆 1.0s/2.5s（fullHistory 4339ms）。
+ // 行高仍走估算 + 可见行按需物化，补齐结束后队列按就近顺序继续 drain。
                 if tableView.isTracking || tableView.isDecelerating || tableView.isDragging
                     || self.heightAnimationActive || self.userIsScrolling {
                     return
+                }
+ // 回填期让路：与滚动/动画同等级，整段 drain 暂停；
+ // 补齐结束后自动恢复（队列按就近顺序继续消化）。首次跳过/恢复各打一个点，
+ // 便于真机归因确认闸门真的生效（不逐 tick 打点）。
+                if self.parent.isFillingHistory {
+                    if !self.measureDrainSkipMarked {
+                        self.measureDrainSkipMarked = true
+                        ScrollHitchProbe.mark("drainSkipForFill", ["queued": self.pendingMeasure.count])
+                    }
+                    return
+                }
+                if self.measureDrainSkipMarked {
+                    self.measureDrainSkipMarked = false
+                    ScrollHitchProbe.mark("drainResume", ["queued": self.pendingMeasure.count])
                 }
                 if self.pendingMeasure.isEmpty {
                     self.stopMeasureDrainTimer()
@@ -1482,7 +1512,7 @@ private struct MessageTableRepresentable: UIViewRepresentable {
                 guard let id = self.pendingMeasure.removeFirst() else { return }
                 if let item = self.item(for: id) {
  // rowHost 构建路径内部会把 (签名, 高度) 写入 rowHeightEstimates。
-                    _ = self.rowHost(for: item, isNewest: self.isNewest(item))
+                    _ = self.rowHost(for: item, isNewest: self.isNewest(item), reason: "drain")
                 }
             }
             timer.resume()
@@ -1651,9 +1681,9 @@ private struct MessageTableRepresentable: UIViewRepresentable {
  // 现态实测（宿主缓存命中，零成本）；再置目标态重建实测。
  // giantExpandedHeight = **展开态步骤内容高**（动画期内容钉高用，
  // 两个方向都取展开侧：展开=target、收起=current）。
-                let currentHeight = rowHost(for: item, isNewest: isNewest).height
+                let currentHeight = rowHost(for: item, isNewest: isNewest, reason: "toggle-current").height
                 pendingModeOverride[groupID] = targetMode
-                let targetHeight = rowHost(for: item, isNewest: isNewest).height
+                let targetHeight = rowHost(for: item, isNewest: isNewest, reason: "toggle-target").height
                 giantRowHeights = (currentHeight, targetHeight)
                 let expandedTotal = targetMode == .collapsed ? currentHeight : targetHeight
                 giantExpandedHeight = max(0, expandedTotal - collapsedGroupRowHeight)
@@ -2052,8 +2082,40 @@ private struct MessageTableRepresentable: UIViewRepresentable {
                   let item = item(for: id) else {
                 return UITableView.automaticDimension
             }
-            let h = rowHost(for: item, isNewest: isNewest(item)).height
+ // 【 回填期布局让路】历史补齐的插入全部落在视口**上方**，但 UIKit
+ // 会为每个新插入行索取精确高度 → 逐行构建 SwiftUI 宿主 + sizeThatFits
+ // （实测 15-40ms/行；一次补齐 48-83 行 = 1.0-2.5s 主线程空档，就是 relay
+ // fullHistory 4339ms 的主因：page1 leg 1664ms / page2 leg 2787ms）。
+ // 回填期对「宿主尚未构建且远离视口」的行直接返回估算高度（与
+ // estimatedHeightForRowAt 同源公式，零宿主构建）；可见/邻近行仍精确测量。
+ // 补齐结束后该分支自然失效，恢复原有精确行高语义（滚动到该行时按需测量）。
+ // 回填期 **或** 分段扩窗插入期（isExpandingWindow）：新插入行都落在视口上方，
+ // 由估算高度让路；否则扩窗时 UIKit 会为最多 100 个新插入行同步建宿主
+ // （20-40ms/行 = 2-4s 卡顿， 审查 P2）。
+            if parent.isFillingHistory || isExpandingWindow,
+               rowHosts[id] == nil, !isRowNearViewport(indexPath) {
+                #if DEBUG
+                ScrollHitchProbe.mark("heightEstimateSkip", ["row": indexPath.row])
+                #endif
+                return estimatedRowHeight(for: item, id: id)
+            }
+            #if DEBUG
+            ScrollHitchProbe.mark("heightExactCall", ["row": indexPath.row, "filling": parent.isFillingHistory ? 1 : 0])
+            #endif
+            let h = rowHost(for: item, isNewest: isNewest(item), reason: "height").height
             return h
+        }
+
+ /// 行是否在可见区附近（±3 行）。用于回填期布局让路：只对远处行用估算高度。
+ /// 几何未知（尚未布局/无可见行）时按「精确」处理，避免首屏行高估算偏差。
+        private func isRowNearViewport(_ indexPath: IndexPath) -> Bool {
+            guard let tableView,
+                  let visible = tableView.indexPathsForVisibleRows, !visible.isEmpty else {
+                return true
+            }
+            let rows = visible.map(\.row)
+            guard let low = rows.min(), let high = rows.max() else { return true }
+            return indexPath.row >= low - 3 && indexPath.row <= high + 3
         }
 
  /// 未物化行的高度估算：**必须便宜**（滚动/offset 调整高频调用，绝不构建宿主）。
@@ -2061,6 +2123,12 @@ private struct MessageTableRepresentable: UIViewRepresentable {
         func tableView(_ tableView: UITableView, estimatedHeightForRowAt indexPath: IndexPath) -> CGFloat {
             guard let id = dataSource?.itemIdentifier(for: indexPath),
                   let item = item(for: id) else { return 160 }
+            return estimatedRowHeight(for: item, id: id)
+        }
+
+ /// 估算高度的单一实现（estimatedHeightForRowAt 与回填期 heightForRowAt 共用）：
+ /// 保证两条路径的估算口径完全一致，回填期不会出现「同一行两个高度」。
+        private func estimatedRowHeight(for item: SessionMessageItem, id: String) -> CGFloat {
  // 注意：这里**不做**签名比对——rowSignature 对多步骤组是 O(steps)
  // 字符串构建，UIKit 滚动布局期间高频调用会直接打满主线程（卡顿源）。
  // 估算允许用「上一显示态」的旧值（误差 ≤ 一次切换的 Δ，仍远优于 160）。
@@ -2219,6 +2287,7 @@ private struct MessageTableRepresentable: UIViewRepresentable {
                 "displayed": displayedItems.count,
                 "incoming": items.count,
                 "pinned": pinned ? 1 : 0,
+                "filling": parent.isFillingHistory ? 1 : 0,
             ])
  // 展开/收起动画期间：数据批推迟到 completion（避免修正 offset 与动画竞争）。
             if heightAnimationActive {
@@ -2248,9 +2317,32 @@ private struct MessageTableRepresentable: UIViewRepresentable {
                 }
             }
 
- // 显示窗口解析（固定起点失效时回到默认「最近 N 行」窗口）。
+ // 显示窗口解析。起点 id 失效（重连/截断/组 id 变化导致整窗重建）时**重新锚定到
+ // 当前仍存在的最老已显示行**，而不是回落到 initialWindow（最近 300 行）——否则
+ // 身处历史深处的用户会被抛回最新区，且 2545 的锚点修正解析不到 indexPath 而失效
+ // 。
             if let startID = windowStartItemID, !items.contains(where: { $0.id == startID }) {
-                windowStartItemID = nil
+                let presentIDs = Set(items.map(\.id))
+                windowStartItemID = displayedItems.first(where: { presentIDs.contains($0.id) })?.id
+            }
+ // 【回填期显示窗口锚定 · 真机归因】回填期间数据只在**头部**长出新
+ // 历史行；若显示窗口跟着数据全量走（initialWindow＝最近 300 行），每次 apply
+ // 都会往 UITableView 头部插入新行 → UIKit 在布局里逐行构建 SwiftUI 宿主 +
+ // sizeThatFits（实测 20-40ms/行；一次补齐 36-145 行 = 1.0-2.5s 主线程空档 ×2，
+ // 正是 relay fullHistory 4.0-4.5s 的主因）。
+ // 回填期把窗口起点锚在「当前最老可见行」：新历史行只进 journal/数据层，不进显示
+ // 表（数据层仍逐帧 prepend、页末整窗重建，AC-06 不变）；用户向上滑动时由
+ // maybeExpandWindow 按 100 行分段扩窗，逐段物化历史行，不再一次性塞入整段历史。
+ // 回填结束后锚点保留：显示窗口保持用户当前视野，滚动到顶部预留区再正常扩窗。
+            if parent.isFillingHistory, windowStartItemID == nil,
+               let oldestDisplayed = displayedItems.first?.id,
+               items.contains(where: { $0.id == oldestDisplayed }) {
+                windowStartItemID = oldestDisplayed
+                #if DEBUG
+                ScrollHitchProbe.mark("fillWindowAnchor", [
+                    "displayed": displayedItems.count, "total": items.count,
+                ])
+                #endif
             }
             var windowed = windowedItems(from: items)
             guard !windowed.isEmpty else {
@@ -2375,6 +2467,7 @@ private struct MessageTableRepresentable: UIViewRepresentable {
                 groupLookup = newGroupLookup
                 updateSharedWindow(items: items)
                 maybeExpandWindow()
+                applyFullRangeWindowIfPossible()
                 return
             }
 
@@ -2454,6 +2547,7 @@ private struct MessageTableRepresentable: UIViewRepresentable {
                 }
             }
 
+            applyFullRangeWindowIfPossible()
             if !didInitialBottom, !displayedItems.isEmpty {
                 didInitialBottom = true
  // 常规底座：最新消息在内容底部 → 首屏定位到 offset 最大值；
@@ -2558,6 +2652,38 @@ private struct MessageTableRepresentable: UIViewRepresentable {
             }
             if Self.noServo {
                 return
+            }
+ // 【回填期伺服让路 · 真机归因】历史补齐期间行高从估算→实测的
+ // 收敛会让 contentSize 持续变化：本伺服每次布局都把 pinned 视口重钉到底，
+ // setContentOffset → 下一轮布局 → 新行物化/实测 → contentSize 再变 → 再钉，
+ // 形成「物化风暴」（真机实测一次补齐内两段 1.0s/2.7s 空档、每段 4200-8500 次
+ // willDisplay、36-84 行新宿主=36-84×20-40ms，正是 fullHistory 4.3s 的主因）。
+ // 回填期的贴底/锚定已由 apply 末尾按批完成（每帧一次，而不是每次布局一次）；
+ // 补齐结束后本伺服自动恢复原语义（贴底跟随 / 读历史锚定）。
+            if parent.isFillingHistory {
+                if !servoFillSkipMarked {
+                    servoFillSkipMarked = true
+                    ScrollHitchProbe.mark("servoSkipForFill")
+                }
+ // 回填期「粗钉」：只在大漂移（>1 行估算高度）时补钉一次。逐 0.5pt 追钉会
+ // 形成「钉→布局→再测量→再钉」的物化风暴；完全不钉则 contentSize 随行高
+ // 实测增长、offset 落后 → 视口在内容里向上滑动 → 离屏历史行被大批物化
+ // 。
+                if pinned, !userIsScrolling, !isAdjustingOffset,
+                   !tableView.isTracking, !tableView.isDecelerating,
+                   CACurrentMediaTime() - lastAnimationEndAt > 1.2 {
+                    let target = bottomOffset(tableView)
+                    if abs(tableView.contentOffset.y - target) > 160 {
+                        isAdjustingOffset = true
+                        tableView.setContentOffset(CGPoint(x: 0, y: target), animated: false)
+                        isAdjustingOffset = false
+                    }
+                }
+                return
+            }
+            if servoFillSkipMarked {
+                servoFillSkipMarked = false
+                ScrollHitchProbe.mark("servoResume")
             }
  // 贴底跟随（常规底座）：pinned 且用户不在拖拽/惯性/动画中时，把视口
  // 钉在内容底部（新消息、行高收敛、宿主重测都会让底部下移）。
@@ -2753,33 +2879,53 @@ private struct MessageTableRepresentable: UIViewRepresentable {
  /// 视口纹丝不动（无需锚点补偿）。
  /// 已执行过一次性全量窗口应用（见 scheduleFullRangeApply）。
         private var didFullRangeApply = false
+ /// 一次性全量扩窗已排期（防重复排期；执行成功后由 didFullRangeApply 收口）。
+        private var fullRangeApplyScheduled = false
 
  /// 首屏落定后一次性把窗口扩到已加载全量（延迟 0.6s 等初始收敛；动画中
  /// 顺延）。之后滚动期间零窗口扩展 apply；Markdown 预热也覆盖全量。
         private func scheduleFullRangeApply() {
-            guard !didFullRangeApply else { return }
-            didFullRangeApply = true
+            guard !didFullRangeApply, !fullRangeApplyScheduled else { return }
+            fullRangeApplyScheduled = true
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
-                guard let self, let tableView = self.tableView,
-                      self.didInitialBottom,
-                      !self.heightAnimationActive,
-                      self.parent.items.count > self.displayedItems.count else { return }
-                self.isExpandingWindow = true
-                self.windowStartItemID = self.parent.items.first?.id
-                self.apply(items: self.parent.items, batchToken: self.parent.historyBatchToken)
-                self.isExpandingWindow = false
-                ScrollHitchProbe.mark("windowExpandFull", [
-                    "displayed": self.displayedItems.count,
-                    "total": self.parent.items.count,
-                ])
+                guard let self else { return }
+                self.fullRangeApplyScheduled = false
+                self.applyFullRangeWindowIfPossible()
+            }
+        }
+
+ /// 一次性全量扩窗的**唯一执行点**（成功才置 `didFullRangeApply`）。
+ ///
+ /// 审查修复（P2）：原实现先把 `didFullRangeApply = true` 再判回填期，
+ /// 回填期跳过 = **永久丢弃**（没有重排点）；补齐后用户滑动扩窗时，最多 100 个
+ /// 新插入行会在 `heightForRowAt` 里同步建宿主（20-40ms/行 = 2-4s 卡顿）。
+ /// 现在：回填期/动画期不执行也不置位；补齐结束后的下一次 apply（以及延迟定时器）
+ /// 会再次尝试，真正执行后才置位。
+        private func applyFullRangeWindowIfPossible() {
+ // 动画结束 0.5s 收敛窗（与 apply 内 settleSkipAnchorApply 同口径）内不执行：
+ // 全量扩窗一次在视口上方插入最多数百行，此窗内 apply 不做 offset 锚定修正
+ // → 可见内容整块跳变。不执行也不置位，后续 apply 会再试。
+            guard !didFullRangeApply, let tableView,
+                  didInitialBottom, !heightAnimationActive,
+                  CACurrentMediaTime() - lastAnimationEndAt >= 0.5,
+                  !parent.isFillingHistory,
+                  parent.items.count > displayedItems.count else { return }
+            didFullRangeApply = true
+            isExpandingWindow = true
+            windowStartItemID = parent.items.first?.id
+            apply(items: parent.items, batchToken: parent.historyBatchToken)
+            isExpandingWindow = false
+            ScrollHitchProbe.mark("windowExpandFull", [
+                "displayed": displayedItems.count,
+                "total": parent.items.count,
+            ])
  // 全量文本后台预解析（prewarm 自带去重/预算；分三片让长会话排满）。
-                let all = self.parent.items
-                let chunk = max(1, all.count / 3)
-                var start = 0
-                while start < all.count {
-                    MarkdownPrewarm.prewarm(items: Array(all[start..<min(all.count, start + chunk)]))
-                    start += chunk
-                }
+            let all = parent.items
+            let chunk = max(1, all.count / 3)
+            var start = 0
+            while start < all.count {
+                MarkdownPrewarm.prewarm(items: Array(all[start..<min(all.count, start + chunk)]))
+                start += chunk
             }
         }
 
@@ -2800,6 +2946,15 @@ private struct MessageTableRepresentable: UIViewRepresentable {
  // 不推动视口；冷却（0.8s）保留以防数据批振荡。
             guard !heightAnimationActive else { return }
             guard let oldest = displayedItems.first else { return }
+ // 【回填期自动扩窗闸门 】初始内容较短时 contentOffset 天然落在
+ // 顶部预留区，回填期每批数据都会触发「自动扩窗 → 整段历史塞进显示表 →
+ // 逐行物化（20-40ms/行）」。回填期只放行**用户手势**触发的扩窗
+ // （tracking/decelerating/userIsScrolling），保证「滑动即加载、逐段出现」；
+ // 非手势的自动扩窗推迟到补齐结束（补齐后锚点保留，用户滑动时正常扩窗）。
+            if parent.isFillingHistory,
+               !tableView.isTracking, !tableView.isDecelerating, !userIsScrolling {
+                return
+            }
  // 常规底座：最旧端 = 内容顶部。offset 进入顶部预留区即向旧端扩窗
  // （数据头部插入 + 锚定伺服保持可见内容不动）。
             guard tableView.contentOffset.y <= MessageListWindowPolicy.expandMargin else { return }

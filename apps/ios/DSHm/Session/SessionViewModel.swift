@@ -2030,10 +2030,17 @@ final class SessionViewModel: ObservableObject {
                             pageMinSeq = journal.oldestSeq
                             if !sawFirstPixel {
                                 sawFirstPixel = true
- // 首帧即可渲染：取消防抖、立即重建（firstPixel 语义）。
+ // 首帧即可渲染：取消防抖、立即重建（每页首帧都立即重建，
+ // 保持契约「降序帧逐帧前插、首帧即可渲染」的渐进可见性）。
                                 rebuildNowForHistoryBatch()
-                                ensureProjV1MetricsStarted()
-                                projV1FirstPixelMs = projectedElapsedMs()
+                                if projV1FirstPixelMs == nil {
+ // AC-02 口径 = 整次补齐**首个**成功合入帧 + 重建时刻。
+ // 旧实现只挡 page-local 的 sawFirstPixel，导致第二页的首插入
+ // 覆盖第一页的值（真机实测变成 ~4.2s 的末页时刻，与设计
+ // 「首帧到达即 prepend 并触发重建」不符）。仅此处首次记录。
+                                    ensureProjV1MetricsStarted()
+                                    projV1FirstPixelMs = projectedElapsedMs()
+                                }
                             }
                             syncFillDiagnostics()
                             refreshProjV1Metrics()

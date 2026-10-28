@@ -997,7 +997,11 @@ struct SessionDetailView: View {
                     isRunning: isRunningForMessageItems,
                     historyBatchToken: viewModel.historyBatchToken,
                     scrollToBottomToken: scrollToBottomToken,
-                    isFillingHistory: viewModel.historyFillProgress != nil,
+ // 回填中 = 进度条真值 **或** VM 的补历史状态（进度条有 120/300ms
+ // reveal 延迟，仅看 `historyFillProgress` 会让补齐最早一段拿到 false，
+ // 从而在回填期做逐行精确高度测量 = 主线程空档。两者取或，覆盖全程。）
+                    isFillingHistory: viewModel.historyFillProgress != nil
+                        || viewModel.historyFillState == .loading,
                     processGroupModes: processGroupModes,
                     processGroupWindowHeight: processGroupWindowHeight,
                     currentTurnStartSeq: currentTurnStartSeq,
