@@ -319,6 +319,8 @@ export class TicketUseGuard {
  * `config.features.muxGzip*`; negotiation still needs `hello.caps.gzip`.
  * - projV1 {enabled, truncateLongText}: projection policy from
  * `config.features.projV1*`; negotiation still needs `hello.caps.projV1`.
+ * - onProjV1Partial(report): optional callback when a projected page could not
+ * deliver all frames (link-server folds it into /health counters + audit).
  */
 export class MuxRpcChannel {
   constructor({
@@ -328,6 +330,7 @@ export class MuxRpcChannel {
     limits = {},
     gzip = {},
     projV1 = {},
+    onProjV1Partial,
     log = () => {},
     now = () => Date.now(),
     epoch = randomUUID(),
@@ -337,6 +340,7 @@ export class MuxRpcChannel {
     this.deviceId = deviceId;
     this.forwardUnary = forwardUnary;
     this.issueTicket = typeof issueTicket === 'function' ? issueTicket : () => undefined;
+    this.onProjV1Partial = typeof onProjV1Partial === 'function' ? onProjV1Partial : undefined;
     this.limits = { ...P1_LIMITS, ...limits };
  /** Downstream gzip policy (link-server config.features.muxGzip / muxGzipThresholdBytes). */
     this.gzip = {
@@ -352,6 +356,13 @@ export class MuxRpcChannel {
     this.gzipEnabled = false;
  /** Per-socket negotiated projection (0x02 frames); same lifecycle as gzipEnabled. */
     this.projV1Enabled = false;
+ /**
+ * Per-socket EFFECTIVE truncate/lazy mode (contract v1.1): on only when the
+ * plugin feature allows truncation, projection is negotiated AND the client
+ * asked with `caps.projV1Lazy` (a client without lazy-fetch must never get
+ * `tr`-marked rows). Same per-socket lifecycle as `projV1Enabled`.
+ */
+    this.projV1LazyEnabled = false;
     this.log = log;
     this.now = now;
     this.epoch = epoch;
@@ -401,6 +412,9 @@ export class MuxRpcChannel {
       projV1ProjBytes: 0,
       projV1WireBytes: 0,
       projV1EncodeMs: 0,
+ // Contract v1.1: a page whose frame delivery stopped early (sendBinary
+ // failed mid-page) — never silently counted as a fully delivered page.
+      projV1PartialPages: 0,
       projV1UnknownTypes: 0,
       projV1DroppedTypes: 0,
       projV1UnknownKeys: 0,
@@ -423,6 +437,8 @@ export class MuxRpcChannel {
  // re-negotiate, otherwise an old build on the new socket gets undecodable
  // binary frames. Per-socket state, reset in the same place as gzip.
     this.projV1Enabled = false;
+ // Lazy/truncate negotiation is per socket too (contract v1.1).
+    this.projV1LazyEnabled = false;
   }
 
  /** The downstream socket is gone: keep epoch/log for a while, stop sending. */
@@ -555,6 +571,13 @@ export class MuxRpcChannel {
  // (`caps.projV1 === true`), transport can carry binary frames. The echo is
  // authoritative: `false` means the phone must NOT expect `0x02` frames.
     this.projV1Enabled = this.projV1.enabled === true && clientCaps.projV1 === true && typeof this.transport.sendBinary === 'function';
+ // B (protocol v1.1): truncate/lazy mode is bound to the client's capability —
+ // the plugin feature allows it AND the client negotiated projection AND the
+ // client asked for lazy-fetch with `caps.projV1Lazy === true`. Otherwise the
+ // projection stays full-text even when `features.projV1TruncateLongText` is
+ // on (a client without lazy-fetch must never receive `tr`-marked rows).
+    this.projV1LazyEnabled =
+      this.projV1Enabled === true && this.projV1.truncateLongText === true && clientCaps.projV1Lazy === true;
     if (reconnecting && frame.resume === undefined) {
  // The phone reconnected without a resume cursor: it dropped its stream
  // state, so cancelling the old upstream streams and starting a new epoch
@@ -579,6 +602,9 @@ export class MuxRpcChannel {
  // B (protocol v1): explicit boolean — an old plugin omits the key and an
  // unnegotiated socket echoes `false`, so the phone never expects `0x02`.
         projV1: this.projV1Enabled,
+ // B (protocol v1.1): echo the EFFECTIVE truncate mode (true only when the
+ // feature is on, projection negotiated and the phone asked for lazy).
+        projV1Lazy: this.projV1LazyEnabled,
         maxInFlight: this.limits.rpcMaxInFlight,
         replayBytes: this.limits.replayBytes,
       },
@@ -719,6 +745,8 @@ export class MuxRpcChannel {
  // B (protocol v1): per-socket negotiation snapshot + the client call id
  // that the page header must echo (`header.rpcId`).
           projV1: this.projV1Enabled === true,
+ // Contract v1.1: only a lazy-capable, negotiated client gets truncation.
+          truncateLongText: this.projV1LazyEnabled === true,
           rpcId: frame.id,
         }),
       )
@@ -733,7 +761,7 @@ export class MuxRpcChannel {
  // `welcome.caps.projV1=true` may ever receive a `0x02` frame (contract
  // §1/§10); anything else falls through to the JSON text result below.
         if (result?.projection !== undefined && this.projV1Enabled === true) {
-          this.sendProjection(result.projection);
+          this.sendProjection(result.projection, frame.endpoint);
           return;
         }
         const out = {
@@ -819,27 +847,62 @@ export class MuxRpcChannel {
  * channel's stats: wire bytes are measured from the produced wire buffers, the
  * other fields come from the projection result (link-server measured them).
  *
- * Failure semantics match sendText(): a transport error is logged and never
- * thrown into the caller's promise chain. No `rpc/result` text frame is sent
- * and nothing enters the replay log — like unary results, projection frames
- * are not replayed (contract §5: a mid-page disconnect is healed by the next
- * page request).
+ * Contract v1.1 page lifecycle: the N frames ARE the unary result — no
+ * `rpc/result` text frame is sent and nothing enters the replay log (like
+ * unary results, projection frames are not replayed; a mid-page disconnect is
+ * healed by the next page request). If a frame write fails the remaining
+ * frames are NOT sent (a newer frame without the older ones would corrupt the
+ * client's prepend window) and the page is reported via `onProjV1Partial` +
+ * `stats.projV1PartialPages`, so a half page is never silently treated as a
+ * fully delivered unary.
+ *
+ * @param {{frames: {header: object, chunk: Buffer}[], stats: object}} projection
+ * @param {string} [endpoint] the unary endpoint the page answered
  */
-  sendProjection(projection) {
+  sendProjection(projection, endpoint) {
     const frames = Array.isArray(projection?.frames) ? projection.frames : [];
     const stats = projection?.stats ?? {};
     let wireBytes = 0;
     let sentFrames = 0;
+    let sendFailed = false;
     for (const frame of frames) {
       if (this.transport === undefined) break;
       try {
         const wire = encodeWireFrame({ header: frame.header, chunk: frame.chunk });
-        wireBytes += wire.length;
         if (typeof this.transport.sendBinary !== 'function') throw new Error('transport does not support binary frames');
         this.transport.sendBinary(wire);
+ // Count only bytes actually handed to the transport: a frame whose write
+ // threw was not delivered and must not look like wire success.
+        wireBytes += wire.length;
         sentFrames += 1;
       } catch (error) {
         this.log('device ' + this.deviceId + ': projected page frame send failed: ' + String(error?.message ?? error));
+        sendFailed = true;
+        break;
+      }
+    }
+ // A page that lost a frame mid-stream (or whose first write threw) is a
+ // partial delivery, never a success. A page whose transport was already gone
+ // before the first write is just a dead socket (no frame loss to report).
+    if (frames.length > 0 && sentFrames < frames.length && (sendFailed === true || sentFrames > 0)) {
+      this.stats.projV1PartialPages += 1;
+      const report = {
+        endpoint,
+        rpcId: projection?.header?.rpcId,
+        frames: frames.length,
+        sentFrames,
+        records: Number(stats.records) || 0,
+        wireBytes,
+      };
+      this.log(
+        'device ' + this.deviceId + ': projected page partially delivered (' + String(sentFrames) + '/' + String(frames.length) + ' frames)',
+      );
+      if (this.onProjV1Partial !== undefined) {
+        try {
+          this.onProjV1Partial(report);
+        } catch (error) {
+          this.log('device ' + this.deviceId + ': projV1 partial-page report failed: ' + String(error?.message ?? error));
+        }
       }
     }
     this.stats.projV1Pages += 1;
@@ -887,6 +950,7 @@ export class MuxRpcChannel {
       replayBytes: this.replay.bytes,
       gzip: this.gzipEnabled,
       projV1: this.projV1Enabled,
+      projV1Lazy: this.projV1LazyEnabled,
       inflight: this.inflight.size,
       disposed: this.disposed,
       stats: { ...this.stats },

@@ -717,6 +717,9 @@ export class LinkServer {
       projV1Frames: 0,
       projV1EncodeMs: 0,
       projV1Fallbacks: 0,
+ // Contract v1.1: pages whose 0x02 frame delivery stopped early — never
+ // silently treated as a fully delivered unary (half page ≠ success).
+      projV1PartialPages: 0,
       projV1UnknownTypes: 0,
       projV1DroppedTypes: 0,
       projV1UnknownKeys: 0,
@@ -3382,6 +3385,9 @@ export class LinkServer {
         enabled: this.config.features.projV1 === true,
         truncateLongText: this.config.features.projV1TruncateLongText === true,
       },
+ // Contract v1.1: a page whose frame delivery stopped early is counted +
+ // audited (half page must never look like a completed unary).
+      onProjV1Partial: (report) => this.recordProjV1Partial(device, report),
       log,
     });
     this.p1Channels.set(device.deviceId, channel);
@@ -3537,15 +3543,35 @@ export class LinkServer {
   }
 
  /**
+ * Contract v1.1: one projected page lost a frame mid-stream (channel reported
+ * a partial delivery). Counter + audit make a half page observable instead of
+ * letting it look like a successfully completed unary.
+ * @param {{endpoint?: string, rpcId?: string, frames?: number, sentFrames?: number, records?: number, wireBytes?: number}} report
+ */
+  recordProjV1Partial(device, report = {}) {
+    this.counters.projV1PartialPages += 1;
+    this.audit.record('unary.proj-v1-partial', {
+      deviceId: device.deviceId,
+      transport: 'p1',
+      endpoint: report.endpoint,
+      rpcId: report.rpcId,
+      frames: Number(report.frames) || 0,
+      sentFrames: Number(report.sentFrames) || 0,
+      records: Number(report.records) || 0,
+      wireBytes: Number(report.wireBytes) || 0,
+    });
+  }
+
+ /**
  * Project one negotiated `session/page` success response into wire frames.
  *
- * @param {{endpoint: string, projV1?: boolean, rpcId?: string}} request
+ * @param {{endpoint: string, projV1?: boolean, rpcId?: string, truncateLongText?: boolean}} request
  * @param {number} status upstream HTTP status
  * @param {Buffer} bytes raw upstream response body
  * @returns {{frames: {header: object, chunk: Buffer}[], header: object, stats: object} | undefined}
  * `undefined` means: use the old JSON bytes byte-for-byte.
  */
-  applyProjV1(device, { endpoint, projV1, rpcId }, status, bytes) {
+  applyProjV1(device, { endpoint, projV1, rpcId, truncateLongText }, status, bytes) {
     if (projV1 !== true || endpoint !== 'session/page') return undefined;
     if (this.config.features.projV1 !== true) {
  // Rollback switch, not a degraded page: the channel never negotiates it
@@ -3561,11 +3587,12 @@ export class LinkServer {
     try {
       const value = JSON.parse(bytes.toString('utf8'));
       this.assertProjectablePage(value);
-      const built = buildProjectedPage({
-        value,
-        rpcId,
-        truncateLongText: this.config.features.projV1TruncateLongText === true,
-      });
+ // Contract v1.1: truncation is bound to the client's lazy-fetch capability
+ // — the channel only forwards `truncateLongText:true` for a socket that
+ // negotiated `caps.projV1Lazy`. The feature check is defense in depth (a
+ // stale/misrouted request must never truncate with the feature off).
+      const truncate = truncateLongText === true && this.config.features.projV1TruncateLongText === true;
+      const built = buildProjectedPage({ value, rpcId, truncateLongText: truncate });
       const encodeMs = performance.now() - startedAt;
       const projBytes = built.frames.reduce((sum, frame) => sum + gzipPayloadBytes(frame.chunk), 0);
       const wireBytes = built.frames.reduce((sum, frame) => sum + projWireFrameBytes(frame), 0);
@@ -3591,8 +3618,10 @@ export class LinkServer {
  * B (protocol v1): when the channel negotiated `caps.projV1` it passes
  * `projV1` + the client `rpcId`; a successful `session/page` then carries a
  * `projection` (frames + §9 stats) instead of being JSON-decoded by the phone.
+ * v1.1: `truncateLongText` is the per-socket effective lazy mode (client asked
+ * `caps.projV1Lazy` AND the feature is on), never a raw config read.
  */
-  async forwardP1Unary(device, { endpoint, bodyText, headers, projV1, rpcId } = {}) {
+  async forwardP1Unary(device, { endpoint, bodyText, headers, projV1, rpcId, truncateLongText } = {}) {
     const peer = this.ensurePeer(device);
     if (peer.cookie === undefined) await peer.connect('answer');
     const body = Buffer.from(String(bodyText ?? ''), 'utf8');
@@ -3625,7 +3654,7 @@ export class LinkServer {
  // path; every other response keeps `listLite.bytes` (== the upstream bytes)
  // byte-for-byte. The projection is built from `fullBytes` (the raw upstream
  // body), and `bytes` stays populated for fallback/diagnosis.
-    const projection = this.applyProjV1(device, { endpoint, projV1, rpcId }, upstream.status, fullBytes);
+    const projection = this.applyProjV1(device, { endpoint, projV1, rpcId, truncateLongText }, upstream.status, fullBytes);
     return {
       status: upstream.status,
       contentType: upstream.headers.get('content-type') ?? 'application/octet-stream',
