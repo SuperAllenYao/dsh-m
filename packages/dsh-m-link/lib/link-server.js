@@ -42,6 +42,7 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:https';
 import { homedir, hostname as osHostname, networkInterfaces } from 'node:os';
 import { join } from 'node:path';
+import { performance } from 'node:perf_hooks';
 import { gzipSync } from 'node:zlib';
 
 import { registerAdminRoute, ADMIN_PATH } from './admin.js';
@@ -72,6 +73,7 @@ import { UpstreamPeer } from './upstream-peer.js';
 import { loadWs, wsBindings, wsLoadedFrom } from './ws-provider.js';
 import { mintResumeTicket, MuxRpcChannel, P1_LIMITS, TicketUseGuard, verifyResumeTicket } from './mux-rpc.js';
 import { detectListLiteRequest, LIST_LITE_HEADER, trimSessionListResponse } from './list-lite.js';
+import { buildProjectedPage } from './proj-encode.js';
 
 const PLUGIN_NAME = 'dsh-m-link';
 const PLUGIN_VERSION = '2.17.0';
@@ -207,6 +209,16 @@ const DEFAULTS = {
  // plugin-side rollback switch (false → welcome.caps.gzip stays false).
     muxGzip: true,
     muxGzipThresholdBytes: P1_LIMITS.gzipThresholdBytes,
+ // B (protocol v1, <internal-doc>): project
+ // every successful `session/page` into seq-desc `0x02` binary frames when the
+ // phone negotiates it with `hello.caps.projV1`. DEFAULT OFF is the rollback
+ // switch: with it off the welcome never echoes the capability and the page
+ // path stays byte-identical JSON (contract §8).
+    projV1: false,
+ // Truncate/lazy-fetch mode: long tool output, `meta.lines` and `meta.diffs`
+ // are shortened and flagged with `tr` so the App can fetch the single event
+ // on demand. DEFAULT OFF (contract §0 text invariant: full text by default).
+    projV1TruncateLongText: false,
  // P1.5-A (<internal-doc>): honor the opt-in "lite"
  // `session/list` projection trim (header `x-dshm-list-lite: 1` or the
  // legacy-shaped body hint `_request.listMode=lite`). DEFAULT ON, but it
@@ -254,6 +266,31 @@ function withTimeout(promise, ms, label) {
 
 function isPlainObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+/**
+ * B (protocol v1): uncompressed payload size of one gzip frame chunk, without a
+ * second encode pass. A gzip member always ends with the RFC1952 trailer
+ * `[crc32 u32 LE][isize u32 LE]`, and `isize` is the uncompressed size mod 2^32 —
+ * one page body is capped at MAX_BODY_BYTES upstream, so the encoded payload is
+ * orders of magnitude below 2^32 and the modulo cannot wrap. The header-only
+ * frame of an empty page carries a 0-byte (non-gzip) chunk → 0.
+ */
+function gzipPayloadBytes(chunk) {
+  if (!Buffer.isBuffer(chunk) || chunk.length < 18) return 0;
+  if (chunk[0] !== 0x1f || chunk[1] !== 0x8b) return 0; // not a gzip member
+  return chunk.readUInt32LE(chunk.length - 4);
+}
+
+/**
+ * B (protocol v1): exact bytes of one `0x02` WS frame as `encodeWireFrame()`
+ * lays it out — `[1B version][u32 LE headerLen][header JSON][u32 LE chunkLen][chunk]`.
+ * Counted here (link-server owns the projection counters) without allocating the
+ * wire buffer; mux-rpc measures its own sent bytes for per-channel diagnostics.
+ */
+function projWireFrameBytes(frame) {
+  const headerBytes = Buffer.byteLength(JSON.stringify(frame.header), 'utf8');
+  return 1 + 4 + headerBytes + 4 + frame.chunk.length;
 }
 
 function mergeConfig(base, override) {
@@ -321,6 +358,12 @@ export function resolveConfig(raw) {
   merged.features.muxGzipThresholdBytes = Number.isInteger(merged.features.muxGzipThresholdBytes)
     ? Math.max(1024, merged.features.muxGzipThresholdBytes)
     : DEFAULTS.features.muxGzipThresholdBytes;
+ // B (协议 v1): same explicit-boolean whitelist calibre as muxRpc/muxGzip —
+ // only literal `true` enables projV1; anything else (0/""/null/…) resolves to
+ // OFF, because this is the one-flag rollback switch for the whole projection
+ // path (contract §8). Truncate mode is a separate opt-in, also fail-safe OFF.
+  merged.features.projV1 = merged.features.projV1 === true;
+  merged.features.projV1TruncateLongText = merged.features.projV1TruncateLongText === true;
   for (const key of ['muxRpcResumeWindowMs', 'muxRpcReplayBytes', 'muxRpcReplayFrames', 'muxRpcRpcMaxInFlight', 'muxRpcRpcTimeoutMs', 'muxRpcHelloTimeoutMs', 'muxRpcTicketTtlMs', 'muxRpcTicketReplayGraceMs', 'muxRpcMaxPendingUpgrades']) {
     const fallback = DEFAULTS.features[key];
     merged.features[key] = Number.isInteger(merged.features[key]) && merged.features[key] > 0 ? merged.features[key] : fallback;
@@ -662,6 +705,23 @@ export class LinkServer {
       p1GzipWireBytes: 0,
  /** Cumulative gzipSync wall time (ms, perf_hooks precision; P4-5). */
       p1GzipMs: 0,
+ // B (protocol v1, contract §9): projected `session/page` responses. Byte
+ // counters are cumulative uncompressed/wire sizes so /health can report
+ // the raw↔projected ratio; unknown*/truncated* are projection quality
+ // probes (schema drift shows up as a rising unknownTypes/droppedTypes).
+      projV1Pages: 0,
+      projV1Records: 0,
+      projV1JsonBytes: 0,
+      projV1ProjBytes: 0,
+      projV1WireBytes: 0,
+      projV1Frames: 0,
+      projV1EncodeMs: 0,
+      projV1Fallbacks: 0,
+      projV1UnknownTypes: 0,
+      projV1DroppedTypes: 0,
+      projV1UnknownKeys: 0,
+      projV1UnknownMetaKeys: 0,
+      projV1TruncatedFields: 0,
     };
  // Port hand-off bookkeeping: a later start of this plugin (same process) can
  // reclaim the TLS port from this instance even if its dispose is cut short.
@@ -1449,11 +1509,14 @@ export class LinkServer {
       proto: this.config.features.muxRpc === true ? [PROTOCOL, 'dsh-m/2'] : [PROTOCOL],
  // L1: takeoverWindowMs lets the App align its conflict retry to the real
  // window (missing field → the old 1700ms fallback, so old plugins are not
- // degraded); L3a: muxGzip advertises the compression policy.
+ // degraded); L3a: muxGzip advertises the compression policy. B: projV1 is
+ // the phone-facing capability bit (the App never sends caps.projV1 unless
+ // this is true; the per-socket echo is still negotiated in `welcome`).
       features: {
         muxRpc: this.config.features.muxRpc === true,
         takeoverWindowMs: MUX_TAKEOVER_STALE_MS,
         muxGzip: this.config.features.muxGzip === true,
+        projV1: this.config.features.projV1 === true,
       },
       ready: this.ready,
       inactive: this.disposed || !this.ctxActive(),
@@ -3313,6 +3376,12 @@ export class LinkServer {
         enabled: this.config.features.muxGzip === true,
         thresholdBytes: this.config.features.muxGzipThresholdBytes,
       },
+ // B (protocol v1): plugin-side projection policy; negotiation still needs
+ // `hello.caps.projV1` + a binary-capable transport (see mux-rpc onHello).
+      projV1: {
+        enabled: this.config.features.projV1 === true,
+        truncateLongText: this.config.features.projV1TruncateLongText === true,
+      },
       log,
     });
     this.p1Channels.set(device.deviceId, channel);
@@ -3389,6 +3458,127 @@ export class LinkServer {
     if (typeof channel.disposeTimer.unref === 'function') channel.disposeTimer.unref();
   }
 
+ // ---------------------------------------------------- P1 projV1 projection ---
+ //
+ // B (protocol v1): <internal-doc> (FROZEN v1).
+ // The only behaviour change is the success response of `session/page`: when the
+ // channel negotiated `caps.projV1`, the JSON page is projected + encoded +
+ // framed (A 段 `lib/proj-encode.js`) and the channel sends the frames as `0x02`
+ // binary WS messages. Every failure (non-200 / bad envelope / projection/encode
+ // error) makes the WHOLE page fall back to the untouched upstream JSON bytes —
+ // never a half page (contract §6). Feature off / not negotiated never reaches
+ // here (the channel does not advertise the cap), so it counts nothing.
+
+ /**
+ * Check a `session/page` body is projectable before the frozen projector runs.
+ * contract §2.1/§6(3): every record must be an `event` envelope with a numeric
+ * `event.seq`; other shapes have no proven row-shell semantics, so the caller
+ * falls back to JSON. Kept at the integration point (proj-encode.js is frozen).
+ * @throws {Error} when the page envelope is not projectable
+ */
+  assertProjectablePage(value) {
+    if (!isPlainObject(value)) throw new Error('session/page body is not a JSON object');
+    if (!Array.isArray(value.records)) throw new Error('session/page records is not an array');
+    if (typeof value.hasMore !== 'boolean') throw new Error('session/page hasMore is not a boolean');
+    for (const record of value.records) {
+      if (!isPlainObject(record) || record.type !== 'event' || !isPlainObject(record.event) || typeof record.event.seq !== 'number') {
+        throw new Error('session/page record is not an event envelope');
+      }
+    }
+    return value;
+  }
+
+ /**
+ * Count one whole-page fallback (contract §6) and leave a debug breadcrumb.
+ * Always returns undefined so callers can `return this.recordProjV1Fallback(…)`.
+ */
+  recordProjV1Fallback(device, endpoint, rpcId, reason) {
+    this.counters.projV1Fallbacks += 1;
+    if (this.config.debug.enabled === true) {
+      log('device ' + device.deviceId + ': projV1 fallback on ' + endpoint + ' (rpc ' + String(rpcId) + '): ' + String(reason));
+    }
+    return undefined;
+  }
+
+ /** Fold one projected page into the §9 counters and write its audit row. */
+  recordProjV1Page(device, endpoint, rpcId, built, stats) {
+    this.counters.projV1Pages += 1;
+    this.counters.projV1Records += stats.records;
+    this.counters.projV1JsonBytes += stats.jsonBytes;
+    this.counters.projV1ProjBytes += stats.projBytes;
+    this.counters.projV1WireBytes += stats.wireBytes;
+    this.counters.projV1Frames += built.frames.length;
+    this.counters.projV1EncodeMs += stats.encodeMs;
+    this.counters.projV1UnknownTypes += stats.unknownTypes;
+    this.counters.projV1DroppedTypes += stats.droppedTypes;
+    this.counters.projV1UnknownKeys += stats.unknownKeys;
+    this.counters.projV1UnknownMetaKeys += stats.unknownMetaKeys;
+    this.counters.projV1TruncatedFields += stats.truncatedFields;
+ // contract §9: one metadata-only row per projected page (`/health.counters`
+ // carries the cumulative numbers; this row is the per-page trace).
+    this.audit.record('unary.proj-v1', {
+      deviceId: device.deviceId,
+      endpoint,
+      transport: 'p1',
+      rpcId,
+      frames: built.frames.length,
+      records: stats.records,
+      jsonBytes: stats.jsonBytes,
+      projBytes: stats.projBytes,
+      wireBytes: stats.wireBytes,
+      encodeMs: Math.round(stats.encodeMs * 1000) / 1000,
+      unknownTypes: stats.unknownTypes,
+      droppedTypes: stats.droppedTypes,
+      unknownKeys: stats.unknownKeys,
+      unknownMetaKeys: stats.unknownMetaKeys,
+      truncatedFields: stats.truncatedFields,
+      hasMore: built.hasMore === true,
+    });
+  }
+
+ /**
+ * Project one negotiated `session/page` success response into wire frames.
+ *
+ * @param {{endpoint: string, projV1?: boolean, rpcId?: string}} request
+ * @param {number} status upstream HTTP status
+ * @param {Buffer} bytes raw upstream response body
+ * @returns {{frames: {header: object, chunk: Buffer}[], header: object, stats: object} | undefined}
+ * `undefined` means: use the old JSON bytes byte-for-byte.
+ */
+  applyProjV1(device, { endpoint, projV1, rpcId }, status, bytes) {
+    if (projV1 !== true || endpoint !== 'session/page') return undefined;
+    if (this.config.features.projV1 !== true) {
+ // Rollback switch, not a degraded page: the channel never negotiates it
+ // (welcome.caps.projV1=false), so this is not counted as a fallback.
+      return undefined;
+    }
+    if (status !== 200) {
+ // contract §6(2): the phone expected `0x02` for the page; the error body
+ // goes back as JSON (one page is never split across both paths).
+      return this.recordProjV1Fallback(device, endpoint, rpcId, 'status ' + String(status));
+    }
+    const startedAt = performance.now();
+    try {
+      const value = JSON.parse(bytes.toString('utf8'));
+      this.assertProjectablePage(value);
+      const built = buildProjectedPage({
+        value,
+        rpcId,
+        truncateLongText: this.config.features.projV1TruncateLongText === true,
+      });
+      const encodeMs = performance.now() - startedAt;
+      const projBytes = built.frames.reduce((sum, frame) => sum + gzipPayloadBytes(frame.chunk), 0);
+      const wireBytes = built.frames.reduce((sum, frame) => sum + projWireFrameBytes(frame), 0);
+      const stats = { ...built.stats, jsonBytes: bytes.length, projBytes, wireBytes, encodeMs };
+      this.recordProjV1Page(device, endpoint, rpcId, built, stats);
+      return { frames: built.frames, header: built.header, stats };
+    } catch (error) {
+ // contract §6(3)(4): bad envelope or projection/encode failure — whole
+ // page back to JSON, counted, never a half page.
+      return this.recordProjV1Fallback(device, endpoint, rpcId, String(error?.message ?? error));
+    }
+  }
+
  /**
  * Forward one `rpc` frame to the loopback DSH API (the same target as
  * proxyUnary), but return the raw response to the channel instead of writing
@@ -3397,8 +3587,12 @@ export class LinkServer {
  *
  * P1.5-A: a `rpc` frame may carry `headers` (protocol §3.2); the lite opt-in
  * header or the legacy-shaped body hint is honored exactly like proxyUnary.
+ *
+ * B (protocol v1): when the channel negotiated `caps.projV1` it passes
+ * `projV1` + the client `rpcId`; a successful `session/page` then carries a
+ * `projection` (frames + §9 stats) instead of being JSON-decoded by the phone.
  */
-  async forwardP1Unary(device, { endpoint, bodyText, headers } = {}) {
+  async forwardP1Unary(device, { endpoint, bodyText, headers, projV1, rpcId } = {}) {
     const peer = this.ensurePeer(device);
     if (peer.cookie === undefined) await peer.connect('answer');
     const body = Buffer.from(String(bodyText ?? ''), 'utf8');
@@ -3427,10 +3621,18 @@ export class LinkServer {
     this.counters.proxiedUnary += 1;
     this.audit.record('p1.rpc', { deviceId: device.deviceId, endpoint, status: upstream.status, bytes: fullBytes.length });
     const listLite = this.applyListLite(device, endpoint, 'p1', listLitePlan, fullBytes);
+ // B (protocol v1): only a negotiated `session/page` success leaves the text
+ // path; every other response keeps `listLite.bytes` (== the upstream bytes)
+ // byte-for-byte. The projection is built from `fullBytes` (the raw upstream
+ // body), and `bytes` stays populated for fallback/diagnosis.
+    const projection = this.applyProjV1(device, { endpoint, projV1, rpcId }, upstream.status, fullBytes);
     return {
       status: upstream.status,
       contentType: upstream.headers.get('content-type') ?? 'application/octet-stream',
       bytes: listLite.bytes,
+ // Undefined for the legacy full path: mux-rpc then sends the JSON rpc/result.
+ // Present only for a projected `session/page` (frames + §9 stats).
+      projection,
  // Undefined for the legacy/full path; useful for P1 channel diagnostics.
       listLite: listLite.stats,
     };

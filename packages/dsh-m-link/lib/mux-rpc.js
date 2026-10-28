@@ -24,6 +24,14 @@
  * threshold is sent as a binary WebSocket frame `[1B 0x01][gzip-6 payload]`
  * instead of text; the replay log still stores the text envelope.
  *
+ * Projection v1 (protocol v1, contract <internal-doc>
+ *): when `hello.caps.projV1` is negotiated
+ * and echoed in `welcome.caps.projV1`, a successful `session/page` unary result
+ * carries pre-built projection frames (`lib/proj-encode.js`, frozen A 段) and is
+ * sent as 1..N binary WS frames `[0x02][u32 hlen][header json][u32 clen][chunk]`
+ * instead of one `rpc/result` text frame. Projection frames are NOT replayable
+ * (like unary results); `0x01` and `0x02` are independent per-socket states.
+ *
  * Design: <internal-doc> (this file is the
  * prototype behind `config.features.muxRpc`; default false = M1 behaviour).
  *
@@ -35,6 +43,8 @@
 import { createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 import { gzipSync } from 'node:zlib';
+
+import { encodeWireFrame } from './proj-encode.js';
 
 /** Wire protocol id negotiated in `hello` / echoed in `welcome`. */
 export const P1_PROTO = 'dsh-m/2';
@@ -302,13 +312,26 @@ export class TicketUseGuard {
  * soon as the upstream mux dies, because then there is nothing to resume).
  *
  * Injected dependencies:
- * - forwardUnary({deviceId, endpoint, bodyText}): Promise<{status, contentType, bytes}>
+ * - forwardUnary({deviceId, endpoint, bodyText, headers, projV1, rpcId}):
+ * Promise<{status, contentType, bytes, projection?}>
  * - issueTicket(epoch): string | undefined (resume ticket for the welcome frame)
  * - gzip {enabled, thresholdBytes}: downstream compression policy from
  * `config.features.muxGzip*`; negotiation still needs `hello.caps.gzip`.
+ * - projV1 {enabled, truncateLongText}: projection policy from
+ * `config.features.projV1*`; negotiation still needs `hello.caps.projV1`.
  */
 export class MuxRpcChannel {
-  constructor({ deviceId, forwardUnary, issueTicket, limits = {}, gzip = {}, log = () => {}, now = () => Date.now(), epoch = randomUUID() }) {
+  constructor({
+    deviceId,
+    forwardUnary,
+    issueTicket,
+    limits = {},
+    gzip = {},
+    projV1 = {},
+    log = () => {},
+    now = () => Date.now(),
+    epoch = randomUUID(),
+  }) {
     if (typeof deviceId !== 'string' || deviceId.length === 0) throw new Error('MuxRpcChannel requires a deviceId');
     if (typeof forwardUnary !== 'function') throw new Error('MuxRpcChannel requires forwardUnary()');
     this.deviceId = deviceId;
@@ -320,8 +343,15 @@ export class MuxRpcChannel {
       enabled: gzip.enabled === true,
       thresholdBytes: Number.isInteger(gzip.thresholdBytes) && gzip.thresholdBytes > 0 ? gzip.thresholdBytes : P1_LIMITS.gzipThresholdBytes,
     };
+ /** Projection policy (link-server config.features.projV1 / projV1TruncateLongText). */
+    this.projV1 = {
+      enabled: projV1.enabled === true,
+      truncateLongText: projV1.truncateLongText === true,
+    };
  /** Per-socket negotiated gzip; only `onHello` may set it, `attachTransport` resets it. */
     this.gzipEnabled = false;
+ /** Per-socket negotiated projection (0x02 frames); same lifecycle as gzipEnabled. */
+    this.projV1Enabled = false;
     this.log = log;
     this.now = now;
     this.epoch = epoch;
@@ -361,6 +391,21 @@ export class MuxRpcChannel {
       gzipWireBytes: 0,
  /** Cumulative gzipSync wall time (ms, perf_hooks precision; P4-5). */
       gzipMs: 0,
+ // B (protocol v1, contract §9): projected `session/page` frames actually
+ // produced by this channel (link-server also folds these into /health
+ // counters at projection time; these are the per-channel transport view).
+      projV1Pages: 0,
+      projV1Records: 0,
+      projV1Frames: 0,
+      projV1JsonBytes: 0,
+      projV1ProjBytes: 0,
+      projV1WireBytes: 0,
+      projV1EncodeMs: 0,
+      projV1UnknownTypes: 0,
+      projV1DroppedTypes: 0,
+      projV1UnknownKeys: 0,
+      projV1UnknownMetaKeys: 0,
+      projV1TruncatedFields: 0,
     };
   }
 
@@ -374,6 +419,10 @@ export class MuxRpcChannel {
  // (or an older App that never asks) must not inherit the previous
  // transport's negotiation and receive binary frames it cannot parse.
     this.gzipEnabled = false;
+ // Same for `0x02` projection frames (`hello.caps.projV1`): a reconnect must
+ // re-negotiate, otherwise an old build on the new socket gets undecodable
+ // binary frames. Per-socket state, reset in the same place as gzip.
+    this.projV1Enabled = false;
   }
 
  /** The downstream socket is gone: keep epoch/log for a while, stop sending. */
@@ -502,6 +551,10 @@ export class MuxRpcChannel {
  // ignored on purpose (forward compatibility with future App versions).
     const clientCaps = frame.caps !== null && typeof frame.caps === 'object' && !Array.isArray(frame.caps) ? frame.caps : {};
     this.gzipEnabled = this.gzip.enabled === true && clientCaps.gzip === true && typeof this.transport.sendBinary === 'function';
+ // B (protocol v1 §1): three-way AND — plugin feature on, client asked
+ // (`caps.projV1 === true`), transport can carry binary frames. The echo is
+ // authoritative: `false` means the phone must NOT expect `0x02` frames.
+    this.projV1Enabled = this.projV1.enabled === true && clientCaps.projV1 === true && typeof this.transport.sendBinary === 'function';
     if (reconnecting && frame.resume === undefined) {
  // The phone reconnected without a resume cursor: it dropped its stream
  // state, so cancelling the old upstream streams and starting a new epoch
@@ -523,6 +576,9 @@ export class MuxRpcChannel {
         unary: true,
         resume: true,
         gzip: this.gzipEnabled,
+ // B (protocol v1): explicit boolean — an old plugin omits the key and an
+ // unnegotiated socket echoes `false`, so the phone never expects `0x02`.
+        projV1: this.projV1Enabled,
         maxInFlight: this.limits.rpcMaxInFlight,
         replayBytes: this.limits.replayBytes,
       },
@@ -654,11 +710,32 @@ export class MuxRpcChannel {
     if (typeof entry.timer.unref === 'function') entry.timer.unref();
     this.inflight.set(frame.id, entry);
     Promise.resolve()
-      .then(() => this.forwardUnary({ deviceId: this.deviceId, endpoint: frame.endpoint, bodyText, headers: frame.headers }))
+      .then(() =>
+        this.forwardUnary({
+          deviceId: this.deviceId,
+          endpoint: frame.endpoint,
+          bodyText,
+          headers: frame.headers,
+ // B (protocol v1): per-socket negotiation snapshot + the client call id
+ // that the page header must echo (`header.rpcId`).
+          projV1: this.projV1Enabled === true,
+          rpcId: frame.id,
+        }),
+      )
       .then((result) => {
         if (this.disposed || this.inflight.delete(frame.id) !== true) return;
         clearTimeout(entry.timer);
         this.stats.rpcOk += 1;
+ // B (protocol v1): a projected `session/page` returns pre-built frames.
+ // They replace the text `rpc/result` entirely (contract §5) and are not
+ // appended to the replay log — like unary results, they are not replayed.
+ // The `projV1Enabled` guard is defense in depth: only a socket that saw
+ // `welcome.caps.projV1=true` may ever receive a `0x02` frame (contract
+ // §1/§10); anything else falls through to the JSON text result below.
+        if (result?.projection !== undefined && this.projV1Enabled === true) {
+          this.sendProjection(result.projection);
+          return;
+        }
         const out = {
           type: 'rpc/result',
           id: frame.id,
@@ -735,6 +812,50 @@ export class MuxRpcChannel {
     }
   }
 
+ /**
+ * B (protocol v1): send one projected `session/page` as 1..N `0x02` binary WS
+ * messages, in frame order (already seq-desc: frame 0 is adjacent to the
+ * loaded window's front). Telemetry (contract §9) is folded into this
+ * channel's stats: wire bytes are measured from the produced wire buffers, the
+ * other fields come from the projection result (link-server measured them).
+ *
+ * Failure semantics match sendText(): a transport error is logged and never
+ * thrown into the caller's promise chain. No `rpc/result` text frame is sent
+ * and nothing enters the replay log — like unary results, projection frames
+ * are not replayed (contract §5: a mid-page disconnect is healed by the next
+ * page request).
+ */
+  sendProjection(projection) {
+    const frames = Array.isArray(projection?.frames) ? projection.frames : [];
+    const stats = projection?.stats ?? {};
+    let wireBytes = 0;
+    let sentFrames = 0;
+    for (const frame of frames) {
+      if (this.transport === undefined) break;
+      try {
+        const wire = encodeWireFrame({ header: frame.header, chunk: frame.chunk });
+        wireBytes += wire.length;
+        if (typeof this.transport.sendBinary !== 'function') throw new Error('transport does not support binary frames');
+        this.transport.sendBinary(wire);
+        sentFrames += 1;
+      } catch (error) {
+        this.log('device ' + this.deviceId + ': projected page frame send failed: ' + String(error?.message ?? error));
+      }
+    }
+    this.stats.projV1Pages += 1;
+    this.stats.projV1Records += Number(stats.records) || 0;
+    this.stats.projV1Frames += sentFrames;
+    this.stats.projV1JsonBytes += Number(stats.jsonBytes) || 0;
+    this.stats.projV1ProjBytes += Number(stats.projBytes) || 0;
+    this.stats.projV1WireBytes += wireBytes;
+    this.stats.projV1EncodeMs += Number(stats.encodeMs) || 0;
+    this.stats.projV1UnknownTypes += Number(stats.unknownTypes) || 0;
+    this.stats.projV1DroppedTypes += Number(stats.droppedTypes) || 0;
+    this.stats.projV1UnknownKeys += Number(stats.unknownKeys) || 0;
+    this.stats.projV1UnknownMetaKeys += Number(stats.unknownMetaKeys) || 0;
+    this.stats.projV1TruncatedFields += Number(stats.truncatedFields) || 0;
+  }
+
   failProtocol(error) {
     this.stats.protocolErrors += 1;
     this.stats.lastProtocolError = { code: error?.code, message: String(error?.message ?? error) };
@@ -765,6 +886,7 @@ export class MuxRpcChannel {
       replayFrames: this.replay.entries.length,
       replayBytes: this.replay.bytes,
       gzip: this.gzipEnabled,
+      projV1: this.projV1Enabled,
       inflight: this.inflight.size,
       disposed: this.disposed,
       stats: { ...this.stats },
