@@ -6,6 +6,32 @@ struct ToolResultContentView: View {
     var result: ToolResultItem
     var toolName: String
     @ObservedObject var attachments: AttachmentStore
+ /// 协议 v1 lazy-fetch（契约 §7）：由 `SessionDetailView` 注入（详情页才有）。
+    @Environment(\.lazyFullFetch) private var lazyFullFetch
+    @State private var isFetchingFull = false
+
+ /// 被截断的字段名（`text`/`lines`/`diffs`）；默认模式为空。
+    private var truncatedFields: [String] { result.truncated ?? [] }
+
+ /// 本行是截断版、且有目标 seq 与 fetch 动作 → 展开入口先发窄页请求。
+    private var needsLazyFullFetch: Bool {
+        result.needsLazyFullFetch && lazyFullFetch != nil
+    }
+
+ /// meta.lines / meta.diffs 在视图里没有「展开」入口，截断时给显式取全文按钮。
+    private var hasMetaTruncation: Bool {
+        let fields = Set(truncatedFields)
+        return fields.contains("lines") || fields.contains("diffs")
+    }
+
+    private func requestFullContent() {
+        guard let seq = result.sourceSeq, let action = lazyFullFetch, !isFetchingFull else { return }
+        isFetchingFull = true
+        Task {
+            await action(seq: seq)
+            isFetchingFull = false
+        }
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: Theme.Spacing.xs) {
@@ -15,11 +41,34 @@ struct ToolResultContentView: View {
             if let meta = result.meta {
                 metaRendering(meta: meta)
             }
+ // meta.lines / meta.diffs 截断（lazy 模式）：显式「取全文」入口；
+ // 正文 text 的截断入口在 MonoBlock 的「显示全部 N 行」按钮上。
+            if hasMetaTruncation, needsLazyFullFetch {
+                Button(isFetchingFull ? L10n.t("正在加载完整内容…") : L10n.t("显示完整结果")) {
+                    requestFullContent()
+                }
+                .font(Theme.Typography.label)
+                .foregroundStyle(Theme.Palette.accent)
+                .disabled(isFetchingFull)
+                .accessibilityIdentifier("load-full-result")
+            }
             if !result.text.isEmpty {
                 if result.meta?["cwd"] != nil, result.meta?["lines"] == nil, result.meta?["diffs"] == nil {
-                    MonoBlock(text: result.text, maxLines: 30, color: result.isError ? Theme.Palette.danger : Theme.Palette.textSecondary)
+                    MonoBlock(
+                        text: result.text,
+                        maxLines: 30,
+                        color: result.isError ? Theme.Palette.danger : Theme.Palette.textSecondary,
+                        needsLazyFetch: needsLazyFullFetch && truncatedFields.contains("text"),
+                        onRequestFull: requestFullContent
+                    )
                 } else if result.images.isEmpty {
-                    MonoBlock(text: result.text, maxLines: 30, color: result.isError ? Theme.Palette.danger : Theme.Palette.textSecondary)
+                    MonoBlock(
+                        text: result.text,
+                        maxLines: 30,
+                        color: result.isError ? Theme.Palette.danger : Theme.Palette.textSecondary,
+                        needsLazyFetch: needsLazyFullFetch && truncatedFields.contains("text"),
+                        onRequestFull: requestFullContent
+                    )
                 }
             }
             if let cwd = result.meta?["cwd"]?.stringValue {

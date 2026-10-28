@@ -3563,6 +3563,26 @@ export class LinkServer {
   }
 
  /**
+ * contract v1.1 §7: is this a lazy-fetch narrow-page request?
+ *
+ * The App's verbatim `historyPageRequestArgs` shape is
+ * `payload.args = { request: { address, throughSeq, beforeSeq, maxMessages } }`.
+ * A narrow page is `request.throughSeq === request.beforeSeq` with
+ * `maxMessages === 1` — it exists to fetch the FULL text of the event the App
+ * is expanding, so the plugin must never truncate it (otherwise AC-11 is
+ * unreachable: the App would only ever get the truncated row back).
+ *
+ * @param {unknown} envelope parsed `client-request` body
+ * @returns {boolean}
+ */
+  isLazyFetchNarrowPage(envelope) {
+    const args = envelope?.payload?.args;
+    const pageRequest = isPlainObject(args) ? args.request : undefined;
+    if (!isPlainObject(pageRequest)) return false;
+    return pageRequest.throughSeq === pageRequest.beforeSeq && pageRequest.maxMessages === 1;
+  }
+
+ /**
  * Project one negotiated `session/page` success response into wire frames.
  *
  * @param {{endpoint: string, projV1?: boolean, rpcId?: string, truncateLongText?: boolean}} request
@@ -3619,7 +3639,9 @@ export class LinkServer {
  * `projV1` + the client `rpcId`; a successful `session/page` then carries a
  * `projection` (frames + §9 stats) instead of being JSON-decoded by the phone.
  * v1.1: `truncateLongText` is the per-socket effective lazy mode (client asked
- * `caps.projV1Lazy` AND the feature is on), never a raw config read.
+ * `caps.projV1Lazy` AND the feature is on), never a raw config read; the
+ * lazy-fetch NARROW page is exempt from truncation (contract v1.1 §7) because
+ * it returns exactly the event the App is fetching the full text of.
  */
   async forwardP1Unary(device, { endpoint, bodyText, headers, projV1, rpcId, truncateLongText } = {}) {
     const peer = this.ensurePeer(device);
@@ -3654,7 +3676,16 @@ export class LinkServer {
  // path; every other response keeps `listLite.bytes` (== the upstream bytes)
  // byte-for-byte. The projection is built from `fullBytes` (the raw upstream
  // body), and `bytes` stays populated for fallback/diagnosis.
-    const projection = this.applyProjV1(device, { endpoint, projV1, rpcId, truncateLongText }, upstream.status, fullBytes);
+ // Contract v1.1 §7: the lazy-fetch narrow page (throughSeq===beforeSeq,
+ // maxMessages=1) exists to fetch one event's FULL text — never truncate it,
+ // even when the socket negotiated lazy truncation for regular pages.
+    const narrowPage = this.isLazyFetchNarrowPage(request);
+    const projection = this.applyProjV1(
+      device,
+      { endpoint, projV1, rpcId, truncateLongText: truncateLongText === true && narrowPage !== true },
+      upstream.status,
+      fullBytes,
+    );
     return {
       status: upstream.status,
       contentType: upstream.headers.get('content-type') ?? 'application/octet-stream',
