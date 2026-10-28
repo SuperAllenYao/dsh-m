@@ -150,7 +150,9 @@ final class LinkService: ObservableObject {
             headers: [:],
             connectTimeout: connectTimeout,
             clientInfo: P1ClientInfo(name: "dsh-m-ios", version: Self.appVersion),
-            helloTimeout: P1ProtocolLimits.helloTimeout
+            helloTimeout: P1ProtocolLimits.helloTimeout,
+ // 协议 v1：hello.caps.projV1 跟随客户端回滚开关。
+            wantsProjV1: AppSettings.projV1Enabled
         )
     }
  /// True while the first reconnect after a resumable socket loss runs
@@ -159,11 +161,26 @@ final class LinkService: ObservableObject {
     var p1SilentResume = false
  /// Timestamp of the socket loss, for the `recoverMs` replay metric.
     var p1LostAt: Date?
+
+ // MARK: - DD-16 客户端回滚：projV1 开关运行中变化 → 受控重挂
+
+ /// 目标生效值（合并在飞切换用；nil = 没有待处理的重挂）。
+    private var projV1RemountTarget: Bool?
+ /// 一轮受控重挂在飞（禁止并发重挂/重连风暴）。
+    private var projV1RemountLoopRunning = false
+ /// 观察 `AppSettings.projV1SettingDidChange` 的 token（与
+ /// `firstByteTimeoutObserver` 同款：进程生命周期、弱引用 self）。
+    private var projV1SettingObserver: NSObjectProtocol?
+ /// 单测 seam：受控重挂真实执行次数（不触网络的断言用）。
+    private(set) var projV1RemountCountForTesting = 0
  /// link-perf L2（DEC-D，设计变更二审）：冷启动能力探测是否已
  /// 消费——本 App 运行周期首次连接轮次探测一次（**不绑定 supportsMuxRPC**：
  /// 每周期都要重读 takeoverWindowMs 并探测插件回退，否则持久化的 true 会让
  /// 桌面端重启后的新窗口值永远读不到）；重连/网络切换轮次绝不探测。
  /// 409 保守升级会重置一次（见 `muxConflictAlignEscalated`）。
+ ///
+ /// D 段：探测从「首拨前串行 await」改成「本轮起点并行启动」，
+ /// 不再占冷启关键路径的 500ms（见 `startColdStartCapabilityProbe`）。
     private var p1ColdStartProbeConsumed = false
  /// 本周期 /health 观测到的接管窗口：nil = 无有效观测值（探测未跑/失败，
  /// 或旧插件无字段——后者同时清空 credentials 缓存）。
@@ -180,6 +197,18 @@ final class LinkService: ObservableObject {
  /// 单测 seam：探测结果持久化（nil = 生产路径 `store.save`）。hosted 单测
  /// 与 E2E App 共享同一 Keychain，注入后探测不写真实凭据。
     var p1ColdStartProbePersist: ((PairingCredentials) -> Void)?
+ /// 实施段（D 段 P1 修复）：在飞的冷启能力探测任务。
+ ///
+ /// 旧实现把它当 `connectOnce` 的局部变量并 `defer { cancel() }`——快连接
+ /// （首拨 < 探测往返）时本轮一返回就取消探测，而 `p1ColdStartProbeConsumed`
+ /// 已在启动时置 true → `supportsMuxRPC`/`takeoverWindowMs`/
+ /// `sessionTakeoverWindowObserved` **整个 App 周期都不落地**（探测不再重试）。
+ /// 现在任务挂在实例上，轮次出口不取消；只有登出/解绑（`disconnect`）取消。
+ /// 任务自身 ≤ `p1ColdStartProbeTimeoutSeconds`（0.5s）有界、只弱引用 self，
+ /// 不构成泄漏；结果写回与 `defer cancel` 无关。
+    private(set) var coldProbeTask: Task<Void, Never>?
+ /// 任务代次：避免「旧任务的完成清理」把后来新起的任务句柄清掉（取消/重探）。
+    private var coldProbeGeneration = 0
     var eventsStream: RemoteStreamHandle?
     var connectTask: Task<Void, Never>?
     var retryTask: Task<Void, Never>?
@@ -261,7 +290,8 @@ final class LinkService: ObservableObject {
  // change invalidates the live socket immediately instead of waiting for the
  // system TCP timeout; the reconnect then runs on the new path.
         NetworkPathMonitor.shared.onMeaningfulChange = { [weak self] in
-            self?.handleNetworkPathChanged()
+            guard let self, !self.ignoresNetworkPathChangesForTesting else { return }
+            self.handleNetworkPathChanged()
         }
         ReconnectMetrics.onChange = { [weak self] value in
             self?.reconnectMetricsValue = value
@@ -278,6 +308,21 @@ final class LinkService: ObservableObject {
             let host = notification.userInfo?["host"] as? String
             Task { @MainActor [weak self] in
                 self?.handleFirstByteTimeout(endpoint: endpoint, host: host)
+            }
+        }
+ // DD-16（AC-09/契约 §8 客户端回滚层）：projV1 开关有效值变化 → 受控重挂
+ // transport（重新 hello 且不带/带上 caps.projV1），活连接立即生效。
+ // 与 `firstByteTimeoutObserver` 同款生命周期（弱引用 self，无需手动移除：
+ // 闭包不持有 self，token 随实例释放）。
+        projV1SettingObserver = NotificationCenter.default.addObserver(
+            forName: AppSettings.projV1SettingDidChange,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            let enabled = notification.userInfo?["enabled"] as? Bool
+                ?? AppSettings.projV1Enabled
+            Task { @MainActor [weak self] in
+                self?.applyProjV1SettingChange(enabled: enabled)
             }
         }
         if credentials != nil {
@@ -791,6 +836,12 @@ final class LinkService: ObservableObject {
         p1LostAt = nil
  // link-perf L2/L1：重新配对 = 全新能力语境，冷启动探测与
  // 409 保守升级状态一并复位（新插件/新窗口值立即重学）。
+ //
+ // B-1（审查阻断）：复位「已探测」标记之前必须**取消在飞探测**——否则
+ // 旧探测（快照是上一台设备/上一套凭据）会在 ≤0.5s 后落地并写回，把刚
+ // adopt 的新凭据顶掉（配对语义损坏 / 需二次扫码）。取消会推进探测代次，
+ // 写回处还有代次 + deviceId 双重校验兜底。
+        cancelColdStartCapabilityProbe()
         p1ColdStartProbeConsumed = false
         sessionTakeoverWindowObserved = false
         sessionTakeoverWindowMs = nil
@@ -1085,6 +1136,124 @@ final class LinkService: ObservableObject {
         }
     }
 
+ // MARK: - DD-16 客户端回滚：projV1 开关运行中变化 → 受控重挂
+
+ /// DD-16（AC-09/契约 §8）：把「projV1 开关有效值」应用到**活连接**上。
+ ///
+ /// 语义（设计 DD-16 + 契约 §8 客户端行）：
+ /// - 关闭 → 主动重挂 transport，重新发 hello 且**不带** `caps.projV1`，插件
+ /// `onHello` 按新 caps 重算 `projV1Enabled`（`mux-rpc.js` `attachTransport`
+ /// 先清零、`onHello` 再算），因此活连接此后不再收到 `0x02` 投影帧；
+ /// - 打开 → 对称恢复（重挂后 hello 带 caps.projV1，重新协商）；
+ /// - 无活 P1 连接（未连接 / legacy 路径 / 正在重连）：不需要重挂，下一轮
+ /// `attemptP1Connection` 建通道时自然读新值（见那里的同款同步）；
+ /// - 会话状态由 resume 保持：只关旧 socket、保留流表，重挂轮次走
+ /// `hello{resume}` + `welcome.resume.mode=replay` 的静默续传（不闪断、不重建）；
+ /// - 不产生并发重连风暴：同值/已在目标值 no-op，在飞时目标值合并，循环结束
+ /// 后按最新目标最多再补一次；
+ /// - 重挂失败 → 回到既有重连退避（`connectOnce` 的多候选 + `scheduleReconnect`）。
+ ///
+ /// 未暴露给用户 UI（DEBUG/排障开关）；E2E 通过
+ /// `AppSettings.setProjV1Enabled(_:)` 触发。
+    func applyProjV1SettingChange(enabled: Bool) {
+ // 未连接/legacy：下一轮自然按新值协商，不必重挂（也不制造流量）。
+        guard phase.isConnected, p1Channel != nil, credentials != nil,
+              !manuallyDisconnected else {
+            projV1RemountTarget = nil
+            return
+        }
+        projV1RemountTarget = enabled
+        guard !projV1RemountLoopRunning else { return }
+        startProjV1RemountLoop()
+    }
+
+    private func startProjV1RemountLoop() {
+        projV1RemountLoopRunning = true
+        connectTask?.cancel()
+        connectTask = Task { [weak self] in
+            await self?.runProjV1RemountLoop()
+        }
+    }
+
+ /// 一轮（或按合并后的最新目标补一轮）受控重挂。只做「关旧 socket → 改 hello
+ /// 协商位 → 标 resume 保留 → 跑一次 silent-resume 轮次」，不新增网络预算。
+ ///
+ /// 合并语义：循环每次都读**最新**目标值；同一目标已被当前通道协商 → 不重挂。
+ /// 若恰有一轮连接在飞（silent resume 期间 `phase` 仍是 connected），不抢跑，
+ /// 等它落地后按最新目标决定是否需要补一次（有界等待，绝不并发重连）。
+    private func runProjV1RemountLoop() async {
+        defer { projV1RemountLoopRunning = false }
+        let deadline = Date().addingTimeInterval(Self.projV1RemountWaitForRoundSeconds)
+        while let target = projV1RemountTarget {
+            guard phase.isConnected, let channel = p1Channel else {
+                projV1RemountTarget = nil
+                return
+            }
+            if isConnecting {
+                guard Date() < deadline else {
+ // 在飞轮次迟迟不结束：目标留给下一次自然重连（attemptP1Connection
+ // 也会按当前开关值重新协商），不在这里制造并发重连。
+                    projV1RemountTarget = nil
+                    return
+                }
+                try? await Task.sleep(nanoseconds: 50_000_000)
+                continue
+            }
+            projV1RemountTarget = nil
+            guard channel.wantsProjV1 != target else { continue }
+            retryTask?.cancel()
+            retryTask = nil
+ // 1) 关旧 socket（流表保留，供 resume）；2) 改下一次 hello 的 caps；
+ // 3) 标成 resume 保留 + silent 轮次（phase 不闪断、generation 不 bump）。
+            channel.disconnect(reason: "projV1 开关变更重挂")
+            channel.applyWantsProjV1ForRemount(target)
+            p1Resume.retainAfterSocketLoss()
+            p1SilentResume = true
+            p1LostAt = Date()
+            projV1RemountCountForTesting += 1
+            if let round = projV1RemountRoundForTesting {
+ // 单测 seam：hosted 单测跑真实 `connectOnce` 会触网络与 Keychain，
+ // 这里只验证重挂前置状态与次数（生产恒为 nil）。
+                round()
+            } else {
+                await connectOnce()
+            }
+ // 重挂失败：phase 已离开 connected（visible reconnect/退避），交给既有链路。
+            guard phase.isConnected else { return }
+        }
+    }
+
+ /// 重挂循环等待「在飞连接轮次」落地的上限（正常一轮 <1s；超上限就交回下一轮）。
+    private static let projV1RemountWaitForRoundSeconds: TimeInterval = 5
+
+ /// 单测 seam：把 service 置成「P1 活连接」状态（不触网络/Keychain），用于
+ /// DD-16 受控重挂的状态机断言。生产路径由 `attemptP1Connection` 设置同一组
+ /// 状态：`p1Channel` = 活通道、`p1Resume.channel` = 该通道、`phase` = connected。
+ ///
+ /// hosted 单测的确定基线：`LinkService.init` 可能在飞一轮自动连接（宿主机
+ /// Keychain 里的真实凭据），它的 `phase =.connecting`/`isConnecting = true`
+ /// 会在测试 await 期间落地，与「活连接」断言互斥。这里把连接轮次簿记显式
+ /// 归零（并取消我们自己持有的任务），让后续断言只依赖 seam 设的状态；
+ /// 被取消的遗留轮次由 `connectOnce` 入口的 `Task.isCancelled` 守卫直接退回。
+    func adoptLiveP1ChannelForTesting(_ channel: P1Channel) {
+        connectTask?.cancel()
+        connectTask = nil
+        retryTask?.cancel()
+        retryTask = nil
+        isConnecting = false
+        p1SilentResume = false
+        manuallyDisconnected = false
+        projV1RemountTarget = nil
+        projV1RemountLoopRunning = false
+        p1Channel = channel
+        p1Resume.adoptExistingChannelForTesting(channel)
+        phase = .connected
+    }
+
+ /// 单测 seam：重挂轮次的执行体（nil = 生产 `connectOnce`）。见
+ /// `runProjV1RemountLoop`。
+    var projV1RemountRoundForTesting: (@MainActor () -> Void)?
+
  /// Foreground resume: reconnect immediately; views rebuild from snapshots
  /// when `generation` changes.
     func handleForeground() {
@@ -1274,6 +1443,11 @@ final class LinkService: ObservableObject {
         connectTask = nil
         retryTask?.cancel()
         retryTask = nil
+ // 实施段：登出/解绑/切设备时取消在飞的冷启能力探测（结果不得
+ // 写回已失效的凭据语境）。普通轮次出口**不**取消（见
+ // `startColdStartCapabilityProbe`）。
+        cancelColdStartCapabilityProbe()
+        projV1RemountTarget = nil
         isConnecting = false
         p1SilentResume = false
         p1LostAt = nil
@@ -1334,6 +1508,10 @@ final class LinkService: ObservableObject {
  /// the stale LAN origin must fall back to the relay origin within this round,
  /// not after several backoff delays (design §4.7).
     func connectOnce() async {
+ // 入口先看取消：`connectTask` 被取消（disconnect/重连竞态）后，任务体仍会
+ // 被调度执行；没有这道守卫，一个「已取消但尚未开始」的轮次会在下一次挂起
+ // 后真正拨号，并改写 `phase`/`isConnecting`（hosted 单测与线上都可能遇到）。
+        guard !Task.isCancelled else { return }
         guard !isConnecting, !manuallyDisconnected, let credentials else {
             return
         }
@@ -1382,10 +1560,27 @@ final class LinkService: ObservableObject {
             local: localNetwork,
             pathChanged: pathChanged
         )
- // P1 能力探测（设计 §3-L2）：打**主候选**（按当前网络排序后的首个 origin；
- // 跨网冷启动时陈旧 LAN/relay 地址候选可能不可达——打错 origin 会白付
- // 500ms 且本周期窗口值刷新失败）。单个 origin、不遍历、有界。
-        await probeP1CapabilityIfColdStart(primaryOrigin: orderedCandidates.first)
+ // D 段（连接清理）：冷启 P1 能力探测不再串行挡在首次拨号之前。
+ // 旧实现（v2.17）在本 App 周期首个连接轮次先 `await` 一次 ≤500ms 的
+ // /health 再拨号——冷启白付一个 RTT（HANDOFF §4.D H4：删掉后 ≈0.5s）。
+ // 现在：探测在**本轮起点并行启动**（不 await），首拨立即开始；能力判定
+ // 用两路信息合成——
+ // - 缓存 `supportsMuxRPC`（配对/welcome/上次探测学到的）；
+ // - 本 App 周期首个轮次「乐观 P1」：P1 握手/upgrade 本身就是能力探测
+ // （旧插件在 401/403/503 拒绝 → 同一候选内 useLegacy 回退，不多付
+ // /health 的一次往返）；探测结果落地后（成功/失败）后续轮次只信缓存。
+ // 探测仍然刷新 `takeoverWindowMs`（409 对齐用）与存量设备升 P1（F3），
+ // 只是不再占关键路径。
+        let isColdStartRound = !p1ColdStartProbeConsumed
+ // 实施段（D 段 P1 修复）：**不得**在本轮出口取消探测任务。
+ // 旧实现在快连接（首拨毫秒级返回）时因「轮次出口清理」取消了探测，而
+ // `p1ColdStartProbeConsumed` 已在启动时置 true →
+ // `supportsMuxRPC`/`takeoverWindowMs`/`sessionTakeoverWindowObserved`
+ // 整个 App 周期都不落地且不重试（409 对齐与存量设备升 P1 失效）。
+ // 任务句柄挂在实例上、自带有界超时（0.5s）且只弱引用本对象；登出/解绑由
+ // `disconnect` 取消（见 `cancelColdStartCapabilityProbe`）。
+ // 探测不占首拨关键路径：此处不 await。
+        startColdStartCapabilityProbe(primaryOrigin: orderedCandidates.first)
  // 冷启动 <1s（列表侧）：预热共享 HTTPS 池，让 t0+~100ms 就发出的
  // early session/list 复用已建好的 TLS，而不是再付一次 ~300ms 握手。
         warmHTTPSPoolIfColdStart(prefersRelay: prefersRelay, local: localNetwork)
@@ -1559,7 +1754,12 @@ final class LinkService: ObservableObject {
                 "index": attemptIndex
             ])
             #endif
-            switch await attemptConnection(origin: origin, leafPin: credentials.leafPin, timeout: attemptTimeout) {
+            switch await attemptConnection(
+                origin: origin,
+                leafPin: credentials.leafPin,
+                timeout: attemptTimeout,
+                coldStartOptimistic: isColdStartRound
+            ) {
             case .connected(let bumpGeneration):
                 linkDebug("round: connected " + Self.originLabel(origin))
                 #if DEBUG
@@ -1801,10 +2001,69 @@ final class LinkService: ObservableObject {
  ///
  /// 单测注入 `p1ColdStartProbeFetch`/`p1ColdStartProbePersist` 后不触网络与
  /// Keychain（测试宿主与 E2E App 共享两者）。
+ ///
+ /// D 段：本方法保留原有「消费一次」语义（单测/同步调用用），
+ /// 生产 `connectOnce` 改用并行入口 `startColdStartCapabilityProbe`
+ /// （探测不再挡在首拨之前）。
     func probeP1CapabilityIfColdStart(primaryOrigin: URL?) async {
         guard !p1ColdStartProbeConsumed else { return }
         p1ColdStartProbeConsumed = true
-        guard var current = credentials else { return }
+        coldProbeGeneration += 1
+        await performColdStartCapabilityProbe(
+            primaryOrigin: primaryOrigin,
+            generation: coldProbeGeneration
+        )
+    }
+
+ /// D 段（连接清理）：并行启动冷启能力探测（不 await、不占关键
+ /// 路径）。返回探测任务供调用方按需 await（单测），已消费/在飞/无凭据时
+ /// 返回 nil。
+ ///
+ /// 语义与 `probeP1CapabilityIfColdStart` 完全一致，只是把「等它完成」从
+ /// 首拨前的串行段去掉：结果落地后写回 `credentials`/会话窗口观测值，供
+ /// 后续轮次（409 对齐、存量设备升 P1）使用。探测失败不改变本轮任何行为。
+ ///
+ /// 实施段（D 段 P1 修复）：任务句柄挂在实例上（`coldProbeTask`），
+ /// **连接轮次出口不取消**——快连接下结果也必须落地；登出/解绑由 `disconnect`
+ /// 取消。完成时按代次清理句柄，避免把后来新起的探测误清。
+    @discardableResult
+    func startColdStartCapabilityProbe(primaryOrigin: URL?) -> Task<Void, Never>? {
+        guard !p1ColdStartProbeConsumed, coldProbeTask == nil else { return nil }
+        p1ColdStartProbeConsumed = true
+        coldProbeGeneration += 1
+        let generation = coldProbeGeneration
+        let task = Task { [weak self] in
+            await self?.performColdStartCapabilityProbe(
+                primaryOrigin: primaryOrigin,
+                generation: generation
+            )
+            guard let self, self.coldProbeGeneration == generation else { return }
+            self.coldProbeTask = nil
+        }
+        coldProbeTask = task
+        return task
+    }
+
+ /// 取消在飞的冷启能力探测（登出/解绑/重新配对时调用，避免结果写回旧凭据语境）。
+ ///
+ /// 注意：`cancel()` 只是协作式的——`HTTPSClient.json` 的
+ /// `withCheckedThrowingContinuation` **不感知取消**，探测仍会跑完（≤0.5s）。
+ /// 所以「不写回旧凭据」不靠取消本身，而靠 `performColdStartCapabilityProbe`
+ /// 写回前的三重校验（未取消 + 代次未变 + 仍是同一台设备；见 B-1 修复）。
+    private func cancelColdStartCapabilityProbe() {
+        coldProbeGeneration += 1
+        coldProbeTask?.cancel()
+        coldProbeTask = nil
+    }
+
+ /// 冷启能力探测的实际工作（/health 取数 + 能力/窗口写回）。
+ ///
+ /// B-1（审查阻断）：`generation` = 发起时的探测代次。`await` 期间可能发生
+ /// 解绑/重新配对/切设备，而 /health 请求不感知取消 → 必须在**任何写回之前**
+ /// 校验「本次结果仍属于当前凭据语境」，否则会用旧快照覆盖/复活已删已换的
+ /// 凭据（`PairingCredentials` 含 origin/deviceId/credential/ticket）。
+    private func performColdStartCapabilityProbe(primaryOrigin: URL?, generation: Int) async {
+        guard let current = credentials else { return }
  // 主候选优先；无候选时退回持久化的 origin（旧调用语义）。
         guard let origin = primaryOrigin ?? current.originURL else { return }
         linkDebug("cold-probe: target=" + (origin.host ?? "?"))
@@ -1831,20 +2090,40 @@ final class LinkService: ObservableObject {
                 throw LinkError.httpStatus(status, "cold-probe /health")
             }
             let capabilities = Self.p1HealthCapabilities(from: json)
+ // B-1（审查阻断）：await 期间可能已解绑/重新配对/切设备，而 /health
+ // 请求不感知 Task 取消（`withCheckedThrowingContinuation`）。写回前
+ // 三重校验，任一不满足就整份丢弃——否则旧凭据快照会覆盖（或复活）
+ // 已删/已换的凭据：解绑后静默复活旧配对、重新配对后被旧快照顶掉
+ // （需二次扫码，触 AC-12）。这也是 `cancelColdStartCapabilityProbe`
+ // 注释里承诺的「结果不得写回已失效的凭据语境」的真正落点。
+            guard !Task.isCancelled,
+                  coldProbeGeneration == generation,
+                  let latest = credentials,
+                  latest.deviceId == current.deviceId else {
+                linkDebug("cold-probe: 结果已过期（取消/代次变化/凭据已换），整份丢弃不写回")
+                return
+            }
  // 本周期观测结论（对齐优先级高于 credentials 缓存）：旧插件无字段
  // = 观测到「无窗口」，缓存同步清空（存 nil，设计变更二审拍板）。
             sessionTakeoverWindowObserved = true
             sessionTakeoverWindowMs = capabilities.takeoverWindowMs
  // 能力与窗口写回（存量设备升 P1 的 F3 路径 + 下一周期缓存）。
-            guard current.supportsMuxRPC != capabilities.supportsMuxRPC
-                || current.takeoverWindowMs != capabilities.takeoverWindowMs else { return }
-            current.supportsMuxRPC = capabilities.supportsMuxRPC
-            current.takeoverWindowMs = capabilities.takeoverWindowMs
-            credentials = current
+ //
+ // 实施段（B-1 同一根因的另一面）：写回基准必须是**当前**
+ // 凭据 `latest`，而不是探测起点快照——`await` 期间同一轮握手可能刚
+ // 写入了轮换后的 connectTickets / p1Epoch / p1Sid、或已升 P1；拿旧
+ // 快照 `current` 整体覆盖会把这些一并冲掉（丢 resume 游标/复用已删
+ // ticket）。这里只把「能力位 + 接管窗口」合并进最新凭据。
+            guard latest.supportsMuxRPC != capabilities.supportsMuxRPC
+                || latest.takeoverWindowMs != capabilities.takeoverWindowMs else { return }
+            var updated = latest
+            updated.supportsMuxRPC = capabilities.supportsMuxRPC
+            updated.takeoverWindowMs = capabilities.takeoverWindowMs
+            credentials = updated
             if let persist = p1ColdStartProbePersist {
-                persist(current)
+                persist(updated)
             } else {
-                try? store.save(current)
+                try? store.save(updated)
             }
             linkDebug(
                 "cold-probe: supportsMuxRPC=" + (capabilities.supportsMuxRPC ? "1" : "0")
@@ -1887,14 +2166,25 @@ final class LinkService: ObservableObject {
  /// rollout flag and the plugin capability both allow it, try the single-WSS
  /// dsh-m/2 path first. A fallback-class failure degrades this app session to
  /// the unchanged legacy M1 path, which then runs on the same candidate.
-    private func attemptConnection(origin: URL, leafPin: String, timeout: TimeInterval) async -> ConnectAttemptOutcome {
+    private func attemptConnection(
+        origin: URL,
+        leafPin: String,
+        timeout: TimeInterval,
+        coldStartOptimistic: Bool = false
+    ) async -> ConnectAttemptOutcome {
  // link-perf L2：flag 语义反转后 `AppSettings.remoteProtocolV2`
  // 默认 on（env/UserDefaults 显式覆盖优先）；能否走 P1 由 supportsMuxRPC
  // （配对/冷启动探测/welcome 缓存）与会话级回退状态把关。
+ //
+ // D 段：本 App 周期首个轮次带 `coldStartOptimistic`——缓存
+ // `supportsMuxRPC` 还不是 true（未配对探测/旧缓存 false）时也先试 P1：
+ // P1 upgrade/hello 拒绝会走 `.useLegacy` 在**同一候选内**回退旧路径，
+ // 于是「协商」在 1 次连接尝试内完成（不再先付 /health 的 500ms）。
         if Self.transportRoute(
             flagEnabled: AppSettings.remoteProtocolV2,
             supportsMuxRPC: credentials?.supportsMuxRPC,
-            fellBackToLegacy: p1FellBackToLegacy
+            fellBackToLegacy: p1FellBackToLegacy,
+            coldStartOptimistic: coldStartOptimistic
         ) == .p1 {
             switch await attemptP1Connection(origin: origin, leafPin: leafPin, timeout: timeout) {
             case .connected(let bumpGeneration):
@@ -1920,13 +2210,20 @@ final class LinkService: ObservableObject {
 
  /// Pure routing decision between the dsh-m/2 channel and the legacy M1 path.
  /// Kept free of LinkService state so the whole matrix is unit-testable.
+ ///
+ /// `coldStartOptimistic`：本 App 周期首个连接轮次用
+ /// 「P1 握手即能力探测」代替拨号前的串行 /health——缓存 capability 未知/
+ /// false 时也先试 P1，旧插件会以 upgrade 拒绝（401/403/503）在同一候选内
+ /// 回退 legacy；P1 成功则协商（gzip/projV1/muxRPC）在本次尝试内完成。
     nonisolated static func transportRoute(
         flagEnabled: Bool,
         supportsMuxRPC: Bool?,
-        fellBackToLegacy: Bool
+        fellBackToLegacy: Bool,
+        coldStartOptimistic: Bool = false
     ) -> TransportRoute {
-        guard flagEnabled, supportsMuxRPC == true, !fellBackToLegacy else { return .legacy }
-        return .p1
+        guard flagEnabled, !fellBackToLegacy else { return .legacy }
+        if supportsMuxRPC == true { return .p1 }
+        return coldStartOptimistic ? .p1 : .legacy
     }
 
     enum TransportRoute: Equatable {
@@ -2103,6 +2400,11 @@ final class LinkService: ObservableObject {
             leafPin: leafPin,
             connectTimeout: timeout
         )
+ // DD-16：每一轮都按**当前**开关值重新协商 projV1（新通道由工厂闭包读
+ // `AppSettings.projV1Enabled`；resume 复用的保留通道在这里同步）。
+ // 覆盖「通知丢失 / 在未连接状态下改开关 / 重挂轮次」三种情形——活连接
+ // 立即生效的重挂见 `applyProjV1SettingChange`。
+        channel.applyWantsProjV1ForRemount(AppSettings.projV1Enabled)
         var rejectedTicket: String?
         var retriedTicket = false
         var retriedBackoff = false
@@ -2291,6 +2593,23 @@ final class LinkService: ObservableObject {
  /// `startConnecting`；hosted 单测与 E2E App 共享 Keychain）。
     func setCredentialsForTesting(_ value: PairingCredentials?) {
         credentials = value
+    }
+
+ /// 单测 seam：忽略网络路径变化事件。hosted 单测里模拟器启动期的首次
+ /// 「satisfied 变化」可能触发 `handleNetworkPathChanged()` → `reconnectNow()`，
+ /// 把 `phase` 改成 `connecting` 并起真实拨号，与「活连接」状态机断言互斥。
+ /// 真实设备/App 恒为 false（只有单测会置 true）。
+    var ignoresNetworkPathChangesForTesting = false
+
+ /// 单测 seam：重置「本 App 周期已探测」状态（取消在飞探测 + 清观测值）。
+ /// hosted 测试宿主的 Keychain 里若有真实凭据，`LinkService.init` 的自动连接
+ /// 轮次可能已经消费过探测，单测需要从确定的初始态开始。
+    func resetColdStartProbeStateForTesting() {
+        cancelColdStartCapabilityProbe()
+        p1ColdStartProbeConsumed = false
+        sessionTakeoverWindowObserved = false
+        sessionTakeoverWindowMs = nil
+        muxConflictAlignEscalated = false
     }
 
  /// Persists the live channel's resume cursor into the Keychain credential.

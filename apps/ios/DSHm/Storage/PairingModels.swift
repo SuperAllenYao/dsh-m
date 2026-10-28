@@ -327,4 +327,52 @@ enum AppSettings {
     static func setRemoteProtocolV2(_ enabled: Bool) {
         defaults.set(enabled, forKey: "remoteProtocolV2")
     }
+
+ /// 协议 v1（projV1 投影帧)客户端开关：false 时 `hello.caps`
+ /// 不带 `projV1`，整个 App 会话走旧 JSON 页路径（契约 §8 客户端回滚层）。
+ ///
+ /// 默认 on；优先级：DEBUG `DSHM_PROJ_V1` env 显式 on/off > UserDefaults
+ /// `projV1Enabled` 显式设置 > 默认 on。与 `remoteProtocolV2` 同款三态语义
+ /// （`object(forKey:) == nil` 区分「未设置」与「显式 false」）。
+    static var projV1Enabled: Bool {
+        projV1Resolved()
+    }
+
+ /// 三态解析（纯函数，可单测；测试用独立 suite 注入，不污染真实偏好）。
+    static func projV1Resolved(
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        defaults: UserDefaults = .standard
+    ) -> Bool {
+        #if DEBUG
+        if let raw = environment["DSHM_PROJ_V1"]?.lowercased() {
+            return raw == "1" || raw == "true" || raw == "on"
+        }
+        #endif
+        guard defaults.object(forKey: "projV1Enabled") == nil else {
+            return defaults.bool(forKey: "projV1Enabled")
+        }
+        return true
+    }
+
+    static func setProjV1Enabled(_ enabled: Bool) {
+ // DD-16（AC-09/契约 §8 客户端回滚层）：运行中改开关必须让**活连接**立即按
+ // 新值生效，而不是只对新连接生效——写盘后发通知，`LinkService` 观察者做
+ // 一次受控重挂（重新 hello 且不带 caps.projV1）。
+ //
+ // 只在「解析后的有效值」真的变化时发通知：DEBUG env `DSHM_PROJ_V1` 钉住
+ // 取值时改 UserDefaults 不改变行为，不该白付一次重连。
+        let before = projV1Enabled
+        defaults.set(enabled, forKey: "projV1Enabled")
+        let after = projV1Enabled
+        guard before != after else { return }
+        NotificationCenter.default.post(
+            name: AppSettings.projV1SettingDidChange,
+            object: nil,
+            userInfo: ["enabled": after]
+        )
+    }
+
+ /// projV1 开关有效值变化通知（`userInfo["enabled"]` = 变化后的有效值）。
+ /// 观察者：`LinkService`（DD-16 受控重挂）。
+    static let projV1SettingDidChange = Notification.Name("com.dshm.projV1SettingChanged")
 }

@@ -334,6 +334,20 @@ extension LinkService {
         originOverride: URL? = nil
     ) async throws -> JSONValue {
         if let p1 = p1Channel, p1.isReady {
+ // 协议 v1：协商 projV1 后插件把 `session/page` 成功响应改为
+ // `0x02` 分帧（契约 §5/§6）。普通 unary 调用方（首页/页间预取、lazy-fetch
+ // 窄页、其它 session/page 消费方）语义不变：这里消费整页帧并按旧 JSON
+ // 信封重建（records 升序 + hasMore）。逐帧流式消费见
+ // `projectedSessionPageStream`。
+            if endpoint == "session/page", p1.projV1Negotiated {
+                do {
+                    return try await Self.projectedPageValue(p1: p1, args: args, timeout: timeout)
+                } catch let failure as P1Failure {
+                    throw P1UnaryMapping.linkError(from: failure)
+                } catch let protocolError as P1ProtocolError {
+                    throw LinkError.transport(protocolError.localizedDescription)
+                }
+            }
             do {
                 let result = try await p1.unary(endpoint: endpoint, args: args, timeout: timeout)
                 return try P1UnaryMapping.jsonValue(from: result)
@@ -782,6 +796,64 @@ extension LinkService {
             throw LinkError.malformedEnvelope(L10n.t("session/attachment 缺少 base64 data"))
         }
         return (data, decoded.attachment?.mediaType)
+    }
+
+ // MARK: - Projected session/page streaming（协议 v1，契约 §4）
+
+ /// 投影页帧间空闲超时上限（契约 DD-11：`min(10s, unary 超时)`）。
+    static let maxProjectedFrameIdleSeconds: TimeInterval = 10
+
+ /// 当前 dsh-m/2 连接是否协商成功投影帧（`0x02`）。false = 走既有 JSON 路径
+ /// （legacy 通道 / 旧插件 / 插件 feature off / 客户端开关关闭）。
+    var projectedHistoryAvailable: Bool {
+        guard let p1 = p1Channel, p1.isReady else { return false }
+        return p1.projV1Negotiated
+    }
+
+ /// 投影流式 `session/page`：逐帧返回（帧序 = seq 降序，帧 0 与已加载窗口
+ /// 前沿相邻）。`nil` = 当前连接不能投影，调用方回退既有 `unary` JSON 路径。
+ ///
+ /// 错误语义：`P1Failure`（超时/断线/取消）与 `P1ProtocolError` 直接抛出，
+ /// 由调用方按既有 unary 失败语义处理；已产出的帧保持有效（半页续传）。
+    func projectedSessionPageStream(
+        args: [String: JSONValue],
+        timeout: TimeInterval = 10
+    ) throws -> P1ProjectedStream? {
+        guard let p1 = p1Channel, p1.isReady, p1.projV1Negotiated else { return nil }
+        return try p1.unaryProjected(endpoint: "session/page", args: args, timeout: timeout)
+    }
+
+ /// 消费一整页投影帧 → 旧 JSON 页信封（`{records:[{type:"event",event,seq}], hasMore}`）。
+ ///
+ /// 只给「不需要逐帧的普通 unary 调用方」用；记录按 seq 升序（Host JSON 页口径）。
+ /// 插件整页回退时（`.textResult`）直接走旧 JSON 映射，与旧路径逐字节等价。
+    @MainActor
+    private static func projectedPageValue(
+        p1: P1Channel,
+        args: [String: JSONValue],
+        timeout: TimeInterval
+    ) async throws -> JSONValue {
+ // 契约 DD-11：投影页帧间空闲超时 = `min(10s, unary 超时)`。这里的通用 unary
+ // 调用方（lazy-fetch 窄页 timeout 15s、默认 20s）不得把帧间等待放宽到 >10s。
+        let stream = try p1.unaryProjected(
+            endpoint: "session/page",
+            args: args,
+            timeout: min(timeout, Self.maxProjectedFrameIdleSeconds)
+        )
+        var rows: [JSONValue] = []
+        var hasMore = false
+        for try await event in stream.events {
+            switch event {
+            case .frame(let header, let frameRows):
+                if header.f == 0 { hasMore = header.hasMore ?? false }
+                rows.append(contentsOf: frameRows)
+            case .textResult(let result):
+                return try P1UnaryMapping.jsonValue(from: result)
+            case .completed(_, _, let pageHasMore):
+                hasMore = pageHasMore
+            }
+        }
+        return try ProjV1RowMapping.pageValue(rows: rows, hasMore: hasMore)
     }
 }
 

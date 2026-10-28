@@ -206,6 +206,13 @@ final class P1Channel {
     let clientInfo: P1ClientInfo
     let helloTimeout: TimeInterval
     let maxFrameBytes: Int
+ /// 协议 v1：本通道 hello 是否声明 `caps.projV1`（客户端回滚开关
+ /// `AppSettings.projV1Enabled`；false 时插件按未协商 = 全量旧 JSON 页）。
+ ///
+ /// DD-16：开关运行中变化时，活连接要**重挂**并按新值重新 hello——重挂复用同一
+ /// 通道对象（保留流表做 resume），所以本值必须可更新（见
+ /// `applyWantsProjV1ForRemount`）；只在没有 hello 在飞时允许改。
+    private(set) var wantsProjV1: Bool
 
     private let socketFactory: SocketFactory
     private var socket: P1Socket?
@@ -216,6 +223,9 @@ final class P1Channel {
  /// link-perf L3a：本次 welcome 是否协商了下行 gzip（binary 收帧
  /// 判定与诊断取证共用）。
     var gzipNegotiated: Bool { welcome?.caps.gzip == true }
+ /// 协议 v1：本次欢迎是否协商成功投影帧（`0x02`）。只有 true 时
+ /// App 才预期投影帧；`session/page` 才允许走流式投影路径（契约 §1/§6）。
+    var projV1Negotiated: Bool { welcome?.caps.projV1 == true }
  /// Server channel epoch; changes force the caller to re-open every stream.
     private(set) var epoch: String?
  /// Last downstream `sid` this channel actually applied (resume cursor).
@@ -231,6 +241,19 @@ final class P1Channel {
     private var welcomeContinuation: CheckedContinuation<P1Welcome, Error>?
     private var helloTimeoutTask: Task<Void, Never>?
     private var inboundBeforeWelcome: [String] = []
+ /// welcome 尚未应用时到达/解码完成的 **binary** 帧。
+ ///
+ /// 协商位（`gzip`/`projV1`）只能在 **apply 阶段**按 wire order 校验：welcome 与
+ /// 紧随其后的 `0x01` gzip 帧由 socket 连续投递时，welcome 的 apply 还在解码道/
+ /// main 队列里排队，若在 socket 回调里同步校验就会把已协商的 binary 帧误判为
+ /// 「未协商」→ `violate` → 上层会话级回退 legacy（真机 on 轮实测 6360B gzip 帧
+ /// 触发，projV1 永不生效）。这里把「welcome 应用前」的 binary 帧扣留，welcome
+ /// 应用后按到达顺序重新校验协商位并 apply。上限与文本缓冲一致（8），防异常端刷帧。
+    private var deferredBeforeWelcome: [DeferredInbound] = []
+    private enum DeferredInbound {
+        case frame(P1ServerFrame, rawText: String)
+        case projected(ProjV1Frame)
+    }
     private var hasWelcomed = false
 
  /// Frame decode lane; see `P1InboundDecoding`.
@@ -238,6 +261,8 @@ final class P1Channel {
 
     private var pendingRPC: [String: CheckedContinuation<P1RPCResult, Error>] = [:]
     private var rpcTimeoutTasks: [String: Task<Void, Never>] = [:]
+ /// 协议 v1：在途的投影（`0x02`）页流，按 rpcId 路由（契约 §5）。
+    private var pendingProjected: [String: P1ProjectedRequest] = [:]
 
     private var streams: [String: P1Stream] = [:]
     private var streamDescriptors: [P1StreamDescriptor] = []
@@ -249,13 +274,15 @@ final class P1Channel {
         clientInfo: P1ClientInfo = .dshm,
         helloTimeout: TimeInterval = P1ProtocolLimits.helloTimeout,
         maxFrameBytes: Int = P1ProtocolLimits.maxFrameBytes,
-        inboundDecoding: P1InboundDecoding = .offMain
+        inboundDecoding: P1InboundDecoding = .offMain,
+        wantsProjV1: Bool = true
     ) {
         self.socketFactory = socketFactory
         self.clientInfo = clientInfo
         self.helloTimeout = helloTimeout
         self.maxFrameBytes = maxFrameBytes
         self.inboundDecoding = inboundDecoding
+        self.wantsProjV1 = wantsProjV1
     }
 
  /// Production wiring: one pinned WSS to `host:port` per `connect`.
@@ -268,14 +295,16 @@ final class P1Channel {
         headers: [String: String] = [:],
         connectTimeout: TimeInterval = PinnedTLS.defaultConnectTimeout,
         clientInfo: P1ClientInfo = .dshm,
-        helloTimeout: TimeInterval = P1ProtocolLimits.helloTimeout
+        helloTimeout: TimeInterval = P1ProtocolLimits.helloTimeout,
+        wantsProjV1: Bool = true
     ) {
         self.init(
             socketFactory: {
                 P1WSSocket(host: host, port: port, path: path, headers: headers, leafPin: leafPin, caCertBase64: caCertBase64, connectTimeout: connectTimeout)
             },
             clientInfo: clientInfo,
-            helloTimeout: helloTimeout
+            helloTimeout: helloTimeout,
+            wantsProjV1: wantsProjV1
         )
     }
 
@@ -329,7 +358,7 @@ final class P1Channel {
         }
  // Validate (and serialize) hello before touching the network.
         let helloText = try P1FrameCodec.encodeText(
-            .hello(P1Hello(client: clientInfo, auth: auth, resume: resume)),
+            .hello(P1Hello(client: clientInfo, auth: auth, resume: resume, wantsProjV1: wantsProjV1)),
             maxBytes: maxFrameBytes
         )
         if let resume {
@@ -342,6 +371,7 @@ final class P1Channel {
         lastFailure = nil
         hasWelcomed = false
         inboundBeforeWelcome.removeAll()
+        deferredBeforeWelcome.removeAll()
         replayStats = P1ReplayStats()
         replayTargetSid = nil
         state = .connecting
@@ -391,6 +421,10 @@ final class P1Channel {
 
  /// Closes the socket and fails any in-flight work with `.cancelled`.
  /// Does not fire `onClose` (the caller initiated the teardown).
+ ///
+ /// DD-16：受控重挂复用它关闭旧 socket（流表保留，随后 `connect` 用
+ /// hello{resume} 续上），因此这里**不清流表**——清流表只发生在
+ /// `discardAllStreams`。
     func disconnect(reason: String = "client closed") {
         guard state != .idle else { return }
         let close = socket
@@ -405,6 +439,20 @@ final class P1Channel {
             continuation.resume(throwing: P1Failure.cancelled)
         }
         failPending(.cancelled)
+    }
+
+ /// DD-16（客户端回滚）：重挂前更新本通道下一次 hello 的 `caps.projV1` 意图。
+ ///
+ /// 只允许在没有 hello 在飞时改（`idle`/`closed`）——受控重挂的顺序是
+ /// `disconnect`（关旧 socket、保留流表）→ 本方法 → `connect`（重新 hello）；
+ /// 活连接直接改会让「当前 socket 的协商位」与「已发 hello」不一致。
+ /// 返回是否写入（false = 状态不允许/值未变化，调用方按「下一轮生效」处理）。
+    @discardableResult
+    func applyWantsProjV1ForRemount(_ enabled: Bool) -> Bool {
+        guard state == .idle || state == .closed else { return false }
+        guard wantsProjV1 != enabled else { return false }
+        wantsProjV1 = enabled
+        return true
     }
 
  /// Drops the stream table (live handles plus the re-open descriptors).
@@ -555,6 +603,161 @@ final class P1Channel {
         })
     }
 
+ // MARK: - Projected page streaming（协议 v1，`0x02`）
+
+ /// 发起一次投影流式 unary（契约 §4/§5）：`session/page` 在协商 projV1 后由
+ /// 插件以 1..N 条 `0x02` binary 帧返回，客户端按帧消费（帧序 = seq **降序**，
+ /// 帧 0 与已加载窗口前沿相邻，末帧是页面最老的一段）。
+ ///
+ /// 语义：
+ /// - 每帧回调 `.frame(header:rows:)`（`rows` 是该帧的行数组，每行对应一个 seq）；
+ /// - 末帧（`f == frames-1`）或空页（`frames == 0`）后回调 `.completed` 并结束流；
+ /// - 插件整页回退旧 JSON 时回调 `.textResult`（调用方按旧 JSON 路径解码），
+ /// 不算错误（契约 §6：一页内不会混合投影帧与文本结果）；
+ /// - `timeout` 是**帧间空闲超时**（每帧重置）：首帧慢与末帧慢都不误杀长页，
+ /// 默认 10s（契约修订 v1.1 §5：投影页帧间隔独立超时，不得硬等 30s unary）；
+ /// - 断线/关闭复用既有 unary 错误语义（`.notConnected` / `.socketClosed` …），
+ /// 已回调的帧保持有效（调用方按半页中断语义续传）；
+ /// - 未知/迟到 rpcId 的帧静默丢弃（与既有 unary「迟到响应丢弃」同口径）。
+ ///
+ /// 返回的 `P1ProjectedStream` 自带 `events` 异步序列与 `cancel()`；消费任务
+ /// 取消时底层在途请求随之撤销（AsyncThrowingStream `onTermination`）。回调
+ /// 与取消都在主 actor。
+    func unaryProjected(
+        endpoint: String,
+        args: [String: JSONValue] = [:],
+        timeout: TimeInterval = 10
+    ) throws -> P1ProjectedStream {
+        guard state == .ready, socket != nil else { throw P1Failure.notConnected }
+        guard projV1Negotiated else {
+            throw P1ProtocolError.violation("projV1 未协商，不能请求投影帧")
+        }
+        let id = UUID().uuidString.lowercased()
+        let text = try P1FrameCodec.encodeText(
+            .rpc(P1RPCCall(id: id, endpoint: endpoint, args: args)),
+            maxBytes: maxFrameBytes
+        )
+        var captured: AsyncThrowingStream<P1ProjectedStreamEvent, Error>.Continuation?
+        let events = AsyncThrowingStream(P1ProjectedStreamEvent.self, bufferingPolicy: .unbounded) {
+            captured = $0
+        }
+        guard let continuation = captured else { throw P1Failure.notConnected }
+        let request = P1ProjectedRequest(
+            id: id,
+            endpoint: endpoint,
+            timeout: timeout,
+            continuation: continuation
+        )
+        pendingProjected[id] = request
+        do {
+            try sendText(text)
+        } catch {
+            pendingProjected.removeValue(forKey: id)
+            request.finish(.failure(P1Failure.notConnected))
+            throw P1Failure.notConnected
+        }
+        armProjectedTimeout(request)
+        continuation.onTermination = { [weak self] _ in
+ // 消费方提前结束（break / Task.cancel / handle 释放）：撤掉在途请求；
+ // 半页的剩余帧随后按未知 rpcId 静默丢弃。
+            Task { @MainActor [weak self] in
+                self?.cancelProjected(id)
+            }
+        }
+        return P1ProjectedStream(rpcId: id, events: events) { [weak self] in
+            self?.cancelProjected(id)
+        }
+    }
+
+ /// 撤销一次在途投影流（超时/取消/断线统一入口；幂等）。
+    private func cancelProjected(_ id: String) {
+        guard let request = pendingProjected.removeValue(forKey: id) else { return }
+        request.timeoutTask?.cancel()
+        request.timeoutTask = nil
+        request.finish(.failure(P1Failure.cancelled))
+    }
+
+ /// 帧间空闲超时：每收到一帧重排一次。
+    private func armProjectedTimeout(_ request: P1ProjectedRequest) {
+        request.timeoutTask?.cancel()
+        let interval = max(0.001, request.timeout)
+        request.timeoutTask = Task { [weak self, weak request] in
+            try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
+            guard !Task.isCancelled, let self, let request else { return }
+            guard self.pendingProjected.removeValue(forKey: request.id) != nil else { return }
+            request.timeoutTask = nil
+            request.finish(.failure(P1Failure.timeout("projV1 rpc")))
+        }
+    }
+
+ /// 按 rpcId 路由一帧投影页帧（主 actor；解码已在 inbound 车道完成）。
+    private func applyProjectedFrame(_ frame: ProjV1Frame) {
+        guard let request = pendingProjected[frame.header.rpcId] else {
+ // 超时/取消后的迟到帧（半页剩余部分）或未知 rpcId：静默丢弃。
+            return
+        }
+        do {
+            try routeProjectedFrame(frame, request: request)
+        } catch {
+            pendingProjected.removeValue(forKey: request.id)
+            request.timeoutTask?.cancel()
+            request.timeoutTask = nil
+            request.finish(.failure(error))
+        }
+    }
+
+    private func routeProjectedFrame(_ frame: ProjV1Frame, request: P1ProjectedRequest) throws {
+        let header = frame.header
+        if request.nextFrame == 0 {
+            guard header.f == 0 else {
+                throw P1ProtocolError.violation("projV1: 首帧下标非 0（f=\(header.f)）")
+            }
+            request.totalFrames = header.frames
+            request.expectedRecords = header.records
+            request.hasMore = header.hasMore ?? false
+        }
+        guard header.f == request.nextFrame else {
+            throw P1ProtocolError.violation("projV1: 帧下标跳变（期望 \(request.nextFrame)，收到 \(header.f)）")
+        }
+        request.nextFrame += 1
+        if let total = request.totalFrames, total == 0 {
+ // 0 记录页：header-only 帧直接完成（契约 §4）。
+            request.continuation.yield(.completed(frames: 0, records: 0, hasMore: request.hasMore))
+            takeProjectedAndFinish(request)
+            return
+        }
+ // 契约修订 v1.1：hasMore 也会写在本页**末帧**（客户端「只有末帧才提交
+ // 页面 hasMore」的强制时机）。收集它，末帧到达时与首帧值对账。
+        if let frameHasMore = header.hasMore {
+            request.lastFrameHasMore = frameHasMore
+        }
+        request.receivedRecords += frame.rows.count
+        armProjectedTimeout(request)
+        request.continuation.yield(.frame(header: header, rows: frame.rows))
+        guard let total = request.totalFrames, request.nextFrame >= total else { return }
+        if let expected = request.expectedRecords, expected != request.receivedRecords {
+            throw P1ProtocolError.violation(
+                "projV1: 记录数与 header.records 不符（期望 \(expected)，收到 \(request.receivedRecords)）"
+            )
+        }
+        if let lastFrameHasMore = request.lastFrameHasMore, lastFrameHasMore != request.hasMore {
+            throw P1ProtocolError.violation("projV1: 首帧与末帧 hasMore 不一致")
+        }
+        let pageHasMore = request.lastFrameHasMore ?? request.hasMore
+        request.continuation.yield(.completed(frames: total, records: request.receivedRecords, hasMore: pageHasMore))
+        takeProjectedAndFinish(request)
+    }
+
+ /// 正常完成：摘除在途请求并结束流（幂等由 request.isFinished 保证）。
+    private func takeProjectedAndFinish(_ request: P1ProjectedRequest) {
+        pendingProjected.removeValue(forKey: request.id)
+        request.timeoutTask?.cancel()
+        request.timeoutTask = nil
+        request.finish(.success(()))
+    }
+
+ // MARK: - Streams
+
  /// Opens a logical stream. Returns a handle; server frames are dispatched to
  /// the callbacks in wire order.
  ///
@@ -664,17 +867,103 @@ final class P1Channel {
         decodeInboundLane { text }
     }
 
- /// link-perf L3a：binary 下行帧（gzip 协商成功后的压缩载荷）。
- /// 未协商（welcome.caps.gzip!= true，含 welcome 未到）却收到 binary =
- /// 协议违规——这是「新 App × 旧插件」错配窗口的安全网（设计 §3-L1 兼容
- /// 矩阵第三行），走既有 violate 路径关连接，上层 useLegacy 会话级回退。
+ /// binary 下行帧分派（版本头决定路径，互不干扰，契约 §5）：
+ /// - `0x01`：gzip 文本信封（L3a，要求 `caps.gzip`）；
+ /// - `0x02`：投影页帧（协议 v1，要求 `caps.projV1`；解码见 `ProjV1Codec`）。
+ ///
+ /// 未协商却收到对应版本的 binary = 协议违规——这是「新 App × 旧插件」错配
+ /// 窗口的安全网，走既有 violate 路径关连接，上层 useLegacy 会话级回退。
+ ///
+ /// ⚠️ 真机回归修复：协商校验**不在这里做**（这里是 socket 回调时机，
+ /// 可能早于 welcome 的 apply → 误判违例、整会话回退 legacy）。协商校验与
+ /// 「welcome 前扣留」都下沉到 apply 阶段：`decodeInboundLane` 的
+ /// `requiresGzipNegotiation` 与 `applyProjectedFrameAfterWelcomeCheck`。
+ /// 这里只保留版本分派 + 状态校验（状态在 apply 阶段还会再校验一次）。
     private func handleBinary(_ data: Data) {
-        guard gzipNegotiated else {
-            violate(P1ProtocolError.violation("未协商 gzip 却收到 binary 帧"))
+        switch data.first {
+        case ProjV1Wire.version:
+            guard state == .connecting || state == .ready else { return }
+            decodeInboundProjectedLane(data)
+        case 0x01:
+            guard state == .connecting || state == .ready else { return }
+            decodeInboundLane(
+                { try P1FrameCodec.inflateBinaryFrame(data) },
+                requiresGzipNegotiation: true
+            )
+        case .some(let version):
+            violate(P1ProtocolError.violation("binary 帧版本不支持: \(version)"))
+        case .none:
+            violate(P1ProtocolError.violation("binary 空帧"))
+        }
+    }
+
+ /// 协议 v1：`0x02` 投影帧的解码车道。
+ ///
+ /// gunzip + tagged tree 解码是每帧最重的一段（100 行 ≈ 数百 KB payload），
+ /// 必须与文本帧共用同一串行车道（wire order），再回主 actor 按 rpcId 路由。
+ ///
+ /// 协商位校验在 apply 阶段（`applyProjectedFrameAfterWelcomeCheck`），不在
+ /// socket 回调里——否则 welcome 尚未应用时会把已协商帧误判成违例。
+    private func decodeInboundProjectedLane(_ data: Data) {
+        guard inboundDecoding == .offMain else {
+            let frame: ProjV1Frame
+            do {
+                frame = try ProjV1Codec.decodeFrame(data)
+            } catch {
+                violate(error)
+                return
+            }
+            applyProjectedFrameAfterWelcomeCheck(frame)
             return
         }
-        guard state == .connecting || state == .ready else { return }
-        decodeInboundLane { try P1FrameCodec.inflateBinaryFrame(data) }
+        guard let source = socket else { return }
+        Self.inboundDecodeQueue.async { [weak self] in
+            let decoded: Result<ProjV1Frame, P1ProtocolError>
+            do {
+                #if DEBUG
+                let frame = try PerfProbe.shared.measure(
+                    "p1ProjFrameDecodeBG",
+                    ["bytes": data.count]
+                ) {
+                    try ProjV1Codec.decodeFrame(data)
+                }
+                decoded = .success(frame)
+                #else
+                decoded = .success(try ProjV1Codec.decodeFrame(data))
+                #endif
+            } catch let error as P1ProtocolError {
+                decoded = .failure(error)
+            } catch {
+                decoded = .failure(.violation(error.localizedDescription))
+            }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                MainActor.assumeIsolated {
+                    guard self.socket === source else { return }
+                    guard self.state == .connecting || self.state == .ready else { return }
+                    switch decoded {
+                    case .success(let frame):
+                        self.applyProjectedFrameAfterWelcomeCheck(frame)
+                    case .failure(let error):
+                        self.violate(error)
+                    }
+                }
+            }
+        }
+    }
+
+ /// `0x02` 投影帧的 apply 阶段协商校验（见 `handleBinary` 的回归注释）。
+ /// welcome 尚未应用 → 先扣留，welcome 应用后由 `flushDeferredBeforeWelcome` 处理。
+    private func applyProjectedFrameAfterWelcomeCheck(_ frame: ProjV1Frame) {
+        if shouldDeferUntilWelcome() {
+            deferBeforeWelcome(.projected(frame))
+            return
+        }
+        guard projV1Negotiated else {
+            violate(P1ProtocolError.violation("未协商 projV1 却收到 0x02 投影帧"))
+            return
+        }
+        applyProjectedFrame(frame)
     }
 
  /// Inbound decode lane shared by text frames and (gzip-negotiated) binary
@@ -683,7 +972,14 @@ final class P1Channel {
  /// task per wire frame keeps main-actor application in wire order (serial
  /// queue + FIFO `main.async`) — a binary frame must NOT re-enter
  /// `handleText` from the lane, or the following text frame could overtake it.
-    private func decodeInboundLane(_ produceText: @escaping @Sendable () throws -> String) {
+ ///
+ /// `requiresGzipNegotiation`：binary（`0x01`）车道必须在 **apply 阶段** 校验
+ /// `caps.gzip`（socket 回调时机可能早于 welcome 应用）；inline 与 off-main
+ /// 两条分支都要校验，否则 hosted 单测（inline）与真机（off-main）行为不一致。
+    private func decodeInboundLane(
+        _ produceText: @escaping @Sendable () throws -> String,
+        requiresGzipNegotiation: Bool = false
+    ) {
         guard inboundDecoding == .offMain else {
             let text: String
             do {
@@ -692,7 +988,12 @@ final class P1Channel {
                 violate(error)
                 return
             }
-            decodeAndHandleInline(text)
+            guard let frame = decodeInlineFrame(text) else { return }
+            applyInboundFrame(
+                frame,
+                rawText: text,
+                requiresGzipNegotiation: requiresGzipNegotiation
+            )
             return
         }
         guard let source = socket else { return }
@@ -732,12 +1033,82 @@ final class P1Channel {
                     switch decoded {
                     case .success(let frame):
  // Success implies produceText() completed and rawText was set.
-                        self.applyFrame(frame, rawText: rawText ?? "")
+                        self.applyInboundFrame(
+                            frame,
+                            rawText: rawText ?? "",
+                            requiresGzipNegotiation: requiresGzipNegotiation
+                        )
                     case .failure(let error):
                         self.violate(error)
                     }
                 }
             }
+        }
+    }
+
+ /// 文本车道的 apply 阶段：协商位校验（仅 gzip binary 车道需要）→ 帧分派。
+ /// welcome 尚未应用时先扣留（`deferredBeforeWelcome`），welcome 应用后按序补。
+    private func applyInboundFrame(
+        _ frame: P1ServerFrame,
+        rawText: String,
+        requiresGzipNegotiation: Bool
+    ) {
+        if requiresGzipNegotiation {
+            if shouldDeferUntilWelcome() {
+                deferBeforeWelcome(.frame(frame, rawText: rawText))
+                return
+            }
+            guard gzipNegotiated else {
+                violate(P1ProtocolError.violation("未协商 gzip 却收到 binary 帧"))
+                return
+            }
+        }
+        applyFrame(frame, rawText: rawText)
+    }
+
+ /// welcome 是否尚未应用：此时 binary 的协商位未知，先扣留。
+    private func shouldDeferUntilWelcome() -> Bool {
+        state == .connecting && welcome == nil
+    }
+
+    private func deferBeforeWelcome(_ item: DeferredInbound) {
+        guard deferredBeforeWelcome.count < 8 else {
+            violate(P1ProtocolError.violation("welcome 前收到过多帧"))
+            return
+        }
+        deferredBeforeWelcome.append(item)
+    }
+
+ /// welcome 应用后按到达顺序补处理扣留的 binary 帧（此时协商位已可信）。
+    private func flushDeferredBeforeWelcome() {
+        guard !deferredBeforeWelcome.isEmpty else { return }
+        let pending = deferredBeforeWelcome
+        deferredBeforeWelcome.removeAll()
+        for item in pending {
+            switch item {
+            case .frame(let frame, let rawText):
+                guard gzipNegotiated else {
+                    violate(P1ProtocolError.violation("未协商 gzip 却收到 binary 帧"))
+                    return
+                }
+                applyFrame(frame, rawText: rawText)
+            case .projected(let frame):
+                guard projV1Negotiated else {
+                    violate(P1ProtocolError.violation("未协商 projV1 却收到 0x02 投影帧"))
+                    return
+                }
+                applyProjectedFrame(frame)
+            }
+        }
+    }
+
+ /// 同步解码一帧文本（inline / pre-welcome flush 用）。失败 → violate 并返回 nil。
+    private func decodeInlineFrame(_ text: String) -> P1ServerFrame? {
+        do {
+            return try P1FrameCodec.decodeServerFrame(text, maxBytes: maxFrameBytes)
+        } catch {
+            violate(error)
+            return nil
         }
     }
 
@@ -749,13 +1120,7 @@ final class P1Channel {
  /// frames — never a history page — so decoding them inline cannot block the
  /// main thread.
     private func decodeAndHandleInline(_ text: String) {
-        let frame: P1ServerFrame
-        do {
-            frame = try P1FrameCodec.decodeServerFrame(text, maxBytes: maxFrameBytes)
-        } catch {
-            violate(error)
-            return
-        }
+        guard let frame = decodeInlineFrame(text) else { return }
         applyFrame(frame, rawText: text)
     }
 
@@ -817,6 +1182,13 @@ final class P1Channel {
             )
         }
         state = .ready
+ // welcome 已应用、协商位可信：按序补处理 welcome 前扣留的 binary 帧（协议 v1
+ // 回归修复）。放在 resume continuation 之前——这些帧在 wire order 上属于
+ // welcome 之后，`connect()` 返回时它们必须已经应用完（down 序号连续）。
+        flushDeferredBeforeWelcome()
+ // flush 中若帧本身非法（如 down 序号缺口）→ 已 violate 关连接并把 welcome
+ // continuation 以违规错误 resume；这里不再重复 resume/置 ready 视图。
+        guard state == .ready else { return }
         hasWelcomed = true
         let continuation = welcomeContinuation
         welcomeContinuation = nil
@@ -881,11 +1253,26 @@ final class P1Channel {
     }
 
     private func resolveRPC(_ result: P1RPCResult) {
+ // 协议 v1：投影页整页回退时插件回的是普通 `rpc/result`——在途投影流
+ // 消费它并结束（调用方按旧 JSON 路径解码，契约 §6）。
+        if let request = pendingProjected.removeValue(forKey: result.id) {
+            request.timeoutTask?.cancel()
+            request.timeoutTask = nil
+            request.continuation.yield(.textResult(result))
+            request.finish(.success(()))
+            return
+        }
         guard let continuation = takePending(result.id) else { return }
         continuation.resume(returning: result)
     }
 
     private func rejectRPC(_ frame: P1RPCErrorFrame) {
+        if let request = pendingProjected.removeValue(forKey: frame.id) {
+            request.timeoutTask?.cancel()
+            request.timeoutTask = nil
+            request.finish(.failure(P1Failure.rpcError(id: frame.id, error: frame.error)))
+            return
+        }
         guard let continuation = takePending(frame.id) else { return }
         continuation.resume(throwing: P1Failure.rpcError(id: frame.id, error: frame.error))
     }
@@ -913,6 +1300,14 @@ final class P1Channel {
         rpcTimeoutTasks.removeAll()
         for continuation in continuations {
             continuation.resume(throwing: failure)
+        }
+ // 投影流按既有 unary 错误语义失败（已前插的半页帧由调用方保留续传）。
+        let projected = Array(pendingProjected.values)
+        pendingProjected.removeAll()
+        for request in projected {
+            request.timeoutTask?.cancel()
+            request.timeoutTask = nil
+            request.finish(.failure(failure))
         }
     }
 
@@ -1014,5 +1409,93 @@ private final class P1Stream {
         self.onEnd = onEnd
         self.onError = onError
         self.onClose = onClose
+    }
+}
+
+// MARK: - Projected page stream (protocol v1)
+
+/// 一条投影流式 unary 的回调事件（契约 §4/§6）。
+enum P1ProjectedStreamEvent {
+ /// 一帧已解码：`rows` 为该帧的行数组（seq 降序分帧里的第 f 帧）。
+    case frame(header: ProjV1FrameHeader, rows: [JSONValue])
+ /// 插件整页回退旧 JSON：`rpc/result` 页（调用方按旧 JSON 路径解码）。
+    case textResult(P1RPCResult)
+ /// 本页完成（空页 `frames == 0`）：`records` 为累计记录数，`hasMore` 取首帧
+ /// header（= Host 页面信封原值）。
+    case completed(frames: Int, records: Int, hasMore: Bool)
+}
+
+/// 投影页流的消费句柄。
+///
+/// `events` 按 wire 顺序产出（主 actor）；消费方 `break`/`Task.cancel()`/释放
+/// handle 都会撤销在途请求（`onTermination` → `P1Channel.cancelProjected`）。
+@MainActor
+final class P1ProjectedStream {
+    let rpcId: String
+    let events: AsyncThrowingStream<P1ProjectedStreamEvent, Error>
+    private let cancelHandler: () -> Void
+    private var cancelled = false
+
+    init(
+        rpcId: String,
+        events: AsyncThrowingStream<P1ProjectedStreamEvent, Error>,
+        cancelHandler: @escaping () -> Void
+    ) {
+        self.rpcId = rpcId
+        self.events = events
+        self.cancelHandler = cancelHandler
+    }
+
+ /// 主动取消（幂等）：在途请求按 `.cancelled` 失败，剩余帧静默丢弃。
+    func cancel() {
+        guard !cancelled else { return }
+        cancelled = true
+        cancelHandler()
+    }
+}
+
+/// 一条在途投影流（`P1Channel.pendingProjected` 的值；主 actor）。
+private final class P1ProjectedRequest {
+    let id: String
+    let endpoint: String
+    let timeout: TimeInterval
+    let continuation: AsyncThrowingStream<P1ProjectedStreamEvent, Error>.Continuation
+ /// 下一帧应有的 `f`（帧下标严格连续）。
+    var nextFrame = 0
+ /// 首帧 header 的总帧数（后续帧不带，需记住）。
+    var totalFrames: Int?
+ /// 首帧 header 的总记录数（末帧校验用）。
+    var expectedRecords: Int?
+ /// 首帧 header 的 `hasMore`（= Host 页面信封原值）。
+    var hasMore = false
+ /// 末帧 header 的 `hasMore`（契约修订 v1.1：末帧也写页面 hasMore）。
+    var lastFrameHasMore: Bool?
+ /// 已收到的行数（与 `expectedRecords` 对账）。
+    var receivedRecords = 0
+    var timeoutTask: Task<Void, Never>?
+    private var finished = false
+
+    init(
+        id: String,
+        endpoint: String,
+        timeout: TimeInterval,
+        continuation: AsyncThrowingStream<P1ProjectedStreamEvent, Error>.Continuation
+    ) {
+        self.id = id
+        self.endpoint = endpoint
+        self.timeout = timeout
+        self.continuation = continuation
+    }
+
+ /// 结束流（幂等）：成功 = 正常完成；失败 = 抛给消费方。
+    func finish(_ result: Result<Void, Error>) {
+        guard !finished else { return }
+        finished = true
+        switch result {
+        case .success:
+            continuation.finish()
+        case .failure(let error):
+            continuation.finish(throwing: error)
+        }
     }
 }

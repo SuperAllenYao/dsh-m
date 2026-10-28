@@ -64,6 +64,9 @@ final class SessionJournal {
         case assistantRevisionGap(expected: Int, received: Int)
  /// assistant-stream frame applied (revision ok).
         case assistantStreamProgress(Int)
+ /// lazy-fetch（协议 v1 契约 §7）：已加载窗口里某条事件的 `data` 就地换成
+ /// 完整版本（seq/type/time 与窗口连续性不变）。UI 需要重算该行。
+        case eventContentReplaced(Int)
  /// Unknown/unhandled snapshot record type (ignored).
         case ignored
     }
@@ -307,6 +310,29 @@ final class SessionJournal {
             return record.event
         }
         return prepend(events: incoming, hasMoreOlder: page.hasMore)
+    }
+
+ /// Lazy-fetch（协议 v1 契约 §7）：就地把已加载窗口里某条事件的 `data` 换成
+ /// 完整版本（截断行 → 全文）。只改 `data`：`seq`/`type`/`time`、窗口连续性、
+ /// `lastSeq`/`cursor`/分页状态全部不动；窗口里没有该 seq 时返回 `.ignored`。
+    @discardableResult
+    func replaceEventData(seq: Int, data: JSONValue?) -> Update {
+        guard let index = eventIndex(for: seq) else { return .ignored }
+        events[index].data = data
+        return .eventContentReplaced(seq)
+    }
+
+ /// 已加载窗口内的二分查找（events 恒按 seq 升序）。
+    private func eventIndex(for seq: Int) -> Int? {
+        var low = 0
+        var high = events.count - 1
+        while low <= high {
+            let mid = (low + high) / 2
+            let midSeq = events[mid].seq
+            if midSeq == seq { return mid }
+            if midSeq < seq { low = mid + 1 } else { high = mid - 1 }
+        }
+        return nil
     }
 
  /// Cache-restore / test seam for `prepend(page:)` without wire records.

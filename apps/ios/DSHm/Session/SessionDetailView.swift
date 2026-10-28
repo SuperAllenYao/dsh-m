@@ -242,8 +242,24 @@ struct SessionDetailView: View {
                 e2eFollowProbeElement
                 e2eLinkDebugElement
                 e2ePathChangeTriggerElement
+                projV1MetricsElement
+                projV1HistoryProgressElement
             }
         }
+ // 协议 v1 回滚开关的 E2E 触发器（AC-09/TC-20/21）：**不进左上角 header 覆盖层**。
+ // 真机基线对照回归（AC-06）：它曾被放进上面的 topLeading VStack，
+ // 两个 24×24 可点击按钮把自定义 header 的 `session-back` 盖住 → 旧套件
+ // `testPushTapSubagentSession` 的 tap 落在触发器上、导航没退栈。这里改到
+ // bottomTrailing 并让 gate 默认关闭（见 `e2eProjV1ToggleTriggerElements`）。
+        .overlay(alignment: .bottomTrailing) {
+            e2eProjV1ToggleTriggerElements
+                .padding(.trailing, 8)
+                .padding(.bottom, 96)
+        }
+ // 协议 v1 lazy-fetch（契约 §7）：工具结果「显示全部」入口注入单事件取全文。
+        .environment(\.lazyFullFetch, LazyFullFetchAction { seq in
+            await viewModel.fetchEventFull(seq: seq)
+        })
         .onChange(of: app.link.generation) { generation in
             viewModel.handleGenerationChange(generation)
         }
@@ -654,6 +670,40 @@ struct SessionDetailView: View {
         }
     }
 
+ // MARK: - 协议 v1 投影埋点（跨段约定：W3 的 ProjV1E2ETests 读这两个元素）
+
+ /// 隐藏元素 `proj-v1-metrics`：7 段埋点 + 投影状态单行 JSON（契约 §9）。
+ /// 只在 E2E/指标 gate 下有值（View model 内部按 env gate 计算，生产不渲染）。
+    @ViewBuilder
+    private var projV1MetricsElement: some View {
+        if let metrics = viewModel.projV1MetricsValue {
+            Text("proj-v1-metrics")
+                .font(.system(size: 1))
+                .frame(width: 2, height: 2)
+                .opacity(0.02)
+                .allowsHitTesting(false)
+                .accessibilityIdentifier("proj-v1-metrics")
+                .accessibilityLabel(metrics)
+                .accessibilityValue(metrics)
+        }
+    }
+
+ /// 隐藏元素 `proj-v1-history-progress`：等全量补齐完成用
+ /// （`oldest=<seq>;hasMore=0|1;full=0|1`）。
+    @ViewBuilder
+    private var projV1HistoryProgressElement: some View {
+        if let progress = viewModel.projV1HistoryProgressValue {
+            Text("proj-v1-history-progress")
+                .font(.system(size: 1))
+                .frame(width: 2, height: 2)
+                .opacity(0.02)
+                .allowsHitTesting(false)
+                .accessibilityIdentifier("proj-v1-history-progress")
+                .accessibilityLabel(progress)
+                .accessibilityValue(progress)
+        }
+    }
+
  // MARK: - E2E link state (跨网络用例的可观测判据)
 
  /// 隐藏元素：链路相位 + 连接代号。网络切换用例用它区分「已经重连成功」和
@@ -697,6 +747,43 @@ struct SessionDetailView: View {
             .frame(width: 24, height: 24)
             .contentShape(Rectangle())
             .accessibilityIdentifier("e2e-path-change-trigger")
+        }
+    }
+
+ /// E2E 隐藏触发器：运行中切换客户端
+ /// projV1 回滚开关，验证「无需重启 App，活连接立即按新值生效」（DD-16）。
+ ///
+ /// **默认不渲染**：gate = `DSHM_E2E=1` **且** `DSHM_E2E_PROJV1_TOGGLE=1`
+ /// （跨段约定：W3 只在 remount 轮注入后者；legacy 套件/其它 E2E 套件不设 →
+ /// 零新增可点击视图）。位置在 `bottomTrailing`（避开 header 的 `session-back`
+ /// 与 composer 发送键）——不要再挪回左上角覆盖层，见 body 里 AC-06 回归注释。
+ ///
+ /// 注意：DEBUG env `DSHM_PROJ_V1` 会钉住有效值（优先级高于 UserDefaults），
+ /// E2E 该轮不得同时设置它，否则 `AppSettings.setProjV1Enabled` 不改变有效值、
+ /// 按设计不发重挂通知。
+    @ViewBuilder
+    private var e2eProjV1ToggleTriggerElements: some View {
+        if app.isE2EMode,
+           ProcessInfo.processInfo.environment["DSHM_E2E_PROJV1_TOGGLE"] == "1" {
+            HStack(spacing: 0) {
+                Button {
+                    AppSettings.setProjV1Enabled(false)
+                } label: {
+                    Color.clear
+                }
+                .frame(width: 24, height: 24)
+                .contentShape(Rectangle())
+                .accessibilityIdentifier("e2e-proj-v1-disable-trigger")
+
+                Button {
+                    AppSettings.setProjV1Enabled(true)
+                } label: {
+                    Color.clear
+                }
+                .frame(width: 24, height: 24)
+                .contentShape(Rectangle())
+                .accessibilityIdentifier("e2e-proj-v1-enable-trigger")
+            }
         }
     }
 
@@ -910,7 +997,11 @@ struct SessionDetailView: View {
                     isRunning: isRunningForMessageItems,
                     historyBatchToken: viewModel.historyBatchToken,
                     scrollToBottomToken: scrollToBottomToken,
-                    isFillingHistory: viewModel.historyFillProgress != nil,
+ // 回填中 = 进度条真值 **或** VM 的补历史状态（进度条有 120/300ms
+ // reveal 延迟，仅看 `historyFillProgress` 会让补齐最早一段拿到 false，
+ // 从而在回填期做逐行精确高度测量 = 主线程空档。两者取或，覆盖全程。）
+                    isFillingHistory: viewModel.historyFillProgress != nil
+                        || viewModel.historyFillState == .loading,
                     processGroupModes: processGroupModes,
                     processGroupWindowHeight: processGroupWindowHeight,
                     currentTurnStartSeq: currentTurnStartSeq,
