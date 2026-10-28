@@ -242,10 +242,19 @@ struct SessionDetailView: View {
                 e2eFollowProbeElement
                 e2eLinkDebugElement
                 e2ePathChangeTriggerElement
-                e2eProjV1ToggleTriggerElements
                 projV1MetricsElement
                 projV1HistoryProgressElement
             }
+        }
+ // 协议 v1 回滚开关的 E2E 触发器（AC-09/TC-20/21）：**不进左上角 header 覆盖层**。
+ // 真机基线对照回归（AC-06）：它曾被放进上面的 topLeading VStack，
+ // 两个 24×24 可点击按钮把自定义 header 的 `session-back` 盖住 → 旧套件
+ // `testPushTapSubagentSession` 的 tap 落在触发器上、导航没退栈。这里改到
+ // bottomTrailing 并让 gate 默认关闭（见 `e2eProjV1ToggleTriggerElements`）。
+        .overlay(alignment: .bottomTrailing) {
+            e2eProjV1ToggleTriggerElements
+                .padding(.trailing, 8)
+                .padding(.bottom, 96)
         }
  // 协议 v1 lazy-fetch（契约 §7）：工具结果「显示全部」入口注入单事件取全文。
         .environment(\.lazyFullFetch, LazyFullFetchAction { seq in
@@ -744,16 +753,18 @@ struct SessionDetailView: View {
  /// E2E 隐藏触发器：运行中切换客户端
  /// projV1 回滚开关，验证「无需重启 App，活连接立即按新值生效」（DD-16）。
  ///
- /// 与 `e2ePathChangeTriggerElement` 同款：只在 `DSHM_E2E=1` 下存在，Color.clear
- /// 不渲染也不挡视觉；两个按钮分别对应关/开，测试侧读插件 counters 或
- /// `proj-v1-metrics` 判定是否已回旧 JSON 路径。
+ /// **默认不渲染**：gate = `DSHM_E2E=1` **且** `DSHM_E2E_PROJV1_TOGGLE=1`
+ /// （跨段约定：W3 只在 remount 轮注入后者；legacy 套件/其它 E2E 套件不设 →
+ /// 零新增可点击视图）。位置在 `bottomTrailing`（避开 header 的 `session-back`
+ /// 与 composer 发送键）——不要再挪回左上角覆盖层，见 body 里 AC-06 回归注释。
  ///
  /// 注意：DEBUG env `DSHM_PROJ_V1` 会钉住有效值（优先级高于 UserDefaults），
  /// E2E 该轮不得同时设置它，否则 `AppSettings.setProjV1Enabled` 不改变有效值、
  /// 按设计不发重挂通知。
     @ViewBuilder
     private var e2eProjV1ToggleTriggerElements: some View {
-        if app.isE2EMode {
+        if app.isE2EMode,
+           ProcessInfo.processInfo.environment["DSHM_E2E_PROJV1_TOGGLE"] == "1" {
             HStack(spacing: 0) {
                 Button {
                     AppSettings.setProjV1Enabled(false)
