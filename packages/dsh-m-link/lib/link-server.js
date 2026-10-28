@@ -3477,6 +3477,29 @@ export class LinkServer {
  // here (the channel does not advertise the cap), so it counts nothing.
 
  /**
+ * Unwrap the upstream `session/page` body to the value the phone actually parses.
+ *
+ * The Host answers `/api/session/page` with
+ * `{type:"server-response", result:{ok:true, value:{records,hasMore}}}`, and the
+ * legacy JSON path hands that envelope to the App which unwraps `result.value`
+ * (`P1UnaryMapping.jsonValue` / `ServerResponseEnvelope`). Projection must run on
+ * the SAME value layer — asserting on the raw envelope always fails
+ * (`records is not an array`) and silently forces the whole page back to JSON.
+ * Anything that is not a successful `server-response` is not projectable.
+ *
+ * @param {unknown} body parsed upstream body
+ * @returns {unknown} the `result.value` payload
+ * @throws {Error} when the body is not a successful server-response envelope
+ */
+  projectablePageValue(body) {
+    if (!isPlainObject(body)) throw new Error('session/page body is not a JSON object');
+    if (body.type !== 'server-response') throw new Error('session/page body is not a server-response envelope');
+    const result = isPlainObject(body.result) ? body.result : null;
+    if (result === null || result.ok !== true) throw new Error('session/page envelope result is not ok');
+    return result.value;
+  }
+
+ /**
  * Check a `session/page` body is projectable before the frozen projector runs.
  * contract §2.1/§6(3): every record must be an `event` envelope with a numeric
  * `event.seq`; other shapes have no proven row-shell semantics, so the caller
@@ -3609,7 +3632,8 @@ export class LinkServer {
     }
     const startedAt = performance.now();
     try {
-      const value = JSON.parse(bytes.toString('utf8'));
+      const body = JSON.parse(bytes.toString('utf8'));
+      const value = this.projectablePageValue(body);
       this.assertProjectablePage(value);
  // Contract v1.1: truncation is bound to the client's lazy-fetch capability
  // — the channel only forwards `truncateLongText:true` for a socket that

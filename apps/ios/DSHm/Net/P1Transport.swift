@@ -241,6 +241,19 @@ final class P1Channel {
     private var welcomeContinuation: CheckedContinuation<P1Welcome, Error>?
     private var helloTimeoutTask: Task<Void, Never>?
     private var inboundBeforeWelcome: [String] = []
+ /// welcome 尚未应用时到达/解码完成的 **binary** 帧。
+ ///
+ /// 协商位（`gzip`/`projV1`）只能在 **apply 阶段**按 wire order 校验：welcome 与
+ /// 紧随其后的 `0x01` gzip 帧由 socket 连续投递时，welcome 的 apply 还在解码道/
+ /// main 队列里排队，若在 socket 回调里同步校验就会把已协商的 binary 帧误判为
+ /// 「未协商」→ `violate` → 上层会话级回退 legacy（真机 on 轮实测 6360B gzip 帧
+ /// 触发，projV1 永不生效）。这里把「welcome 应用前」的 binary 帧扣留，welcome
+ /// 应用后按到达顺序重新校验协商位并 apply。上限与文本缓冲一致（8），防异常端刷帧。
+    private var deferredBeforeWelcome: [DeferredInbound] = []
+    private enum DeferredInbound {
+        case frame(P1ServerFrame, rawText: String)
+        case projected(ProjV1Frame)
+    }
     private var hasWelcomed = false
 
  /// Frame decode lane; see `P1InboundDecoding`.
@@ -358,6 +371,7 @@ final class P1Channel {
         lastFailure = nil
         hasWelcomed = false
         inboundBeforeWelcome.removeAll()
+        deferredBeforeWelcome.removeAll()
         replayStats = P1ReplayStats()
         replayTargetSid = nil
         state = .connecting
@@ -859,22 +873,23 @@ final class P1Channel {
  ///
  /// 未协商却收到对应版本的 binary = 协议违规——这是「新 App × 旧插件」错配
  /// 窗口的安全网，走既有 violate 路径关连接，上层 useLegacy 会话级回退。
+ ///
+ /// ⚠️ 真机回归修复：协商校验**不在这里做**（这里是 socket 回调时机，
+ /// 可能早于 welcome 的 apply → 误判违例、整会话回退 legacy）。协商校验与
+ /// 「welcome 前扣留」都下沉到 apply 阶段：`decodeInboundLane` 的
+ /// `requiresGzipNegotiation` 与 `applyProjectedFrameAfterWelcomeCheck`。
+ /// 这里只保留版本分派 + 状态校验（状态在 apply 阶段还会再校验一次）。
     private func handleBinary(_ data: Data) {
         switch data.first {
         case ProjV1Wire.version:
-            guard projV1Negotiated else {
-                violate(P1ProtocolError.violation("未协商 projV1 却收到 0x02 投影帧"))
-                return
-            }
             guard state == .connecting || state == .ready else { return }
             decodeInboundProjectedLane(data)
         case 0x01:
-            guard gzipNegotiated else {
-                violate(P1ProtocolError.violation("未协商 gzip 却收到 binary 帧"))
-                return
-            }
             guard state == .connecting || state == .ready else { return }
-            decodeInboundLane { try P1FrameCodec.inflateBinaryFrame(data) }
+            decodeInboundLane(
+                { try P1FrameCodec.inflateBinaryFrame(data) },
+                requiresGzipNegotiation: true
+            )
         case .some(let version):
             violate(P1ProtocolError.violation("binary 帧版本不支持: \(version)"))
         case .none:
@@ -886,6 +901,9 @@ final class P1Channel {
  ///
  /// gunzip + tagged tree 解码是每帧最重的一段（100 行 ≈ 数百 KB payload），
  /// 必须与文本帧共用同一串行车道（wire order），再回主 actor 按 rpcId 路由。
+ ///
+ /// 协商位校验在 apply 阶段（`applyProjectedFrameAfterWelcomeCheck`），不在
+ /// socket 回调里——否则 welcome 尚未应用时会把已协商帧误判成违例。
     private func decodeInboundProjectedLane(_ data: Data) {
         guard inboundDecoding == .offMain else {
             let frame: ProjV1Frame
@@ -895,7 +913,7 @@ final class P1Channel {
                 violate(error)
                 return
             }
-            applyProjectedFrame(frame)
+            applyProjectedFrameAfterWelcomeCheck(frame)
             return
         }
         guard let source = socket else { return }
@@ -925,7 +943,7 @@ final class P1Channel {
                     guard self.state == .connecting || self.state == .ready else { return }
                     switch decoded {
                     case .success(let frame):
-                        self.applyProjectedFrame(frame)
+                        self.applyProjectedFrameAfterWelcomeCheck(frame)
                     case .failure(let error):
                         self.violate(error)
                     }
@@ -934,13 +952,34 @@ final class P1Channel {
         }
     }
 
+ /// `0x02` 投影帧的 apply 阶段协商校验（见 `handleBinary` 的回归注释）。
+ /// welcome 尚未应用 → 先扣留，welcome 应用后由 `flushDeferredBeforeWelcome` 处理。
+    private func applyProjectedFrameAfterWelcomeCheck(_ frame: ProjV1Frame) {
+        if shouldDeferUntilWelcome() {
+            deferBeforeWelcome(.projected(frame))
+            return
+        }
+        guard projV1Negotiated else {
+            violate(P1ProtocolError.violation("未协商 projV1 却收到 0x02 投影帧"))
+            return
+        }
+        applyProjectedFrame(frame)
+    }
+
  /// Inbound decode lane shared by text frames and (gzip-negotiated) binary
  /// frames. `produceText` runs ON the decode lane
  /// (identity for text; `[0x01][gzip]` → JSON text for binary), so one lane
  /// task per wire frame keeps main-actor application in wire order (serial
  /// queue + FIFO `main.async`) — a binary frame must NOT re-enter
  /// `handleText` from the lane, or the following text frame could overtake it.
-    private func decodeInboundLane(_ produceText: @escaping @Sendable () throws -> String) {
+ ///
+ /// `requiresGzipNegotiation`：binary（`0x01`）车道必须在 **apply 阶段** 校验
+ /// `caps.gzip`（socket 回调时机可能早于 welcome 应用）；inline 与 off-main
+ /// 两条分支都要校验，否则 hosted 单测（inline）与真机（off-main）行为不一致。
+    private func decodeInboundLane(
+        _ produceText: @escaping @Sendable () throws -> String,
+        requiresGzipNegotiation: Bool = false
+    ) {
         guard inboundDecoding == .offMain else {
             let text: String
             do {
@@ -949,7 +988,12 @@ final class P1Channel {
                 violate(error)
                 return
             }
-            decodeAndHandleInline(text)
+            guard let frame = decodeInlineFrame(text) else { return }
+            applyInboundFrame(
+                frame,
+                rawText: text,
+                requiresGzipNegotiation: requiresGzipNegotiation
+            )
             return
         }
         guard let source = socket else { return }
@@ -989,12 +1033,82 @@ final class P1Channel {
                     switch decoded {
                     case .success(let frame):
  // Success implies produceText() completed and rawText was set.
-                        self.applyFrame(frame, rawText: rawText ?? "")
+                        self.applyInboundFrame(
+                            frame,
+                            rawText: rawText ?? "",
+                            requiresGzipNegotiation: requiresGzipNegotiation
+                        )
                     case .failure(let error):
                         self.violate(error)
                     }
                 }
             }
+        }
+    }
+
+ /// 文本车道的 apply 阶段：协商位校验（仅 gzip binary 车道需要）→ 帧分派。
+ /// welcome 尚未应用时先扣留（`deferredBeforeWelcome`），welcome 应用后按序补。
+    private func applyInboundFrame(
+        _ frame: P1ServerFrame,
+        rawText: String,
+        requiresGzipNegotiation: Bool
+    ) {
+        if requiresGzipNegotiation {
+            if shouldDeferUntilWelcome() {
+                deferBeforeWelcome(.frame(frame, rawText: rawText))
+                return
+            }
+            guard gzipNegotiated else {
+                violate(P1ProtocolError.violation("未协商 gzip 却收到 binary 帧"))
+                return
+            }
+        }
+        applyFrame(frame, rawText: rawText)
+    }
+
+ /// welcome 是否尚未应用：此时 binary 的协商位未知，先扣留。
+    private func shouldDeferUntilWelcome() -> Bool {
+        state == .connecting && welcome == nil
+    }
+
+    private func deferBeforeWelcome(_ item: DeferredInbound) {
+        guard deferredBeforeWelcome.count < 8 else {
+            violate(P1ProtocolError.violation("welcome 前收到过多帧"))
+            return
+        }
+        deferredBeforeWelcome.append(item)
+    }
+
+ /// welcome 应用后按到达顺序补处理扣留的 binary 帧（此时协商位已可信）。
+    private func flushDeferredBeforeWelcome() {
+        guard !deferredBeforeWelcome.isEmpty else { return }
+        let pending = deferredBeforeWelcome
+        deferredBeforeWelcome.removeAll()
+        for item in pending {
+            switch item {
+            case .frame(let frame, let rawText):
+                guard gzipNegotiated else {
+                    violate(P1ProtocolError.violation("未协商 gzip 却收到 binary 帧"))
+                    return
+                }
+                applyFrame(frame, rawText: rawText)
+            case .projected(let frame):
+                guard projV1Negotiated else {
+                    violate(P1ProtocolError.violation("未协商 projV1 却收到 0x02 投影帧"))
+                    return
+                }
+                applyProjectedFrame(frame)
+            }
+        }
+    }
+
+ /// 同步解码一帧文本（inline / pre-welcome flush 用）。失败 → violate 并返回 nil。
+    private func decodeInlineFrame(_ text: String) -> P1ServerFrame? {
+        do {
+            return try P1FrameCodec.decodeServerFrame(text, maxBytes: maxFrameBytes)
+        } catch {
+            violate(error)
+            return nil
         }
     }
 
@@ -1006,13 +1120,7 @@ final class P1Channel {
  /// frames — never a history page — so decoding them inline cannot block the
  /// main thread.
     private func decodeAndHandleInline(_ text: String) {
-        let frame: P1ServerFrame
-        do {
-            frame = try P1FrameCodec.decodeServerFrame(text, maxBytes: maxFrameBytes)
-        } catch {
-            violate(error)
-            return
-        }
+        guard let frame = decodeInlineFrame(text) else { return }
         applyFrame(frame, rawText: text)
     }
 
@@ -1074,6 +1182,13 @@ final class P1Channel {
             )
         }
         state = .ready
+ // welcome 已应用、协商位可信：按序补处理 welcome 前扣留的 binary 帧（协议 v1
+ // 回归修复）。放在 resume continuation 之前——这些帧在 wire order 上属于
+ // welcome 之后，`connect()` 返回时它们必须已经应用完（down 序号连续）。
+        flushDeferredBeforeWelcome()
+ // flush 中若帧本身非法（如 down 序号缺口）→ 已 violate 关连接并把 welcome
+ // continuation 以违规错误 resume；这里不再重复 resume/置 ready 视图。
+        guard state == .ready else { return }
         hasWelcomed = true
         let continuation = welcomeContinuation
         welcomeContinuation = nil
