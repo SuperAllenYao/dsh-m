@@ -6,7 +6,7 @@ DSH-m 通过自托管、TLS 证书钉扎的桥接，把 iPhone App **DSH-m** 连
 
 ## 状态
 
-当前版本 **v2.17.0**（2026-10-27）。已交付的能力：
+当前版本 **v2.18.0**（2026-10-29）。已交付的能力：
 
 **导航**
 
@@ -22,6 +22,7 @@ DSH-m 通过自托管、TLS 证书钉扎的桥接，把 iPhone App **DSH-m** 连
 - 连接稳定：首次启动链路就绪即进入；断线自动恢复（单 WSS 传输与断线恢复 `dsh-m/2`、按 origin 复用的 keep-alive 连接池）；待处理卡片在重连时不清空，重连后按事件 ID 幂等重投。
 - 公网访问：在桌面设置页一键部署自托管 relay，部署后进程内激活隧道（无需重载插件）。
 - 网络自适应：配对与连接都自动按当前网络选路径（直连优先、2 秒不通切中继）；连接成功后自动学习 Mac 的最新端点；网络环境变化（Wi-Fi / 蜂窝 / 热点 / Mac 局域网 IP 变更）时自动换路并即时重拨，Wi-Fi↔蜂窝双向切换约 1 秒内恢复连接；同一 Wi-Fi 下冷启动约 1.6s 连上。
+- 下行内容压缩：蜂窝网络下同样的内容传得更快、更省流量；连接冲突时的等待从 1.5 秒缩短到约 0.8 秒，弱网下自动放宽。
 
 **会话与交互**
 
@@ -31,6 +32,7 @@ DSH-m 通过自托管、TLS 证书钉扎的桥接，把 iPhone App **DSH-m** 连
 - 分组「+」一键新建会话并直达；未发送输入自动存草稿，回到该工作区继续；新建的草稿会话固定排在列表顶部，创建后立刻可见（与桌面端一致）；新建空白会话布局与有消息会话一致。
 - 顶栏品牌与版本信息重排：版本号下沉第二行，两行与 logo 等高。
 - 会话详情为一条平铺消息流（对齐 DSH 桌面端）：无 turn 卡片与按轮折叠；推理与工具调用按「过程组」平铺展开——组头显示「N 步 · 运行中 / 已完成」，点一下收起整组，收起/展开时组头停在原位不动；模型思考时思考内容在组内逐字增长（点开可看全文），工具尚未开始先显示「准备运行命令…」；文件变更卡在流尾；每行独立懒加载，下拉加载的新消息立即可见；消息区采用系统级循环复用列表，几千条消息的超长会话也能流畅快速滚动——历史加载进行中快速滑动几乎不掉帧，超长消息整条一次成型，巨型过程组（上百步）展开收起同样顺滑。
+- 大会话的历史加载更快：进入会话即取、边取边显示，下一页提前预取；跨网（蜂窝 / 中继）打开大会话，历史加载从约半分钟降到约 1.3 秒，打开后约 0.4 秒内就能看到内容。
 - 子代理与工具调用视图；子代理入口常驻数量，只有真实运行中才播放边框流光，运行期间新启动的子代理即时计入。
 - 审批与用户提问：底部交互面板强制作答，可向下折叠查看会话输出，右上角状态图标指示这一刻的会话状态（等待审批 / 等待作答 / 进行中 / 出错 / 未开始 / 空闲 / 离线），等待审批或作答时可重新展开底部面板；多题问答一题一页（上一题 / 下一题、进度、单选自动前进、返回保留草稿、跳过与提交校验）；支持锁屏推送直接处理。
 - 统一底部弹层（模型 / 权限 / 子代理 / 文件变更 / 思考 / 工具详情）：从屏幕底部全宽弹出、高度随内容自适应并含底部安全区，按住顶部触摸条下滑即可收起。
@@ -151,7 +153,7 @@ DSH-m connects the iOS app **DSH-m** to your Mac's DSH desktop through a self-ho
 
 ## Status
 
-Current version **v2.17.0** (2026-10-27). What ships today:
+Current version **v2.18.0** (2026-10-29). What ships today:
 
 **Connection and pairing**
 
@@ -160,6 +162,7 @@ Current version **v2.17.0** (2026-10-27). What ships today:
 - Reliable connection: the app enters as soon as the link is ready on first launch; automatic recovery after disconnects (single-WSS transport with resume `dsh-m/2`, per-origin keep-alive connection pooling); pending cards are not cleared on reconnect and are re-delivered idempotently by event ID.
 - Public access: deploy a self-hosted relay with one click from the desktop settings page; the tunnel activates in-process (no plugin reload).
 - Network-aware: after every successful connect the app learns the Mac's current endpoints; when the network environment changes (Wi-Fi / cellular / hotspot / Mac LAN IP change) it automatically picks the fastest reachable path and redials immediately — switching between Wi-Fi and cellular recovers the connection in about a second, and a same-Wi-Fi cold start connects in about 1.6s.
+- Downstream compression: the same content travels faster and uses less data on cellular; waiting on a connection conflict drops from 1.5s to about 0.8s, relaxing automatically on weak networks.
 
 **Sessions and interaction**
 
@@ -169,6 +172,7 @@ Current version **v2.17.0** (2026-10-27). What ships today:
 - The「+」on a group header creates a new session and jumps straight in; unsent input is kept as a draft, and a newly created draft session stays at the top of the list (matching the desktop app). A brand-new empty session lays out like one with messages.
 - Header redesign: the version number sits on a second line level with the logo.
 - The session detail is a single flat message stream (matching the DSH desktop app): no turn cards or per-turn folding; reasoning and tool calls lay out flat inside process groups — the group header shows "N steps · running / done", one tap collapses the group, and collapsing or expanding keeps the header exactly in place. While the model thinks, the thinking text grows word by word inside the group (tap to read it all), and a tool that has not started yet shows "Preparing to run command…". The file-changes card sits at the end of the stream, and every row lazy-loads on its own, so long sessions stay smooth and newly paged-in messages appear immediately.
+- Long sessions load their history faster: content is fetched as you enter and shown progressively, with the next page prefetched; opening a long session across networks (cellular / relay) loads its history in about 1.3s instead of about half a minute, and shows content within about 0.4s.
 - Subagent and tool-call views; the subagent entry keeps a persistent count, plays the border beam only while subagents are actually running, and counts subagents started while the session is open immediately.
 - Approvals and user questions: the bottom interaction panel makes answering mandatory, folds down so you can read the conversation output, and the top-right status icon shows this moment's session state (waiting for approval / waiting for an answer / running / error / not started / idle / offline) while a waiting state re-opens it; multi-question prompts page one question at a time (previous / next, progress, auto-advance for single-select, drafts preserved, skip / submit validation); lock-screen push actions are supported.
 - Unified bottom popups (models / permissions / subagents / file changes / reasoning / tool details): full-width sheets rise from the screen edge, size themselves to their content plus the bottom safe area, and dismiss by dragging the top grabber down.
