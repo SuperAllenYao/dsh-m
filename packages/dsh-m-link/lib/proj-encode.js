@@ -313,6 +313,9 @@ function projectData(event, stats, options) {
       if (content.blocks !== undefined) out.content = content.blocks;
       const source = pick(data.source, SOURCE_KEYS);
       if (source !== undefined) out.source = source;
+ // 契约 §2.2：`data.id` 必须保留——UserBubble.messageId 参与 FlowRow 等值，
+ // 投影路径缺失会让「FlowRow 深度相等」保真门禁失败（独立审查 P2-4）。
+      if (data.id !== undefined) out.id = data.id;
       return out;
     }
     case 'assistant/message': {
@@ -707,6 +710,8 @@ export function buildProjectedPage({ value, rpcId, batch = BATCH_RECORDS, trunca
     });
   } else {
     for (const { index, chunk } of chunks) {
+ // hasMore 同时写在首帧（页面级元信息）与末帧（客户端"末帧才提交 hasMore"
+ // 的强制时机，独立审查 P1-2）：末帧缺失会让半页中断无法区分"还有更早"。
       const header =
         index === 0
           ? {
@@ -719,7 +724,9 @@ export function buildProjectedPage({ value, rpcId, batch = BATCH_RECORDS, trunca
               hasMore,
               batch,
             }
-          : { fmt: FRAME_FORMAT, v: PROJ_VERSION, rpcId, f: index };
+          : index === chunks.length - 1
+            ? { fmt: FRAME_FORMAT, v: PROJ_VERSION, rpcId, f: index, hasMore }
+            : { fmt: FRAME_FORMAT, v: PROJ_VERSION, rpcId, f: index };
       frames.push({ header, chunk });
     }
   }
