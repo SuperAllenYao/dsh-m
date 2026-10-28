@@ -327,4 +327,34 @@ enum AppSettings {
     static func setRemoteProtocolV2(_ enabled: Bool) {
         defaults.set(enabled, forKey: "remoteProtocolV2")
     }
+
+ /// 协议 v1（projV1 投影帧)客户端开关：false 时 `hello.caps`
+ /// 不带 `projV1`，整个 App 会话走旧 JSON 页路径（契约 §8 客户端回滚层）。
+ ///
+ /// 默认 on；优先级：DEBUG `DSHM_PROJ_V1` env 显式 on/off > UserDefaults
+ /// `projV1Enabled` 显式设置 > 默认 on。与 `remoteProtocolV2` 同款三态语义
+ /// （`object(forKey:) == nil` 区分「未设置」与「显式 false」）。
+    static var projV1Enabled: Bool {
+        projV1Resolved()
+    }
+
+ /// 三态解析（纯函数，可单测；测试用独立 suite 注入，不污染真实偏好）。
+    static func projV1Resolved(
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        defaults: UserDefaults = .standard
+    ) -> Bool {
+        #if DEBUG
+        if let raw = environment["DSHM_PROJ_V1"]?.lowercased() {
+            return raw == "1" || raw == "true" || raw == "on"
+        }
+        #endif
+        guard defaults.object(forKey: "projV1Enabled") == nil else {
+            return defaults.bool(forKey: "projV1Enabled")
+        }
+        return true
+    }
+
+    static func setProjV1Enabled(_ enabled: Bool) {
+        defaults.set(enabled, forKey: "projV1Enabled")
+    }
 }

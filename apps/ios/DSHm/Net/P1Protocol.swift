@@ -106,12 +106,29 @@ struct P1Hello: Equatable {
     var client: P1ClientInfo
     var auth: P1Auth
     var resume: P1ResumeCursor?
+ /// 协议 v1：是否在 `caps` 里声明支持 `0x02` 投影帧。false 时
+ /// hello 不带该键（回滚开关 `DSHM_PROJ_V1=0` / UserDefaults `projV1Enabled=false`），
+ /// 插件按「未协商」处理 → 整页旧 JSON（契约 §1/§8）。
+    var wantsProjV1: Bool
+ /// 契约修订 v1.1：`caps.projV1Lazy` —— 客户端实现了 lazy-fetch
+ /// （`SessionViewModel.fetchEventFull(seq:)`）时发 true；插件只有
+ /// `features.projV1TruncateLongText=true` **且** 本 caps 为 true 才截断
+ /// 长文本（否则整页全量，展开入口零网络）。
+    var wantsProjV1Lazy: Bool
 
-    init(client: P1ClientInfo, auth: P1Auth, resume: P1ResumeCursor? = nil) {
+    init(
+        client: P1ClientInfo,
+        auth: P1Auth,
+        resume: P1ResumeCursor? = nil,
+        wantsProjV1: Bool = true,
+        wantsProjV1Lazy: Bool = true
+    ) {
         self.v = P1Proto.version
         self.client = client
         self.auth = auth
         self.resume = resume
+        self.wantsProjV1 = wantsProjV1
+        self.wantsProjV1Lazy = wantsProjV1Lazy
     }
 }
 
@@ -192,6 +209,16 @@ enum P1ClientFrame: Equatable {
         if let ticket = hello.auth.ticket, !ticket.isEmpty { auth["ticket"] = .string(ticket) }
         if let muxToken = hello.auth.muxToken, !muxToken.isEmpty { auth["muxToken"] = .string(muxToken) }
 
+        var caps: [String: JSONValue] = ["gzip": .bool(true)]
+ // 协议 v1：协商 projV1（未知 caps 键双方忽略，前向兼容）。
+ // 契约修订 v1.1：同时声明 lazy-fetch 能力（本 App 已实现
+ // `fetchEventFull(seq:)`，插件据此才允许 `truncateLongText` 截断）。
+        if hello.wantsProjV1 {
+            caps["projV1"] = .bool(true)
+            if hello.wantsProjV1Lazy {
+                caps["projV1Lazy"] = .bool(true)
+            }
+        }
         var object: [String: JSONValue] = [
             "type": .string("hello"),
             "v": .int(Int64(hello.v)),
@@ -200,7 +227,7 @@ enum P1ClientFrame: Equatable {
  // link-perf L3a（DEC-A）：广播下行 gzip 能力；旧插件
  // onHello 忽略未知 caps 键（不 protocolViolation），welcome 不
  // 回显 gzip → App 不预期压缩帧（错配窗口安全网的前提）。
-            "caps": .object(["gzip": .bool(true)]),
+            "caps": .object(caps),
         ]
         if let resume = hello.resume {
             guard !resume.logEpoch.isEmpty else {
@@ -292,6 +319,10 @@ struct P1Caps: Decodable, Equatable {
  /// （nil）——此时 App 不预期压缩帧，收到 binary 帧 = 协议违规（设计
  /// §3-L1 兼容矩阵「新 App × 旧插件」错配行的安全网）。
     var gzip: Bool?
+ /// 协议 v1（projV1）：投影 `0x02` 帧协商位。旧插件/feature 关闭
+ /// 时不回显（nil）→ 等价 false，`session/page` 走旧 JSON 文本结果。只有
+ /// 协商成功后 App 才预期 `0x02` 帧（未协商收到 = 协议违规）。
+    var projV1: Bool?
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
@@ -312,10 +343,11 @@ struct P1Caps: Decodable, Equatable {
         self.maxInFlight = maxInFlight
         self.replayBytes = replayBytes
         self.gzip = try container.decodeIfPresent(Bool.self, forKey: .gzip)
+        self.projV1 = try container.decodeIfPresent(Bool.self, forKey: .projV1)
     }
 
     private enum CodingKeys: String, CodingKey {
-        case unary, resume, maxInFlight, replayBytes, gzip
+        case unary, resume, maxInFlight, replayBytes, gzip, projV1
     }
 }
 
