@@ -355,6 +355,24 @@ enum AppSettings {
     }
 
     static func setProjV1Enabled(_ enabled: Bool) {
+ // DD-16（AC-09/契约 §8 客户端回滚层）：运行中改开关必须让**活连接**立即按
+ // 新值生效，而不是只对新连接生效——写盘后发通知，`LinkService` 观察者做
+ // 一次受控重挂（重新 hello 且不带 caps.projV1）。
+ //
+ // 只在「解析后的有效值」真的变化时发通知：DEBUG env `DSHM_PROJ_V1` 钉住
+ // 取值时改 UserDefaults 不改变行为，不该白付一次重连。
+        let before = projV1Enabled
         defaults.set(enabled, forKey: "projV1Enabled")
+        let after = projV1Enabled
+        guard before != after else { return }
+        NotificationCenter.default.post(
+            name: AppSettings.projV1SettingDidChange,
+            object: nil,
+            userInfo: ["enabled": after]
+        )
     }
+
+ /// projV1 开关有效值变化通知（`userInfo["enabled"]` = 变化后的有效值）。
+ /// 观察者：`LinkService`（DD-16 受控重挂）。
+    static let projV1SettingDidChange = Notification.Name("com.dshm.projV1SettingChanged")
 }

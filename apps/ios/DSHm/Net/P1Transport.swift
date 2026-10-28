@@ -208,7 +208,11 @@ final class P1Channel {
     let maxFrameBytes: Int
  /// 协议 v1：本通道 hello 是否声明 `caps.projV1`（客户端回滚开关
  /// `AppSettings.projV1Enabled`；false 时插件按未协商 = 全量旧 JSON 页）。
-    let wantsProjV1: Bool
+ ///
+ /// DD-16：开关运行中变化时，活连接要**重挂**并按新值重新 hello——重挂复用同一
+ /// 通道对象（保留流表做 resume），所以本值必须可更新（见
+ /// `applyWantsProjV1ForRemount`）；只在没有 hello 在飞时允许改。
+    private(set) var wantsProjV1: Bool
 
     private let socketFactory: SocketFactory
     private var socket: P1Socket?
@@ -403,6 +407,10 @@ final class P1Channel {
 
  /// Closes the socket and fails any in-flight work with `.cancelled`.
  /// Does not fire `onClose` (the caller initiated the teardown).
+ ///
+ /// DD-16：受控重挂复用它关闭旧 socket（流表保留，随后 `connect` 用
+ /// hello{resume} 续上），因此这里**不清流表**——清流表只发生在
+ /// `discardAllStreams`。
     func disconnect(reason: String = "client closed") {
         guard state != .idle else { return }
         let close = socket
@@ -417,6 +425,20 @@ final class P1Channel {
             continuation.resume(throwing: P1Failure.cancelled)
         }
         failPending(.cancelled)
+    }
+
+ /// DD-16（客户端回滚）：重挂前更新本通道下一次 hello 的 `caps.projV1` 意图。
+ ///
+ /// 只允许在没有 hello 在飞时改（`idle`/`closed`）——受控重挂的顺序是
+ /// `disconnect`（关旧 socket、保留流表）→ 本方法 → `connect`（重新 hello）；
+ /// 活连接直接改会让「当前 socket 的协商位」与「已发 hello」不一致。
+ /// 返回是否写入（false = 状态不允许/值未变化，调用方按「下一轮生效」处理）。
+    @discardableResult
+    func applyWantsProjV1ForRemount(_ enabled: Bool) -> Bool {
+        guard state == .idle || state == .closed else { return false }
+        guard wantsProjV1 != enabled else { return false }
+        wantsProjV1 = enabled
+        return true
     }
 
  /// Drops the stream table (live handles plus the re-open descriptors).

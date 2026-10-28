@@ -800,6 +800,9 @@ extension LinkService {
 
  // MARK: - Projected session/page streaming（协议 v1，契约 §4）
 
+ /// 投影页帧间空闲超时上限（契约 DD-11：`min(10s, unary 超时)`）。
+    static let maxProjectedFrameIdleSeconds: TimeInterval = 10
+
  /// 当前 dsh-m/2 连接是否协商成功投影帧（`0x02`）。false = 走既有 JSON 路径
  /// （legacy 通道 / 旧插件 / 插件 feature off / 客户端开关关闭）。
     var projectedHistoryAvailable: Bool {
@@ -830,7 +833,13 @@ extension LinkService {
         args: [String: JSONValue],
         timeout: TimeInterval
     ) async throws -> JSONValue {
-        let stream = try p1.unaryProjected(endpoint: "session/page", args: args, timeout: timeout)
+ // 契约 DD-11：投影页帧间空闲超时 = `min(10s, unary 超时)`。这里的通用 unary
+ // 调用方（lazy-fetch 窄页 timeout 15s、默认 20s）不得把帧间等待放宽到 >10s。
+        let stream = try p1.unaryProjected(
+            endpoint: "session/page",
+            args: args,
+            timeout: min(timeout, Self.maxProjectedFrameIdleSeconds)
+        )
         var rows: [JSONValue] = []
         var hasMore = false
         for try await event in stream.events {

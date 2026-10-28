@@ -242,6 +242,7 @@ struct SessionDetailView: View {
                 e2eFollowProbeElement
                 e2eLinkDebugElement
                 e2ePathChangeTriggerElement
+                e2eProjV1ToggleTriggerElements
                 projV1MetricsElement
                 projV1HistoryProgressElement
             }
@@ -737,6 +738,41 @@ struct SessionDetailView: View {
             .frame(width: 24, height: 24)
             .contentShape(Rectangle())
             .accessibilityIdentifier("e2e-path-change-trigger")
+        }
+    }
+
+ /// E2E 隐藏触发器：运行中切换客户端
+ /// projV1 回滚开关，验证「无需重启 App，活连接立即按新值生效」（DD-16）。
+ ///
+ /// 与 `e2ePathChangeTriggerElement` 同款：只在 `DSHM_E2E=1` 下存在，Color.clear
+ /// 不渲染也不挡视觉；两个按钮分别对应关/开，测试侧读插件 counters 或
+ /// `proj-v1-metrics` 判定是否已回旧 JSON 路径。
+ ///
+ /// 注意：DEBUG env `DSHM_PROJ_V1` 会钉住有效值（优先级高于 UserDefaults），
+ /// E2E 该轮不得同时设置它，否则 `AppSettings.setProjV1Enabled` 不改变有效值、
+ /// 按设计不发重挂通知。
+    @ViewBuilder
+    private var e2eProjV1ToggleTriggerElements: some View {
+        if app.isE2EMode {
+            HStack(spacing: 0) {
+                Button {
+                    AppSettings.setProjV1Enabled(false)
+                } label: {
+                    Color.clear
+                }
+                .frame(width: 24, height: 24)
+                .contentShape(Rectangle())
+                .accessibilityIdentifier("e2e-proj-v1-disable-trigger")
+
+                Button {
+                    AppSettings.setProjV1Enabled(true)
+                } label: {
+                    Color.clear
+                }
+                .frame(width: 24, height: 24)
+                .contentShape(Rectangle())
+                .accessibilityIdentifier("e2e-proj-v1-enable-trigger")
+            }
         }
     }
 

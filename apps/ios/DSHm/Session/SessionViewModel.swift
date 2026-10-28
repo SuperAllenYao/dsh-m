@@ -542,10 +542,18 @@ final class SessionViewModel: ObservableObject {
     private var lazyFullFetchInFlight: Set<Int> = []
     private var lazyFullFetched: Set<Int> = []
 
- /// 7 段客户端埋点（契约 §9）：投影页/帧/回退累计与各段时刻（相对本次补齐起点）。
+ /// 7 段客户端埋点（契约 §9）：投影页/帧/回退累计与各段时刻。
+ ///
+ /// **同一时间轴**：`action`（进入动作）= 0 = `historyFillStartedAt`，其余各段
+ /// 都是相对该起点的毫秒（`projectedElapsedMs()`）。AC-10 要求
+ /// `action ≤ connect ≤ firstByte ≤ firstChunkDecoded ≤ firstPixel ≤
+ /// lastFrame ≤ fullHistory` 且强制 `lastFrame ≤ fullHistory`——所以 `connect`
+ /// 取「连接完成在本时间轴上的位置」（进入动作前已连接 → 0），**不是**连接轮次
+ /// 耗时；轮次耗时另记 `connectMs`（AC-03 证据，口径 = `ConnectionMetrics`）。
     private var projV1PageCount = 0
     private var projV1FrameCount = 0
     private var projV1FallbackPages = 0
+    private var projV1ConnectMs: Int?
     private var projV1FirstByteMs: Int?
     private var projV1FirstChunkDecodedMs: Int?
     private var projV1FirstPixelMs: Int?
@@ -1206,6 +1214,9 @@ final class SessionViewModel: ObservableObject {
  // resumes, which keep the generation on purpose.
                 self.handleLinkPhaseChange(phase)
                 if phase.isConnected {
+ // 7 段埋点 connect：链路在本次详情时间线内才就绪时补记（同一
+ // 时间轴，保证 connect ≤ firstByte）。
+                    self.recordProjV1ConnectIfNeeded()
                     self.maybeFlushQueued()
                     self.resumeHistoryFillAfterReconnect()
                 } else {
@@ -1541,6 +1552,9 @@ final class SessionViewModel: ObservableObject {
         if historyFillStartedAt == nil { historyFillStartedAt = Date() }
         historyFillState = .loading
  // 协议 v1：本次补齐开始即初始化 7 段埋点（mode 等首帧到达后再刷新）。
+ // `beginProjV1MetricsTimelineIfNeeded` 同时把 connect 段定初值：进入动作
+ // 时链路已就绪 → 0；否则等 phase 变 connected 时补记。
+        beginProjV1MetricsTimelineIfNeeded()
         refreshProjV1Metrics()
         syncFillDiagnostics()
         historyFillTask = Task { [weak self] in
@@ -2002,6 +2016,7 @@ final class SessionViewModel: ObservableObject {
                                 sawFirstPixel = true
  // 首帧即可渲染：取消防抖、立即重建（firstPixel 语义）。
                                 rebuildNowForHistoryBatch()
+                                ensureProjV1MetricsStarted()
                                 projV1FirstPixelMs = projectedElapsedMs()
                             }
                             syncFillDiagnostics()
@@ -2043,6 +2058,7 @@ final class SessionViewModel: ObservableObject {
                 : nil
             return applyDecodedHistoryPage(page, pageMainThreadStart: 0, encodedBytes: encodedBytes)
         }
+        ensureProjV1MetricsStarted()
         projV1PageCount += 1
         projV1LastFrameMs = projectedElapsedMs()
         if let minSeq = pageMinSeq {
@@ -2100,6 +2116,9 @@ final class SessionViewModel: ObservableObject {
  /// 已完成 off-main 解码，两段同刻记录——设备侧差异由 transport 的
  /// `p1ProjFrameDecodeBG` 探针单独取证）。
     private func recordProjectedFirstFrame() {
+ // 段赋值前先确保时间线已开始（首次发布时 `ensureProjV1MetricsStarted`
+ // 会清空各段，顺序错了会把刚记下的段清掉）。
+        ensureProjV1MetricsStarted()
         let ms = projectedElapsedMs()
         if projV1FirstByteMs == nil { projV1FirstByteMs = ms }
         if projV1FirstChunkDecodedMs == nil { projV1FirstChunkDecodedMs = ms }
@@ -2194,8 +2213,13 @@ final class SessionViewModel: ObservableObject {
         var fields: [String] = []
         fields.append("\"mode\":\"\(projV1FrameCount > 0 ? "projv1" : "json")\"")
         fields.append("\"action\":0")
-        if let connect = ConnectionMetrics.lastConnectMilliseconds {
-            fields.append("\"connect\":\(connect)")
+ // 7 段：connect = 连接完成在本时间轴上的位置（进入动作前已连接 → 0），
+ // 保证 action ≤ connect ≤ firstByte。轮次耗时单独给 connectMs（AC-03 证据，
+ // 口径同 `ConnectionMetrics`），两者不可混用——用轮次耗时会让「App 先连上、
+ // 再进详情」的常见路径出现 connect > firstByte 的假逆序。
+        if let connect = projV1ConnectMs { fields.append("\"connect\":\(connect)") }
+        if let connectMs = ConnectionMetrics.lastConnectMilliseconds {
+            fields.append("\"connectMs\":\(connectMs)")
         }
         if let value = projV1FirstByteMs { fields.append("\"firstByte\":\(value)") }
         if let value = projV1FirstChunkDecodedMs { fields.append("\"firstChunkDecoded\":\(value)") }
@@ -2209,18 +2233,23 @@ final class SessionViewModel: ObservableObject {
         fields.append("\"oldestSeq\":\(journal.oldestSeq ?? -1)")
         fields.append("\"rows\":\(flow.rows.count)")
         projV1MetricsValue = "{" + fields.joined(separator: ",") + "}"
- // 跨段约定（W3 E2E 读取）：oldSeq/hasMoreOlder/full。
+ // 跨段约定（W3 E2E 读取）：oldestSeq/hasMoreOlder/full。
         projV1HistoryProgressValue = "oldestSeq=\(journal.oldestSeq ?? -1)"
             + ";hasMoreOlder=\(journal.hasMoreOlder ? 1 : 0)"
             + ";full=\(historyFillState == .completed ? 1 : 0)"
     }
 
  /// 一次详情加载的 7 段计数在首次发布时从零开始（进入动作 = 此刻）。
+ ///
+ /// 注意调用顺序：它会在「尚未发布」时清空各段，所以**任何段赋值之前**必须
+ /// 先调用（`refreshProjV1Metrics` / `beginProjV1MetricsTimelineIfNeeded` /
+ /// 各段记录函数入口都有调用）——否则首次发布会把刚记下的段清掉。
     private func ensureProjV1MetricsStarted() {
         if projV1MetricsValue == nil {
             projV1PageCount = 0
             projV1FrameCount = 0
             projV1FallbackPages = 0
+            projV1ConnectMs = nil
             projV1FirstByteMs = nil
             projV1FirstChunkDecodedMs = nil
             projV1FirstPixelMs = nil
@@ -2229,10 +2258,33 @@ final class SessionViewModel: ObservableObject {
         }
     }
 
+ /// 时间线起点（= 进入动作）：初始化 7 段并记录 connect 的初值。
+ /// 进入动作时链路已就绪 → connect = 0（连接在本轮之前完成）；否则留空，
+ /// 等 `recordProjV1ConnectIfNeeded()` 在 phase 变为 connected 时补（缺就缺，
+ /// 不伪造）。
+    private func beginProjV1MetricsTimelineIfNeeded() {
+        guard Self.projV1MetricsEnabled else { return }
+        ensureProjV1MetricsStarted()
+        guard projV1ConnectMs == nil, link?.phase.isConnected == true else { return }
+        projV1ConnectMs = 0
+    }
+
+ /// 链路就绪时补记 connect 段（同一时间轴）。只在本次详情时间线已开始后记录。
+    private func recordProjV1ConnectIfNeeded() {
+        guard Self.projV1MetricsEnabled, projV1MetricsValue != nil else { return }
+        guard projV1ConnectMs == nil, link?.phase.isConnected == true else { return }
+        projV1ConnectMs = projectedElapsedMs()
+        refreshProjV1Metrics()
+    }
+
     private func markHistoryFillCompleted() {
         guard historyFillState != .completed else { return }
         historyFillState = .completed
         historyFillCompletedAt = Date()
+ // 7 段时间线：先确保时间线已开始（首次发布的 reset 不得吃掉紧接着要写的
+ // 段；无更早历史的路径会直接走到这里，跳过 `startHistoryFillIfPossible`
+ // 的初始化）。
+        beginProjV1MetricsTimelineIfNeeded()
         if let started = historyFillStartedAt {
             let milliseconds = Date().timeIntervalSince(started) * 1000
             DetailMetrics.markHistoryFillCompleted(
@@ -2249,7 +2301,9 @@ final class SessionViewModel: ObservableObject {
             "oldest": journal.oldestSeq ?? -1,
         ])
  // 协议 v1 7 段埋点：fullHistory = 全量历史完成时刻（相对补齐起点）。
-        projV1FullHistoryMs = projectedElapsedMs()
+ // 强制 lastFrame ≤ fullHistory（AC-10）：同一单调钟下本该自然成立，显式夹紧
+ // 防「末帧段取点晚于完成判定」的取值错误。
+        projV1FullHistoryMs = max(projectedElapsedMs(), projV1LastFrameMs ?? 0)
         refreshProjV1Metrics()
         historyFillTask?.cancel()
         historyFillTask = nil
