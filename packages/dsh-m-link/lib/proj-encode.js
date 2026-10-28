@@ -25,7 +25,21 @@ export const GZIP_LEVEL = 6;
 /** 截断模式阈值（仅 features.projV1TruncateLongText=true 时生效，默认关闭）。 */
 export const TRUNCATE_LIMITS = Object.freeze({ textLines: 60, metaLines: 120, diffLines: 40 });
 
-/** 已确知的隐藏/忽略事件类型：data 丢弃但**不**计入 unknownTypes（属预期内）。 */
+/**
+ * legacy 别名：历史日志/旧实现里出现、但**不在** Host 权威词表（62 类）中的类型。
+ * 运行期行为与 ignored 等价（行壳保留、data 丢弃、不计 unknown）；单独登记是为了
+ * 让分类快照（`host-event-vocabulary.json`）能区分「词表内隐藏」与「词表外别名」。
+ */
+export const LEGACY_ALIAS_TYPES = Object.freeze([
+  'request/header-encoded',
+  'session-log-deepseek/*',
+]);
+
+/**
+ * 已确知的隐藏/忽略事件类型：data 丢弃但**不**计入 unknownTypes（属预期内）。
+ * Host 权威词表 62 类中的 42 类（20 projected + 42 known-ignored = 62；AC-14 / DD-15
+ * 快照守卫按此校验，schema 漂移必须由守卫测试报警）。
+ */
 export const KNOWN_IGNORED_TYPES = Object.freeze([
   'developer/message',
   'request/header',
@@ -58,8 +72,18 @@ export const KNOWN_IGNORED_TYPES = Object.freeze([
   'team/member',
   'subagent/catalog',
   'subagent/model-selection-policy',
-  'session-log-deepseek/*',
-  'request/header-encoded',
+ // AC-14 补齐：Host 62 类词表中此前未分类的 11 类。
+  'feedback/message-delete',
+  'feedback/message-put',
+  'feedback/record',
+  'hook/invoked',
+  'hook/result',
+  'image/offload',
+  'plan/mode',
+  'schedule/change',
+  'subagent/descriptor',
+  'team/message/delivered',
+  'team/message/queued',
 ]);
 
 /** data 字段被投影保留的事件类型（其余类型只出行壳）。 */
@@ -86,8 +110,55 @@ export const PROJECTED_TYPES = Object.freeze([
   'workspace/changes',
 ]);
 
-const KNOWN_IGNORED = new Set(KNOWN_IGNORED_TYPES);
+/**
+ * 投影行 data 顶层键白名单（按 event.type，契约 §2.2）。
+ * 单一事实来源：守卫测试用它做「App 消费键 ⊆ 白名单」与「白名单 ↔ 投影实现」
+ * 的双向绑定；嵌套键（content[]/message/meta/source/reason/goal/files/todos/
+ * job.toolCall 的存在性）由投影实现控制，meta 子键见 `META_KEYS`。
+ */
+export const PROJECTED_DATA_KEYS = Object.freeze({
+  'user/message': Object.freeze(['content', 'source', 'id']),
+  'assistant/message': Object.freeze(['turn', 'message']),
+  'tool/call': Object.freeze(['callId', 'name', 'turn', 'step', 'arguments']),
+  'tool/result': Object.freeze(['turn', 'name', 'toolCallId', 'callId', 'message', 'meta']),
+  'tool/ptc-dispatch-start': Object.freeze(['subCallId', 'parentCallId', 'name', 'arguments', 'turn']),
+  'tool/ptc-dispatch': Object.freeze(['subCallId', 'parentCallId', 'turn', 'isError', 'content', 'meta']),
+  'turn/start': Object.freeze(['turn']),
+  'turn/end': Object.freeze(['turn', 'reason']),
+  'approval/asked': Object.freeze(['id', 'toolName', 'reason']),
+  'approval/decided': Object.freeze(['id', 'outcome']),
+  'todo/write': Object.freeze(['todos']),
+  'goal/change': Object.freeze(['goal']),
+  'deliverables/presented': Object.freeze(['files']),
+  'command/run': Object.freeze(['name']),
+  'command/done': Object.freeze(['text']),
+  'job/registered': Object.freeze(['jobId', 'kind', 'label', 'startedAt', 'toolCall']),
+  'job/settled': Object.freeze(['jobId', 'status', 'finishedAt', 'toolCall']),
+  'approval/policy': Object.freeze(['policy']),
+  'sandbox/mode': Object.freeze(['mode']),
+  'workspace/changes': Object.freeze([]),
+});
+
+const KNOWN_IGNORED = new Set([...KNOWN_IGNORED_TYPES, ...LEGACY_ALIAS_TYPES]);
+const LEGACY_ALIAS = new Set(LEGACY_ALIAS_TYPES);
 const PROJECTED = new Set(PROJECTED_TYPES);
+
+/**
+ * 投影分类器（AC-14 / TC-30 守卫测试入口），与 `projectRecord` 的运行期判定一致：
+ * - `'projected'`：data 按白名单投影（`PROJECTED_TYPES`）；
+ * - `'ignored'`：行壳保留、data 丢弃、不计 unknown（`KNOWN_IGNORED_TYPES`）；
+ * - `'legacy'`：Host 词表外的历史别名，运行期按 ignored 处理（`LEGACY_ALIAS_TYPES`）；
+ * - `'unknown'`：未登记类型 → 行壳 + `stats.unknownTypes` 计数。
+ * @param {unknown} type
+ * @returns {'projected'|'ignored'|'legacy'|'unknown'}
+ */
+export function classifyEventType(type) {
+  if (typeof type !== 'string') return 'unknown';
+  if (PROJECTED.has(type)) return 'projected';
+  if (LEGACY_ALIAS.has(type)) return 'legacy';
+  if (KNOWN_IGNORED.has(type)) return 'ignored';
+  return 'unknown';
+}
 
 /** meta 白名单：值原样保留（7 处全文中的 lines/diffs 在此）。 */
 export const META_KEYS = Object.freeze([

@@ -211,10 +211,11 @@ const DEFAULTS = {
     muxGzipThresholdBytes: P1_LIMITS.gzipThresholdBytes,
  // B (protocol v1, <internal-doc>): project
  // every successful `session/page` into seq-desc `0x02` binary frames when the
- // phone negotiates it with `hello.caps.projV1`. DEFAULT OFF is the rollback
- // switch: with it off the welcome never echoes the capability and the page
- // path stays byte-identical JSON (contract §8).
-    projV1: false,
+ // phone negotiates it with `hello.caps.projV1`. DEFAULT ON (decision
+ // DEC-03: a plugin restart ships it); `false` is the emergency rollback
+ // switch only — with it off the welcome never echoes the capability and the
+ // page path stays byte-identical JSON (contract §8).
+    projV1: true,
  // Truncate/lazy-fetch mode: long tool output, `meta.lines` and `meta.diffs`
  // are shortened and flagged with `tr` so the App can fetch the single event
  // on demand. DEFAULT OFF (contract §0 text invariant: full text by default).
