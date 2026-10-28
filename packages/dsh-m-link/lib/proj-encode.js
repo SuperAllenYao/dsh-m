@@ -29,6 +29,11 @@ export const TRUNCATE_LIMITS = Object.freeze({ textLines: 60, metaLines: 120, di
  * legacy 别名：历史日志/旧实现里出现、但**不在** Host 权威词表（62 类）中的类型。
  * 运行期行为与 ignored 等价（行壳保留、data 丢弃、不计 unknown）；单独登记是为了
  * 让分类快照（`host-event-vocabulary.json`）能区分「词表内隐藏」与「词表外别名」。
+ *
+ * - `request/header-encoded`：历史日志里真实出现过的**精确类型名**（运行期按精确匹配处理）；
+ * - `session-log-deepseek/*`：**词表模式**，不是 glob——不做前缀/通配展开匹配，真实类型
+ * `session-log-deepseek/delivery-accepted` 已单独登记在 `KNOWN_IGNORED_TYPES`（词表 62 类内）。
+ * 该字面量只作快照口径映射保留，不参与运行期匹配，因此不改变 droppedTypes/unknownTypes。
  */
 export const LEGACY_ALIAS_TYPES = Object.freeze([
   'request/header-encoded',
@@ -506,10 +511,15 @@ function projectData(event, stats, options) {
       return pick(data, ['name']) ?? {};
     case 'command/done':
       return pick(data, ['text']) ?? {};
-    case 'job/registered':
-    case 'job/settled': {
-      const out = pick(data, ['jobId', 'kind', 'label', 'startedAt', 'status', 'finishedAt']) ?? {};
+    case 'job/registered': {
+      const out = pick(data, ['jobId', 'kind', 'label', 'startedAt']) ?? {};
  // 存在性语义：App 用 `data?["toolCall"]!= nil` 去重，值本身不读。
+      if (Object.prototype.hasOwnProperty.call(data, 'toolCall')) out.toolCall = {};
+      return out;
+    }
+    case 'job/settled': {
+ // 与 job/registered 分列（独立审查 B-2）：共用 pick 列表会把对方类型的键静默投影出去。
+      const out = pick(data, ['jobId', 'status', 'finishedAt']) ?? {};
       if (Object.prototype.hasOwnProperty.call(data, 'toolCall')) out.toolCall = {};
       return out;
     }

@@ -836,6 +836,12 @@ final class LinkService: ObservableObject {
         p1LostAt = nil
  // link-perf L2/L1：重新配对 = 全新能力语境，冷启动探测与
  // 409 保守升级状态一并复位（新插件/新窗口值立即重学）。
+ //
+ // B-1（审查阻断）：复位「已探测」标记之前必须**取消在飞探测**——否则
+ // 旧探测（快照是上一台设备/上一套凭据）会在 ≤0.5s 后落地并写回，把刚
+ // adopt 的新凭据顶掉（配对语义损坏 / 需二次扫码）。取消会推进探测代次，
+ // 写回处还有代次 + deviceId 双重校验兜底。
+        cancelColdStartCapabilityProbe()
         p1ColdStartProbeConsumed = false
         sessionTakeoverWindowObserved = false
         sessionTakeoverWindowMs = nil
@@ -2002,7 +2008,11 @@ final class LinkService: ObservableObject {
     func probeP1CapabilityIfColdStart(primaryOrigin: URL?) async {
         guard !p1ColdStartProbeConsumed else { return }
         p1ColdStartProbeConsumed = true
-        await performColdStartCapabilityProbe(primaryOrigin: primaryOrigin)
+        coldProbeGeneration += 1
+        await performColdStartCapabilityProbe(
+            primaryOrigin: primaryOrigin,
+            generation: coldProbeGeneration
+        )
     }
 
  /// D 段（连接清理）：并行启动冷启能力探测（不 await、不占关键
@@ -2023,7 +2033,10 @@ final class LinkService: ObservableObject {
         coldProbeGeneration += 1
         let generation = coldProbeGeneration
         let task = Task { [weak self] in
-            await self?.performColdStartCapabilityProbe(primaryOrigin: primaryOrigin)
+            await self?.performColdStartCapabilityProbe(
+                primaryOrigin: primaryOrigin,
+                generation: generation
+            )
             guard let self, self.coldProbeGeneration == generation else { return }
             self.coldProbeTask = nil
         }
@@ -2032,6 +2045,11 @@ final class LinkService: ObservableObject {
     }
 
  /// 取消在飞的冷启能力探测（登出/解绑/重新配对时调用，避免结果写回旧凭据语境）。
+ ///
+ /// 注意：`cancel()` 只是协作式的——`HTTPSClient.json` 的
+ /// `withCheckedThrowingContinuation` **不感知取消**，探测仍会跑完（≤0.5s）。
+ /// 所以「不写回旧凭据」不靠取消本身，而靠 `performColdStartCapabilityProbe`
+ /// 写回前的三重校验（未取消 + 代次未变 + 仍是同一台设备；见 B-1 修复）。
     private func cancelColdStartCapabilityProbe() {
         coldProbeGeneration += 1
         coldProbeTask?.cancel()
@@ -2039,8 +2057,13 @@ final class LinkService: ObservableObject {
     }
 
  /// 冷启能力探测的实际工作（/health 取数 + 能力/窗口写回）。
-    private func performColdStartCapabilityProbe(primaryOrigin: URL?) async {
-        guard var current = credentials else { return }
+ ///
+ /// B-1（审查阻断）：`generation` = 发起时的探测代次。`await` 期间可能发生
+ /// 解绑/重新配对/切设备，而 /health 请求不感知取消 → 必须在**任何写回之前**
+ /// 校验「本次结果仍属于当前凭据语境」，否则会用旧快照覆盖/复活已删已换的
+ /// 凭据（`PairingCredentials` 含 origin/deviceId/credential/ticket）。
+    private func performColdStartCapabilityProbe(primaryOrigin: URL?, generation: Int) async {
+        guard let current = credentials else { return }
  // 主候选优先；无候选时退回持久化的 origin（旧调用语义）。
         guard let origin = primaryOrigin ?? current.originURL else { return }
         linkDebug("cold-probe: target=" + (origin.host ?? "?"))
@@ -2067,20 +2090,40 @@ final class LinkService: ObservableObject {
                 throw LinkError.httpStatus(status, "cold-probe /health")
             }
             let capabilities = Self.p1HealthCapabilities(from: json)
+ // B-1（审查阻断）：await 期间可能已解绑/重新配对/切设备，而 /health
+ // 请求不感知 Task 取消（`withCheckedThrowingContinuation`）。写回前
+ // 三重校验，任一不满足就整份丢弃——否则旧凭据快照会覆盖（或复活）
+ // 已删/已换的凭据：解绑后静默复活旧配对、重新配对后被旧快照顶掉
+ // （需二次扫码，触 AC-12）。这也是 `cancelColdStartCapabilityProbe`
+ // 注释里承诺的「结果不得写回已失效的凭据语境」的真正落点。
+            guard !Task.isCancelled,
+                  coldProbeGeneration == generation,
+                  let latest = credentials,
+                  latest.deviceId == current.deviceId else {
+                linkDebug("cold-probe: 结果已过期（取消/代次变化/凭据已换），整份丢弃不写回")
+                return
+            }
  // 本周期观测结论（对齐优先级高于 credentials 缓存）：旧插件无字段
  // = 观测到「无窗口」，缓存同步清空（存 nil，设计变更二审拍板）。
             sessionTakeoverWindowObserved = true
             sessionTakeoverWindowMs = capabilities.takeoverWindowMs
  // 能力与窗口写回（存量设备升 P1 的 F3 路径 + 下一周期缓存）。
-            guard current.supportsMuxRPC != capabilities.supportsMuxRPC
-                || current.takeoverWindowMs != capabilities.takeoverWindowMs else { return }
-            current.supportsMuxRPC = capabilities.supportsMuxRPC
-            current.takeoverWindowMs = capabilities.takeoverWindowMs
-            credentials = current
+ //
+ // 实施段（B-1 同一根因的另一面）：写回基准必须是**当前**
+ // 凭据 `latest`，而不是探测起点快照——`await` 期间同一轮握手可能刚
+ // 写入了轮换后的 connectTickets / p1Epoch / p1Sid、或已升 P1；拿旧
+ // 快照 `current` 整体覆盖会把这些一并冲掉（丢 resume 游标/复用已删
+ // ticket）。这里只把「能力位 + 接管窗口」合并进最新凭据。
+            guard latest.supportsMuxRPC != capabilities.supportsMuxRPC
+                || latest.takeoverWindowMs != capabilities.takeoverWindowMs else { return }
+            var updated = latest
+            updated.supportsMuxRPC = capabilities.supportsMuxRPC
+            updated.takeoverWindowMs = capabilities.takeoverWindowMs
+            credentials = updated
             if let persist = p1ColdStartProbePersist {
-                persist(current)
+                persist(updated)
             } else {
-                try? store.save(current)
+                try? store.save(updated)
             }
             linkDebug(
                 "cold-probe: supportsMuxRPC=" + (capabilities.supportsMuxRPC ? "1" : "0")

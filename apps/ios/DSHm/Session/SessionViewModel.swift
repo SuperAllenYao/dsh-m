@@ -553,6 +553,12 @@ final class SessionViewModel: ObservableObject {
     private var projV1PageCount = 0
     private var projV1FrameCount = 0
     private var projV1FallbackPages = 0
+ /// 契约 §9 要求的失败诊断计数（DD-11 失败分支必须可观测）：
+ /// - `projV1FrameTimeouts`：帧间空闲超时次数（`min(10s, unary 超时)`）；
+ /// - `projV1PartialPageRetries`：页未收齐（含超时/中断/解码失败）导致按新
+ /// beforeSeq 重取的次数。二者可同时自增（超时导致的半页重取是典型情况）。
+    private var projV1FrameTimeouts = 0
+    private var projV1PartialPageRetries = 0
     private var projV1ConnectMs: Int?
     private var projV1FirstByteMs: Int?
     private var projV1FirstChunkDecodedMs: Int?
@@ -568,9 +574,19 @@ final class SessionViewModel: ObservableObject {
  /// E2E/指标 gate（沿用既有 AppModel/ConnectionMetrics 口径）：只有该 gate 下
  /// 才挂隐藏可访问元素 `proj-v1-metrics` / `proj-v1-history-progress`。
     static var projV1MetricsEnabled: Bool {
+        #if DEBUG
+ // hosted 单测无法改进程环境变量：允许测试用 seam 直接打开 gate（只影响
+ // Debug 构建；Release/E2E 仍只看环境变量）。
+        if let override = projV1MetricsTestOverride { return override }
+        #endif
         let env = ProcessInfo.processInfo.environment
         return env["DSHM_E2E"] == "1" || env["DSHM_STARTUP_METRICS"] == "1"
     }
+
+    #if DEBUG
+ /// 单测 seam：强制开关 `proj-v1-metrics` gate（nil = 按环境变量）。
+    static var projV1MetricsTestOverride: Bool?
+    #endif
 
  /// E2E 隐藏元素 `proj-v1-metrics` 的单行 JSON（nil = 非 gate/无数据）。
  /// 字段口径见 Lead 跨段约定与契约 §9：mode/action/connect/firstByte/
@@ -2043,9 +2059,14 @@ final class SessionViewModel: ObservableObject {
             dbg("projected history page interrupted: " + failure.userMessage)
             if Task.isCancelled { return .cancelled }
  // 未收齐的页按失败处理（不得当成功）；已前插帧保留，续传去重。
+ // 契约 §9：帧间超时（DD-11 `min(10s, unary 超时)`）与「未收齐即重取」
+ // 都是必须可观测的失败诊断计数。
+            noteProjectedPageFailure(failure)
             return .retryTransient
         } catch {
             dbg("projected history page failed: " + NetworkErrorInterpreter.message(for: error))
+ // 解码/未知错误导致页未收齐 → 同样计入半页重取。
+            noteProjectedPageInterrupted()
             return .retryTransient
         }
  // MARK: 流正常结束（收齐全部帧或 header-only 空页）
@@ -2210,6 +2231,15 @@ final class SessionViewModel: ObservableObject {
     private func refreshProjV1Metrics() {
         guard Self.projV1MetricsEnabled else { return }
         ensureProjV1MetricsStarted()
+        publishProjV1Metrics()
+    }
+
+ /// 组装并发布 `proj-v1-metrics` 单行 JSON / `proj-v1-history-progress`。
+ ///
+ /// **不**重置计数（重置只在 `ensureProjV1MetricsStarted()` 里、且只对尚未发布
+ /// 的时间线生效）——先记计数再发布时必须走这里，否则 refresh 内部的首次
+ /// ensure 会把刚记下的值清掉（失败诊断计数就在这种路径上）。
+    private func publishProjV1Metrics() {
         var fields: [String] = []
         fields.append("\"mode\":\"\(projV1FrameCount > 0 ? "projv1" : "json")\"")
         fields.append("\"action\":0")
@@ -2232,6 +2262,9 @@ final class SessionViewModel: ObservableObject {
         fields.append("\"events\":\(journal.events.count)")
         fields.append("\"oldestSeq\":\(journal.oldestSeq ?? -1)")
         fields.append("\"rows\":\(flow.rows.count)")
+ // 契约 §9 失败诊断计数（追加字段；既有字段名/顺序不动）。
+        fields.append("\"projFrameTimeouts\":\(projV1FrameTimeouts)")
+        fields.append("\"projPartialPageRetries\":\(projV1PartialPageRetries)")
         projV1MetricsValue = "{" + fields.joined(separator: ",") + "}"
  // 跨段约定（W3 E2E 读取）：oldestSeq/hasMoreOlder/full。
         projV1HistoryProgressValue = "oldestSeq=\(journal.oldestSeq ?? -1)"
@@ -2249,6 +2282,8 @@ final class SessionViewModel: ObservableObject {
             projV1PageCount = 0
             projV1FrameCount = 0
             projV1FallbackPages = 0
+            projV1FrameTimeouts = 0
+            projV1PartialPageRetries = 0
             projV1ConnectMs = nil
             projV1FirstByteMs = nil
             projV1FirstChunkDecodedMs = nil
@@ -2257,6 +2292,51 @@ final class SessionViewModel: ObservableObject {
             projV1FullHistoryMs = nil
         }
     }
+
+ /// 投影页失败诊断计数（契约 §9 / DD-11）：`frameTimeouts` 只对帧间空闲超时
+ /// 自增；`partialPageRetries` 对「页未收齐即按新 beforeSeq 重取」自增（超时导致
+ /// 的半页重取两者都加——这是 DD-11 的典型失败路径）。
+    private func noteProjectedPageFailure(_ failure: P1Failure) {
+        recordProjV1PageFailure(
+            frameTimeout: Self.isFrameTimeout(failure),
+            partialPageRetry: true
+        )
+    }
+
+ /// 非 `P1Failure` 的中断（解码/未知错误）：同样属于「页未收齐即重取」。
+    private func noteProjectedPageInterrupted() {
+        recordProjV1PageFailure(frameTimeout: false, partialPageRetry: true)
+    }
+
+    private func recordProjV1PageFailure(frameTimeout: Bool, partialPageRetry: Bool) {
+        guard Self.projV1MetricsEnabled else { return }
+ // 顺序：先确保时间线已开始（首次会清零），再记计数，最后发布——发布走
+ // `publishProjV1Metrics()`（不重置），否则 refresh 内的 ensure 会清掉刚记的值。
+        ensureProjV1MetricsStarted()
+        if frameTimeout { projV1FrameTimeouts += 1 }
+        if partialPageRetry { projV1PartialPageRetries += 1 }
+        publishProjV1Metrics()
+    }
+
+ /// 纯函数（单测覆盖）：帧间超时判定——`P1Failure.timeout` 即
+ /// `P1ProjectedRequest` 的帧空闲超时（`P1Transport.armProjectedTimeout`）。
+    nonisolated static func isFrameTimeout(_ failure: P1Failure) -> Bool {
+        if case .timeout = failure { return true }
+        return false
+    }
+
+    #if DEBUG
+ /// 单测 seam：注入一次「投影页失败」，验证契约 §9 失败诊断计数确实进入
+ /// `proj-v1-metrics` JSON（hosted 单测造真实 10s 帧超时太慢）。
+    func noteProjectedPageFailureForTesting(_ failure: P1Failure) {
+        noteProjectedPageFailure(failure)
+    }
+
+ /// 单测 seam：注入一次非 `P1Failure` 的页中断（半页重取计数）。
+    func noteProjectedPageInterruptedForTesting() {
+        noteProjectedPageInterrupted()
+    }
+    #endif
 
  /// 时间线起点（= 进入动作）：初始化 7 段并记录 connect 的初值。
  /// 进入动作时链路已就绪 → connect = 0（连接在本轮之前完成）；否则留空，
