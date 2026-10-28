@@ -538,6 +538,13 @@ enum ConnectionMetrics {
         return "connectMs=\(milliseconds(connectedAt));candidateMs=\(milliseconds(candidateAt));authMs=\(milliseconds(authAt));wsMs=\(milliseconds(wsAt));readyMs=\(milliseconds(readyAt));host=\(firstHost ?? "-");relayFirst=\(relayFirst ? 1 : 0);beginEpochMs=\(beginEpochMs ?? -1);proto=\(proto);authMode=\(authMode);resumeMode=\(resumeMode);fallbackLegacy=\(fallbackLegacy ? 1 : 0)"
     }
 
+ /// 最近一轮「连接完成」耗时（ms，与 `connectMs` 同口径）。详情页 7 段埋点
+ /// （`proj-v1-metrics` 的 `connect` 段）复用；未启用/本轮未连接时 nil。
+    static var lastConnectMilliseconds: Int? {
+        guard isEnabled, let startedAt, let connectedAt else { return nil }
+        return max(0, Int((connectedAt - startedAt) * 1000))
+    }
+
     static func reset() {
         startedAt = nil
         beginEpochMs = nil

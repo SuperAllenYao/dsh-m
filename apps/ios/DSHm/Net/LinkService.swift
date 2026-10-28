@@ -150,7 +150,9 @@ final class LinkService: ObservableObject {
             headers: [:],
             connectTimeout: connectTimeout,
             clientInfo: P1ClientInfo(name: "dsh-m-ios", version: Self.appVersion),
-            helloTimeout: P1ProtocolLimits.helloTimeout
+            helloTimeout: P1ProtocolLimits.helloTimeout,
+ // 协议 v1：hello.caps.projV1 跟随客户端回滚开关。
+            wantsProjV1: AppSettings.projV1Enabled
         )
     }
  /// True while the first reconnect after a resumable socket loss runs
@@ -164,6 +166,9 @@ final class LinkService: ObservableObject {
  /// 每周期都要重读 takeoverWindowMs 并探测插件回退，否则持久化的 true 会让
  /// 桌面端重启后的新窗口值永远读不到）；重连/网络切换轮次绝不探测。
  /// 409 保守升级会重置一次（见 `muxConflictAlignEscalated`）。
+ ///
+ /// D 段：探测从「首拨前串行 await」改成「本轮起点并行启动」，
+ /// 不再占冷启关键路径的 500ms（见 `startColdStartCapabilityProbe`）。
     private var p1ColdStartProbeConsumed = false
  /// 本周期 /health 观测到的接管窗口：nil = 无有效观测值（探测未跑/失败，
  /// 或旧插件无字段——后者同时清空 credentials 缓存）。
@@ -1382,10 +1387,20 @@ final class LinkService: ObservableObject {
             local: localNetwork,
             pathChanged: pathChanged
         )
- // P1 能力探测（设计 §3-L2）：打**主候选**（按当前网络排序后的首个 origin；
- // 跨网冷启动时陈旧 LAN/relay 地址候选可能不可达——打错 origin 会白付
- // 500ms 且本周期窗口值刷新失败）。单个 origin、不遍历、有界。
-        await probeP1CapabilityIfColdStart(primaryOrigin: orderedCandidates.first)
+ // D 段（连接清理）：冷启 P1 能力探测不再串行挡在首次拨号之前。
+ // 旧实现（v2.17）在本 App 周期首个连接轮次先 `await` 一次 ≤500ms 的
+ // /health 再拨号——冷启白付一个 RTT（HANDOFF §4.D H4：删掉后 ≈0.5s）。
+ // 现在：探测在**本轮起点并行启动**（不 await），首拨立即开始；能力判定
+ // 用两路信息合成——
+ // - 缓存 `supportsMuxRPC`（配对/welcome/上次探测学到的）；
+ // - 本 App 周期首个轮次「乐观 P1」：P1 握手/upgrade 本身就是能力探测
+ // （旧插件在 401/403/503 拒绝 → 同一候选内 useLegacy 回退，不多付
+ // /health 的一次往返）；探测结果落地后（成功/失败）后续轮次只信缓存。
+ // 探测仍然刷新 `takeoverWindowMs`（409 对齐用）与存量设备升 P1（F3），
+ // 只是不再占关键路径。
+        let isColdStartRound = !p1ColdStartProbeConsumed
+        let coldProbeTask = startColdStartCapabilityProbe(primaryOrigin: orderedCandidates.first)
+        defer { coldProbeTask?.cancel() }
  // 冷启动 <1s（列表侧）：预热共享 HTTPS 池，让 t0+~100ms 就发出的
  // early session/list 复用已建好的 TLS，而不是再付一次 ~300ms 握手。
         warmHTTPSPoolIfColdStart(prefersRelay: prefersRelay, local: localNetwork)
@@ -1559,7 +1574,12 @@ final class LinkService: ObservableObject {
                 "index": attemptIndex
             ])
             #endif
-            switch await attemptConnection(origin: origin, leafPin: credentials.leafPin, timeout: attemptTimeout) {
+            switch await attemptConnection(
+                origin: origin,
+                leafPin: credentials.leafPin,
+                timeout: attemptTimeout,
+                coldStartOptimistic: isColdStartRound
+            ) {
             case .connected(let bumpGeneration):
                 linkDebug("round: connected " + Self.originLabel(origin))
                 #if DEBUG
@@ -1801,9 +1821,33 @@ final class LinkService: ObservableObject {
  ///
  /// 单测注入 `p1ColdStartProbeFetch`/`p1ColdStartProbePersist` 后不触网络与
  /// Keychain（测试宿主与 E2E App 共享两者）。
+ ///
+ /// D 段：本方法保留原有「消费一次」语义（单测/同步调用用），
+ /// 生产 `connectOnce` 改用并行入口 `startColdStartCapabilityProbe`
+ /// （探测不再挡在首拨之前）。
     func probeP1CapabilityIfColdStart(primaryOrigin: URL?) async {
         guard !p1ColdStartProbeConsumed else { return }
         p1ColdStartProbeConsumed = true
+        await performColdStartCapabilityProbe(primaryOrigin: primaryOrigin)
+    }
+
+ /// D 段（连接清理）：并行启动冷启能力探测（不 await、不占关键
+ /// 路径）。返回探测任务供本轮 `defer` 取消；已消费/无凭据时返回 nil。
+ ///
+ /// 语义与 `probeP1CapabilityIfColdStart` 完全一致，只是把「等它完成」从
+ /// 首拨前的串行段去掉：结果落地后写回 `credentials`/会话窗口观测值，供
+ /// 后续轮次（409 对齐、存量设备升 P1）使用。探测失败不改变本轮任何行为。
+    @discardableResult
+    func startColdStartCapabilityProbe(primaryOrigin: URL?) -> Task<Void, Never>? {
+        guard !p1ColdStartProbeConsumed else { return nil }
+        p1ColdStartProbeConsumed = true
+        return Task { [weak self] in
+            await self?.performColdStartCapabilityProbe(primaryOrigin: primaryOrigin)
+        }
+    }
+
+ /// 冷启能力探测的实际工作（/health 取数 + 能力/窗口写回）。
+    private func performColdStartCapabilityProbe(primaryOrigin: URL?) async {
         guard var current = credentials else { return }
  // 主候选优先；无候选时退回持久化的 origin（旧调用语义）。
         guard let origin = primaryOrigin ?? current.originURL else { return }
@@ -1887,14 +1931,25 @@ final class LinkService: ObservableObject {
  /// rollout flag and the plugin capability both allow it, try the single-WSS
  /// dsh-m/2 path first. A fallback-class failure degrades this app session to
  /// the unchanged legacy M1 path, which then runs on the same candidate.
-    private func attemptConnection(origin: URL, leafPin: String, timeout: TimeInterval) async -> ConnectAttemptOutcome {
+    private func attemptConnection(
+        origin: URL,
+        leafPin: String,
+        timeout: TimeInterval,
+        coldStartOptimistic: Bool = false
+    ) async -> ConnectAttemptOutcome {
  // link-perf L2：flag 语义反转后 `AppSettings.remoteProtocolV2`
  // 默认 on（env/UserDefaults 显式覆盖优先）；能否走 P1 由 supportsMuxRPC
  // （配对/冷启动探测/welcome 缓存）与会话级回退状态把关。
+ //
+ // D 段：本 App 周期首个轮次带 `coldStartOptimistic`——缓存
+ // `supportsMuxRPC` 还不是 true（未配对探测/旧缓存 false）时也先试 P1：
+ // P1 upgrade/hello 拒绝会走 `.useLegacy` 在**同一候选内**回退旧路径，
+ // 于是「协商」在 1 次连接尝试内完成（不再先付 /health 的 500ms）。
         if Self.transportRoute(
             flagEnabled: AppSettings.remoteProtocolV2,
             supportsMuxRPC: credentials?.supportsMuxRPC,
-            fellBackToLegacy: p1FellBackToLegacy
+            fellBackToLegacy: p1FellBackToLegacy,
+            coldStartOptimistic: coldStartOptimistic
         ) == .p1 {
             switch await attemptP1Connection(origin: origin, leafPin: leafPin, timeout: timeout) {
             case .connected(let bumpGeneration):
@@ -1920,13 +1975,20 @@ final class LinkService: ObservableObject {
 
  /// Pure routing decision between the dsh-m/2 channel and the legacy M1 path.
  /// Kept free of LinkService state so the whole matrix is unit-testable.
+ ///
+ /// `coldStartOptimistic`：本 App 周期首个连接轮次用
+ /// 「P1 握手即能力探测」代替拨号前的串行 /health——缓存 capability 未知/
+ /// false 时也先试 P1，旧插件会以 upgrade 拒绝（401/403/503）在同一候选内
+ /// 回退 legacy；P1 成功则协商（gzip/projV1/muxRPC）在本次尝试内完成。
     nonisolated static func transportRoute(
         flagEnabled: Bool,
         supportsMuxRPC: Bool?,
-        fellBackToLegacy: Bool
+        fellBackToLegacy: Bool,
+        coldStartOptimistic: Bool = false
     ) -> TransportRoute {
-        guard flagEnabled, supportsMuxRPC == true, !fellBackToLegacy else { return .legacy }
-        return .p1
+        guard flagEnabled, !fellBackToLegacy else { return .legacy }
+        if supportsMuxRPC == true { return .p1 }
+        return coldStartOptimistic ? .p1 : .legacy
     }
 
     enum TransportRoute: Equatable {

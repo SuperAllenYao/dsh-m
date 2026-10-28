@@ -1,6 +1,32 @@
 import SwiftUI
 import UIKit
 
+// MARK: - lazy-fetch 动作（协议 v1 契约 §7）
+
+/// 工具结果展开入口的「取全文」动作（`SessionViewModel.fetchEventFull(seq:)`）。
+///
+/// 通过 Environment 注入：`ToolResultContentView` 在任意层级（主流程行 / 过程组 /
+/// 详情 sheet / 嵌套调用）都能拿到，不必把回调一路穿过 cell 的 Equatable 比较。
+struct LazyFullFetchAction {
+    let handler: @MainActor (Int) async -> Void
+
+    func callAsFunction(seq: Int) async {
+        await handler(seq)
+    }
+}
+
+private struct LazyFullFetchKey: EnvironmentKey {
+    static let defaultValue: LazyFullFetchAction? = nil
+}
+
+extension EnvironmentValues {
+ /// nil = 没有 lazy-fetch（非详情页 / 测试宿主 / 非投影模式）。
+    var lazyFullFetch: LazyFullFetchAction? {
+        get { self[LazyFullFetchKey.self] }
+        set { self[LazyFullFetchKey.self] = newValue }
+    }
+}
+
 // MARK: - Markdown / text
 
 /// Block-level markdown (headings / lists / code blocks / tables / quotes /...).
@@ -23,6 +49,11 @@ struct MonoBlock: View {
     var text: String
     var maxLines: Int? = 40
     var color: Color = Theme.Palette.textSecondary
+ /// 协议 v1 lazy-fetch（契约 §7）：本块文本是截断版、且提供了 `onRequestFull`。
+ /// true 时「显示全部 N 行」先发一次窄页请求取全文（拿到后本块重建为完整文本，
+ /// 再点才是零网络的本地展开）；false = 现有行为（零变化）。
+    var needsLazyFetch: Bool = false
+    var onRequestFull: (() -> Void)? = nil
     @State private var showAll = false
 
     private var lines: [String] { text.components(separatedBy: "\n") }
@@ -46,10 +77,17 @@ struct MonoBlock: View {
             .background(Theme.Palette.codeBackground, in: RoundedRectangle(cornerRadius: Theme.Radius.sm, style: .continuous))
             .overlay(RoundedRectangle(cornerRadius: Theme.Radius.sm, style: .continuous).strokeBorder(Theme.Palette.border, lineWidth: 1))
             if let maxLines, !showAll, lines.count > maxLines {
-                Button(L10n.f("显示全部 %lld 行", lines.count)) { showAll = true }
-                    .font(Theme.Typography.label)
-                    .foregroundStyle(Theme.Palette.accent)
-                    .accessibilityIdentifier("show-full-output")
+                Button(L10n.f("显示全部 %lld 行", lines.count)) {
+                    if needsLazyFetch, let onRequestFull {
+ // 契约 §7：截断行先取单事件全文（失败降级保持截断内容）。
+                        onRequestFull()
+                    } else {
+                        showAll = true
+                    }
+                }
+                .font(Theme.Typography.label)
+                .foregroundStyle(Theme.Palette.accent)
+                .accessibilityIdentifier("show-full-output")
             }
         }
     }

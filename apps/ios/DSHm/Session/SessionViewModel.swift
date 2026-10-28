@@ -530,8 +530,56 @@ final class SessionViewModel: ObservableObject {
  /// True between start() and stop(): the filler only runs while the detail lives.
     private var detailOnScreen = false
 
+ // MARK: - 协议 v1（projV1）投影历史页 / lazy-fetch 状态
+
+ /// 投影流式历史页是否可用：P1 通道协商成功（`welcome.caps.projV1=true`）且
+ /// 测试 loader 未接管。false = 走既有 JSON 页路径（契约 §6 兼容矩阵）。
+    private var projectedHistoryFillEnabled: Bool {
+        historyPageLoader == nil && (link?.projectedHistoryAvailable ?? false)
+    }
+
+ /// lazy-fetch（契约 §7）在途/已成功的目标 seq（同一行重复点击只发一次）。
+    private var lazyFullFetchInFlight: Set<Int> = []
+    private var lazyFullFetched: Set<Int> = []
+
+ /// 7 段客户端埋点（契约 §9）：投影页/帧/回退累计与各段时刻（相对本次补齐起点）。
+    private var projV1PageCount = 0
+    private var projV1FrameCount = 0
+    private var projV1FallbackPages = 0
+    private var projV1FirstByteMs: Int?
+    private var projV1FirstChunkDecodedMs: Int?
+    private var projV1FirstPixelMs: Int?
+    private var projV1LastFrameMs: Int?
+    private var projV1FullHistoryMs: Int?
+ /// 投影页内最小 seq（用于契约 §5 的 next cursor 纯函数）。
+    private var projV1PageMinSeq: Int?
+ /// lazy-fetch 成功后强制一次全量派生重建（data 变了但窗口 seq 范围没变，
+ /// 增量分支会误判 "unchanged"）。
+    private var forceFullRebuild = false
+
+ /// E2E/指标 gate（沿用既有 AppModel/ConnectionMetrics 口径）：只有该 gate 下
+ /// 才挂隐藏可访问元素 `proj-v1-metrics` / `proj-v1-history-progress`。
+    static var projV1MetricsEnabled: Bool {
+        let env = ProcessInfo.processInfo.environment
+        return env["DSHM_E2E"] == "1" || env["DSHM_STARTUP_METRICS"] == "1"
+    }
+
+ /// E2E 隐藏元素 `proj-v1-metrics` 的单行 JSON（nil = 非 gate/无数据）。
+ /// 字段口径见 Lead 跨段约定与契约 §9：mode/action/connect/firstByte/
+ /// firstChunkDecoded/firstPixel/fullHistory/lastFrame/pages/frames/fallbacks/
+ /// events/oldestSeq/rows（未发生的段省略）。
+    @Published private(set) var projV1MetricsValue: String?
+ /// E2E 隐藏元素 `proj-v1-history-progress`：`oldest=..;hasMore=0|1;full=0|1`。
+    @Published private(set) var projV1HistoryProgressValue: String?
+
  /// Oldest loaded log position (diagnostics/tests only: the view has no entry).
     var oldestLoadedSeq: Int? { journal.oldestSeq }
+ /// Test seam：分页状态（lazy-fetch 窄页的 hasMore 不得改动它）。
+    var hasMoreOlderForTesting: Bool { journal.hasMoreOlder }
+ /// Test seam：某事件当前的 data（lazy-fetch 全文回填断言用）。
+    func eventDataForTesting(seq: Int) -> JSONValue? {
+        journal.events.first { $0.seq == seq }?.data
+    }
  /// The session's first event is loaded (filler terminal state).
     var reachedFirstEvent: Bool { journal.hasReachedOldest }
 
@@ -794,6 +842,9 @@ final class SessionViewModel: ObservableObject {
  /// 必须显式传 payload.cursor（翻旧页只受 beforeSeq 上界约束，throughSeq
  /// 的新旧不影响页内容——见 SessionJournal.prepend 的语义注释）。
     private func startFillPagePrefetch(beforeSeq: Int, throughSeq: Int? = nil) {
+ // 协议 v1：投影路径逐帧消费，整页 JSON 预取没有收益（反而
+ // 强制整页缓冲）；投影走 projectedHistoryFillEnabled 时跳过预取流水线。
+        guard !projectedHistoryFillEnabled else { return }
         guard fillPagePrefetchTask == nil, fillPagePrefetch == nil else { return }
         guard historyFillTransportAvailable() else { return }
         let args = Self.historyPageRequestArgs(
@@ -1225,6 +1276,11 @@ final class SessionViewModel: ObservableObject {
         historyFillWatchdogTask?.cancel()
         historyFillWatchdogTask = nil
         lastHistoryFillWatchdogAt = nil
+ // 协议 v1：隐藏埋点元素只属于本次详情会话；离开即清空（gate 外本就是 nil）。
+        projV1MetricsValue = nil
+        projV1HistoryProgressValue = nil
+        lazyFullFetchInFlight.removeAll()
+        lazyFullFetched.removeAll()
     }
 
  /// Called when the link generation changed (reconnect): rebuild from snapshot.
@@ -1407,6 +1463,9 @@ final class SessionViewModel: ObservableObject {
 
  /// Test seam (unit tests have no socket): replaces the session/page unary.
     var historyPageLoader: (([String: JSONValue]) async throws -> JSONValue)?
+ /// Test seam（无 socket）：lazy-fetch 的窄页 `session/page` 取数（契约 §7）。
+ /// nil = 生产路径 `link.unary`。
+    var eventFullPageLoader: (([String: JSONValue]) async throws -> JSONValue)?
 
  /// session/page wire request (same key names the old manual pager used).
     nonisolated static func historyPageRequestArgs(
@@ -1481,6 +1540,8 @@ final class SessionViewModel: ObservableObject {
         }
         if historyFillStartedAt == nil { historyFillStartedAt = Date() }
         historyFillState = .loading
+ // 协议 v1：本次补齐开始即初始化 7 段埋点（mode 等首帧到达后再刷新）。
+        refreshProjV1Metrics()
         syncFillDiagnostics()
         historyFillTask = Task { [weak self] in
             await self?.runHistoryFillLoop()
@@ -1699,7 +1760,18 @@ final class SessionViewModel: ObservableObject {
         return page
     }
 
+ /// 历史页取数分派：投影协商成功 → `0x02` 分帧流式路径；否则既有 JSON 页路径。
+ ///
+ /// 契约 §6 兼容矩阵：legacy 通道 / 旧插件 / 插件 feature off / 客户端开关关闭
+ /// 全部落回 JSON（字节级等价旧行为）。
     private func fetchHistoryPage(beforeSeq: Int) async -> HistoryPageOutcome {
+        if projectedHistoryFillEnabled {
+            return await fetchProjectedHistoryPage(beforeSeq: beforeSeq)
+        }
+        return await fetchHistoryPageJSON(beforeSeq: beforeSeq)
+    }
+
+    private func fetchHistoryPageJSON(beforeSeq: Int) async -> HistoryPageOutcome {
         #if DEBUG
         let pageMainThreadStart = CACurrentMediaTime()
         #endif
@@ -1767,6 +1839,22 @@ final class SessionViewModel: ObservableObject {
             dbg("history page decode failed: unexpected payload shape")
             return .failed
         }
+        let encodedBytes: Int? = (Self.e2eFillDiagnosticsEnabled || Self.e2eFillDiagnosticsTestOverride)
+            ? CacheIO.encode(value)?.count
+            : nil
+        #if DEBUG
+        return applyDecodedHistoryPage(page, pageMainThreadStart: pageMainThreadStart, encodedBytes: encodedBytes)
+        #else
+        return applyDecodedHistoryPage(page, pageMainThreadStart: 0, encodedBytes: encodedBytes)
+        #endif
+    }
+
+ /// 合并一页已解码的历史页（JSON 路径与「插件整页回退」共用；语义与旧实现一致）。
+    private func applyDecodedHistoryPage(
+        _ page: SessionPage,
+        pageMainThreadStart: CFTimeInterval,
+        encodedBytes: Int?
+    ) -> HistoryPageOutcome {
         ScrollHitchProbe.mark("pageDecoded", ["records": page.records.count])
  // 真机：Host 偶发回空页（瞬时）时，旧代码直接 terminal →
  // completed，补齐永久停在 hasMoreOlder=1。空页绝不能进 journal.prepend
@@ -1812,8 +1900,8 @@ final class SessionViewModel: ObservableObject {
             #if DEBUG
             historyFillPageMergedAtForTesting.append(CACurrentMediaTime())
             #endif
-            if Self.e2eFillDiagnosticsEnabled || Self.e2eFillDiagnosticsTestOverride {
-                historyFillBytes += CacheIO.encode(value)?.count ?? 0
+            if let encodedBytes {
+                historyFillBytes += encodedBytes
             }
         }
         if page.records.isEmpty || !journal.hasMoreOlder {
@@ -1824,6 +1912,321 @@ final class SessionViewModel: ObservableObject {
             + " oldest=" + String(journal.oldestSeq ?? -1)
             + " rows=" + String(rows.count))
         return .progress
+    }
+
+ // MARK: - 协议 v1：投影分帧历史页（契约 §4/§5）
+
+ /// 投影分帧历史页：帧序 = seq **降序**（帧 0 是页面 seq 最高的一段，与已加载
+ /// 窗口前沿相邻；末帧是页面最老的一段）。
+ ///
+ /// 渐进语义（契约修订 v1.1 第 1/2 条）：
+ /// - 每帧到达即 `journal.prepend(events:hasMoreOlder:)` 并排一次派生重建
+ /// （复用既有 `.olderPrepended` 防抖批次；**首帧立即重建** = firstPixel）；
+ /// - `hasMoreOlder = 非末帧? true: header.hasMore`：只有 `f == frames-1`
+ /// 那一帧允许提交页面 hasMore；帧未收齐前绝不置 hasReachedOldest /
+ /// markHistoryFillCompleted；
+ /// - 未收齐就断线/超时 = 失败（不得把半页当成功），已前插的帧保留为有效
+ /// 历史，返回 `.retryTransient` 由补齐循环按新的 beforeSeq 续传（重复由
+ /// journal 去重）；
+ /// - 降序中间态允许「tool/result 先于 tool/call」的临时孤儿行：页末的
+ /// rebuild 走 renderState.prepend/resolveOrphanResults 自愈（契约 v1.1 第 3 条）。
+    private func fetchProjectedHistoryPage(beforeSeq: Int) async -> HistoryPageOutcome {
+        guard let link else { return .failed }
+        let args = Self.historyPageRequestArgs(
+            address: address,
+            throughSeq: journal.cursor,
+            beforeSeq: beforeSeq,
+            maxMessages: historyPageMessages
+        )
+        markPageRequestIssued(beforeSeq: beforeSeq, source: "loop")
+        #if DEBUG
+        let pageMainThreadStart = CACurrentMediaTime()
+        #endif
+        ScrollHitchProbe.mark("pageFetchBegin", ["beforeSeq": beforeSeq, "proj": 1])
+        let stream: P1ProjectedStream
+        do {
+            guard let created = try link.projectedSessionPageStream(args: args, timeout: 10) else {
+ // 协商态在请求发出前失效（断线回退）：本页回落旧 JSON 路径。
+                return await fetchHistoryPageJSON(beforeSeq: beforeSeq)
+            }
+            stream = created
+        } catch {
+            dbg("projected history page request failed: " + NetworkErrorInterpreter.message(for: error))
+            return .retryTransient
+        }
+        var mergedRecords = 0
+        var framesSeen = 0
+        var firstFrameArrived = false
+        var totalFrames: Int?
+        var pageHasMore: Bool?
+        var pageMinSeq: Int?
+        var fallbackValue: JSONValue?
+        var sawFirstPixel = false
+        do {
+            for try await event in stream.events {
+                if Task.isCancelled {
+                    stream.cancel()
+                    return .cancelled
+                }
+                switch event {
+                case .frame(let header, let rows):
+                    if !firstFrameArrived {
+                        firstFrameArrived = true
+                        totalFrames = header.frames
+                        pageHasMore = header.hasMore
+                        recordProjectedFirstFrame()
+                        historyLoadTimeline.markPageArrive()
+                        ScrollHitchProbe.mark("fillPageArrive", ["beforeSeq": beforeSeq, "proj": 1])
+                        #if DEBUG
+                        historyFillPageArrivedAtForTesting.append(CACurrentMediaTime())
+                        #endif
+                    }
+                    framesSeen += 1
+                    projV1FrameCount += 1
+                    do {
+                        let events = try ProjV1RowMapping.events(from: rows)
+                        let isLast = header.isLastFrame(totalFrames: totalFrames)
+ // 契约修订 v1.1：只有末帧允许提交页面 hasMore；末帧自带
+ // hasMore 时优先用它（首帧值作为兜底/对账在 transport 做过）。
+                        let pageHasMoreOlder = isLast ? (header.hasMore ?? pageHasMore ?? true) : true
+                        let update = journal.prepend(events: events, hasMoreOlder: pageHasMoreOlder)
+                        var inserted = 0
+                        if case .olderPrepended(let seqs) = update {
+                            inserted = seqs.count
+                        }
+                        applyJournalUpdate(update)
+                        if inserted > 0 {
+                            mergedRecords += inserted
+                            pageMinSeq = journal.oldestSeq
+                            if !sawFirstPixel {
+                                sawFirstPixel = true
+ // 首帧即可渲染：取消防抖、立即重建（firstPixel 语义）。
+                                rebuildNowForHistoryBatch()
+                                projV1FirstPixelMs = projectedElapsedMs()
+                            }
+                            syncFillDiagnostics()
+                            refreshProjV1Metrics()
+ // 让出主线程一拍：每帧都插行/重建时触摸投递不被饿死
+ // 。
+                            await Task.yield()
+                        }
+                    } catch {
+                        dbg("projected history frame rejected: " + String(describing: error))
+                        stream.cancel()
+                        return .failed
+                    }
+                case .textResult(let result):
+ // 插件整页回退旧 JSON（契约 §6）：本页按旧路径解码合入。
+                    fallbackValue = try? P1UnaryMapping.jsonValue(from: result)
+                case .completed(let frames, let records, let hasMore):
+                    totalFrames = frames
+                    pageHasMore = hasMore
+                    _ = records
+                }
+            }
+        } catch let failure as P1Failure {
+            dbg("projected history page interrupted: " + failure.userMessage)
+            if Task.isCancelled { return .cancelled }
+ // 未收齐的页按失败处理（不得当成功）；已前插帧保留，续传去重。
+            return .retryTransient
+        } catch {
+            dbg("projected history page failed: " + NetworkErrorInterpreter.message(for: error))
+            return .retryTransient
+        }
+ // MARK: 流正常结束（收齐全部帧或 header-only 空页）
+        if let fallbackValue {
+            projV1FallbackPages += 1
+            refreshProjV1Metrics()
+            guard let page = await Self.historyPageOffMain(fallbackValue) else { return .failed }
+            let encodedBytes: Int? = (Self.e2eFillDiagnosticsEnabled || Self.e2eFillDiagnosticsTestOverride)
+                ? CacheIO.encode(fallbackValue)?.count
+                : nil
+            return applyDecodedHistoryPage(page, pageMainThreadStart: 0, encodedBytes: encodedBytes)
+        }
+        projV1PageCount += 1
+        projV1LastFrameMs = projectedElapsedMs()
+        if let minSeq = pageMinSeq {
+            projV1PageMinSeq = minSeq
+            let next = Self.projectedNextFillPageCursor(minSeq: minSeq, hasMore: pageHasMore ?? false)
+            ScrollHitchProbe.mark("projNextFillCursor", ["minSeq": minSeq, "next": next ?? -1])
+        }
+        ScrollHitchProbe.mark("pageApplied", [
+            "records": mergedRecords,
+            "oldest": journal.oldestSeq ?? -1,
+            "pages": historyFillPages,
+            "proj": 1,
+            "frames": framesSeen,
+        ])
+        if framesSeen == 0 {
+ // 0 记录页（header-only 帧）：契约 §4。hasMore=true 时按既有「瞬时
+ // 空页」退避重试，不把补齐钉死为 completed。
+            refreshProjV1Metrics()
+            if pageHasMore == true, journal.hasMoreOlder {
+                dbg("projected history page empty while hasMoreOlder; retrying")
+                return .retryEmptyPage
+            }
+            return .terminal
+        }
+        if mergedRecords > 0 {
+            historyFillPages += 1
+            #if DEBUG
+            historyFillPageMergedAtForTesting.append(CACurrentMediaTime())
+            PerfProbe.shared.record(
+                "historyBatchMain",
+                ms: (CACurrentMediaTime() - pageMainThreadStart) * 1000,
+                ["records": mergedRecords, "frames": framesSeen, "proj": 1]
+            )
+            #endif
+        }
+        refreshProjV1Metrics()
+ // 全量收齐后才有资格判 terminal（`hasMoreOlder` 已由末帧写入）。
+        if !journal.hasMoreOlder { return .terminal }
+        guard mergedRecords > 0 else { return .retryStalePage }
+        dbg("projected history page merged: pages=" + String(historyFillPages)
+            + " frames=" + String(framesSeen)
+            + " oldest=" + String(journal.oldestSeq ?? -1)
+            + " rows=" + String(rows.count))
+        return .progress
+    }
+
+ /// 契约 §5：投影页的 next cursor = 页内最小 seq（升序第一行 `s`）+ header.hasMore。
+ /// 纯函数（单测覆盖）：`hasMore!= true` / 已到 seq 0 / 空页 → nil（不再请求）。
+    nonisolated static func projectedNextFillPageCursor(minSeq: Int?, hasMore: Bool) -> Int? {
+        guard hasMore, let minSeq, minSeq > 0 else { return nil }
+        return minSeq
+    }
+
+ /// 投影页首帧时刻（7 段埋点 firstByte/firstChunkDecoded；本架构中帧回调前
+ /// 已完成 off-main 解码，两段同刻记录——设备侧差异由 transport 的
+ /// `p1ProjFrameDecodeBG` 探针单独取证）。
+    private func recordProjectedFirstFrame() {
+        let ms = projectedElapsedMs()
+        if projV1FirstByteMs == nil { projV1FirstByteMs = ms }
+        if projV1FirstChunkDecodedMs == nil { projV1FirstChunkDecodedMs = ms }
+    }
+
+ /// 相对本次补齐起点的毫秒（未开始补齐时 = 0）。
+    private func projectedElapsedMs() -> Int {
+        guard let started = historyFillStartedAt else { return 0 }
+        return max(0, Int(Date().timeIntervalSince(started) * 1000))
+    }
+
+ // MARK: - 协议 v1：lazy-fetch（契约 §7）
+
+ /// 单事件窄页取全文（lazy-fetch）。
+ ///
+ /// 真实 Host 实测语义：
+ /// - `session/page` args = `{request:{address, throughSeq: seq+1, beforeSeq:
+ /// seq+1, maxMessages: 1}}`（含 `request` 包裹）；
+ /// - `maxMessages` 计的是**消息窗口**不是原始事件 → 返回小页可能 1–28 条，
+ /// 必须在返回记录里按 `event.seq == seq` 精确挑；
+ /// - 小页不含目标（Host 语义漂移）→ 重试一次 `maxMessages = 10`，仍失败则
+ /// 降级（保持截断内容 + debug log，不阻塞会话）；
+ /// - 该响应同样走 projV1（投影后 1 帧）；统一经 `link.unary` 的整页装配读回
+ /// JSON 信封，所以投影/JSON 两种响应都解；
+ /// - **绝不**用这个小页的 `hasMore` 改 `journal.hasMoreOlder`。
+ ///
+ /// 成功后 `journal.replaceEventData` 就地换 data 并强制一次全量派生重建
+ /// （窗口 seq 范围没变，增量分支会误判 "unchanged"）。失败返回 false，UI
+ /// 保持截断内容可重试。
+    @discardableResult
+    func fetchEventFull(seq: Int) async -> Bool {
+        guard seq >= 0 else { return false }
+        if lazyFullFetched.contains(seq) { return true }
+        guard !lazyFullFetchInFlight.contains(seq) else { return false }
+        if eventFullPageLoader == nil, link == nil { return false }
+        lazyFullFetchInFlight.insert(seq)
+        defer { lazyFullFetchInFlight.remove(seq) }
+        for maxMessages in [1, 10] {
+            if Task.isCancelled { return false }
+            let args = Self.historyPageRequestArgs(
+                address: address,
+                throughSeq: seq + 1,
+                beforeSeq: seq + 1,
+                maxMessages: maxMessages
+            )
+            do {
+                let value: JSONValue
+                if let loader = eventFullPageLoader {
+                    value = try await loader(args)
+                } else if let link {
+                    value = try await link.unary("session/page", args: args, timeout: 15)
+                } else {
+                    return false
+                }
+                guard let page = Self.sessionPage(from: value),
+                      let event = page.records.compactMap(\.event).first(where: { $0.seq == seq }),
+                      let data = event.data else {
+                    dbg("lazy-fetch: 小页不含目标事件 seq=\(seq)（maxMessages=\(maxMessages)）")
+                    continue
+                }
+ // 契约修订 v1.1 §7：窄页也受投影影响——若插件对窄页照常截断，
+ // 返回的仍是截断内容（带 tr）。此时绝不能写回 journal（会把已取
+ // 全文退回截断态），按「未拿到全文」处理（重试/降级）。
+                if data["tr"]?.arrayValue?.isEmpty == false {
+                    dbg("lazy-fetch: 窄页响应仍带 tr（插件未对窄页关闭截断），seq=\(seq)，maxMessages=\(maxMessages)")
+                    continue
+                }
+                let update = journal.replaceEventData(seq: seq, data: data)
+                applyJournalUpdate(update)
+                lazyFullFetched.insert(seq)
+                rebuildNowForHistoryBatch()
+                dbg("lazy-fetch: seq=\(seq) 全文已加载（maxMessages=\(maxMessages)）")
+                return true
+            } catch {
+                dbg("lazy-fetch failed seq=\(seq)（maxMessages=\(maxMessages)）: "
+                    + NetworkErrorInterpreter.message(for: error))
+            }
+        }
+ // 降级：保持截断内容 + 可重试，不阻塞会话。
+        return false
+    }
+
+ /// 测试/视图：某 seq 是否正在 lazy-fetch（按钮 loading 态）。
+    func isLazyFullFetchInFlight(seq: Int) -> Bool {
+        lazyFullFetchInFlight.contains(seq)
+    }
+
+ /// 7 段埋点刷新（gate 外零成本；gate 内单行 JSON）。
+    private func refreshProjV1Metrics() {
+        guard Self.projV1MetricsEnabled else { return }
+        ensureProjV1MetricsStarted()
+        var fields: [String] = []
+        fields.append("\"mode\":\"\(projV1FrameCount > 0 ? "projv1" : "json")\"")
+        fields.append("\"action\":0")
+        if let connect = ConnectionMetrics.lastConnectMilliseconds {
+            fields.append("\"connect\":\(connect)")
+        }
+        if let value = projV1FirstByteMs { fields.append("\"firstByte\":\(value)") }
+        if let value = projV1FirstChunkDecodedMs { fields.append("\"firstChunkDecoded\":\(value)") }
+        if let value = projV1FirstPixelMs { fields.append("\"firstPixel\":\(value)") }
+        if let value = projV1FullHistoryMs { fields.append("\"fullHistory\":\(value)") }
+        if let value = projV1LastFrameMs { fields.append("\"lastFrame\":\(value)") }
+        fields.append("\"pages\":\(projV1PageCount)")
+        fields.append("\"frames\":\(projV1FrameCount)")
+        fields.append("\"fallbacks\":\(projV1FallbackPages)")
+        fields.append("\"events\":\(journal.events.count)")
+        fields.append("\"oldestSeq\":\(journal.oldestSeq ?? -1)")
+        fields.append("\"rows\":\(flow.rows.count)")
+        projV1MetricsValue = "{" + fields.joined(separator: ",") + "}"
+ // 跨段约定（W3 E2E 读取）：oldSeq/hasMoreOlder/full。
+        projV1HistoryProgressValue = "oldestSeq=\(journal.oldestSeq ?? -1)"
+            + ";hasMoreOlder=\(journal.hasMoreOlder ? 1 : 0)"
+            + ";full=\(historyFillState == .completed ? 1 : 0)"
+    }
+
+ /// 一次详情加载的 7 段计数在首次发布时从零开始（进入动作 = 此刻）。
+    private func ensureProjV1MetricsStarted() {
+        if projV1MetricsValue == nil {
+            projV1PageCount = 0
+            projV1FrameCount = 0
+            projV1FallbackPages = 0
+            projV1FirstByteMs = nil
+            projV1FirstChunkDecodedMs = nil
+            projV1FirstPixelMs = nil
+            projV1LastFrameMs = nil
+            projV1FullHistoryMs = nil
+        }
     }
 
     private func markHistoryFillCompleted() {
@@ -1845,6 +2248,9 @@ final class SessionViewModel: ObservableObject {
             "pages": historyFillPages,
             "oldest": journal.oldestSeq ?? -1,
         ])
+ // 协议 v1 7 段埋点：fullHistory = 全量历史完成时刻（相对补齐起点）。
+        projV1FullHistoryMs = projectedElapsedMs()
+        refreshProjV1Metrics()
         historyFillTask?.cancel()
         historyFillTask = nil
         cancelFillPagePrefetch()
@@ -2406,6 +2812,13 @@ final class SessionViewModel: ObservableObject {
                 pendingRebuild = true
                 scheduleRebuild()
             }
+        case .eventContentReplaced(let seq):
+ // lazy-fetch（协议 v1 §7）：data 变了但窗口 seq 范围没变，增量分支会
+ // 误判 "unchanged"——强制一次全量派生重建（一次性用户动作，可接受）。
+            ScrollHitchProbe.mark("journalEventContentReplaced", ["seq": seq])
+            forceFullRebuild = true
+            pendingRebuild = true
+            scheduleRebuild()
         case .duplicate, .ignored, .assistantStreamProgress:
             if readingHistory {
  // 读历史时尾部 live 预览不可见：先记一笔，回贴底时 flush。
@@ -2610,7 +3023,12 @@ final class SessionViewModel: ObservableObject {
  // tail (live events), at the front (history pages) or wholesale (snapshot /
  // reconnect reset). Auto-detect which one happened so a running session with
  // the full history loaded does not re-fold thousands of events per frame.
-        if let range = renderState.loadedSeqRange,
+        if forceFullRebuild {
+ // lazy-fetch 原地换 data：窗口范围可能未变，必须无视增量判定全量重建。
+            forceFullRebuild = false
+            branch = "reset"
+            renderState.reset(events: events, pendingUserEchoes: pendingUserEchoes.echoes, nowMs: nowMs)
+        } else if let range = renderState.loadedSeqRange,
            let first = events.first?.seq,
            let last = events.last?.seq {
             if first == range.lowerBound, last == range.upperBound {
@@ -2690,6 +3108,8 @@ final class SessionViewModel: ObservableObject {
  // 自愈入口：每次 derived 发布（snapshot / 事件 / 历史批）都检查一次，
  // 冷却约束保证不会演变成高频重启。
         checkHistoryFillWatchdog()
+ // 协议 v1 7 段埋点：rows/events/oldestSeq 随派生发布刷新（gate 外零成本）。
+        refreshProjV1Metrics()
  // M2b-2c: if the detail is already on screen (cache or live snapshot), this
  // is the first visible content.
         maybeMarkDetailFirstFrame()
