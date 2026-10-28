@@ -3567,10 +3567,12 @@ export class LinkServer {
  *
  * The App's verbatim `historyPageRequestArgs` shape is
  * `payload.args = { request: { address, throughSeq, beforeSeq, maxMessages } }`.
- * A narrow page is `request.throughSeq === request.beforeSeq` with
- * `maxMessages === 1` — it exists to fetch the FULL text of the event the App
- * is expanding, so the plugin must never truncate it (otherwise AC-11 is
- * unreachable: the App would only ever get the truncated row back).
+ * A narrow page is `request.throughSeq === request.beforeSeq` with a small
+ * window (`maxMessages <= 50`) — it exists to fetch the FULL text of the event
+ * the App is expanding, so the plugin must never truncate it (otherwise AC-11
+ * is unreachable: the App would only ever get the truncated row back).
+ * `<= 50` instead of `=== 1` also covers the App's `maxMessages = 10` fallback;
+ * normal history paging uses 500/1400, so it can never be exempted by mistake.
  *
  * @param {unknown} envelope parsed `client-request` body
  * @returns {boolean}
@@ -3579,7 +3581,8 @@ export class LinkServer {
     const args = envelope?.payload?.args;
     const pageRequest = isPlainObject(args) ? args.request : undefined;
     if (!isPlainObject(pageRequest)) return false;
-    return pageRequest.throughSeq === pageRequest.beforeSeq && pageRequest.maxMessages === 1;
+    if (pageRequest.throughSeq !== pageRequest.beforeSeq) return false;
+    return typeof pageRequest.maxMessages === 'number' && pageRequest.maxMessages <= 50;
   }
 
  /**
@@ -3676,9 +3679,10 @@ export class LinkServer {
  // path; every other response keeps `listLite.bytes` (== the upstream bytes)
  // byte-for-byte. The projection is built from `fullBytes` (the raw upstream
  // body), and `bytes` stays populated for fallback/diagnosis.
- // Contract v1.1 §7: the lazy-fetch narrow page (throughSeq===beforeSeq,
- // maxMessages=1) exists to fetch one event's FULL text — never truncate it,
- // even when the socket negotiated lazy truncation for regular pages.
+ // Contract v1.1 §7: the lazy-fetch narrow page (throughSeq===beforeSeq with
+ // a small window, maxMessages<=50) exists to fetch one event's FULL text —
+ // never truncate it, even when the socket negotiated lazy truncation for
+ // regular pages.
     const narrowPage = this.isLazyFetchNarrowPage(request);
     const projection = this.applyProjV1(
       device,
