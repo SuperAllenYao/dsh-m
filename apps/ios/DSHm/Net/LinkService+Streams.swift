@@ -814,7 +814,7 @@ extension LinkService {
  /// 由调用方按既有 unary 失败语义处理；已产出的帧保持有效（半页续传）。
     func projectedSessionPageStream(
         args: [String: JSONValue],
-        timeout: TimeInterval = 20
+        timeout: TimeInterval = 10
     ) throws -> P1ProjectedStream? {
         guard let p1 = p1Channel, p1.isReady, p1.projV1Negotiated else { return nil }
         return try p1.unaryProjected(endpoint: "session/page", args: args, timeout: timeout)

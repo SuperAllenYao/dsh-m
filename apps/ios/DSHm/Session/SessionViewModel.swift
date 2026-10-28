@@ -1945,7 +1945,7 @@ final class SessionViewModel: ObservableObject {
         ScrollHitchProbe.mark("pageFetchBegin", ["beforeSeq": beforeSeq, "proj": 1])
         let stream: P1ProjectedStream
         do {
-            guard let created = try link.projectedSessionPageStream(args: args, timeout: 20) else {
+            guard let created = try link.projectedSessionPageStream(args: args, timeout: 10) else {
  // 协商态在请求发出前失效（断线回退）：本页回落旧 JSON 路径。
                 return await fetchHistoryPageJSON(beforeSeq: beforeSeq)
             }
@@ -2158,6 +2158,13 @@ final class SessionViewModel: ObservableObject {
                       let event = page.records.compactMap(\.event).first(where: { $0.seq == seq }),
                       let data = event.data else {
                     dbg("lazy-fetch: 小页不含目标事件 seq=\(seq)（maxMessages=\(maxMessages)）")
+                    continue
+                }
+ // 契约修订 v1.1 §7：窄页也受投影影响——若插件对窄页照常截断，
+ // 返回的仍是截断内容（带 tr）。此时绝不能写回 journal（会把已取
+ // 全文退回截断态），按「未拿到全文」处理（重试/降级）。
+                if data["tr"]?.arrayValue?.isEmpty == false {
+                    dbg("lazy-fetch: 窄页响应仍带 tr（插件未对窄页关闭截断），seq=\(seq)，maxMessages=\(maxMessages)")
                     continue
                 }
                 let update = journal.replaceEventData(seq: seq, data: data)

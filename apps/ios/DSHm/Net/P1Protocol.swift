@@ -323,6 +323,10 @@ struct P1Caps: Decodable, Equatable {
  /// 时不回显（nil）→ 等价 false，`session/page` 走旧 JSON 文本结果。只有
  /// 协商成功后 App 才预期 `0x02` 帧（未协商收到 = 协议违规）。
     var projV1: Bool?
+ /// 契约修订 v1.1：`welcome.caps.projV1Lazy` —— 截断实际生效位（插件
+ /// `features.projV1TruncateLongText` ∧ 客户端 caps.projV1Lazy ∧ 已协商）。
+ /// nil = 未生效（截断关闭/旧插件），App 行为不变（无 `tr` → 本地展开）。
+    var projV1Lazy: Bool?
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
@@ -344,10 +348,11 @@ struct P1Caps: Decodable, Equatable {
         self.replayBytes = replayBytes
         self.gzip = try container.decodeIfPresent(Bool.self, forKey: .gzip)
         self.projV1 = try container.decodeIfPresent(Bool.self, forKey: .projV1)
+        self.projV1Lazy = try container.decodeIfPresent(Bool.self, forKey: .projV1Lazy)
     }
 
     private enum CodingKeys: String, CodingKey {
-        case unary, resume, maxInFlight, replayBytes, gzip, projV1
+        case unary, resume, maxInFlight, replayBytes, gzip, projV1, projV1Lazy
     }
 }
 

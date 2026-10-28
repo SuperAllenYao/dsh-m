@@ -578,7 +578,8 @@ final class P1Channel {
  /// - 末帧（`f == frames-1`）或空页（`frames == 0`）后回调 `.completed` 并结束流；
  /// - 插件整页回退旧 JSON 时回调 `.textResult`（调用方按旧 JSON 路径解码），
  /// 不算错误（契约 §6：一页内不会混合投影帧与文本结果）；
- /// - `timeout` 是**帧间空闲超时**（每帧重置）：首帧慢与末帧慢都不误杀长页；
+ /// - `timeout` 是**帧间空闲超时**（每帧重置）：首帧慢与末帧慢都不误杀长页，
+ /// 默认 10s（契约修订 v1.1 §5：投影页帧间隔独立超时，不得硬等 30s unary）；
  /// - 断线/关闭复用既有 unary 错误语义（`.notConnected` / `.socketClosed` …），
  /// 已回调的帧保持有效（调用方按半页中断语义续传）；
  /// - 未知/迟到 rpcId 的帧静默丢弃（与既有 unary「迟到响应丢弃」同口径）。
@@ -589,7 +590,7 @@ final class P1Channel {
     func unaryProjected(
         endpoint: String,
         args: [String: JSONValue] = [:],
-        timeout: TimeInterval = 30
+        timeout: TimeInterval = 10
     ) throws -> P1ProjectedStream {
         guard state == .ready, socket != nil else { throw P1Failure.notConnected }
         guard projV1Negotiated else {
