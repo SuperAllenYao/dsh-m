@@ -160,7 +160,11 @@ extension SessionRowBuilder {
             isError: message?["isError"]?.boolValue ?? false,
             text: MessageContent.text(from: content),
             meta: data?["meta"] ?? message?["meta"],
-            images: MessageContent.images(from: content)
+            images: MessageContent.images(from: content),
+ // 协议 v1 lazy-fetch（契约 §7）：行 data 里的 `tr` 标记被截断的字段；
+ // sourceSeq 是本 tool/result 事件自己的 seq（窄页请求的 key）。
+            truncated: data?["tr"]?.arrayValue?.compactMap { $0.stringValue },
+            sourceSeq: event.seq
         )
         let toolCallId = message?["toolCallId"]?.stringValue
             ?? data?["toolCallId"]?.stringValue
@@ -204,7 +208,9 @@ extension SessionRowBuilder {
             isError: message?["isError"]?.boolValue ?? false,
             text: MessageContent.text(from: message?["content"]),
             meta: message?["meta"],
-            images: MessageContent.images(from: message?["content"])
+            images: MessageContent.images(from: message?["content"]),
+            truncated: data?["tr"]?.arrayValue?.compactMap { $0.stringValue },
+            sourceSeq: event.seq
         )
         guard let subCallId = data?["subCallId"]?.stringValue else { return }
         _ = attachToolResult(callId: subCallId, result: result, rows: &rows)

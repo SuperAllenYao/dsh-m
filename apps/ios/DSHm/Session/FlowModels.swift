@@ -96,6 +96,18 @@ struct ToolResultItem: Equatable {
     var text: String
     var meta: JSONValue?
     var images: [ImageRef]
+ /// 协议 v1 lazy-fetch（契约 §7）：被截断的字段名（`text`/`lines`/`diffs`）。
+ /// nil = 本行未截断（默认模式；展开入口走本地展开、零网络）。
+    var truncated: [String]? = nil
+ /// 该结果事件自己的 seq（`tool/result` 行的 seq），lazy-fetch 窄页请求的 key。
+ /// 注意不是调用行的 seq：截断发生在 `tool/result` 事件上。
+    var sourceSeq: Int? = nil
+
+ /// 是否需要先 lazy-fetch 才能拿到全文（截断 + 知道目标 seq）。
+    var needsLazyFullFetch: Bool {
+        guard let truncated, !truncated.isEmpty else { return false }
+        return sourceSeq != nil
+    }
 }
 
 /// 工具参数的惰性解析持有者。

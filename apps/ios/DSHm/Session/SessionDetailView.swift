@@ -242,8 +242,14 @@ struct SessionDetailView: View {
                 e2eFollowProbeElement
                 e2eLinkDebugElement
                 e2ePathChangeTriggerElement
+                projV1MetricsElement
+                projV1HistoryProgressElement
             }
         }
+ // 协议 v1 lazy-fetch（契约 §7）：工具结果「显示全部」入口注入单事件取全文。
+        .environment(\.lazyFullFetch, LazyFullFetchAction { seq in
+            await viewModel.fetchEventFull(seq: seq)
+        })
         .onChange(of: app.link.generation) { generation in
             viewModel.handleGenerationChange(generation)
         }
@@ -651,6 +657,40 @@ struct SessionDetailView: View {
                 .accessibilityIdentifier("e2e-history-fill")
                 .accessibilityLabel(value)
                 .accessibilityValue(value)
+        }
+    }
+
+ // MARK: - 协议 v1 投影埋点（跨段约定：W3 的 ProjV1E2ETests 读这两个元素）
+
+ /// 隐藏元素 `proj-v1-metrics`：7 段埋点 + 投影状态单行 JSON（契约 §9）。
+ /// 只在 E2E/指标 gate 下有值（View model 内部按 env gate 计算，生产不渲染）。
+    @ViewBuilder
+    private var projV1MetricsElement: some View {
+        if let metrics = viewModel.projV1MetricsValue {
+            Text("proj-v1-metrics")
+                .font(.system(size: 1))
+                .frame(width: 2, height: 2)
+                .opacity(0.02)
+                .allowsHitTesting(false)
+                .accessibilityIdentifier("proj-v1-metrics")
+                .accessibilityLabel(metrics)
+                .accessibilityValue(metrics)
+        }
+    }
+
+ /// 隐藏元素 `proj-v1-history-progress`：等全量补齐完成用
+ /// （`oldest=<seq>;hasMore=0|1;full=0|1`）。
+    @ViewBuilder
+    private var projV1HistoryProgressElement: some View {
+        if let progress = viewModel.projV1HistoryProgressValue {
+            Text("proj-v1-history-progress")
+                .font(.system(size: 1))
+                .frame(width: 2, height: 2)
+                .opacity(0.02)
+                .allowsHitTesting(false)
+                .accessibilityIdentifier("proj-v1-history-progress")
+                .accessibilityLabel(progress)
+                .accessibilityValue(progress)
         }
     }
 
