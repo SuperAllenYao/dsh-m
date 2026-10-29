@@ -90,11 +90,22 @@ struct BackgroundTasksSheet: View {
                             tab == candidate ? Theme.Palette.accentSoft : Color.clear,
                             in: RoundedRectangle(cornerRadius: Theme.Radius.sm, style: .continuous)
                         )
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
                 .accessibilityIdentifier("background-tab-" + candidate.rawValue)
                 .accessibilityAddTraits(tab == candidate ? [.isSelected] : [])
             }
+        }
+        .overlay(alignment: .center) {
+ // verification (TC-30): a tap 1–2pt inside the 4pt gap
+ // still selected a tab (system hit slop around the enlarged labels).
+ // This no-op strip owns the gap, so the gap itself never switches.
+            Color.clear
+                .frame(width: 4)
+                .contentShape(Rectangle())
+                .onTapGesture { }
+                .accessibilityHidden(true)
         }
         .padding(4)
         .background(Theme.Palette.surface, in: RoundedRectangle(cornerRadius: Theme.Radius.sm + 2, style: .continuous))
