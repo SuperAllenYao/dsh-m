@@ -74,6 +74,17 @@ enum MarkdownRenderPolicy {
         #endif
     }()
 
+ /// v7：flatten 文档含代码块时按代码块切段渲染
+ /// （代码段保留一键复制入口）。DEBUG 下 `DSHM_MD_FLATTEN_SEGMENTS=0` 退回
+ /// 老的单 Text 路径，用于诊断「切段是否引起布局/选中异常」。
+    static let isFlattenSegmentsEnabled: Bool = {
+        #if DEBUG
+        return ProcessInfo.processInfo.environment["DSHM_MD_FLATTEN_SEGMENTS"] != "0"
+        #else
+        return true
+        #endif
+    }()
+
     static func shouldFlatten(text: String, blockCount: Int) -> Bool {
         guard isFlattenEnabled, !text.isEmpty, shouldParse(text) else { return false }
         return text.count > flattenCharThreshold || blockCount >= flattenBlockThreshold

@@ -454,6 +454,15 @@ struct WorkspaceListView: View {
                     .listRowSeparator(.hidden)
                     .accessibilityIdentifier("workspace-list-error")
                 }
+                if !viewModel.pinnedSessions.isEmpty {
+ // No section header: the compact cards sit
+ // directly under the 工作区 title, above the first workspace.
+                    Section {
+                        ForEach(Array(viewModel.pinnedSessions.enumerated()), id: \.element.id) { index, session in
+                            pinnedRow(session, index: index)
+                        }
+                    }
+                }
                 ForEach(Array(viewModel.groups.enumerated()), id: \.element.id) { index, group in
                     workspaceSection(group, index: index)
                 }
@@ -471,6 +480,52 @@ struct WorkspaceListView: View {
             .listSectionSpacing(Theme.Spacing.l)
             .scrollContentBackground(.hidden)
             .accessibilityIdentifier("workspace-session-list")
+        }
+    }
+
+ /// One pinned row above the workspace groups: compact 44pt card, same swipe
+ /// actions as a normal row (pin toggle / archive). No section header.
+    private func pinnedRow(_ session: SessionListItem, index: Int) -> some View {
+        let pinned = viewModel.followState.pinnedSessionIds.contains(session.sessionId)
+        return SessionCardView(
+            session: session,
+            pendingApprovals: viewModel.pendingApprovalCount(sessionId: session.sessionId, link: app.link),
+            isConnected: app.link.phase.isConnected,
+            draftPreview: nil,
+            isPinned: pinned,
+            compact: true
+        ) {
+            DetailMetrics.beginTap()
+            app.openSession(session.followAddress)
+        }
+        .equatable()
+        .accessibilityIdentifier("pinned-session-card-\(index)")
+        .listRowInsets(EdgeInsets(top: 6, leading: Theme.Spacing.pageInset, bottom: 6, trailing: Theme.Spacing.pageInset))
+        .listRowBackground(Color.clear)
+        .listRowSeparator(.hidden)
+        .onAppear {
+ // Same first-frame contract as `sessionRow`: when every visible
+ // session is pinned (or all groups are collapsed) this is the only
+ // row that reaches the screen.
+            viewModel.markFirstFrameVisible()
+        }
+        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+            Button {
+                handlePinToggle(session)
+            } label: {
+                Image(systemName: pinned ? "pin.slash" : "pin")
+            }
+            .tint(pinned ? Theme.Palette.borderStrong : Theme.Palette.accent)
+            .accessibilityLabel(pinned ? L10n.t("取消置顶") : L10n.t("置顶"))
+            .accessibilityIdentifier("pinned-swipe-pin-" + session.sessionId)
+            Button {
+                handleArchiveRequest(session)
+            } label: {
+                Image(systemName: "archivebox")
+            }
+            .tint(Theme.Palette.warning)
+            .accessibilityLabel(L10n.t("归档"))
+            .accessibilityIdentifier("pinned-swipe-archive-" + session.sessionId)
         }
     }
 
@@ -716,6 +771,8 @@ struct SessionCardView: View, Equatable {
     var isConnected: Bool
     var draftPreview: String? = nil
     var isPinned: Bool = false
+ /// 44pt single row for the pinned area.
+    var compact: Bool = false
     var onTap: () -> Void
 
  /// cold-launch freeze: the workspace list re-renders several times
@@ -728,6 +785,7 @@ struct SessionCardView: View, Equatable {
             && lhs.isConnected == rhs.isConnected
             && lhs.draftPreview == rhs.draftPreview
             && lhs.isPinned == rhs.isPinned
+            && lhs.compact == rhs.compact
     }
 
  /// v5.4 status: waiting-for-answer > in-progress > not-started > idle; offline
@@ -743,63 +801,13 @@ struct SessionCardView: View, Equatable {
 
     var body: some View {
         Button(action: onTap) {
-            VStack(alignment: .leading, spacing: Theme.Spacing.xs) {
-                HStack(alignment: .firstTextBaseline, spacing: Theme.Spacing.xs) {
- // R3 (m3 panel 1): the pinned card leads its title with the
- // 13pt pin mark (Lucide path, accent) - no chip.
-                    if isPinned {
-                        PinMark()
-                            .alignmentGuide(.firstTextBaseline) { dimension in
- // v6 §4: guide = 12.0 for the 13pt pin (was 10.5,
- // 1.27pt low). The title line box centre is
- // 14.67 - 9 = 5.67pt below the baseline; 5.5 is
- // the rounded constant and keeps row height intact.
-                                pinTitleBaselineGuide(pinSize: dimension.height)
-                            }
-                    }
-                    Text(session.title?.isEmpty == false
-                         ? (session.title ?? "")
-                         : (session.blank == true ? L10n.t("新会话") : L10n.t("未命名会话")))
-                        .font(Theme.Typography.cardTitle)
-                        .foregroundStyle(Theme.Palette.textPrimary)
-                        .lineLimit(1)
-                    Spacer(minLength: Theme.Spacing.xs)
-                    Text(DisplayFormat.relativeTime(session.lastPromptAt ?? session.updatedAt))
-                        .font(Theme.Typography.label)
-                        .foregroundStyle(Theme.Palette.textTertiary)
-                }
-                if let draftPreview {
- // M2: draft chip (warning text on hairline pill) + one-line
- // preview; replaces the status row on a blank card.
-                    HStack(spacing: Theme.Spacing.xs) {
-                        Text(L10n.t("草稿"))
-                            .font(Theme.Typography.diffGutter)
-                            .foregroundStyle(Theme.Palette.warning)
-                            .padding(.horizontal, Theme.Spacing.xxs + 2)
-                            .padding(.vertical, 2)
-                            .background(Theme.Palette.surface, in: Capsule())
-                            .overlay(Capsule().strokeBorder(Theme.Palette.border, lineWidth: 1))
-                        Text(draftPreview)
-                            .font(Theme.Typography.caption)
-                            .foregroundStyle(Theme.Palette.textSecondary)
-                            .lineLimit(1)
-                            .truncationMode(.tail)
-                        Spacer(minLength: 0)
-                    }
+            Group {
+                if compact {
+                    compactContent
                 } else {
-                    HStack(spacing: Theme.Spacing.xs) {
- // v6: the same A-form linear icon as the detail header,
- // 14pt; icon and status word share the semantic color
- // (design mockup 04).
-                        SessionStatusIcon(kind: status.kind, size: 14)
-                        Text(status.localizedLabel)
-                            .font(Theme.Typography.caption)
-                            .foregroundStyle(status.kind.color)
-                        Spacer(minLength: 0)
-                    }
+                    regularContent
                 }
             }
-            .padding(Theme.Spacing.m)
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(
  // R3 (design 3.2): pinned = accent-soft fill (10%) + accent
@@ -818,6 +826,91 @@ struct SessionCardView: View, Equatable {
             )
         }
         .buttonStyle(.plain)
+    }
+
+ /// 44pt single-row pinned card: pin mark + title +
+ /// relative time + status icon. The status word is dropped; the icon
+ /// colour carries the state.
+    private var compactContent: some View {
+        HStack(spacing: Theme.Spacing.xs) {
+            if isPinned {
+                PinMark(size: 12)
+            }
+            titleText
+            Spacer(minLength: Theme.Spacing.xs)
+            Text(DisplayFormat.relativeTime(session.lastPromptAt ?? session.updatedAt))
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(Theme.Palette.textTertiary)
+                .lineLimit(1)
+            SessionStatusIcon(kind: status.kind, size: 12)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 12)
+        .frame(height: 44)
+    }
+
+    private var regularContent: some View {
+        VStack(alignment: .leading, spacing: Theme.Spacing.xs) {
+            HStack(alignment: .firstTextBaseline, spacing: Theme.Spacing.xs) {
+ // R3 (m3 panel 1): the pinned card leads its title with the
+ // 13pt pin mark (Lucide path, accent) - no chip.
+                if isPinned {
+                    PinMark()
+                        .alignmentGuide(.firstTextBaseline) { dimension in
+ // v6 §4: guide = 12.0 for the 13pt pin (was 10.5,
+ // 1.27pt low). The title line box centre is
+ // 14.67 - 9 = 5.67pt below the baseline; 5.5 is
+ // the rounded constant and keeps row height intact.
+                            pinTitleBaselineGuide(pinSize: dimension.height)
+                        }
+                }
+                titleText
+                Spacer(minLength: Theme.Spacing.xs)
+                Text(DisplayFormat.relativeTime(session.lastPromptAt ?? session.updatedAt))
+                    .font(Theme.Typography.label)
+                    .foregroundStyle(Theme.Palette.textTertiary)
+            }
+            if let draftPreview {
+ // M2: draft chip (warning text on hairline pill) + one-line
+ // preview; replaces the status row on a blank card.
+                HStack(spacing: Theme.Spacing.xs) {
+                    Text(L10n.t("草稿"))
+                        .font(Theme.Typography.diffGutter)
+                        .foregroundStyle(Theme.Palette.warning)
+                        .padding(.horizontal, Theme.Spacing.xxs + 2)
+                        .padding(.vertical, 2)
+                        .background(Theme.Palette.surface, in: Capsule())
+                        .overlay(Capsule().strokeBorder(Theme.Palette.border, lineWidth: 1))
+                    Text(draftPreview)
+                        .font(Theme.Typography.caption)
+                        .foregroundStyle(Theme.Palette.textSecondary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                    Spacer(minLength: 0)
+                }
+            } else {
+                HStack(spacing: Theme.Spacing.xs) {
+ // v6: the same A-form linear icon as the detail header,
+ // 14pt; icon and status word share the semantic color
+ // (design mockup 04).
+                    SessionStatusIcon(kind: status.kind, size: 14)
+                    Text(status.localizedLabel)
+                        .font(Theme.Typography.caption)
+                        .foregroundStyle(status.kind.color)
+                    Spacer(minLength: 0)
+                }
+            }
+        }
+        .padding(Theme.Spacing.m)
+    }
+
+    private var titleText: some View {
+        Text(session.title?.isEmpty == false
+             ? (session.title ?? "")
+             : (session.blank == true ? L10n.t("新会话") : L10n.t("未命名会话")))
+            .font(Theme.Typography.cardTitle)
+            .foregroundStyle(Theme.Palette.textPrimary)
+            .lineLimit(1)
     }
 }
 

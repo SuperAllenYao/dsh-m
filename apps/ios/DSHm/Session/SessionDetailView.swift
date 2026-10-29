@@ -62,6 +62,8 @@ struct SessionDetailView: View {
 
     @StateObject private var viewModel: SessionViewModel
     @StateObject private var attachments: AttachmentStore
+ /// session-scoped background-job roster for the shared entry.
+    @StateObject private var jobModel = JobListModel()
     @State private var submittingApproval = false
  /// v0.2.0 interaction panel: folded while the user reads the conversation
  /// output; the header badge re-opens it. Input stays blocked meanwhile.
@@ -116,120 +118,7 @@ struct SessionDetailView: View {
  // opening an approval must not resize the conversation (the old in-flow
  // panel pushed the whole session screen up). It covers the topmost layer
  // from the very bottom of the screen, surface + home-indicator band。
-        sessionContent
-            .background(Theme.Palette.background.ignoresSafeArea())
-            .overlay {
-                pendingInteractionOverlay
-            }
-        .task {
-            viewModel.attach(link: app.link)
-            attachments.attach(link: app.link)
-            viewModel.start()
-            #if DEBUG
- // E2E 注入闸门：基线会话详情页实际出现（push tap / 网络切换
- // 注入以此为 t0 计延迟，杜绝「注入早于测试基线」的假红）。
-            app.noteE2EDetailAppeared(sessionId: sessionId)
- // task-4 E2E seam: inject a synthetic exact changes summary
- // (DSHM_E2E=1 + DSHM_E2E_CHANGES_SUMMARY) so the cross-end title口径
- // (Host total=50 vs files.length=18) is assertable on a real device.
- // DEBUG-only; product launches never set these env vars.
-            if app.isE2EMode {
-                viewModel.installE2EChangesSummaryPreviewIfRequested()
- // 文件对比 E2E：sheet → 行 → diff 页可显示注入的 hunk（DSHM_E2E_CHANGES_DIFF）。
-                viewModel.installE2EChangesDiffPreviewIfRequested()
-            }
-            if let percent = e2eContextPreviewPercent {
-                viewModel.installE2EContextPreview(percent: percent)
-            }
-            let modelPreviewMode = app.isE2EMode
-                ? ProcessInfo.processInfo.environment["DSHM_E2E_MODEL"]
-                : nil
-            switch modelPreviewMode {
-            case "1", "fake":
- // Isolated stack: deterministic fake catalog (screenshot only).
-                viewModel.installE2EModelPreview()
-                present(.modelSelection)
-            case "entry":
-                viewModel.installE2EModelPreview()
-            case "open":
- // Real device evidence: real catalog + real sheet, no fake data.
-                await viewModel.loadModelCatalogIfNeeded()
-                present(.modelSelection)
-            case "swap":
- // Real device evidence: real catalog + a real `session/selectModel`
- // round trip; the strip then shows the Host-confirmed selection.
-                await viewModel.loadModelCatalogIfNeeded()
-                if let target = viewModel.modelCatalog?.firstAlternativeSelection(
-                    to: viewModel.modelSelection
-                ) {
-                    await viewModel.selectModel(target)
-                }
-            default:
-                await viewModel.loadModelCatalogIfNeeded()
-            }
- // Real-sheet evidence hooks (no data injection): open the permission
- // sheet / subagent list so their fitted height can be screenshot-checked.
-            if app.isE2EMode,
-               ProcessInfo.processInfo.environment["DSHM_E2E_PERMISSION"] == "1" {
-                await viewModel.loadPermissionCatalogIfNeeded()
-                present(.permission)
-            }
-            if app.isE2EMode,
-               ProcessInfo.processInfo.environment["DSHM_E2E_SUBAGENT_LIST"] == "1" {
-                present(.subagentList)
-            }
-            #else
-            await viewModel.loadModelCatalogIfNeeded()
-            #endif
-            syncPendingPanel()
-            if app.isE2EMode,
-               ProcessInfo.processInfo.environment["DSHM_E2E_PANEL_COLLAPSED"] == "1" {
-                pendingPanelCollapsed = true
-            }
-        }
- // v0.2.0 interaction panel: a new pending item expands the panel and
- // dismisses the composer keyboard; resolving everything restores the input.
-        .onChange(of: pendingInteraction?.id) { _, _ in
-            syncPendingPanel()
-        }
-        .task(id: viewModel.subagentCatalog.count) {
- // v5.5 §14.5: light 8s poll while the parent has subagents; every tick
- // refreshes the v5.4 runtimes and the v5.5 context window. The
- // activity-triggered 2s debounce lives in SessionViewModel.
-            guard subagentContext == nil, !viewModel.subagentCatalog.isEmpty else { return }
-            while !Task.isCancelled {
-                await viewModel.refreshSessionListDerived(pendingApprovalAgentIds: pendingApprovalAgentIds)
-                try? await Task.sleep(nanoseconds: 8_000_000_000)
-            }
-        }
-        .onDisappear {
-            #if DEBUG
-            if ProcessInfo.processInfo.environment["DSHM_E2E"] == "1" {
-                NSLog("[NAVLIFE] detail disappear session=%@ sub=%d", sessionId, subagentContext != nil ? 1 : 0)
-            }
-            #endif
- // R2 (design 2.4): persist the composer draft on leave (the 500 ms
- // debounce may still be pending); an empty draft removes the file.
-            viewModel.flushDraft()
-            viewModel.stop()
-        }
-        .onAppear {
-            #if DEBUG
-            if ProcessInfo.processInfo.environment["DSHM_E2E"] == "1" {
-                NSLog("[NAVLIFE] detail appear session=%@ sub=%d", sessionId, subagentContext != nil ? 1 : 0)
-            }
-            #endif
- // P0：被子会话覆盖时父页暂停派生发布（数据加载/订阅不暂停）。
-            viewModel.setDetailCovered(!sessionDetailIsTopmost)
- // 壳优先：header/返回/输入框/消息区骨架这一帧就上屏（幂等）。
-            viewModel.markDetailShellFrame()
- // M2b-2c: detail in-app first-frame mark (idempotent).
-            viewModel.markDetailViewAppeared()
- // 内容已在首帧前就绪（缓存命中窗口）时，onChange 不会触发，这里补标一次。
-            if !viewModel.rows.isEmpty {
-                markFirstContentAfterLayout()
-            }
-        }
+        detailBase
         .onChange(of: sessionDetailIsTopmost) { _, topmost in
  // 回到栈顶：立即补一次发布（setDetailCovered 内部 flush pending rebuild）。
             viewModel.setDetailCovered(!topmost)
@@ -307,6 +196,126 @@ struct SessionDetailView: View {
         }
     }
 
+ /// First half of the body's modifier chain, split out to keep each
+ /// expression small enough for the Swift type checker.
+    private var detailBase: some View {
+        sessionContent
+            .modifier(JobRosterLifecycle(sessionId: sessionId, jobModel: jobModel, link: app.link, phase: app.link.phase))
+            .background(Theme.Palette.background.ignoresSafeArea())
+            .overlay {
+                pendingInteractionOverlay
+            }
+        .task {
+            viewModel.attach(link: app.link)
+            attachments.attach(link: app.link)
+            viewModel.start()
+            #if DEBUG
+ // E2E 注入闸门：基线会话详情页实际出现（push tap / 网络切换
+ // 注入以此为 t0 计延迟，杜绝「注入早于测试基线」的假红）。
+            app.noteE2EDetailAppeared(sessionId: sessionId)
+ // task-4 E2E seam: inject a synthetic exact changes summary
+ // (DSHM_E2E=1 + DSHM_E2E_CHANGES_SUMMARY) so the cross-end title口径
+ // (Host total=50 vs files.length=18) is assertable on a real device.
+ // DEBUG-only; product launches never set these env vars.
+            if app.isE2EMode {
+                viewModel.installE2EChangesSummaryPreviewIfRequested()
+ // 文件对比 E2E：sheet → 行 → diff 页可显示注入的 hunk（DSHM_E2E_CHANGES_DIFF）。
+                viewModel.installE2EChangesDiffPreviewIfRequested()
+            }
+            if let percent = e2eContextPreviewPercent {
+                viewModel.installE2EContextPreview(percent: percent)
+            }
+            let modelPreviewMode = app.isE2EMode
+                ? ProcessInfo.processInfo.environment["DSHM_E2E_MODEL"]
+                : nil
+            switch modelPreviewMode {
+            case "1", "fake":
+ // Isolated stack: deterministic fake catalog (screenshot only).
+                viewModel.installE2EModelPreview()
+                present(.modelSelection)
+            case "entry":
+                viewModel.installE2EModelPreview()
+            case "open":
+ // Real device evidence: real catalog + real sheet, no fake data.
+                await viewModel.loadModelCatalogIfNeeded()
+                present(.modelSelection)
+            case "swap":
+ // Real device evidence: real catalog + a real `session/selectModel`
+ // round trip; the strip then shows the Host-confirmed selection.
+                await viewModel.loadModelCatalogIfNeeded()
+                if let target = viewModel.modelCatalog?.firstAlternativeSelection(
+                    to: viewModel.modelSelection
+                ) {
+                    await viewModel.selectModel(target)
+                }
+            default:
+                await viewModel.loadModelCatalogIfNeeded()
+            }
+ // Real-sheet evidence hooks (no data injection): open the permission
+ // sheet / subagent list so their fitted height can be screenshot-checked.
+            if app.isE2EMode,
+               ProcessInfo.processInfo.environment["DSHM_E2E_PERMISSION"] == "1" {
+                await viewModel.loadPermissionCatalogIfNeeded()
+                present(.permission)
+            }
+            if app.isE2EMode,
+               ProcessInfo.processInfo.environment["DSHM_E2E_SUBAGENT_LIST"] == "1" {
+                present(.backgroundTasks(initialTab: .subagents))
+            }
+            #else
+            await viewModel.loadModelCatalogIfNeeded()
+            #endif
+            syncPendingPanel()
+            if app.isE2EMode,
+               ProcessInfo.processInfo.environment["DSHM_E2E_PANEL_COLLAPSED"] == "1" {
+                pendingPanelCollapsed = true
+            }
+        }
+ // v0.2.0 interaction panel: a new pending item expands the panel and
+ // dismisses the composer keyboard; resolving everything restores the input.
+        .onChange(of: pendingInteraction?.id) { _, _ in
+            syncPendingPanel()
+        }
+        .task(id: viewModel.subagentCatalog.count) {
+ // v5.5 §14.5: light 8s poll while the parent has subagents; every tick
+ // refreshes the v5.4 runtimes and the v5.5 context window. The
+ // activity-triggered 2s debounce lives in SessionViewModel.
+            guard subagentContext == nil, !viewModel.subagentCatalog.isEmpty else { return }
+            while !Task.isCancelled {
+                await viewModel.refreshSessionListDerived(pendingApprovalAgentIds: pendingApprovalAgentIds)
+                try? await Task.sleep(nanoseconds: 8_000_000_000)
+            }
+        }
+        .onDisappear {
+            #if DEBUG
+            if ProcessInfo.processInfo.environment["DSHM_E2E"] == "1" {
+                NSLog("[NAVLIFE] detail disappear session=%@ sub=%d", sessionId, subagentContext != nil ? 1 : 0)
+            }
+            #endif
+ // R2 (design 2.4): persist the composer draft on leave (the 500 ms
+ // debounce may still be pending); an empty draft removes the file.
+            viewModel.flushDraft()
+            viewModel.stop()
+        }
+        .onAppear {
+            #if DEBUG
+            if ProcessInfo.processInfo.environment["DSHM_E2E"] == "1" {
+                NSLog("[NAVLIFE] detail appear session=%@ sub=%d", sessionId, subagentContext != nil ? 1 : 0)
+            }
+            #endif
+ // P0：被子会话覆盖时父页暂停派生发布（数据加载/订阅不暂停）。
+            viewModel.setDetailCovered(!sessionDetailIsTopmost)
+ // 壳优先：header/返回/输入框/消息区骨架这一帧就上屏（幂等）。
+            viewModel.markDetailShellFrame()
+ // M2b-2c: detail in-app first-frame mark (idempotent).
+            viewModel.markDetailViewAppeared()
+ // 内容已在首帧前就绪（缓存命中窗口）时，onChange 不会触发，这里补标一次。
+            if !viewModel.rows.isEmpty {
+                markFirstContentAfterLayout()
+            }
+        }
+    }
+
  // MARK: - v0.2.0 bottom popups
 
  /// Unified bottom popup layer: full width, anchored to the physical bottom
@@ -358,14 +367,21 @@ struct SessionDetailView: View {
                     Task { await viewModel.loadPermissionCatalogIfNeeded(force: true) }
                 }
             )
-        case .subagentList:
-            SubagentListView(
+        case .backgroundTasks(let initialTab):
+            BackgroundTasksSheet(
+                initialTab: initialTab,
                 entries: subagentListEntries,
-                runtimes: subagentListRuntimes
-            ) { entry in
-                app.openSubagentSession(entry, parentAddress: address, parentSessionId: sessionId)
-                dismissSheet()
-            }
+                runtimes: subagentListRuntimes,
+                jobs: jobModel,
+                isConnected: app.link.phase.isConnected,
+                killJob: { job in
+                    try await jobModel.kill(job, link: app.link)
+                },
+                onOpenSubagent: { entry in
+                    app.openSubagentSession(entry, parentAddress: address, parentSessionId: sessionId)
+                    dismissSheet()
+                }
+            )
         case .modelSelection:
             ModelSelectionSheet(
                 catalog: viewModel.modelCatalog,
@@ -405,8 +421,8 @@ struct SessionDetailView: View {
                 permissionsValue: viewModel.permissionsValue,
                 contextPressure: viewModel.contextPressure,
                 modelTrigger: viewModel.modelTriggerState,
-                subagentCount: stripSubagentCount,
-                subagentRunning: stripSubagentRunning,
+                backgroundCount: stripBackgroundCount,
+                backgroundRunning: stripBackgroundRunning,
                 onPermissionTap: {
                     present(.permission)
  // M5: the preset catalog is a lazy read; a failed load keeps
@@ -414,7 +430,7 @@ struct SessionDetailView: View {
                     Task { await viewModel.loadPermissionCatalogIfNeeded() }
                 },
                 onModelTap: modelEntryPoint,
-                onSubagentTap: subagentEntryPoint
+                onBackgroundTap: backgroundEntryPoint
             )
             composer
         }
@@ -825,7 +841,7 @@ struct SessionDetailView: View {
             Spacer(minLength: Theme.Spacing.xs)
  // 右上角常显会话状态图标（A 线性，纯展示不可点）。
  // 等待审批/作答的处理入口保留在底部面板与折叠输入条（BlockedComposerBar）。
-            SessionStatusIcon(kind: sessionStatusKind, size: 24)
+            SessionStatusIcon(kind: sessionStatusKind, size: 24, motionScale: 1.3)
                 .accessibilityIdentifier("session-status-icon")
                 .accessibilityValue(sessionStatusKind.a11yValue)
                 .frame(width: 36, height: 36)
@@ -1297,10 +1313,15 @@ struct SessionDetailView: View {
  // MARK: - v5.5 status-strip entry points
 
  /// v5.5 §14.3/§14.6: tapping the icon-only subagent cell opens the half-sheet.
-    private var subagentEntryPoint: (() -> Void)? {
-        guard stripSubagentCount > 0 else { return nil }
-        return { present(.subagentList) }
+    private var backgroundEntryPoint: (() -> Void)? {
+        guard stripSubagentCount > 0 || !jobModel.jobs.isEmpty else { return nil }
+        let initial: BackgroundTasksTab = stripSubagentCount > 0 ? .subagents : .jobs
+        return { present(.backgroundTasks(initialTab: initial)) }
     }
+
+    private var stripBackgroundCount: Int { stripSubagentCount }
+
+    private var stripBackgroundRunning: Bool { stripSubagentRunning || jobModel.hasLiveJobs }
 
  // MARK: - v5.5 E2E subagent preview (evidence only)
 
@@ -1665,8 +1686,8 @@ enum SessionDetailSheet: Identifiable {
  /// v0.2.7：思考全文（原先由过程组 cell 内的.sheet 呈现，cell 重建会丢弹层）。
     case reasoning(String)
     case permission
- /// v5.4 task-13: half-sheet subagent list of the parent session.
-    case subagentList
+ /// shared sheet with 子代理列表 / 后台任务 tabs.
+    case backgroundTasks(initialTab: BackgroundTasksTab)
  /// v0.2.0: composer model selection panel.
     case modelSelection
 
@@ -1676,9 +1697,35 @@ enum SessionDetailSheet: Identifiable {
         case .fileChanges(let changes): return "changes-\(changes.seq ?? -1)"
         case .reasoning(let text): return "reasoning-\(text.count)-\(text.prefix(24))"
         case .permission: return "permission"
-        case .subagentList: return "subagent-list"
+        case .backgroundTasks(let tab): return "background-tasks-\(tab.rawValue)"
         case .modelSelection: return "model-selection"
         }
+    }
+}
+
+/// session-scoped background-job roster lifecycle, kept in its own
+/// modifier so the detail view's already-large body stays type-checkable.
+private struct JobRosterLifecycle: ViewModifier {
+    var sessionId: String
+    @ObservedObject var jobModel: JobListModel
+    var link: LinkService
+    var phase: LinkService.Phase
+
+    func body(content: Content) -> some View {
+        content
+            .onAppear {
+                jobModel.start(sessionId: sessionId, link: link)
+            }
+            .onDisappear {
+                jobModel.stop()
+            }
+            .onChange(of: phase.isConnected) { _, connected in
+                if connected {
+                    jobModel.start(sessionId: sessionId, link: link)
+                } else {
+                    jobModel.stop()
+                }
+            }
     }
 }
 

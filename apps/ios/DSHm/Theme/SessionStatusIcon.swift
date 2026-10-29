@@ -44,6 +44,9 @@ enum SessionStatusKind {
 struct SessionStatusIcon: View {
     var kind: SessionStatusKind
     var size: CGFloat = 24
+ /// Motion amplitude multiplier. 1.0 = list/baseline; the detail header
+ /// passes 1.3 (user requirement: bigger answer bounce).
+    var motionScale: CGFloat = 1
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var active = false
@@ -70,7 +73,7 @@ struct SessionStatusIcon: View {
             base
                 .scaleEffect(kind == .approval && active ? 1.10 : 1)
                 .opacity(kind == .approval && active ? 0.55 : 1)
-                .offset(y: kind == .answer ? (active ? -2 * size / Self.viewBox : 0) : 0)
+                .offset(y: kind == .answer ? (active ? -2 * motionScale * size / Self.viewBox : 0) : 0)
                 .animation(animation, value: active)
                 .onAppear { restartAnimation() }
                 .onChange(of: kind) { _, _ in restartAnimation() }
@@ -254,8 +257,19 @@ struct SessionStatusIcon: View {
 
     private static let plusMark = SVGPath.path(from: "M12 9.3 v5.4 M9.3 12 h5.4")
 
+ /// Cloud outline authored as cubic beziers (the original three sweep=0
+ /// arcs converted with W3C endpoint-to-center math). The SVGPath arc
+ /// renderer uses an unsigned control-point coefficient for negative
+ /// sweeps, so the same geometry expressed as arcs came out as a zigzag;
+ /// cubics render identically on every parser and keep PinMark untouched.
     private static let offlineCloud = SVGPath.path(
-        from: "M7.1 18.3 h9.35 a3.65 3.65 0 0 0 0.55 -7.26 a5.35 5.35 0 0 0 -10.05 -1.16 A3.85 3.85 0 0 0 7.1 18.3 z"
+        from: "M7.1 18.3 L16.45 18.3 "
+            + "C18.3632 18.3059 19.9563 16.8335 20.1008 14.9257 "
+            + "C20.2453 13.018 18.8922 11.3224 17 11.04 "
+            + "C16.5089 8.8102 14.6568 7.1379 12.3887 6.8761 "
+            + "C10.1205 6.6143 7.9362 7.8207 6.95 9.88 "
+            + "C4.6249 9.9214 2.7736 11.8399 2.815 14.165 "
+            + "C2.8564 16.4901 4.7749 18.3414 7.1 18.3 Z"
     )
     private static let offlineSlash = SVGPath.path(from: "M4.7 4.6 l14.6 14.8")
 

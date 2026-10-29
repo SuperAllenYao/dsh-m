@@ -215,7 +215,7 @@ enum Theme {
         static let quick = Animation.timingCurve(0.2, 0.8, 0.2, 1, duration: 0.16)
         static let standard = Animation.timingCurve(0.2, 0.8, 0.2, 1, duration: 0.2)
  /// v5.5 §14.3 subagent capsule: one linear turn per 1.2s, forever.
- /// Reduce Motion renders the ring statically instead (SubagentCapsuleButton).
+ /// Reduce Motion renders the ring statically instead (BackgroundEntryCapsule).
         static let ringRotation = Animation.linear(duration: 1.2).repeatForever(autoreverses: false)
  /// Workspace folder glyph morph: the front cover swings open/closed and
  /// the tint cross-fades (single icon, both directions;).

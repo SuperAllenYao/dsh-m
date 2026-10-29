@@ -72,11 +72,11 @@ import {
 import { UpstreamPeer } from './upstream-peer.js';
 import { loadWs, wsBindings, wsLoadedFrom } from './ws-provider.js';
 import { mintResumeTicket, MuxRpcChannel, P1_LIMITS, TicketUseGuard, verifyResumeTicket } from './mux-rpc.js';
-import { detectListLiteRequest, LIST_LITE_HEADER, trimSessionListResponse } from './list-lite.js';
+import { detectListLiteRequest, isSessionListEndpoint, LIST_LITE_HEADER, trimSessionListResponse } from './list-lite.js';
 import { buildProjectedPage } from './proj-encode.js';
 
 const PLUGIN_NAME = 'dsh-m-link';
-const PLUGIN_VERSION = '2.18.0';
+const PLUGIN_VERSION = '2.19.0';
 const MUX_PATH = '/api/remote.mux';
 
 /**
@@ -616,6 +616,8 @@ export class LinkServer {
  * and refreshed on demand in the push path (`refreshPushTitleCache`).
  */
     this.pushTitleCache = new Map();
+ /** childSessionId -> catalog label ('' when the parent catalog entry has no label). */
+    this.pushSubagentLabels = new Map();
     this.pushTitleCacheAt = 0;
  /** In-flight title-cache refresh promise (deduped), undefined when idle. */
     this.pushTitleRefresh = undefined;
@@ -833,7 +835,7 @@ export class LinkServer {
     if (this.disposed || typeof sessionId !== 'string' || sessionId.length === 0) return 0;
     if (this.notifier === undefined || this.devices === undefined) return 0;
     const info = titleInfo ?? this.pushTitleInfoFor?.(sessionId);
-    const title = pushTitleForSession(info, 'DSH 回合完成');
+    const title = pushTitleForSession(info, '未命名会话');
     let sent = 0;
     const targets = typeof this.pushTargets === 'function'
       ? this.pushTargets()
@@ -843,7 +845,7 @@ export class LinkServer {
         kind: 'turn-end',
         collapseId: 'turn-end:' + sessionId,
         title,
-        body: '回合完成',
+        body: '回合结束',
         threadId: sessionId,
         data: { type: 'turn-end', sessionId },
       });
@@ -860,7 +862,7 @@ export class LinkServer {
     if (this.disposed || typeof sessionId !== 'string' || sessionId.length === 0) return 0;
     if (this.notifier === undefined || this.devices === undefined) return 0;
     const info = titleInfo ?? this.pushTitleInfoFor?.(sessionId);
-    const title = pushTitleForSession(info, 'DSH 回合失败');
+    const title = pushTitleForSession(info, '未命名会话');
     let sent = 0;
     const targets = typeof this.pushTargets === 'function'
       ? this.pushTargets()
@@ -990,7 +992,9 @@ export class LinkServer {
       type: 'client-request',
       rpcId: 'turn-watch-' + randomUUID(),
       method: 'session/list',
-      payload: { args: {} },
+ // typert direct invocation: the host method is `list(_request, signal)`;
+ // a bare args object fails its strict codec with gateway/arguments-invalid.
+      payload: { args: { _request: {} } },
     };
     const timeoutMs = this.config.notifications.requestTimeoutMs;
     const response = await fetch(this.loopbackOrigin + '/api/session/list', {
@@ -1025,11 +1029,27 @@ export class LinkServer {
     if (value === undefined || !Array.isArray(value.items)) {
       throw new Error('session/list envelope is not ok');
     }
-    return value.items
+    return this.trimSessionListRows(value.items);
+  }
+
+ /**
+ * Keep only the fields the watcher / push-title cache needs from one
+ * `session/list` row. `subagentCatalog` is kept so a push for a subagent can
+ * use the same label the App's subagent list shows (catalog label wins).
+ */
+  trimSessionListRows(items) {
+    return (Array.isArray(items) ? items : [])
       .map((item) => {
         if (item === null || typeof item !== 'object') return null;
         if (typeof item.sessionId !== 'string' || item.sessionId.length === 0) return null;
         const values = item.projections?.values;
+        const catalog = Array.isArray(values?.subagentCatalog)
+          ? values.subagentCatalog
+              .map((entry) => (entry !== null && typeof entry === 'object' && typeof entry.id === 'string'
+                ? { id: entry.id, label: typeof entry.label === 'string' ? entry.label : '' }
+                : null))
+              .filter((entry) => entry !== null)
+          : undefined;
         return {
           sessionId: item.sessionId,
           running: item.running === true,
@@ -1038,6 +1058,7 @@ export class LinkServer {
           blank: item.blank === true,
           origin: typeof item.origin === 'string' ? item.origin : undefined,
           parentSessionId: typeof item.parentSessionId === 'string' ? item.parentSessionId : undefined,
+          ...(catalog === undefined ? {} : { subagentCatalog: catalog }),
         };
       })
       .filter((item) => item !== null);
@@ -1052,29 +1073,71 @@ export class LinkServer {
  */
   seedPushTitles(items) {
     const cache = new Map();
+    const labels = new Map();
     for (const item of Array.isArray(items) ? items : []) {
       if (item === null || typeof item !== 'object') continue;
       if (typeof item.sessionId !== 'string' || item.sessionId.length === 0) continue;
       cache.set(item.sessionId, {
         title: typeof item.title === 'string' ? item.title : undefined,
         blank: item.blank === true,
+        ...(typeof item.parentSessionId === 'string' && item.parentSessionId.length > 0
+          ? { parentSessionId: item.parentSessionId }
+          : {}),
       });
+      if (Array.isArray(item.subagentCatalog)) {
+        for (const entry of item.subagentCatalog) {
+          if (entry === null || typeof entry !== 'object' || typeof entry.id !== 'string') continue;
+          labels.set(entry.id, typeof entry.label === 'string' ? entry.label : '');
+        }
+      }
     }
     this.pushTitleCache = cache;
+    this.pushSubagentLabels = labels;
     this.pushTitleCacheAt = Date.now();
   }
 
- /** Cached title info for one session (undefined = unknown -> fixed type title). */
+ /**
+ * Seed the title/catalog caches from one untrimmed upstream `session/list`
+ * response body. The phone's lite request is trimmed by this plugin *after*
+ * the upstream read, so the raw bytes still carry the full projections
+ * (`title`, `subagentCatalog`).
+ */
+  seedPushTitlesFromBytes(bytes) {
+    try {
+      const parsed = JSON.parse(Buffer.from(bytes).toString('utf8'));
+      const value = parsed?.result?.ok === true ? parsed.result.value : undefined;
+      if (value === undefined || !Array.isArray(value.items)) return;
+      this.seedPushTitles(this.trimSessionListRows(value.items));
+    } catch {
+ /* best effort: a non-JSON body never blocks a push */
+    }
+  }
+
+ /** Cached title info for one session (undefined = unknown -> "未命名会话" fallback). */
   pushTitleInfoFor(sessionId) {
     if (typeof sessionId !== 'string' || sessionId.length === 0) return undefined;
-    return this.pushTitleCache?.get(sessionId);
+    const shortId = sessionId.slice(0, 8);
+ // Subagent: the App's list shows the parent catalog label; a catalog entry
+ // with an empty label falls back to the 8-char id (displayLabel rules).
+    if (this.pushSubagentLabels?.has(sessionId)) {
+      const label = this.pushSubagentLabels.get(sessionId);
+      if (typeof label === 'string' && label.length > 0) return { title: label, blank: false };
+      return { title: shortId, blank: false };
+    }
+    const info = this.pushTitleCache?.get(sessionId);
+    if (info === undefined) return undefined;
+    if (typeof info.parentSessionId === 'string' && info.parentSessionId.length > 0) {
+      const title = typeof info.title === 'string' ? info.title : '';
+      return { title: title.length > 0 ? title : shortId, blank: false };
+    }
+    return info;
   }
 
  /**
  * Refresh the push-title cache from `session/list` at most once per
  * `PUSH_TITLE_TTL_MS`; concurrent pushes share one in-flight read. Best effort:
  * a host/transport failure keeps the previous cache and never blocks a push
- * (the alert then keeps its fixed type title).
+ * (the alert then keeps its session-shaped "未命名会话" fallback).
  */
   async refreshPushTitleCache({ maxAgeMs = PUSH_TITLE_TTL_MS } = {}) {
     if (this.disposed === true) return;
@@ -1107,14 +1170,14 @@ export class LinkServer {
 
  /**
  * Resolve the title of the session behind an alert push (async: may refresh the
- * cache once). `undefined` means "unknown" — the notifier keeps the fixed type
- * title in that case.
+ * cache once). `undefined` means "unknown" — the notifier keeps the session-shaped
+ * "未命名会话" fallback in that case.
  */
   async resolvePushTitle(sessionId) {
     try {
       await this.refreshPushTitleCache();
     } catch {
- /* fall back to the fixed type title */
+ /* fall back to the session-shaped "未命名会话" title */
     }
     return this.pushTitleInfoFor(sessionId);
   }
@@ -2790,6 +2853,7 @@ export class LinkServer {
       return sendJson(response, 502, { ok: false, error: 'upstream-unreachable', message: String(error?.message ?? error) });
     }
     const fullBytes = Buffer.from(await upstream.arrayBuffer());
+    if (isSessionListEndpoint(url.pathname)) this.seedPushTitlesFromBytes(fullBytes);
     this.counters.proxiedUnary += 1;
     const listLite = this.applyListLite(device, url.pathname, 'legacy', listLitePlan, fullBytes);
     const bytes = listLite.bytes;
@@ -3697,6 +3761,7 @@ export class LinkServer {
       redirect: 'manual',
     });
     const fullBytes = Buffer.from(await upstream.arrayBuffer());
+    if (endpoint === 'session/list') this.seedPushTitlesFromBytes(fullBytes);
     this.counters.proxiedUnary += 1;
     this.audit.record('p1.rpc', { deviceId: device.deviceId, endpoint, status: upstream.status, bytes: fullBytes.length });
     const listLite = this.applyListLite(device, endpoint, 'p1', listLitePlan, fullBytes);
@@ -3980,16 +4045,16 @@ export class LinkServer {
     }
     if (kind === 'approval') {
       return {
-        title: 'DSH 需要审批',
-        body: '工具调用 bash 等待你的确认（测试通知）',
+        title: '未命名会话',
+        body: '等待审批：bash（测试通知）',
         category: APPROVAL_CATEGORY,
         data: { type: 'approval', toolName: 'bash', eventId: 'test-event', ...link },
       };
     }
     if (kind === 'question') {
       return {
-        title: 'DSH 需要你的回答',
-        body: '有 2 个问题等待你回答（测试通知）',
+        title: '未命名会话',
+        body: '等待作答 2 个问题（测试通知）',
         data: { type: 'question', eventId: 'test-question', questionCount: 2, ...link },
       };
     }

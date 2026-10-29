@@ -182,12 +182,12 @@ struct SessionStatusStrip: View {
     var contextPressure: ContextPressureValue?
  /// Model entry trigger state; nil hides the cell (subagent sessions).
     var modelTrigger: ModelTriggerState?
- /// v5.4 task-13: child subagent count + running animation state.
-    var subagentCount: Int = 0
-    var subagentRunning: Bool = false
+ /// shared entry: subagent count + live (subagent or job) state.
+    var backgroundCount: Int = 0
+    var backgroundRunning: Bool = false
     var onPermissionTap: () -> Void
     var onModelTap: (() -> Void)? = nil
-    var onSubagentTap: (() -> Void)? = nil
+    var onBackgroundTap: (() -> Void)? = nil
 
     static func permissionLabel(_ value: String?) -> String {
         switch value {
@@ -214,12 +214,12 @@ struct SessionStatusStrip: View {
                 } else {
                     Spacer(minLength: 0)
                 }
-                if subagentCount > 0, let onSubagentTap {
+                if let onBackgroundTap {
                     cellDivider
-                    SubagentCapsuleButton(
-                        count: subagentCount,
-                        isRunning: subagentRunning,
-                        onTap: onSubagentTap
+                    BackgroundEntryCapsule(
+                        count: backgroundCount,
+                        isRunning: backgroundRunning,
+                        onTap: onBackgroundTap
                     )
                     .frame(width: 52)
                     .frame(maxHeight: .infinity)
@@ -331,12 +331,13 @@ struct SessionStatusStrip: View {
     }
 }
 
-/// v0.2.0 subagent entry (B "边框流光"): compact 44×24 capsule; the icon + count
-/// form one centred group, and while any child runs a 26%-perimeter accent beam
-/// travels along the capsule border (1.6 s loop). Reduce Motion degrades to a
-/// static accent border. This animation is the only stroke layer: the former
-/// nested ring + capsule double stroke is gone.
-struct SubagentCapsuleButton: View {
+/// shared entry for subagents + background jobs.
+///
+/// Fused icon (subagent top-left, terminal bottom-right, diagonal seam) inside
+/// a 52×24 capsule; the count is the subagent count (hidden when 0). While any
+/// subagent or job is live the existing 26%-perimeter beam animates along the
+/// border; Reduce Motion degrades to a static accent border.
+struct BackgroundEntryCapsule: View {
     var count: Int
     var isRunning: Bool
     var onTap: () -> Void
@@ -356,23 +357,26 @@ struct SubagentCapsuleButton: View {
                     SubagentBeamOverlay()
                         .accessibilityHidden(true)
                 }
-                HStack(spacing: 2) {
-                    Image(systemName: isRunning ? "person.2.fill" : "person.2")
-                        .font(.system(size: 12, weight: .semibold))
-                        .frame(height: 12)
-                    Text("\(count)")
-                        .font(.system(size: 10.5, weight: .medium))
-                        .monospacedDigit()
-                        .lineLimit(1)
+                HStack(spacing: 3) {
+                    FusedBackgroundIcon(
+                        size: 15,
+                        color: isRunning ? tint : Theme.Palette.textSecondary
+                    )
+                    if count > 0 {
+                        Text("\(count)")
+                            .font(.system(size: 10.5, weight: .medium))
+                            .monospacedDigit()
+                            .lineLimit(1)
+                            .foregroundStyle(isRunning ? tint : Theme.Palette.textSecondary)
+                    }
                 }
-                .foregroundStyle(isRunning ? tint : Theme.Palette.textSecondary)
             }
-            .frame(width: 44, height: 24)
+            .frame(width: 52, height: 24)
             .contentShape(Capsule())
         }
         .buttonStyle(.plain)
-        .accessibilityIdentifier("subagent-capsule")
-        .accessibilityLabel(L10n.t("子代理"))
+        .accessibilityIdentifier("background-entry")
+        .accessibilityLabel(L10n.t("后台任务"))
         .accessibilityValue("\(isRunning ? "running" : "idle"):\(count)")
     }
 
@@ -382,6 +386,93 @@ struct SubagentCapsuleButton: View {
 
     private var borderWidth: CGFloat {
         isRunning && reduceMotion ? 1.2 : 1
+    }
+}
+
+/// Fused "subagent + terminal" icon approved on: both glyphs are
+/// authored in the same 24-unit box, each clipped by the square's diagonal
+/// (seam endpoints (3.4,20.4)-(19.4,4.5)); glyph stroke 1.25, seam 1.1.
+struct FusedBackgroundIcon: View {
+    var size: CGFloat = 15
+    var color: Color
+
+    private var glyphStroke: StrokeStyle { StrokeStyle(lineWidth: 1.25, lineCap: .round, lineJoin: .round) }
+
+    var body: some View {
+        ZStack {
+            subagent
+                .clipShape(FusedTopLeftHalf())
+            terminal
+                .clipShape(FusedBottomRightHalf())
+            Path { path in
+                path.move(to: CGPoint(x: 3.4, y: 20.4))
+                path.addLine(to: CGPoint(x: 19.4, y: 4.5))
+            }
+            .stroke(color, style: StrokeStyle(lineWidth: 1.1, lineCap: .round))
+        }
+        .frame(width: 24, height: 24)
+        .scaleEffect(size / 24)
+        .frame(width: size, height: size)
+        .accessibilityHidden(true)
+    }
+
+    private var subagent: some View {
+        ZStack {
+            Path(ellipseIn: CGRect(x: 5.3, y: 4.5, width: 6.2, height: 6.2))
+                .stroke(color, style: glyphStroke)
+            Path { path in
+                path.addArc(
+                    center: CGPoint(x: 8.9, y: 17.2),
+                    radius: 5.5,
+                    startAngle: .degrees(180),
+                    endAngle: .degrees(0),
+                    clockwise: false
+                )
+            }
+            .stroke(color, style: glyphStroke)
+            Path(ellipseIn: CGRect(x: 14.1, y: 8.4, width: 3.6, height: 3.6))
+                .stroke(color, style: glyphStroke)
+        }
+    }
+
+    private var terminal: some View {
+        ZStack {
+            Path(roundedRect: CGRect(x: 6.6, y: 12.2, width: 12.8, height: 8.2), cornerRadius: 2)
+                .stroke(color, style: glyphStroke)
+            Path { path in
+                path.move(to: CGPoint(x: 9.9, y: 15.2))
+                path.addLine(to: CGPoint(x: 12.3, y: 17))
+                path.addLine(to: CGPoint(x: 9.9, y: 18.8))
+            }
+            .stroke(color, style: glyphStroke)
+            Path { path in
+                path.move(to: CGPoint(x: 14.6, y: 18.8))
+                path.addLine(to: CGPoint(x: 17.4, y: 18.8))
+            }
+            .stroke(color, style: glyphStroke)
+        }
+    }
+}
+
+private struct FusedTopLeftHalf: Shape {
+    func path(in rect: CGRect) -> Path {
+        var path = Path()
+        path.move(to: CGPoint(x: rect.minX, y: rect.minY))
+        path.addLine(to: CGPoint(x: rect.maxX, y: rect.minY))
+        path.addLine(to: CGPoint(x: rect.minX, y: rect.maxY))
+        path.closeSubpath()
+        return path
+    }
+}
+
+private struct FusedBottomRightHalf: Shape {
+    func path(in rect: CGRect) -> Path {
+        var path = Path()
+        path.move(to: CGPoint(x: rect.maxX, y: rect.minY))
+        path.addLine(to: CGPoint(x: rect.maxX, y: rect.maxY))
+        path.addLine(to: CGPoint(x: rect.minX, y: rect.maxY))
+        path.closeSubpath()
+        return path
     }
 }
 
