@@ -34,6 +34,34 @@ enum MarkdownFlattener {
         return result
     }
 
+ /// blocks → segments（纯函数；不含缓存）。连续的非代码块合成一个文本段，
+ /// 代码块单独成段；段间距由调用方 VStack 负责，段内不加首尾空行。
+    static func segments(blocks: [MarkdownBlock], variant: MarkdownRenderVariant) -> [MarkdownFlattenSegment] {
+        var out: [MarkdownFlattenSegment] = []
+        var current = AttributedString()
+        var hasContent = false
+
+        func flush() {
+            guard hasContent else { return }
+            out.append(.text(current))
+            current = AttributedString()
+            hasContent = false
+        }
+
+        for block in blocks {
+            if case .codeBlock(let language, let code) = block {
+                flush()
+                out.append(.code(language: language, code: code))
+                continue
+            }
+            if hasContent { current.append(blockSpacer) }
+            append(block, to: &current, variant: variant)
+            hasContent = true
+        }
+        flush()
+        return out
+    }
+
  /// 块间距（一个空行）。
     private static var blockSpacer: AttributedString {
         AttributedString("\n\n")
@@ -200,6 +228,15 @@ enum MarkdownFlattener {
     }
 }
 
+/// One renderable slice of a flattened long message (v7).
+///
+/// Prose blocks stay one `AttributedString` run; fenced code blocks become a
+/// real `MarkdownCodeBlockView` so long messages keep the one-tap copy entry.
+enum MarkdownFlattenSegment {
+    case text(AttributedString)
+    case code(language: String?, code: String)
+}
+
 // MARK: - Cache
 
 /// 超长 Markdown 行的 flatten 结果缓存（key = 变体 + 原文）。
@@ -215,13 +252,21 @@ final class MarkdownFlattenCache {
         init(_ value: AttributedString) { self.value = value }
     }
 
+    private final class SegmentBox {
+        let value: [MarkdownFlattenSegment]
+        init(_ value: [MarkdownFlattenSegment]) { self.value = value }
+    }
+
     private let cache = NSCache<NSString, Box>()
+    private let segmentsCache = NSCache<NSString, SegmentBox>()
     private let lock = NSLock()
     private var missCountStorage = 0
 
     init(countLimit: Int = 200, totalCostLimit: Int = 48 * 1024 * 1024) {
         cache.countLimit = countLimit
         cache.totalCostLimit = totalCostLimit
+        segmentsCache.countLimit = countLimit
+        segmentsCache.totalCostLimit = totalCostLimit
     }
 
  /// Number of flattens performed (cache misses); test/diagnostic only.
@@ -252,7 +297,22 @@ final class MarkdownFlattenCache {
         return value
     }
 
+ /// Segmented form of the same flattened document (code blocks kept apart
+ /// for the copy header). Cached separately; the all-text case still uses
+ /// `attributedString(for:)`.
+    func segments(for text: String, variant: MarkdownRenderVariant) -> [MarkdownFlattenSegment] {
+        let key = (variant == .compact ? "cs|" : "bs|") + text as NSString
+        if let box = segmentsCache.object(forKey: key) {
+            return box.value
+        }
+        let blocks = MarkdownDocumentCache.shared.blocks(for: text)
+        let value = MarkdownFlattener.segments(blocks: blocks, variant: variant)
+        segmentsCache.setObject(SegmentBox(value), forKey: key, cost: max(text.utf8.count, 1))
+        return value
+    }
+
     func removeAll() {
         cache.removeAllObjects()
+        segmentsCache.removeAllObjects()
     }
 }

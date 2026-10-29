@@ -1,6 +1,6 @@
 import SwiftUI
 
-/// Minimal SVG path-data parser (M/L/H/V/A/Z, absolute + relative) covering the
+/// Minimal SVG path-data parser (M/L/H/V/C/A/Z, absolute + relative) covering the
 /// vector assets this app embeds. Arcs are converted to cubic beziers with the
 /// standard W3C endpoint-to-center parameterization (spec F.6.5), split into
 /// <=90 degree segments, so a Path renders identically to the SVG source with
@@ -104,6 +104,17 @@ enum SVGPath {
                         let y = nextNumber()
                         current = CGPoint(x: current.x, y: command == "V" ? y : current.y + y)
                         path.addLine(to: current)
+                    }
+                case "C", "c":
+                    while peekNumber() {
+                        let x1 = nextNumber(); let y1 = nextNumber()
+                        let x2 = nextNumber(); let y2 = nextNumber()
+                        let x = nextNumber(); let y = nextNumber()
+                        let c1 = command == "C" ? CGPoint(x: x1, y: y1) : CGPoint(x: current.x + x1, y: current.y + y1)
+                        let c2 = command == "C" ? CGPoint(x: x2, y: y2) : CGPoint(x: current.x + x2, y: current.y + y2)
+                        let end = command == "C" ? CGPoint(x: x, y: y) : CGPoint(x: current.x + x, y: current.y + y)
+                        path.addCurve(to: end, control1: c1, control2: c2)
+                        current = end
                     }
                 case "A", "a":
                     while peekNumber() {

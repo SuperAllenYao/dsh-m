@@ -11,12 +11,16 @@ import SwiftUI
 struct SubagentListView: View {
     var entries: [SubagentCatalogEntry]
     var runtimes: [String: SubagentRuntime]
+ /// The two-tab sheet embeds the list without its own title header.
+    var showsHeader: Bool = true
     var onSelect: (SubagentCatalogEntry) -> Void
 
     var body: some View {
         VStack(spacing: 0) {
-            SheetHeader(title: L10n.t("子代理"))
-            Rectangle().fill(Theme.Palette.border).frame(height: 1)
+            if showsHeader {
+                SheetHeader(title: L10n.t("子代理"))
+                Rectangle().fill(Theme.Palette.border).frame(height: 1)
+            }
             ScrollView {
                 VStack(alignment: .leading, spacing: Theme.Spacing.xs) {
                     if entries.isEmpty {

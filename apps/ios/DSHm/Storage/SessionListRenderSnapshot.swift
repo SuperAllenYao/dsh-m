@@ -39,6 +39,10 @@ struct SessionListRenderSnapshot: Codable, Equatable, Sendable {
  /// Registry state so incremental `workspace/follow` frames can still be applied
  /// after a compact-only cold start (the raw cache is restored in the background).
     var followBaseline: JSONValue?
+ /// 置顶区：置顶会话已从 `groups` 拆出，必须单独落盘，否则冷启动
+ /// 首帧只剩分组、置顶卡与会话计数要等 raw 快照后台补齐。旧快照没有该字段
+ /// （解码为 nil），restore 时按 follow baseline 从 `groups` 里再拆一次。
+    var pinned: [Session]?
     var groups: [Group]
 
  /// Builds the compact render row for one list item.

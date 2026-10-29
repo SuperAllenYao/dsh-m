@@ -680,26 +680,66 @@ struct MarkdownDocumentView: View {
         if MarkdownRenderPolicy.shouldFlatten(text: text, blockCount: blocks.count) {
  // 方案①：超长消息 → 预构建 AttributedString + 单 Text（首现只剩一次
  // 原生 Text 布局；行高预测量走同一条 sizeThatFits 自动受益）。
-            flattenedTextView(blockCount: blocks.count)
+            flattenedTextView(blocks: blocks)
         } else {
             blockListView(blocks: blocks)
         }
     }
 
  /// 单视图富文本（方案①）：整条消息一个 Text；选择/长按复制/链接点击全保留。
-    private func flattenedTextView(blockCount: Int) -> some View {
-        Text(MarkdownFlattenCache.shared.attributedString(for: text, variant: variant))
-            .foregroundStyle(color)
-            .lineSpacing(MarkdownTypography.lineSpacing(variant))
-            .monospacedDigit()
-            .textSelection(.enabled)
-            .fixedSize(horizontal: false, vertical: true)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .onAppear {
-                #if DEBUG
-                ScrollHitchProbe.mark("mdAppearFlat", ["chars": text.count, "blocks": blockCount])
-                #endif
+ /// 含代码块时按代码块切段（prose 仍单 Text，代码段用换行版代码视图 + 复制），
+ /// 这样长消息的每个代码块也有一键复制入口（v7）。
+    @ViewBuilder
+    private func flattenedTextView(blocks: [MarkdownBlock]) -> some View {
+        let blockCount = blocks.count
+ // code review P2: decide from the parsed blocks, not from a
+ // freshly-built segment array — code-free long messages keep the single
+ // attributed-string path with no extra construction/cache entry.
+        let hasCode = blocks.contains { block in
+            if case .codeBlock = block { return true }
+            return false
+        }
+        Group {
+            if hasCode && MarkdownRenderPolicy.isFlattenSegmentsEnabled {
+                let segments = MarkdownFlattenCache.shared.segments(for: text, variant: variant)
+                VStack(alignment: .leading, spacing: Theme.Spacing.xs) {
+                    ForEach(Array(segments.enumerated()), id: \.offset) { _, segment in
+                        switch segment {
+                        case .text(let attributed):
+                            Text(attributed)
+                                .foregroundStyle(color)
+                                .lineSpacing(MarkdownTypography.lineSpacing(variant))
+                                .monospacedDigit()
+                                .textSelection(.enabled)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        case .code(let language, let code):
+                            MarkdownCodeBlockView(language: language, code: code, wrap: true)
+                        }
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .textSelection(.enabled)
+                .onAppear {
+                    #if DEBUG
+                    ScrollHitchProbe.mark("mdAppearFlatSeg", ["chars": text.count, "blocks": blockCount])
+                    #endif
+                }
+            } else {
+                Text(MarkdownFlattenCache.shared.attributedString(for: text, variant: variant))
+                    .foregroundStyle(color)
+                    .lineSpacing(MarkdownTypography.lineSpacing(variant))
+                    .monospacedDigit()
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .onAppear {
+                        #if DEBUG
+                        ScrollHitchProbe.mark("mdAppearFlat", ["chars": text.count, "blocks": blockCount])
+                        #endif
+                    }
             }
+        }
     }
 
     private func blockListView(blocks: [MarkdownBlock]) -> some View {
@@ -872,23 +912,79 @@ struct MarkdownListItemView: View {
 /// radius = --dsw-radius-lg（16px）；顶部信息栏 bg =
 /// --dsw-alias-markdown-code-block-banner（dark #2c2c2e）、padding 9px 14px、
 /// infostring 用 11px mono + label-primary；内容 padding 16px、11px mono。
-/// App 保留既有横向滚动 + 文本选择（桌面端为自动换行 + 复制按钮）。
+///
+/// v7 复制：头栏常显（无语言显示「代码」），右侧复制按钮；
+/// 点击复制纯代码，对勾 +「已复制」1 秒后恢复（桌面端同款反馈）。
+/// `wrap: true` 供 flatten 长消息切段使用——保持换行、无横向滚动，
+/// 与 flatten 既有的「代码块换行」视觉一致。
 struct MarkdownCodeBlockView: View {
     let language: String?
     let code: String
+    var wrap: Bool = false
+
+    @State private var copied = false
+    @State private var resetTask: Task<Void, Never>?
+
+    private var languageLabel: String {
+        if let language, !language.isEmpty { return language }
+        return L10n.t("代码")
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            if let language, !language.isEmpty {
-                Text(language)
-                    .font(Theme.Typography.monoSmall)
-                    .foregroundStyle(Theme.Palette.textPrimary)
-                    .lineLimit(1)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 9)
-                    .background(Theme.Palette.codeBlockBanner)
+            header
+            content
+        }
+        .background(Theme.Palette.codeBlockBackground)
+ // 桌面代码块 border-radius 16px 来自 CSS var(--dsw-radius-lg)，正圆角。
+        .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.codeBlock, style: .circular))
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .onDisappear {
+            resetTask?.cancel()
+            resetTask = nil
+        }
+    }
+
+    private var header: some View {
+        HStack(spacing: 8) {
+            Text(languageLabel)
+                .font(Theme.Typography.monoSmall)
+                .foregroundStyle(Theme.Palette.textPrimary)
+                .lineLimit(1)
+            Spacer(minLength: 8)
+            Button(action: copyCode) {
+                HStack(spacing: 4) {
+                    Image(systemName: copied ? "checkmark" : "doc.on.doc")
+                        .font(.system(size: 12, weight: .semibold))
+                    if copied {
+                        Text(L10n.t("已复制"))
+                            .font(.system(size: 11, weight: .medium))
+                    }
+                }
+                .foregroundStyle(copied ? Theme.Palette.waiting : Theme.Palette.textSecondary)
+                .frame(width: 44, height: 44)
+                .contentShape(Rectangle())
             }
+            .buttonStyle(.plain)
+            .accessibilityLabel(L10n.t(copied ? "已复制" : "复制代码"))
+            .accessibilityIdentifier("code-copy")
+        }
+        .padding(.leading, 14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Theme.Palette.codeBlockBanner)
+    }
+
+    @ViewBuilder
+    private var content: some View {
+        if wrap {
+            Text(code.isEmpty ? " " : code)
+                .font(Theme.Typography.monoSmall)
+                .foregroundStyle(Theme.Palette.textPrimary)
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(Theme.Spacing.m)
+        } else {
             ScrollView(.horizontal, showsIndicators: false) {
                 Text(code.isEmpty ? " " : code)
                     .font(Theme.Typography.monoSmall)
@@ -900,10 +996,18 @@ struct MarkdownCodeBlockView: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .background(Theme.Palette.codeBlockBackground)
- // 桌面代码块 border-radius 16px 来自 CSS var(--dsw-radius-lg)，正圆角。
-        .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.codeBlock, style: .circular))
-        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func copyCode() {
+        UIPasteboard.general.string = code
+        resetTask?.cancel()
+        withAnimation(Theme.Motion.quick) { copied = true }
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        resetTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            guard !Task.isCancelled else { return }
+            withAnimation(Theme.Motion.quick) { copied = false }
+        }
     }
 }
 

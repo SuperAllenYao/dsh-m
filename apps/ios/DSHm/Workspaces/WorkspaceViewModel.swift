@@ -41,6 +41,10 @@ final class WorkspaceViewModel: ObservableObject {
     }
 
     @Published private(set) var groups: [WorkspaceGroup] = []
+ /// Pinned sessions rendered above the workspace groups.
+ /// Derived from `followState.pinnedSessionIds`; the groups exclude them so
+ /// a pinned session appears exactly once in the list.
+    @Published private(set) var pinnedSessions: [SessionListItem] = []
     @Published private(set) var isLoading = true
     @Published private(set) var errorText: String?
     @Published private(set) var lastLoadedAt: Date?
@@ -280,8 +284,48 @@ final class WorkspaceViewModel: ObservableObject {
                let frame = try? follow.decode(WorkspaceFollowFrame.self) {
                 followState.apply(frame)
             }
-            groups = render.payload.groups.map(Self.workspaceGroup(from:))
-            sessionCount = groups.reduce(0) { $0 + $1.sessions.count }
+            var restoredGroups = render.payload.groups.map(Self.workspaceGroup(from:))
+ // code review P2: the compact snapshot persists the pinned
+ // area in its own field (pinned rows are already split out of `groups`),
+ // so pinning survives a cold start on the very first frame instead of
+ // waiting for the background raw restore.
+            var restoredPinned: [SessionListItem] = []
+            if let storedPinned = render.payload.pinned {
+                restoredPinned = storedPinned.map(SessionListRenderSnapshot.listItem(from:))
+            } else {
+ // Legacy snapshot (written before the pinned field existed): its
+ // groups still contain the pinned rows, so split them back out from
+ // the follow baseline.
+                let pinnedRank = Dictionary(
+                    followState.pinnedSessionIds.enumerated().map { ($0.element, $0.offset) },
+                    uniquingKeysWith: { first, _ in first }
+                )
+                if !pinnedRank.isEmpty {
+                    for index in restoredGroups.indices {
+                        var kept: [SessionListItem] = []
+                        for session in restoredGroups[index].sessions {
+                            if pinnedRank[session.sessionId] != nil {
+                                restoredPinned.append(session)
+                            } else {
+                                kept.append(session)
+                            }
+                        }
+                        restoredGroups[index].sessions = kept
+                    }
+                    restoredPinned.sort { lhs, rhs in
+                        let leftRank = pinnedRank[lhs.sessionId] ?? Int.max
+                        let rightRank = pinnedRank[rhs.sessionId] ?? Int.max
+                        if leftRank != rightRank { return leftRank < rightRank }
+                        let leftTime = Self.activity(of: lhs)
+                        let rightTime = Self.activity(of: rhs)
+                        if leftTime != rightTime { return leftTime > rightTime }
+                        return lhs.sessionId < rhs.sessionId
+                    }
+                }
+            }
+            pinnedSessions = restoredPinned
+            groups = restoredGroups
+            sessionCount = groups.reduce(0) { $0 + $1.sessions.count } + restoredPinned.count
             groupsVersion += 1
             isLoading = false
             loadedFromCache = true
@@ -428,7 +472,11 @@ final class WorkspaceViewModel: ObservableObject {
         guard sessionsLoaded, let sessionList = lastSessionListJSON else { return }
         let follow = followBaselineJSON()
         cacheStore.save(sessionList: sessionList, followBaseline: follow)
-        cacheStore.saveRenderSnapshot(groups: renderGroups(), followBaseline: follow)
+        cacheStore.saveRenderSnapshot(
+            groups: renderGroups(),
+            pinned: renderPinned(),
+            followBaseline: follow
+        )
     }
 
  /// M2b-2b: the raw encode (~1MB) and compact write are pure value-type work —
@@ -437,10 +485,11 @@ final class WorkspaceViewModel: ObservableObject {
         guard sessionsLoaded, let sessionList = lastSessionListJSON else { return }
         let follow = followBaselineJSON()
         let render = renderGroups()
+        let pinned = renderPinned()
         let store = cacheStore
         Task.detached(priority: .utility) {
             store.save(sessionList: sessionList, followBaseline: follow)
-            store.saveRenderSnapshot(groups: render, followBaseline: follow)
+            store.saveRenderSnapshot(groups: render, pinned: pinned, followBaseline: follow)
         }
     }
 
@@ -455,6 +504,12 @@ final class WorkspaceViewModel: ObservableObject {
                 sessions: group.sessions.map(SessionListRenderSnapshot.session(from:))
             )
         }
+    }
+
+ /// Compact shape of the pinned area (already split out of `groups`), persisted
+ /// so a cold start renders the pinned cards on the first frame.
+    private func renderPinned() -> [SessionListRenderSnapshot.Session] {
+        pinnedSessions.map(SessionListRenderSnapshot.session(from:))
     }
 
     var isConnected: Bool {
@@ -1342,15 +1397,26 @@ final class WorkspaceViewModel: ObservableObject {
         maybeStartPrewarm()
     }
 
- /// Test seam: prewarm order. The list's first visible card comes first (that is
- /// what the user — and the live bench — taps first), then the rest by recency.
+ /// Test seam: prewarm order. The first cards the user sees come first — the
+ /// pinned area (when non-empty) sits above every group, then the first group's
+ /// first card, then the rest by recency.
     func prewarmCandidates(limit: Int) -> [SessionWindowPrewarmer.Candidate] {
         guard limit > 0 else { return [] }
         var candidates: [SessionWindowPrewarmer.Candidate] = []
         var seen = Set<String>()
+ // code review P3: pinned rows no longer live in `groups`, so
+ // without this the very first card on screen (pinned[0]) was never warmed.
+        for session in pinnedSessions {
+            guard candidates.count < limit else { break }
+            guard seen.insert(session.sessionId).inserted else { continue }
+            candidates.append(
+                SessionWindowPrewarmer.Candidate(sessionId: session.sessionId, address: session.followAddress)
+            )
+        }
         for group in groups {
+            guard candidates.count < limit else { break }
             guard let first = group.sessions.first else { continue }
-            seen.insert(first.sessionId)
+            guard seen.insert(first.sessionId).inserted else { continue }
             candidates.append(
                 SessionWindowPrewarmer.Candidate(sessionId: first.sessionId, address: first.followAddress)
             )
@@ -1599,7 +1665,7 @@ final class WorkspaceViewModel: ObservableObject {
 
         var rebuilt: [WorkspaceGroup] = []
         rebuilt.reserveCapacity(followState.workspaces.count)
-        var count = 0
+        var visibleAll: [SessionListItem] = []
         for workspace in followState.workspaces {
             var sessions: [SessionListItem] = []
             sessions.reserveCapacity(workspace.sessionIds.count)
@@ -1614,7 +1680,8 @@ final class WorkspaceViewModel: ObservableObject {
                 sessions.append(session)
             }
             sessions.sort(by: comparator)
-            count += sessions.count
+            visibleAll.append(contentsOf: sessions)
+            sessions.removeAll { pinnedRank[$0.sessionId] != nil }
 
             let title = workspace.title.trimmingCharacters(in: .whitespacesAndNewlines)
             rebuilt.append(
@@ -1627,13 +1694,31 @@ final class WorkspaceViewModel: ObservableObject {
                 )
             )
         }
+ // Pinned sessions leave their workspace group and are rendered once,
+ // above every group. Most recent pin first.
+        let pinned = visibleAll
+            .filter { pinnedRank[$0.sessionId] != nil }
+            .sorted { lhs, rhs in
+                let leftRank = pinnedRank[lhs.sessionId] ?? Int.max
+                let rightRank = pinnedRank[rhs.sessionId] ?? Int.max
+                if leftRank != rightRank { return leftRank < rightRank }
+                let leftTime = Self.activity(of: lhs)
+                let rightTime = Self.activity(of: rhs)
+                if leftTime != rightTime { return leftTime > rightTime }
+                return lhs.sessionId < rhs.sessionId
+            }
+
  // Diff guard: a refresh that yields identical content must not publish a new
  // array (no list flash / scroll jump, and the auto-open hook stays silent).
+        if pinned != pinnedSessions {
+            pinnedSessions = pinned
+            groupsVersion += 1
+        }
         if rebuilt != groups {
             groups = rebuilt
             groupsVersion += 1
         }
-        sessionCount = count
+        sessionCount = visibleAll.count
     }
 
  // MARK: - Visibility & ordering (shared with unit tests)

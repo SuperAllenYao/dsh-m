@@ -100,9 +100,13 @@ final class SessionListCacheStore {
     }
 
  /// Writes the compact render snapshot (same identity/TTL envelope as the raw one).
+ /// `pinned` carries the pinned area separately: those rows are split out of
+ /// `groups`, so without their own field the cold-start first frame would show
+ /// every workspace but lose the pinned cards until the raw snapshot lands.
     @discardableResult
     func saveRenderSnapshot(
         groups: [SessionListRenderSnapshot.Group],
+        pinned: [SessionListRenderSnapshot.Session],
         followBaseline: JSONValue?
     ) -> Bool {
         guard let identity = identity() else { return false }
@@ -111,6 +115,7 @@ final class SessionListCacheStore {
             savedAt: now(),
             identity: identity,
             followBaseline: followBaseline,
+            pinned: pinned,
             groups: groups
         )
         return CacheIO.writeAtomically(payload, to: renderFileURL, fileManager: fileManager)

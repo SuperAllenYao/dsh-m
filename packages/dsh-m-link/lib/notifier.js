@@ -31,16 +31,15 @@ export const APPROVAL_CATEGORY = 'dshm-approval';
 /**
  * Pure: pick the alert title for a session.
  *
- * - `info` missing (no row / not polled yet) -> keep the fixed type title
- * ("DSH 回合完成"), so an old host or a cold cache never produces an empty
- * notification title;
+ * - `info` missing (no row / not polled yet) -> "未命名会话" fallback, so a
+ * cold cache still gets a session-shaped title and never a fixed event type;
  * - a non-empty title -> that title (desktop card title);
  * - an empty/blank title -> same wording as the App session list
  * (`apps/ios/DSHm/Protocol/RemoteModels.swift`, `displayTitle`):
  * "新会话" when the row is blank, "未命名会话" otherwise.
  *
  * @param {SessionTitleInfo|null|undefined} info
- * @param {string} fallback fixed type title used when no title info exists
+ * @param {string} fallback session-shaped title used when no title info exists (callers pass "未命名会话")
  * @returns {string}
  */
 export function pushTitleForSession(info, fallback) {
@@ -183,14 +182,16 @@ export class Notifier {
     if (value === undefined || value === null) return;
     if (value.type === 'waterfall' && value.event === 'approval/request') {
       if (!this.config.approval || !this.dedupe('approval|' + String(value.eventId))) return;
-      const toolName = typeof value.request?.toolName === 'string' ? value.request.toolName : 'tool';
+      const rawToolName = typeof value.request?.toolName === 'string' ? value.request.toolName.trim() : '';
+      if (rawToolName.length === 0) this.log('approval push missing toolName: ' + String(value.eventId));
+      const toolName = rawToolName.length > 0 ? rawToolName : '未知工具';
       const sessionId = typeof value.agentId === 'string' ? value.agentId : undefined;
       this.notify(device, {
         kind: 'approval',
- // title = the triggering session's title, body = the event.
-        title: 'DSH 需要审批',
+ // title = the triggering session's title, body = the pending action.
+        title: '未命名会话',
         titleSessionId: sessionId,
-        body: '工具调用 ' + toolName + ' 等待你的确认',
+        body: '等待审批：' + toolName,
         threadId: sessionId,
  // The category is what makes iOS render the 允许/拒绝 actions (M4).
         category: APPROVAL_CATEGORY,
@@ -207,9 +208,9 @@ export class Notifier {
       const sessionId = typeof value.agentId === 'string' ? value.agentId : undefined;
       this.notify(device, {
         kind: 'question',
-        title: 'DSH 需要你的回答',
+        title: '未命名会话',
         titleSessionId: sessionId,
-        body: questions.length === 1 ? '有 1 个问题等待你回答' : '有 ' + String(questions.length) + ' 个问题等待你回答',
+        body: '等待作答 ' + String(questions.length) + ' 个问题',
         threadId: sessionId,
         data: {
           type: 'question',
@@ -239,10 +240,10 @@ export class Notifier {
         if (!this.config.turnEnd) return;
         this.notify(device, {
           kind: 'turn-end',
-          title: 'DSH 回合完成',
+          title: '未命名会话',
           titleSessionId: sessionId,
  // Title carries the session; the body only describes the event.
-          body: '回合完成',
+          body: '回合结束',
           threadId: sessionId,
           data: { type: 'turn-end', sessionId },
         });
@@ -252,7 +253,7 @@ export class Notifier {
         if (!this.config.failure) return;
         this.notify(device, {
           kind: 'failure',
-          title: 'DSH 回合失败',
+          title: '未命名会话',
           titleSessionId: sessionId,
  // The protocol has no error text on turn/end (only reason.kind), so
  // there is no cheap detail to append: report the event only.
@@ -275,7 +276,7 @@ export class Notifier {
  /**
  * Resolve the alert title for one push.
  *
- * `title` is the fixed type title kept as the fallback; `titleSessionId` is the
+ * `title` is the session-shaped fallback (callers pass "未命名会话"); `titleSessionId` is the
  * session the alert belongs to, resolved through `resolveSessionTitle`. The
  * resolver may be async (link-server refreshes its `session/list` title cache
  * on demand) — this runs inside the send queue, never on the bridge path.
