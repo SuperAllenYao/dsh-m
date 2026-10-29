@@ -221,7 +221,6 @@ struct SessionStatusStrip: View {
                         isRunning: backgroundRunning,
                         onTap: onBackgroundTap
                     )
-                    .frame(width: 52)
                     .frame(maxHeight: .infinity)
                 }
             }
@@ -334,9 +333,12 @@ struct SessionStatusStrip: View {
 /// shared entry for subagents + background jobs.
 ///
 /// Fused icon (subagent top-left, terminal bottom-right, diagonal seam) inside
-/// a 52×24 capsule; the count is the subagent count (hidden when 0). While any
-/// subagent or job is live the existing 26%-perimeter beam animates along the
-/// border; Reduce Motion degrades to a static accent border.
+/// a 24pt-tall capsule; the width follows the measured content width so the
+/// left/right padding is exactly half of the former fixed 52pt capsule padding
+/// (0 digits ≈34pt, 1 digit ≈38pt, 2 digits ≈41pt). The count is the subagent
+/// count (hidden when 0). While any subagent or job is live the existing
+/// 26%-perimeter beam animates along the border; Reduce Motion degrades to a
+/// static accent border.
 struct BackgroundEntryCapsule: View {
     var count: Int
     var isRunning: Bool
@@ -344,7 +346,25 @@ struct BackgroundEntryCapsule: View {
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
+ /// Measured natural width of the content row (icon + optional digits).
+ /// Defaults to the one-digit width (15 + 3 + ≈6.3) so the first layout pass
+ /// starts near the final width instead of a visibly wrong one.
+    @State private var contentWidth: CGFloat = 24.3
+
     private var tint: Color { Theme.Palette.accent }
+
+ /// Width formula (AC-12/AC-13). The pre-fix capsule was 52pt wide with the
+ /// content centred, so keeping exactly half of that padding gives
+ /// `(52 + w) / 2`; the 0/1/2-digit states all stay on this exact formula.
+    static let referenceWidth: CGFloat = 52
+ /// Floor for very wide counts: the halving formula would otherwise let the
+ /// digits touch the 1pt stroke (only 3+ digits with `w > 44` are affected).
+    static let minSidePadding: CGFloat = 4
+
+    static func width(contentWidth: CGFloat) -> CGFloat {
+        let halvedPadding = (referenceWidth + contentWidth) / 2
+        return max(halvedPadding, contentWidth + minSidePadding * 2)
+    }
 
     var body: some View {
         Button(action: onTap) {
@@ -370,14 +390,38 @@ struct BackgroundEntryCapsule: View {
                             .foregroundStyle(isRunning ? tint : Theme.Palette.textSecondary)
                     }
                 }
+ // fixedSize keeps the reported width at the content's natural
+ // size (never compressed by the capsule's current width), so a
+ // wide count can't get the measurement stuck too small.
+                .fixedSize()
+                .onGeometryChange(for: CGFloat.self) { proxy in
+                    proxy.size.width
+                } action: { measured in
+ // 未完成布局时可能上报 0，不能把胶囊宽度带偏。
+                    guard measured > 0 else { return }
+                    if measured != contentWidth {
+                        contentWidth = measured
+                    }
+                    Self.probe(measured: measured, count: count)
+                }
             }
-            .frame(width: 52, height: 24)
+            .frame(width: Self.width(contentWidth: contentWidth), height: 24)
             .contentShape(Capsule())
         }
         .buttonStyle(.plain)
         .accessibilityIdentifier("background-entry")
         .accessibilityLabel(L10n.t("后台任务"))
         .accessibilityValue("\(isRunning ? "running" : "idle"):\(count)")
+    }
+
+ /// 探针（设计 §7.1）：`DSHM_CAPSULE_PROBE=1` 时输出实测内容宽与胶囊宽，
+ /// 验证段据此对照宽度公式；非 DEBUG 或未开启时零开销。
+    private static func probe(measured: CGFloat, count: Int) {
+        #if DEBUG
+        guard ProcessInfo.processInfo.environment["DSHM_CAPSULE_PROBE"] == "1" else { return }
+        NSLog("[CAPSULE] content=%.2f width=%.2f count=%d",
+              measured, width(contentWidth: measured), count)
+        #endif
     }
 
     private var borderColor: Color {

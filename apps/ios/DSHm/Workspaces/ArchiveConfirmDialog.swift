@@ -36,6 +36,7 @@ struct ArchiveConfirmDialog: View {
                         .font(Theme.Typography.button.weight(.regular))
                         .foregroundStyle(Theme.Palette.textSecondary)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
                 .accessibilityIdentifier("archive-confirm-cancel")
@@ -47,6 +48,7 @@ struct ArchiveConfirmDialog: View {
                         .font(Theme.Typography.button)
                         .foregroundStyle(Theme.Palette.warning)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
                 .accessibilityIdentifier("archive-confirm-action")

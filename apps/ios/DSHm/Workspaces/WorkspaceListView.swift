@@ -452,6 +452,7 @@ struct WorkspaceListView: View {
                     .listRowInsets(EdgeInsets(top: 0, leading: Theme.Spacing.pageInset, bottom: Theme.Spacing.s, trailing: Theme.Spacing.pageInset))
                     .listRowBackground(Color.clear)
                     .listRowSeparator(.hidden)
+                    .listRowSeparatorTint(.clear)
                     .accessibilityIdentifier("workspace-list-error")
                 }
                 if !viewModel.pinnedSessions.isEmpty {
@@ -474,6 +475,7 @@ struct WorkspaceListView: View {
                     .listRowInsets(EdgeInsets())
                     .listRowBackground(Color.clear)
                     .listRowSeparator(.hidden)
+                    .listRowSeparatorTint(.clear)
                     .accessibilityHidden(true)
             }
             .listStyle(.plain)
@@ -503,6 +505,7 @@ struct WorkspaceListView: View {
         .listRowInsets(EdgeInsets(top: 6, leading: Theme.Spacing.pageInset, bottom: 6, trailing: Theme.Spacing.pageInset))
         .listRowBackground(Color.clear)
         .listRowSeparator(.hidden)
+        .listRowSeparatorTint(.clear)
         .onAppear {
  // Same first-frame contract as `sessionRow`: when every visible
  // session is pinned (or all groups are collapsed) this is the only
@@ -624,6 +627,9 @@ struct WorkspaceListView: View {
  // Plain-list section headers carry their own system insets; zero
  // them so the header width matches the cards exactly.
             .listRowInsets(EdgeInsets())
+ // No separator above/below a workspace header.
+            .listRowSeparator(.hidden)
+            .listRowSeparatorTint(.clear)
     }
 
  /// One session row inside the native List: the equatable card plus the
@@ -682,6 +688,7 @@ struct WorkspaceListView: View {
         .listRowInsets(EdgeInsets(top: 6, leading: Theme.Spacing.pageInset, bottom: 6, trailing: Theme.Spacing.pageInset))
         .listRowBackground(Color.clear)
         .listRowSeparator(.hidden)
+        .listRowSeparatorTint(.clear)
         .swipeActions(edge: .trailing, allowsFullSwipe: false) {
             Button {
                 handlePinToggle(session)
