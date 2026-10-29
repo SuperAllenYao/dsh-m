@@ -6,7 +6,9 @@ DSH-m 通过自托管、TLS 证书钉扎的桥接，把 iPhone App **DSH-m** 连
 
 ## 状态
 
-当前版本 **v2.18.0**（2026-10-29）。已交付的能力：
+当前版本 **v2.19.0**（2026-10-29）。已交付的能力：
+
+- **本轮五项**：推送标题=会话名、正文=状态描述；置顶会话集中到「工作区」标题下的紧凑置顶区；代码块一键复制（含长消息）；子代理/后台任务共用入口与任务停止；离线云朵图标修正、等待作答动效加强。
 
 **导航**
 
@@ -153,7 +155,9 @@ DSH-m connects the iOS app **DSH-m** to your Mac's DSH desktop through a self-ho
 
 ## Status
 
-Current version **v2.18.0** (2026-10-29). What ships today:
+Current version **v2.19.0** (2026-10-29). What ships today:
+
+- **This release**: session-named push titles with state bodies; pinned sessions in a compact area under the Workspaces title; one-tap code-block copy (including long messages); a shared subagents/background-tasks entry with stop; corrected offline cloud icon and a stronger waiting-for-answer animation.
 
 **Connection and pairing**
 
