@@ -50,98 +50,21 @@ DSH-m 通过自托管、TLS 证书钉扎的桥接，把 iPhone App **DSH-m** 连
 |---|---|
 | `packages/dsh-m-link/` | macOS DSH 插件：3466 端口上的 TLS 桥接、配对、设备认证、透明远程桥接、APNs 发送、relay 部署引擎、桌面设置页 |
 | `packages/dsh-m-relay/` | 用于公网访问的轻量 Go relay（控制通道 + bridge 端口段） |
-| `apps/ios/` | SwiftUI iPhone App（`DSHm`）、单元测试、XcodeGen 工程描述 |
+| `apps/ios/` | SwiftUI iPhone App（`DSHm`）源码 |
 
-## 环境要求
+## 源码仓库说明
 
-| 组件 | 要求 |
-|---|---|
-| macOS | 桌面 DSH App（插件加载到它的 `desktop` profile） |
-| Node.js | ≥ 22（插件运行时与插件测试套件） |
-| Xcode | Xcode 16+，以及用于真机构建的 Apple Developer team |
-| XcodeGen | `brew install xcodegen`（`.xcodeproj` 由 `apps/ios/project.yml` 生成） |
-| Go | 1.26+ —— 仅在你自行构建 relay 时需要 |
-| iPhone | iOS 17+ |
-
-## 快速开始
-
-1. **安装插件**到 DSH 的 `desktop` profile —— 可以按 bundle 安装
-   （`dsh plugin --profile desktop add file:/path/to/dsh-m/packages/dsh-m-link`），
-   也可以使用 symlink + profile patch。配置模板见
-   [`config.example.yml`](packages/dsh-m-link/config.example.yml)。
-2. **完全重启 DSH 桌面 App**（不是刷新页面）。
-3. **构建并安装 iOS App**（见下），然后打开。
-4. 在 Mac 上打开 **设置 → DSH-m 手机连接**，在 App 中输入 8 位配对码（或扫描二维码）。
-   两台设备需在同一网络 —— 或已部署 relay。
-5. 可选，用于离家访问：在同一设置页使用 **远程 relay（自托管服务器）**，
-   把 relay 部署到你自己的 Linux 主机。
-
-## 构建 iOS App
-
-```sh
-brew install xcodegen
-cd apps/ios
-xcodegen generate
-open DSHm.xcodeproj
-```
-
-在 Xcode 的 *Signing & Capabilities* 中选择你的签名 team，然后在 iPhone 上运行。模拟器也可以运行（无需签名）。
-
-App 图标已包含在工程中：`apps/ios/DSHm/Resources/Assets.xcassets/AppIcon.appiconset/`
-（重新生成方式：`apps/ios/Design/AppIcon/generate.py`）。
-每次构建都会自动带上图标，无需额外的 Xcode 步骤。
-
-单元测试（模拟器）：
-
-```sh
-cd apps/ios
-xcodegen generate
-export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
-xcodebuild test -project DSHm.xcodeproj -scheme DSHm \
-  -destination 'platform=iOS Simulator,name=iPhone 18 Pro' \
-  -only-testing:DSHmTests -derivedDataPath /tmp/dshm-verify-dd \
-  CODE_SIGNING_ALLOWED=NO
-```
-
-## 插件测试
-
-插件测试套件离线运行，不会触碰正在运行的插件实例（11 个套件，共 195 项检查）：
-
-```sh
-cd packages/dsh-m-link
-node test/apns-payload-shape.mjs    # 11 项：APNs payload 形状
-node test/m4-notify.mjs             # 13 项：通知管线
-node test/m2-transport.mjs          #  8 项：传输分帧
-node test/m2-paircode.mjs           # 18 项：配对码 + Bonjour
-node test/m2-tunnel.mjs --skip-real-relay  # 23 项：隧道客户端
-node test/m2b-deploy.mjs            # 36 项：一键部署引擎
-node test/p1-mux-rpc.mjs            # 26 项：单 WSS mux RPC
-node test/p1-single-wss.mjs         #  6 项：单 WSS 传输
-node test/p1-tickets.mjs            #  9 项：attach ticket
-node test/p1-lite-list.mjs          # 14 项：轻量会话列表
-node test/session-permission.mjs    # 31 项：权限切换
-```
-
-## 构建 relay（可选）
-
-Relay 二进制是**构建产物，不纳入仓库**。构建时会同时重新生成部署引擎用于校验的 manifest：
-
-```sh
-bash packages/dsh-m-relay/scripts/build-release.sh   # linux-amd64 + linux-arm64
-```
-
-然后通过桌面 UI / CLI 部署，或用
-`packages/dsh-m-relay/deploy/install.sh` 手工安装。
+本仓库只公开源代码、README 与 release notes。构建配置（XcodeGen 工程、`package.json`/`go.mod`）、资源文件、单元/E2E 测试、部署脚本与密钥配置均不在公开仓库内，因此不能直接从本仓库构建或运行测试。产品安装与使用请以 release notes 和官方发布渠道为准。
 
 ## 安全说明
 
 - 配对后的手机对你的 Mac 拥有**等同 owner 的控制权**（可在会话中执行工具）。请把任何已配对设备视为受信设备；手机丢失后，立即在 *设置 → DSH-m 手机连接 → 已配对设备* 中吊销。
-- 优先使用局域网或你自建的 relay。生产 profile 中保持 `debug.enabled` 关闭；不要提交 APNs 密钥（`.p8`）、隧道密钥或配对 payload —— 仓库自带的 `.gitignore` 已覆盖这些文件。
+- 优先使用局域网或你自建的 relay。生产 profile 中保持 `debug.enabled` 关闭；不要在公开仓库或提交中放置 APNs 密钥（`.p8`）、隧道密钥或配对 payload。
 - 手机以插件自签 CA 证书为信任锚（配对时固定），并校验服务端证书链与有效期；每台配对设备拥有独立密钥；已吊销设备会被以 `auth/revoked` 拒绝。
 
 ## 许可
 
-[MIT](LICENSE)
+MIT
 
 ---
 
@@ -192,91 +115,12 @@ Not included: peer-to-peer (P2P) connectivity. Public access relies on a relay y
 |---|---|
 | `packages/dsh-m-link/` | macOS DSH plugin: TLS bridge on port 3466, pairing, device auth, transparent remote bridge, APNs sender, relay deploy engine, desktop settings page |
 | `packages/dsh-m-relay/` | Small Go relay for public-network access (control channel + bridge port range) |
-| `apps/ios/` | SwiftUI iPhone app (`DSHm`), unit tests, XcodeGen project spec |
+| `docs/release-notes/` | Release notes |
+| `apps/ios/` | SwiftUI iPhone app (`DSHm`) source |
 
-## Requirements
+## Source-only repository
 
-| Component | Requirement |
-|---|---|
-| macOS | Desktop DSH app (the plugin is loaded into its `desktop` profile) |
-| Node.js | ≥ 22 (plugin runtime and plugin test suites) |
-| Xcode | Xcode 16+, plus an Apple Developer team for real-device builds |
-| XcodeGen | `brew install xcodegen` (the `.xcodeproj` is generated from `apps/ios/project.yml`) |
-| Go | 1.26+ — only if you build the relay yourself |
-| iPhone | iOS 17+ |
-
-## Quick start
-
-1. **Install the plugin** into your DSH `desktop` profile — either as a bundle
-   (`dsh plugin --profile desktop add file:/path/to/dsh-m/packages/dsh-m-link`)
-   or with a symlink + profile patch. The config template is
-   [`config.example.yml`](packages/dsh-m-link/config.example.yml).
-2. **Restart the DSH desktop app completely** (not a page reload).
-3. **Build and install the iOS app** (below), then open it.
-4. On the Mac: **Settings → DSH-m phone connection**, enter the 8-digit pairing
-   code in the app (or scan the QR code). Both devices must be on the same
-   network — or a relay must already be deployed.
-5. Optional, for access away from home: use **Remote relay (self-hosted server)**
-   in the same settings page to deploy the relay to a Linux host you own.
-
-## Build the iOS app
-
-```sh
-brew install xcodegen
-cd apps/ios
-xcodegen generate
-open DSHm.xcodeproj
-```
-
-Select your signing team in Xcode's *Signing & Capabilities*, then run on your
-iPhone. The simulator works too (no signing required).
-
-The app icon is part of the project: `apps/ios/DSHm/Resources/Assets.xcassets/AppIcon.appiconset/`
-(regeneration: `apps/ios/Design/AppIcon/generate.py`).
-Every build ships it — no extra Xcode step.
-
-Unit tests (simulator):
-
-```sh
-cd apps/ios
-xcodegen generate
-export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
-xcodebuild test -project DSHm.xcodeproj -scheme DSHm \
-  -destination 'platform=iOS Simulator,name=iPhone 18 Pro' \
-  -only-testing:DSHmTests -derivedDataPath /tmp/dshm-verify-dd \
-  CODE_SIGNING_ALLOWED=NO
-```
-
-## Plugin tests
-
-The plugin test suites run offline and never touch the live plugin instance
-(11 suites, 195 checks in total):
-
-```sh
-cd packages/dsh-m-link
-node test/apns-payload-shape.mjs    # 11 checks: APNs payload shape
-node test/m4-notify.mjs             # 13 checks: notification pipeline
-node test/m2-transport.mjs          #  8 checks: transport framing
-node test/m2-paircode.mjs           # 18 checks: pairing code + Bonjour
-node test/m2-tunnel.mjs --skip-real-relay  # 23 checks: tunnel client
-node test/m2b-deploy.mjs            # 36 checks: one-click deploy engine
-node test/p1-mux-rpc.mjs            # 26 checks: single-WSS mux RPC
-node test/p1-single-wss.mjs         #  6 checks: single-WSS transport
-node test/p1-tickets.mjs            #  9 checks: attach tickets
-node test/p1-lite-list.mjs          # 14 checks: lite session list
-node test/session-permission.mjs    # 31 checks: permission switching
-```
-
-## Build the relay (optional)
-
-Relay binaries are **build outputs and are not committed**. Building them also
-regenerates the manifest the deploy engine verifies:
-
-```sh
-bash packages/dsh-m-relay/scripts/build-release.sh   # linux-amd64 + linux-arm64
-```
-
-Then deploy it with the desktop UI / CLI, or install manually with `packages/dsh-m-relay/deploy/install.sh`.
+This repository publishes source code, README and release notes only. Build configuration (XcodeGen project, `package.json`/`go.mod`), resources, unit/E2E tests, deployment scripts and key configuration are not included, so the repo cannot be built or tested directly. Use release notes and the official distribution channel for installation and usage.
 
 ## Security notes
 
@@ -284,8 +128,8 @@ Then deploy it with the desktop UI / CLI, or install manually with `packages/dsh
   in your sessions). Treat any paired device as trusted; revoke a lost phone
   immediately in *Settings → DSH-m phone connection → Paired devices*.
 - Prefer LAN or a relay you control. Keep `debug.enabled` off in production
-  profiles; never commit APNs keys (`.p8`), tunnel secrets or pairing payloads —
-  the shipped `.gitignore` covers these.
+  profiles; never place APNs keys (`.p8`), tunnel secrets or pairing payloads in the
+  public repository or in commits.
 - The phone anchors trust on the plugin's self-signed CA certificate (pinned at
   pairing time) and validates the server certificate chain and validity period;
   each paired device has its own key; revoked devices are rejected with
@@ -293,4 +137,4 @@ Then deploy it with the desktop UI / CLI, or install manually with `packages/dsh
 
 ## License
 
-[MIT](LICENSE)
+MIT
