@@ -35,6 +35,7 @@ import { readFileSync } from 'node:fs';
 import { isIP } from 'node:net';
 import { connect as netConnect } from 'node:net';
 import { homedir } from 'node:os';
+import { performance } from 'node:perf_hooks';
 import { connect as tlsConnect } from 'node:tls';
 
 export const TUNNEL_PROTOCOL_VERSION = 1;
@@ -53,6 +54,21 @@ const MAX_LOCAL_STREAMS = 32;
 const DEFAULT_HELLO_TIMEOUT_MS = 10_000;
 const DEFAULT_BACKOFF_MS = [1_000, 2_000, 5_000, 10_000, 30_000];
 const DEFAULT_HEARTBEAT_SEC = 15;
+/**
+ * DD-15: a heartbeat tick only judges the tunnel dead when the monotonic clock
+ * says nothing arrived for 3 intervals. The interval itself can be frozen or
+ * coalesced (macOS App Nap, sleep); a tick that fires this much later than its
+ * interval crossed such a gap and must not judge at all — otherwise the first
+ * tick after wake tears the tunnel down.
+ */
+const HEARTBEAT_FROZEN_TICK_FACTOR = 2;
+/**
+ * DD-15: during system sleep macOS pauses the monotonic clock
+ * (`mach_absolute_time`) while `Date.now()` keeps advancing, so the two deltas
+ * of one tick disagree. Any disagreement beyond this tolerance means the wall
+ * clock jumped (sleep / NTP step), which makes the silence window meaningless.
+ */
+const HEARTBEAT_CLOCK_JUMP_TOLERANCE_MS = 2_000;
 
 const sidBuffer = (sid) => {
   const buf = Buffer.alloc(4);
@@ -206,7 +222,17 @@ export class TunnelClient {
     this.heartbeatTimer = undefined;
     this.helloTimer = undefined;
     this.heartbeatSec = DEFAULT_HEARTBEAT_SEC;
+ /** Wall-clock timestamp of the last inbound frame (diagnostics only). */
     this.lastFrameAt = 0;
+ /**
+ * DD-15: monotonic timestamp of the last inbound frame. Silence is measured
+ * on this clock only: `Date.now()` jumps by the whole sleep/freeze interval,
+ * `performance.now()` does not (macOS pauses it during system sleep).
+ */
+    this.lastFrameAtMono = 0;
+ /** Previous heartbeat-tick anchors (wall + monotonic), for clock-jump detection. */
+    this.lastHeartbeatWallAt = 0;
+    this.lastHeartbeatMonoAt = 0;
  /** Latest pairing-code publish request; flushed on ready. */
     this.pendingCode = undefined;
   }
@@ -459,6 +485,7 @@ export class TunnelClient {
 
   onFrame(type, payload) {
     this.lastFrameAt = Date.now();
+    this.lastFrameAtMono = performance.now();
     switch (type) {
       case FRAME_TYPE.JSON:
         this.onControl(payload);
@@ -563,6 +590,7 @@ export class TunnelClient {
     const heartbeat = Number(message.heartbeatSec);
     this.heartbeatSec = Number.isInteger(heartbeat) && heartbeat >= 1 && heartbeat <= 300 ? heartbeat : DEFAULT_HEARTBEAT_SEC;
     this.lastFrameAt = Date.now();
+    this.lastFrameAtMono = performance.now();
     this.startHeartbeat();
     this.setState('ready');
     this.audit.record('tunnel.ready', { origin: this.origin, port: this.port ?? null, heartbeatSec: this.heartbeatSec });
@@ -593,16 +621,44 @@ export class TunnelClient {
   startHeartbeat() {
     if (this.heartbeatTimer !== undefined) clearInterval(this.heartbeatTimer);
     const interval = Math.max(100, this.heartbeatSec * 1000);
+    this.lastHeartbeatWallAt = Date.now();
+    this.lastHeartbeatMonoAt = performance.now();
     this.heartbeatTimer = setInterval(() => {
-      const now = Date.now();
-      if (now - this.lastFrameAt > 3 * interval) {
+      const wallNow = Date.now();
+      const monoNow = performance.now();
+      const wallDelta = wallNow - this.lastHeartbeatWallAt;
+      const monoDelta = monoNow - this.lastHeartbeatMonoAt;
+      this.lastHeartbeatWallAt = wallNow;
+      this.lastHeartbeatMonoAt = monoNow;
+ // DD-15: judge silence only on a tick that closed a normal interval. The
+ // interval can be frozen/coalesced (App Nap, sleep) and the wall clock can
+ // jump while the monotonic clock does not (macOS pauses it during system
+ // sleep); a tick that crossed such a gap only pings and re-anchors, because
+ // the silence it measures is not evidence that the relay went away.
+      const clockJumped = Math.abs(wallDelta - monoDelta) > HEARTBEAT_CLOCK_JUMP_TOLERANCE_MS;
+      const tickFrozen = monoDelta > interval * HEARTBEAT_FROZEN_TICK_FACTOR;
+      if (clockJumped || tickFrozen) {
+ // If the gap alone already covers the whole timeout window, never count
+ // it as silence: re-anchor the frame clock so a real disconnect is found
+ // by a later tick (at most one interval after wake), not by the first
+ // tick after wake.
+        if (clockJumped || monoNow - this.lastFrameAtMono > 3 * interval) this.lastFrameAtMono = monoNow;
+        this.audit.record('tunnel.heartbeat-skipped', {
+          reason: clockJumped ? 'clock-jump' : 'tick-frozen',
+          wallDeltaMs: wallDelta,
+          monoDeltaMs: Math.round(monoDelta),
+        });
+        this.sendJSON({ t: 'ping', ts: wallNow });
+        return;
+      }
+      if (monoNow - this.lastFrameAtMono > 3 * interval) {
         this.lastError = 'heartbeat-timeout';
-        this.audit.record('tunnel.heartbeat-timeout', { heartbeatSec: this.heartbeatSec });
+        this.audit.record('tunnel.heartbeat-timeout', { heartbeatSec: this.heartbeatSec, silentMs: Math.round(monoNow - this.lastFrameAtMono) });
         this.log('tunnel: heartbeat timeout (' + String(this.heartbeatSec) + 's interval), reconnecting');
         this.socket?.destroy();
         return;
       }
-      this.sendJSON({ t: 'ping', ts: now });
+      this.sendJSON({ t: 'ping', ts: wallNow });
     }, interval);
     if (typeof this.heartbeatTimer.unref === 'function') this.heartbeatTimer.unref();
   }

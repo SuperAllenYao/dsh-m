@@ -43,6 +43,20 @@ struct ModelSelection: Codable, Equatable, Sendable {
     }
 }
 
+extension ModelSelection {
+ /// DD-05: builds the selection shown when the session itself has no projection
+ /// (`modelSelection == nil`) — the deployment default from
+ /// `session/modelCatalog.default`. Pure mapping: it is never written back to the
+ /// session or the catalog.
+    init(defaultSelection: ModelCatalog.DefaultSelection) {
+        self.init(
+            provider: defaultSelection.provider,
+            model: defaultSelection.model,
+            reasoningEffort: defaultSelection.reasoningEffort
+        )
+    }
+}
+
 /// `session/modelCatalog` result: provider-grouped models, deployment default and
 /// isolated provider failures.
 struct ModelCatalog: Decodable, Equatable, Sendable {

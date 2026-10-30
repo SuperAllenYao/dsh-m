@@ -91,6 +91,68 @@ struct P1ResumePlan: Equatable {
 enum P1ResumeTickets {
     static let maxTickets = 2
 
+ /// 票据 payload 的本地过期预检（DD-12，纯函数，不触网）。
+ ///
+ /// 票据格式（插件 `mintResumeTicket`，`packages/dsh-m-link/lib/mux-rpc.js`）：
+ /// `base64url(payloadJSON).base64url(HMAC-SHA256)`，payload 里的 `exp` 是
+ /// **毫秒**时间戳。客户端只读 `exp`、不校验签名（签名由插件负责）：过期票据
+ /// 发 hello 只会换来 `auth/invalid-ticket`（4401）+ 再走一次 ECDSA 挑战，
+ /// 白白多付 1+2 个 RTT；本地判定后直接走 ECDSA。
+ ///
+ /// - Returns: `true` = 已过期；`false` = 未过期；`nil` = **未知**（格式不符 /
+ /// 没有数字 `exp` / base64url 或 JSON 解析失败）——调用方保持现行为（仍按
+ /// 票据发送），不因解析失败改变协议行为。
+    static func isExpired(ticket: String, now: Date = Date()) -> Bool? {
+        guard let expiresAtMs = expiryMilliseconds(ticket: ticket) else { return nil }
+        return expiresAtMs <= now.timeIntervalSince1970 * 1000
+    }
+
+ /// 票据 payload 的毫秒 `exp`；解析失败/字段类型不符时 nil。
+    static func expiryMilliseconds(ticket: String) -> TimeInterval? {
+        guard let payload = decodePayload(ticket: ticket) else { return nil }
+        guard let raw = payload["exp"], !(raw is Bool), let number = raw as? NSNumber else { return nil }
+        let milliseconds = number.doubleValue
+        guard milliseconds.isFinite else { return nil }
+        return milliseconds
+    }
+
+ /// 本次连接尝试可用的下一张票（DD-12）：队列里**未用过**、且本地判定
+ /// **未过期**（未知视作可用，保持旧 App 语义）的第一张；没有则 nil
+ /// （调用方直接走 ECDSA）。
+    static func nextUsableTicket(
+        _ tickets: [String]?,
+        used: Set<String>,
+        now: Date = Date()
+    ) -> String? {
+        guard let tickets else { return nil }
+        return tickets.first { ticket in
+            !ticket.isEmpty
+                && !used.contains(ticket)
+                && isExpired(ticket: ticket, now: now) != true
+        }
+    }
+
+ /// 解码票据的 payload 段为 JSON 对象；失败返回 nil。
+ ///
+ /// 真实票据形如 `payload.signature`；为便于单测也接受「只有 payload」的
+ /// 写法（没有 `.` 时整串视为 payload），不影响生产行为（真实票据恒有签名段）。
+    private static func decodePayload(ticket: String) -> [String: Any]? {
+        guard !ticket.isEmpty else { return nil }
+        let dot = ticket.firstIndex(of: ".")
+        var body = dot.map { String(ticket[ticket.startIndex..<$0]) } ?? ticket
+        guard !body.isEmpty else { return nil }
+ // base64url -> base64（插件侧无 padding）。
+        body = body
+            .replacingOccurrences(of: "-", with: "+")
+            .replacingOccurrences(of: "_", with: "/")
+        while body.count % 4 != 0 { body += "=" }
+        guard let data = Data(base64Encoded: body),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        return object
+    }
+
     static func rotate(
         _ tickets: [String]?,
         used: String?,

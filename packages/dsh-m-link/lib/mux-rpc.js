@@ -73,8 +73,14 @@ export const P1_LIMITS = {
   helloTimeoutMs: 3_000,
  /** Resume ticket lifetime (stateless HMAC ticket, see mintResumeTicket). */
   ticketTtlMs: 10 * 60_000,
- /** A used ticket jti may be replayed once within this window (lost welcome). */
-  ticketReplayGraceMs: 10_000,
+ /**
+ * A used ticket jti may be replayed up to `ticketReplayMaxReplays` times inside
+ * this window (a reconnect whose `welcome` was lost, e.g. a network switch or
+ * wake-up burst), after which it is rejected. DD-07: 10s → 60s.
+ */
+  ticketReplayGraceMs: 60_000,
+ /** Replays allowed for one jti inside the grace window (DD-07: 1 → 3). */
+  ticketReplayMaxReplays: 3,
  /** Downstream text frames at/above this size are gzip-compressed (L3a). */
   gzipThresholdBytes: 4096,
 };
@@ -234,20 +240,22 @@ export function verifyResumeTicket({ secret, ticket, now = Date.now() }) {
 }
 
 /**
- * In-memory single-use guard for resume-ticket `jti` values (design §4.2 #1).
+ * In-memory replay guard for resume-ticket `jti` values (design §4.2 #1).
  *
- * A ticket verifies once, then may be replayed **once** within `graceMs` (the
- * App re-sends the same ticket when the first `welcome` is lost), after which
- * it is rejected. Entries are kept until the ticket expires so a used ticket
- * cannot become reusable by waiting.
+ * A ticket verifies once, then may be replayed up to `maxReplays` times within
+ * `graceMs` (the App re-sends the same ticket when the first `welcome` is lost,
+ * or when a reconnect burst crosses the same cached ticket), after which it is
+ * rejected. DD-07 raises the defaults to 3 replays / 60s. Entries are kept until
+ * the ticket expires so a used ticket cannot become reusable by waiting.
  *
  * Deliberately process-local and never persisted: a plugin restart drops both
  * the HMAC secret and this table, so every cached ticket dies and the App
  * falls back to ECDSA (accepted, see README §3.3).
  */
 export class TicketUseGuard {
-  constructor({ graceMs = P1_LIMITS.ticketReplayGraceMs, maxEntries = 4096, now = () => Date.now() } = {}) {
+  constructor({ graceMs = P1_LIMITS.ticketReplayGraceMs, maxReplays = P1_LIMITS.ticketReplayMaxReplays, maxEntries = 4096, now = () => Date.now() } = {}) {
     this.graceMs = graceMs;
+    this.maxReplays = Number.isInteger(maxReplays) && maxReplays >= 0 ? maxReplays : P1_LIMITS.ticketReplayMaxReplays;
     this.maxEntries = maxEntries;
     this.now = now;
  /** @type {Map<string, {firstUsedAt: number, replays: number, expiresAt: number}>} */
@@ -272,8 +280,8 @@ export class TicketUseGuard {
       this.evictOverflow();
       return { ok: true, replay: false };
     }
-    if (now - entry.firstUsedAt <= this.graceMs && entry.replays === 0) {
-      entry.replays = 1;
+    if (now - entry.firstUsedAt <= this.graceMs && entry.replays < this.maxReplays) {
+      entry.replays += 1;
       return { ok: true, replay: true };
     }
     return { ok: false, reason: 'replayed' };
@@ -423,7 +431,14 @@ export class MuxRpcChannel {
     };
   }
 
- /** Attach a (new) downstream socket. A reconnect reuses the channel state. */
+ /**
+ * Attach a (new) downstream socket. A reconnect reuses the channel state.
+ *
+ * @param {{send: (text: string) => void, sendBinary?: (data: Buffer) => void, close: (code: number, reason: string) => void}} transport
+ * @returns {number} the transport generation of this attach; pass it to
+ * `detachTransport(gen)` so a LATE `close` event from this socket cannot
+ * detach a transport a newer connection has since attached (DD-06).
+ */
   attachTransport(transport) {
     if (this.disposed) throw new Error('MuxRpcChannel is disposed');
     if (this.transport !== undefined) throw new Error('MuxRpcChannel already has a transport');
@@ -439,12 +454,28 @@ export class MuxRpcChannel {
     this.projV1Enabled = false;
  // Lazy/truncate negotiation is per socket too (contract v1.1).
     this.projV1LazyEnabled = false;
+    return this.transportGen;
   }
 
- /** The downstream socket is gone: keep epoch/log for a while, stop sending. */
-  detachTransport() {
+ /**
+ * The downstream socket is gone: keep epoch/log for a while, stop sending.
+ *
+ * `gen` is the generation `attachTransport()` returned for the socket whose
+ * `close` event is being handled. A takeover re-attaches the channel in the
+ * same synchronous stack as the old socket's `close(4409)`, so the old
+ * socket's close event necessarily arrives AFTER the new attach; without the
+ * generation check it would detach the NEW transport and the phone would go
+ * silent. Omitted `gen` keeps the unconditional-detach semantics (internal
+ * call sites and tests that own the channel).
+ *
+ * @param {number} [gen] transport generation captured at attach time
+ * @returns {boolean} true when this call actually detached the transport
+ */
+  detachTransport(gen) {
+    if (Number.isInteger(gen) && gen !== this.transportGen) return false;
     this.transport = undefined;
     this.clearInflight('downstream closed');
+    return true;
   }
 
  /** Attach the upstream mux sender and flush client frames buffered meanwhile. */

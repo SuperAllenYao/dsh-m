@@ -76,7 +76,7 @@ import { detectListLiteRequest, isSessionListEndpoint, LIST_LITE_HEADER, trimSes
 import { buildProjectedPage } from './proj-encode.js';
 
 const PLUGIN_NAME = 'dsh-m-link';
-const PLUGIN_VERSION = '2.20.0';
+const PLUGIN_VERSION = '2.21.0';
 const MUX_PATH = '/api/remote.mux';
 
 /**
@@ -2922,6 +2922,14 @@ export class LinkServer {
     } catch {
  /* already gone */
     }
+ // DD-06: the WebSocket `close` event is asynchronous (the production ws
+ // CLOSE_TIMEOUT is 30s), so the replacement connection reaches
+ // `attachTransport()` in the SAME synchronous stack while the old transport
+ // is still attached; that would throw `already has a transport` and kick the
+ // new socket with 1011. Release the old transport here, synchronously. The
+ // old socket's own close callback is a no-op afterwards thanks to the
+ // generation check in `detachTransport(gen)`.
+    device.p1Channel?.detachTransport();
     return true;
   }
 
@@ -3129,6 +3137,10 @@ export class LinkServer {
   attachP1Downstream(deviceHint, downstream) {
     let device = deviceHint;
     let channel;
+ // DD-06: transport generation captured when THIS socket attached the channel.
+ // A take-over re-attaches the channel in the same stack as close(4409), so
+ // this socket's late close event must not detach/dispose the replacement.
+    let channelTransportGen = 0;
     let helloSeen = false;
  // task-11 E2E: one-shot hello delay for the next reconnect (debug action
  // `p1.drop`); consumed here so only this socket is affected.
@@ -3249,6 +3261,7 @@ export class LinkServer {
           close(1011, 'host inactive');
           return;
         }
+        channelTransportGen = channel.transportGen;
         channel.handleClient(text);
       };
       if (device === undefined && helloHoldMs > 0) {
@@ -3273,12 +3286,18 @@ export class LinkServer {
     downstream.once('close', (code, reason) => {
       downstream.off('message', onMessage);
       settlePending();
-      if (channel !== undefined) channel.detachTransport();
+ // DD-06: only this socket's own transport may be detached here. If the
+ // device was taken over in the meantime, the channel already carries the
+ // replacement transport and this late close is a no-op.
+      if (channel !== undefined) channel.detachTransport(channelTransportGen);
       if (device !== undefined && device.downstream === downstream) {
         device.downstream = undefined;
         device.lastDownstreamActivityAt = 0;
       }
-      if (channel !== undefined) this.scheduleP1Disposal(device, channel);
+ // Same generation check for the resume-window timer: a late close from the
+ // taken-over socket must not arm a dispose() that would close(1001) the
+ // transport the new connection just attached.
+      if (channel !== undefined) this.scheduleP1Disposal(device, channel, channelTransportGen);
  // task-11: the close code/reason is what tells an E2E drop (4000) apart
  // from a transport failure; metadata only (no frame payloads).
       this.audit.record('conn.closed', { deviceId: device?.deviceId, proto: 'dsh-m/2', code, reason: String(reason ?? '') });
@@ -3295,11 +3314,12 @@ export class LinkServer {
         this.counters.authFailed += 1;
         return { error: 'auth/invalid-ticket' };
       }
- // Single-use + one grace replay (design §4.2 #1): a used ticket may be
- // replayed once inside the grace window (a reconnect whose `welcome` was
- // lost), then it is rejected, so a leaked ticket is not usable for its
- // whole TTL. The jti table is in-memory only: a plugin restart drops it
- // together with the HMAC secret and the App falls back to ECDSA.
+ // Single-use with a bounded replay allowance (design §4.2 #1, DD-07): a
+ // used ticket may be replayed up to 3 times inside the 60s grace window
+ // (a reconnect burst whose `welcome` was lost), then it is rejected, so a
+ // leaked ticket is not usable for its whole TTL. The jti table is
+ // in-memory only: a plugin restart drops it together with the HMAC secret
+ // and the App falls back to ECDSA.
       if (this.p1TicketUses.use(verified.jti, verified.expiresAt).ok !== true) {
         this.counters.authFailed += 1;
         return { error: 'auth/ticket-replayed' };
@@ -3509,9 +3529,20 @@ export class LinkServer {
     return channel;
   }
 
- /** Keep a detached channel (replay log) for the resume window, then drop it. */
-  scheduleP1Disposal(device, channel) {
+ /**
+ * Keep a detached channel (replay log) for the resume window, then drop it.
+ *
+ * @param {object} device
+ * @param {import('./mux-rpc.js').MuxRpcChannel} channel
+ * @param {number} [transportGen] generation of the transport that just closed
+ * (DD-06): when the channel has since been re-attached (take-over/new
+ * connection), the old socket's close must not arm a timer that would
+ * `dispose()` — and therefore close(1001) — the transport the new
+ * connection attached. Omitted keeps the previous unconditional behaviour.
+ */
+  scheduleP1Disposal(device, channel, transportGen) {
     if (this.disposed || channel.disposed) return;
+    if (Number.isInteger(transportGen) && channel.transportGen !== transportGen) return;
     clearTimeout(channel.disposeTimer);
     channel.disposeTimer = setTimeout(() => {
       channel.disposeTimer = undefined;

@@ -234,9 +234,17 @@ extension LinkService {
  // waterfalls so the card disappears without an error (T10).
         var approvals = pendingApprovals
         var questions = pendingUserQuestions
+ // DD-04：cancel 帧只带 eventId；撤销前先拿到该 pending question 的
+ // callId，撤销后登记屏蔽，列表卡片的等待计数立即回落。
+        var cancelledWaterfall: UserQuestionWaterfall?
+        if case .cancel(let eventId) = event {
+            cancelledWaterfall = questions.first { $0.eventId == eventId }
+        }
         ForwardedWaterfallQueue.apply(event, approvals: &approvals, questions: &questions)
         if approvals != pendingApprovals { pendingApprovals = approvals }
         if questions != pendingUserQuestions { pendingUserQuestions = questions }
+ // 撤销的是问题瀑布时登记其去重键（问题 id 指纹 + callId），列表计数立即回落。
+        markQuestionDismissed(waterfall: cancelledWaterfall)
  // v6：实时运行态 emit → 列表卡片状态即时刷新。
         if case .emit(let name, let args) = event,
            let live = LiveSessionStatusEmit.parse(name: name, args: args) {
@@ -282,6 +290,11 @@ extension LinkService {
             "callId": .string(callId),
             "answer": UserQuestionAnswersBatch(answers: answers).jsonValue(),
         ])
+ // DD-04：用户问答提交成功即该 call 不再等待本机作答（`accepted == true`
+ // 答完；`false` = 已在桌面端作答/过期）——登记屏蔽键（callId + 同一瀑布的
+ // 问题指纹），列表等待计数立即减去它（快照残留 active 在 TTL 内被扣掉）。
+        markQuestionDismissed("c:" + callId)
+        markQuestionDismissed(waterfall: pendingUserQuestions.first { $0.callId == callId })
         if let accepted = value.boolValue { return accepted }
         if let accepted = value["accepted"]?.boolValue { return accepted }
         return false
@@ -307,6 +320,9 @@ extension LinkService {
                 answers: answers
             )
         )
+ // DD-04：提交成功 → 先登记这条 waterfall 的去重键（问题 id 指纹 + callId），
+ // 再移除等待项；旧 Host 没有 callId 也能被列表正确扣掉。
+        markQuestionDismissed(waterfall: pendingUserQuestions.first(where: { $0.eventId == eventId }))
         pendingUserQuestions.removeAll { $0.eventId == eventId }
     }
 

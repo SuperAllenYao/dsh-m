@@ -673,6 +673,13 @@ final class SessionViewModel: ObservableObject {
     var modelSelector: ((ModelSelection) async throws -> ModelSelection)?
     private var modelCatalogLoaded = false
     private var modelCatalogUnknownSelection: ModelSelection?
+ /// DD-05: last time a `model/selection` event was handled. `nil` = this Host has
+ /// never pushed one (old Host, or a fresh session before the first switch), which
+ /// arms the 30s `session/follow` refollow fallback below.
+    private var lastModelSelectionEventAt: Date?
+ /// DD-05: 30s refollow timer (`session/follow` snapshot replay) while
+ /// `lastModelSelectionEventAt == nil`; only runs while the detail is on screen.
+    private var modelRefollowTimer: Task<Void, Never>?
     private var stream: RemoteStreamHandle?
     private var restartTask: Task<Void, Never>?
     private var rebuildTask: Task<Void, Never>?
@@ -709,12 +716,23 @@ final class SessionViewModel: ObservableObject {
 
  // MARK: - Model selection (v0.2.0)
 
+ /// DD-05: the selection the status strip and the model sheet display.
+ /// Session projection first (`journal.modelSelection`, kept live by the
+ /// `model/selection` event), deployment default from `session/modelCatalog`
+ /// as the fallback for fresh sessions. Derived value only — never written back
+ /// to the session or the catalog.
+    var effectiveModelSelection: ModelSelection? {
+        if let modelSelection { return modelSelection }
+        guard let defaultSelection = modelCatalog?.defaultSelection else { return nil }
+        return ModelSelection(defaultSelection: defaultSelection)
+    }
+
  /// Status-strip model entry content. `nil` for subagent sessions (desktop
  /// parity: addressed subagent sessions expose no model selection).
     var modelTriggerState: ModelTriggerState? {
         guard !isSubagentSession else { return nil }
         if let catalog = modelCatalog {
-            return catalog.triggerState(for: modelSelection, isLoading: modelCatalogLoading)
+            return catalog.triggerState(for: effectiveModelSelection, isLoading: modelCatalogLoading)
         }
         if modelCatalogLoading {
             return ModelTriggerState(text: L10n.t("正在加载模型…"), isLoading: true)
@@ -1266,10 +1284,15 @@ final class SessionViewModel: ObservableObject {
         openStream()
         startHistoryFillIfPossible()
         checkHistoryFillWatchdog()
+ // DD-05: 重新进入详情：旧 Host 兜底重读的判定重新开始。
+        startModelRefollowIfNeeded()
     }
 
     func stop() {
         detailOnScreen = false
+        stopModelRefollow()
+        lastModelSelectionEventAt = nil
+        resetUserInteractingState()
         restartTask?.cancel()
         rebuildTask?.cancel()
         subagentDebounceTask?.cancel()
@@ -1316,6 +1339,10 @@ final class SessionViewModel: ObservableObject {
         observedGeneration = generation
         if generation > 0 {
             reopenStream()
+ // DD-05：连接重建后重新评估「旧 Host 模型跟随兜底」（断线期间可能错过
+ // `model/selection` 事件）。
+            lastModelSelectionEventAt = nil
+            startModelRefollowIfNeeded()
         }
         maybeFlushQueued()
         resetFileChangesExactFetch(reason: "generation-change")
@@ -1443,6 +1470,11 @@ final class SessionViewModel: ObservableObject {
  // Self-heal entry: a reconnect must also revive a fill stuck in
  // failed/loading-with-no-task, not only the pausedOffline case.
             checkHistoryFillWatchdog()
+ // DD-05: 链路恢复后重新评估旧 Host 的模型跟随兜底。
+            startModelRefollowIfNeeded()
+        } else {
+ // DD-05: 断开时停止兜底重读（重连后由上面的分支或 generation 变化重启）。
+            stopModelRefollow()
         }
     }
 
@@ -2861,6 +2893,11 @@ final class SessionViewModel: ObservableObject {
                 }
             case .event(let event):
                 dbg("event: " + event.type + " seq=" + String(event.seq))
+ // DD-05: 收到 `model/selection` 说明该 Host 会推送实时选择，
+ // 停掉「旧 Host 模型跟随兜底」的 30s 重读。
+                if event.type == "model/selection" {
+                    noteModelSelectionEvent()
+                }
                 #if DEBUG
                 let eventApplyStart = CACurrentMediaTime()
                 let update = journal.apply(event: event)
@@ -2976,9 +3013,23 @@ final class SessionViewModel: ObservableObject {
         checkHistoryFillWatchdog()
     }
 
- /// task-5: 三路实时预览（文本 / 思考 / 工具参数）共用 10Hz 节流发布；
+ /// task-5: 三路实时预览（文本 / 思考 / 工具参数）共用 4Hz 节流发布；
  /// `flush` 用于 turn 结束/重建，立即同步到最新值。
-    private func publishLiveStreamText(flush: Bool = false) {
+ /// DD-02: 列表滚动交互期间冻结尾部（`force` = 1s 上限/交互结束的强制补齐）。
+    private func publishLiveStreamText(flush: Bool = false, force: Bool = false) {
+        if isUserInteracting, !force {
+ // DD-02：手指在列表上（拖拽/惯性）时不发布尾部 —— 数据仍在 journal
+ // 里增长，交互结束或 1s 上限到达时一次补齐。
+ // 例外：live 预览已被结算清空（持久 `assistant/message`/`turn/end` 落地）
+ // 时放行这次 flush —— 不清掉旧预览会与持久行重复显示，且这不是尾部增长。
+            let isSettlingLiveText = flush
+                && journal.liveAssistantText.isEmpty
+                && !liveAssistantText.isEmpty
+            if !isSettlingLiveText {
+                deferredTailPublish = true
+                return
+            }
+        }
         if flush {
             liveTextThrottleTask?.cancel()
             liveTextThrottleTask = nil
@@ -2994,15 +3045,22 @@ final class SessionViewModel: ObservableObject {
         }
         if liveTextThrottleTask != nil { return }
         syncLiveStreamValues()
- // 读历史时尾部 live 预览在视图侧被冻结，10Hz 发布只制造整表重算；
- // 降到 4Hz（数据不丢，回到底部立即 flush）。贴底跟随仍保持 10Hz 实时感。
-        let throttle: UInt64 = detailCovered
-            ? 1_000_000_000
-            : (readingHistory ? 250_000_000 : 100_000_000)
+ // 测试注入（0）：同步发布，不排队 trailing-edge 任务，后续帧也不会被合并
+ // 窗口拦住——`applyStreamValue` 返回时 @Published 即最新值。生产默认
+ // 250ms，走下方合并；冻结/读历史/覆盖降频逻辑完全不变。
+        guard livePublishIntervalNanoseconds > 0 else { return }
+ // DD-02：贴底发布间隔 100ms → 250ms（4Hz，授权「成段」观感）。
+ // 被覆盖（不可见）时 1s 合并一次；数据不丢，交互结束后立即 flush。
+        let throttle: UInt64 = detailCovered ? 1_000_000_000 : livePublishIntervalNanoseconds
         liveTextThrottleTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: throttle)
             guard let self, !Task.isCancelled else { return }
             self.liveTextThrottleTask = nil
+            guard !self.isUserInteracting else {
+ // 节流窗口内开始了拖动/惯性：冻结，等交互结束或 1s 上限补齐。
+                self.deferredTailPublish = true
+                return
+            }
             self.syncLiveStreamValues()
         }
     }
@@ -3097,11 +3155,66 @@ final class SessionViewModel: ObservableObject {
                 fillDiagnosticsDirty = false
                 syncFillDiagnostics()
             }
+ // DD-05: 重新可见 → 未收到 `model/selection` 的旧 Host 恢复兜底重读。
+            startModelRefollowIfNeeded()
+        } else {
+ // DD-05: 被子会话覆盖（不可见）→ 暂停 30s 兜底重读。
+            stopModelRefollow()
         }
     }
 
  /// 读历史期间被推迟的尾部 live 发布（数据在 journal 里，回贴底补发）。
     private var deferredTailPublish = false
+
+ /// Test seam（DD-02 发布合并窗口）：生产默认 250ms；单测设 0 表示同步发布
+ /// （`applyStreamValue` 之后立即能读到最后一次写入的 @Published 值）。
+ /// 只影响实时预览的发布节奏，journal 写入/读历史冻结/重建防抖都不变。
+    var livePublishIntervalNanoseconds: UInt64 = 250_000_000
+
+ /// DD-02: 列表滚动交互态（手指拖拽 / 惯性）。为真时尾部 live 预览冻结
+ /// （数据仍写 journal），交互结束或 1s 上限到达时一次补齐。
+    private var isUserInteracting = false
+ /// DD-02: 交互冻结的 1s 上限兜底（交互结束回调丢失时仍能补齐）。
+    private var interactionFlushDeadlineTask: Task<Void, Never>?
+
+ /// DD-02: 列表交互开始/结束（来自列表的 `scrollViewWillBeginDragging` /
+ /// `scrollViewDidEndDragging(willDecelerate:false)` / `scrollViewDidEndDecelerating`）。
+ /// 只影响 UI 发布节奏，journal/历史补齐/网络加载完全不动。
+    func setUserInteracting(_ value: Bool) {
+        if value {
+ // 每次收到滚动活动都续期：连续拖动期间不触发上限（尾部保持冻结），
+ // 只有「交互结束回调丢失 + 1s 内没有任何滚动活动」才强制补齐。
+            isUserInteracting = true
+            interactionFlushDeadlineTask?.cancel()
+            interactionFlushDeadlineTask = Task { [weak self] in
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                guard !Task.isCancelled, let self else { return }
+                self.interactionFlushDeadlineTask = nil
+                self.flushLiveTailAfterInteraction()
+            }
+            return
+        }
+        guard isUserInteracting else { return }
+        isUserInteracting = false
+        interactionFlushDeadlineTask?.cancel()
+        interactionFlushDeadlineTask = nil
+        flushLiveTailAfterInteraction()
+    }
+
+ /// 页面销毁时清掉交互冻结态（手势中断不会再有结束回调）。
+    private func resetUserInteractingState() {
+        interactionFlushDeadlineTask?.cancel()
+        interactionFlushDeadlineTask = nil
+        isUserInteracting = false
+    }
+
+ /// 交互结束/上限到达：把交互期间冻结的尾部一次补齐。
+ /// 读历史时保持冻结（回贴底由 `setReadingHistory` 补发），不白做整表重算。
+    private func flushLiveTailAfterInteraction() {
+        guard deferredTailPublish else { return }
+        guard !readingHistory else { return }
+        publishLiveStreamText(flush: true, force: true)
+    }
 
  /// 视图侧贴底状态变化时调用（onNearBottomChange 链路）。只影响发布节奏，不暂停加载。
     func setReadingHistory(_ value: Bool) {
@@ -3112,7 +3225,12 @@ final class SessionViewModel: ObservableObject {
             if pendingRebuild || deferredTailPublish {
                 deferredTailPublish = false
                 rebuildNowForHistoryBatch()
-                publishLiveStreamText(flush: true)
+                if isUserInteracting {
+ // DD-02：手指仍在列表上 → 尾部继续冻结，交互结束时再补齐。
+                    deferredTailPublish = true
+                } else {
+                    publishLiveStreamText(flush: true)
+                }
             }
         }
     }
@@ -3693,6 +3811,56 @@ final class SessionViewModel: ObservableObject {
         modelCatalogUnknownSelection = selection
         Task { [weak self] in
             await self?.loadModelCatalogIfNeeded(force: true)
+        }
+    }
+
+ // MARK: - DD-05: 模型跟随兜底（旧 Host 不投递 `model/selection`）
+
+ /// `model/selection` 事件处理：该 Host 会推送实时选择，记时间并停掉兜底重读。
+    private func noteModelSelectionEvent() {
+        lastModelSelectionEventAt = Date()
+        stopModelRefollow()
+    }
+
+ /// 详情页可见且从未收到 `model/selection` 时，每 30s 重开一次 `session/follow`
+ /// （首帧 snapshot 带回 `modelSelection` 投影），覆盖「停留在详情页、桌面端切换
+ /// 模型」的旧 Host。收到首个事件 / 页面消失 / 链路断开即停。
+    private func startModelRefollowIfNeeded() {
+        guard modelRefollowTimer == nil, !isSubagentSession,
+              lastModelSelectionEventAt == nil, detailOnScreen, !detailCovered,
+              let link, link.phase.isConnected else { return }
+        modelRefollowTimer = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 30_000_000_000)
+                guard !Task.isCancelled, let self else { return }
+                guard self.detailOnScreen, !self.detailCovered,
+                      self.lastModelSelectionEventAt == nil,
+                      let link = self.link, link.phase.isConnected else {
+                    self.stopModelRefollow()
+                    return
+                }
+                self.reopenFollowForModelRefollow()
+            }
+        }
+    }
+
+    private func stopModelRefollow() {
+        modelRefollowTimer?.cancel()
+        modelRefollowTimer = nil
+    }
+
+ /// 兜底重读：用重连同一条路径（`reopenStream()`）重开 `session/follow`——先取消
+ /// 旧流与在飞历史补齐，再打开新订阅；快照到达后走既有 snapshot 替换路径。
+    private func reopenFollowForModelRefollow() {
+        guard detailOnScreen, !detailCovered, let link, link.phase.isConnected else {
+            stopModelRefollow()
+            return
+        }
+ // 空会话（骨架/空态由 isLoading 决定）保持原态，避免一次 loading 闪烁。
+        let wasLoading = isLoading
+        reopenStream()
+        if rows.isEmpty, isLoading != wasLoading {
+            isLoading = wasLoading
         }
     }
 

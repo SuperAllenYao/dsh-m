@@ -60,6 +60,12 @@ final class LinkService: ObservableObject {
  /// `open` calls answer through `$events/result`; the pending list lets the
  /// UI observe live requests that have no snapshot projection yet.
     @Published var pendingUserQuestions: [UserQuestionWaterfall] = []
+ /// DD-04：已答/已撤销的实时问题 callId → 屏蔽时刻。
+ ///
+ /// 写方 = 回答成功与 cancel 帧（`LinkService+Streams`）；读方 = 列表卡片的
+ /// 等待计数（快照里的 active 在 TTL 内被屏蔽，卡片立即从 waitingAnswer 回落）。
+ /// TTL 60s 或真断开（`clearPendingWaterfalls`）时清空；不持久化。
+    @Published private(set) var dismissedQuestionCallIds: [String: Date] = [:]
  /// `$events` 实时会话运行态（`api-session/status` emit）：列表卡片用它即时刷新
  /// 状态，不必等下一次 `session/list`（用户 报障：列表状态不实时）。
     @Published private(set) var liveSessionRunning: [String: Bool] = [:]
@@ -212,6 +218,12 @@ final class LinkService: ObservableObject {
     var eventsStream: RemoteStreamHandle?
     var connectTask: Task<Void, Never>?
     var retryTask: Task<Void, Never>?
+
+    #if DEBUG
+ /// 验证期诊断：`DSHM_LINKDUMP=1` 时每 5s 把实时事件状态写进
+ /// Documents/link-dump.json，供 devicectl 拉取判读（生产不编译行为）。
+    private var linkDumpTask: Task<Void, Never>?
+    #endif
  /// 最近一轮每个候选的失败类别：用于区分"桌面端还在启动"（插件未就绪/地址不可达）
  /// 与普通断网，从而在重启窗口内用短固定退避快速探测，不让退避滚到 10s。
     private var lastRoundFailureClasses: [CandidateFailureClass] = []
@@ -261,6 +273,34 @@ final class LinkService: ObservableObject {
     private var lastFirstByteVerificationAt: Date?
     private var transportVerificationTask: Task<Void, Never>?
 
+ // MARK: - DD-08/DD-14（轮次无进展看门狗 + 关闭补轮）
+
+ /// 看门狗阈值：连接轮次超过它没有任何进展即强制一次「并行发现 + 重新挑战」。
+ ///
+ /// BASIS-17 的兜底：锁屏/断链后 App 侧可能出现「拨号长期无进展」，现有候选
+ /// 超时是 2.5–8s，最后候选要烧满整档；这里把任何卡死路径压到 ~3s，再由候选
+ /// 队列/下一轮重新发现与重新挑战。
+    nonisolated static let roundProgressWatchdogSeconds: TimeInterval = 3
+
+ /// 本轮最后一次「有进展」的时刻：任一候选的拨号开始、TCP/TLS 建立、鉴权
+ /// 完成、HTTP upgrade / `welcome` 都算（见 `noteRoundProgress`）。
+    private var lastRoundProgressAt: Date?
+ /// 本轮看门狗是否已经强制过一次（每轮最多一次，避免强制风暴）。
+    private var roundWatchdogForced = false
+ /// 看门狗任务句柄（轮次出口取消）。
+    private var roundWatchdogTask: Task<Void, Never>?
+ /// 看门狗代次：旧轮次的出口只允许取消自己那一代的看门狗。
+    private var roundWatchdogGeneration = 0
+ /// 单测 seam：看门狗阈值（`nil` = 生产 3s；测试可缩短以覆盖强制重拨路径）。
+    var roundProgressWatchdogSecondsForTesting: TimeInterval?
+
+ /// DD-14：`handleP1Close` 取消在飞连接轮时置真，由轮次出口按现有退避补一轮。
+ /// 不置位的话「直接起的新 Task」会被 `connectOnce` 的 `!isConnecting` 守卫
+ /// 静默挡掉，关闭后可能静默停摆（BASIS-24）。
+    private var needsFollowUpRound = false
+ /// DD-14 补轮去抖：0.3s 内重复的补轮请求合并成一轮，不放大退避抖动。
+    private var lastFollowUpRoundAt: Date?
+
  /// Short-lived api token (auto-refreshed on expiry/401).
     var apiToken: String?
     var apiTokenExpiresAt: Date?
@@ -283,6 +323,9 @@ final class LinkService: ObservableObject {
 
     init() {
         credentials = store.load()
+        #if DEBUG
+        startLinkDumpIfNeeded()
+        #endif
  // T2(B2)：冷启动直接恢复未过期的 api token（若本机 Keychain 有），
  // 让随后 connect 轮次里的 api token 预取命中快路径（省 2 个 RTT）。
         restorePersistedAPIToken()
@@ -1099,7 +1142,11 @@ final class LinkService: ObservableObject {
         restorePersistedAPIToken()
         retryTask?.cancel()
         retryTask = nil
+ // 在飞轮次不重启（保持原语义）：补轮标志也不动——那个在飞轮次的出口
+ // 还要靠它补一轮（DD-14）。
         if isConnecting { return }
+ // 显式发起连接：丢弃旧的补轮请求（DD-14），由本次轮次负责。
+        needsFollowUpRound = false
         connectTask?.cancel()
         connectTask = Task { [weak self] in
             await self?.connectOnce()
@@ -1121,6 +1168,9 @@ final class LinkService: ObservableObject {
         retryTask = nil
         attempt = 0
         manuallyDisconnected = false
+ // 显式重连（含前台恢复/看门狗）：旧的补轮请求作废（DD-14），本次轮次
+ // 由调用方自己的路径负责，避免出口再叠一轮。
+        needsFollowUpRound = false
  // An explicit reconnect is the operator/UI retry: probe dsh-m/2 again
  // even if an earlier round degraded to the legacy path, and do a full
  // rebuild instead of continuing a retained resume channel.
@@ -1286,6 +1336,48 @@ final class LinkService: ObservableObject {
  /// A healthy mux on the current network is reused with no traffic (P0-5 rule);
  /// every other state reconnects **now**, cancelling a pending backoff wait so
  /// the chain never pays the 0.5-10s `scheduleReconnect` delay.
+    #if DEBUG
+ /// 启动诊断转储（幂等）。仅 DEBUG + env 开启时有开销。
+    func startLinkDumpIfNeeded() {
+        guard ProcessInfo.processInfo.environment["DSHM_LINKDUMP"] == "1" else { return }
+        guard linkDumpTask == nil else { return }
+        linkDumpTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 5_000_000_000)
+                guard let self, !Task.isCancelled else { return }
+                self.writeLinkDump()
+            }
+        }
+    }
+
+    private func writeLinkDump() {
+        let questions = pendingUserQuestions.map { [
+            "eventId": $0.eventId,
+            "agentId": $0.agentId ?? "nil",
+            "callId": $0.callId ?? "nil",
+            "questions": String($0.questions.count),
+        ] }
+        let approvals = pendingApprovals.map { [
+            "eventId": $0.eventId,
+            "agentId": $0.agentId ?? "nil",
+        ] }
+        let payload: [String: Any] = [
+            "ts": ISO8601DateFormatter().string(from: Date()),
+            "phase": String(describing: phase),
+            "generation": generation,
+            "eventsStreamOpen": eventsStream != nil,
+            "eventsClientIdConfirmed": eventsClientIdConfirmed,
+            "pendingUserQuestions": questions,
+            "pendingApprovals": approvals,
+            "liveSessionRunning": liveSessionRunning,
+            "dismissedQuestionCallIds": Array(dismissedQuestionCallIds.keys),
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted]),
+              let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else { return }
+        try? data.write(to: dir.appendingPathComponent("link-dump.json"), options: .atomic)
+    }
+    #endif
+
     func handlePageEnter() {
         ReconnectMetrics.beginPageEnter(reason: "listPage")
         guard credentials != nil, !manuallyDisconnected else { return }
@@ -1449,6 +1541,8 @@ final class LinkService: ObservableObject {
         cancelColdStartCapabilityProbe()
         projV1RemountTarget = nil
         isConnecting = false
+        cancelRoundWatchdog()
+        needsFollowUpRound = false
         p1SilentResume = false
         p1LostAt = nil
         teardownTransport()
@@ -1516,6 +1610,11 @@ final class LinkService: ObservableObject {
             return
         }
         isConnecting = true
+ // DD-08：轮次无进展看门狗。本轮任一候选的拨号/TCP/TLS/鉴权/HTTP/welcome
+ // 进展都会刷新 `lastRoundProgressAt`；超过阈值无进展则强制一次「并行发现
+ // + 重新挑战」（见 `forceRechallengeAfterStall`）。轮次出口取消。
+        let watchdogGeneration = startRoundWatchdog()
+        defer { cancelRoundWatchdog(generation: watchdogGeneration) }
  // 轮起点：mux 冲突重试的等待基准（插件 1.5s 静默接管窗口从旧连接最后
  // 一帧起算 ≈ 本时刻）。
         let roundStartedAt = Date()
@@ -1539,6 +1638,8 @@ final class LinkService: ObservableObject {
         )
         guard !candidates.isEmpty else {
             isConnecting = false
+ // 没有可拨地址：补轮也不会成功，清掉标志（DD-14）。
+            needsFollowUpRound = false
             phase = .needsRepair(L10n.t("配对凭据没有可用的服务器地址，请重新配对"))
             return
         }
@@ -1600,32 +1701,25 @@ final class LinkService: ObservableObject {
  // LAN 侧重连从 ~1.9–2.4s 降到 ~0.3–0.5s。陈旧 LAN 地址（Mac 换 IP）由
  // speculative 紧上限兜底：最多烧 1.2s 就转后台收敛结果，不劣于旧的
  // 「先发现 1.5–2s 再拨」。
+ // DD-13：`.none` 不再串行等待「发现 + 探测」——**恒先拨首候选**，发现与
+ // 探测只服务首拨失败后的后续候选。旧实现的 `.none`（跨网段陈旧 LAN 首
+ // 候选 / 单候选）会先 await 一次发现+并行探测，最坏 2.2s 才发第一次拨号
+ // （BASIS-23），是 AC-17 冷启 1s 目标的直接阻塞。
+ //
+ // 跨网段首候选的次序不变（仍按当前网络重排），只是先拨、紧上限 1.2s
+ // （见下方 `dialFirstStaleLANCap`）；发现/探测在后台并行，首拨失败才
+ // 消费结果重排剩余候选。
+        let shouldDiscover = endpointsDirty || candidates.count > 1
         let dialPolicy = Self.dialFirstPolicy(
             prefersRelay: prefersRelay,
             orderedCandidates: orderedCandidates,
             local: localNetwork,
-            shouldDiscover: endpointsDirty || candidates.count > 1
+            shouldDiscover: shouldDiscover
         )
-        var dialCandidates = orderedCandidates
+        let dialCandidates = orderedCandidates
         var convergenceConsumed = false
         var convergenceTask: Task<(origins: [String], observations: [EndpointHealing.ProbeObservation]), Never>?
-        switch dialPolicy {
-        case .none:
-            let discovery = await discoverAndProbe(
-                candidates: orderedCandidates,
-                local: localNetwork,
-                prefersRelay: prefersRelay,
-                credentials: credentials
-            )
-            dialCandidates = Self.dialOrder(
-                discovered: discovery.origins,
-                observations: discovery.observations,
-                fallback: orderedCandidates,
-                local: localNetwork,
-                prefersRelay: prefersRelay
-            )
-            convergenceConsumed = true
-        case .fullBudget, .speculative:
+        if shouldDiscover {
             let convergenceStartedAt = Date()
             convergenceTask = Task { [weak self] in
                 guard let self else { return ([], []) }
@@ -1643,8 +1737,8 @@ final class LinkService: ObservableObject {
                 #endif
                 return result
             }
-            linkDebug("round: dial-first \(dialPolicy) (dial now, convergence in background)")
         }
+        linkDebug("round: dial-first \(dialPolicy) (dial now, convergence in background)")
         defer { convergenceTask?.cancel() }
         let hasSameSubnetLAN = dialCandidates.contains {
             Self.candidateRole(host: $0.host, local: localNetwork) == .lanSameSubnet
@@ -1700,6 +1794,9 @@ final class LinkService: ObservableObject {
             let attemptCount = max(queue.count, dialCandidates.count)
             if Task.isCancelled {
                 isConnecting = false
+ // DD-14：被取消的轮次（关闭/看门狗/新轮次顶替）从出口补一轮，
+ // 否则「关掉在飞轮」之后可能没有任何轮次在跑。
+                consumeFollowUpRoundAtRoundExit()
                 return
             }
             let remaining = roundDeadline.timeIntervalSinceNow
@@ -1727,6 +1824,19 @@ final class LinkService: ObservableObject {
             ) {
                 attemptTimeout = min(attemptTimeout, cap)
             }
+ // DD-13：`.none` 轮次的首候选（跨网段陈旧 LAN）现在也立即拨号——
+ // 只给一个投机紧上限（1.2s），超时即转后台收敛结果/下一候选。
+            if let cap = Self.dialFirstStaleLANCap(
+                attemptIndex: attemptIndex,
+                policy: dialPolicy,
+                origin: origin,
+                local: localNetwork,
+                shouldDiscover: shouldDiscover
+            ) {
+                attemptTimeout = min(attemptTimeout, cap)
+            }
+ // DD-08：拨号开始即「有进展」，看门狗据此区分卡死与正常慢拨号。
+            noteRoundProgress("candidate")
  // authenticateToken() reads `credentials.origin`, so point it at the
  // origin under test before every attempt.
             setCurrentOrigin(origin, persist: false)
@@ -1777,6 +1887,8 @@ final class LinkService: ObservableObject {
                 ReconnectMetrics.markPickedOrigin(host)
                 setCurrentOrigin(origin, persist: true)
                 isConnecting = false
+ // 连接成功：本轮的补轮请求作废（DD-14，避免下一次出口误补）。
+                needsFollowUpRound = false
                 attempt = 0
                 lastConnectedAt = Date()
                 lastErrorText = nil
@@ -1955,7 +2067,11 @@ final class LinkService: ObservableObject {
             }
         }
         isConnecting = false
-        guard !Task.isCancelled else { return }
+        if Task.isCancelled {
+ // DD-14：同上——轮次出口按现有退避补一轮（0.3s 去抖）。
+            consumeFollowUpRoundAtRoundExit()
+            return
+        }
  // Only when every candidate rejected the credential is re-pairing the only
  // remedy; a single rejected (stale/healed) origin must not end the round.
         if !credentialRejections.isEmpty, credentialRejections.count >= dialCandidates.count {
@@ -1963,6 +2079,8 @@ final class LinkService: ObservableObject {
  // T2(B2)：凭据被所有候选拒绝 = repair 语义，持久化的 api
  // token 也一并作废（重新配对时 adopt 会再清一次，双保险）。
             apiTokenStore.clear(scope: apiTokenScope)
+ // 需要重新配对：补轮不会成功，清掉标志（DD-14）。
+            needsFollowUpRound = false
             phase = .needsRepair(credentialRejections.last ?? L10n.t("配对凭据被拒绝，请重新配对"))
             return
         }
@@ -1981,6 +2099,107 @@ final class LinkService: ObservableObject {
  // 整轮都失败：下一轮必须重新发现端点（很可能手里全是旧地址）。
         endpointsDirty = true
         _ = rotateOriginIfPossible(reason: failures.last ?? L10n.t("连接失败"))
+ // DD-14：本轮自己就会退避补一轮，清掉补轮标志避免出口再叠一轮。
+        needsFollowUpRound = false
+        scheduleReconnect()
+    }
+
+ // MARK: - DD-08 轮次无进展看门狗
+
+ /// 记录本轮一次「有进展」（DD-08）。任一候选的拨号开始 / TCP+TLS / 鉴权 /
+ /// HTTP upgrade / `welcome` 都算；看门狗只看这一个时间戳。
+    private func noteRoundProgress(_ stage: String) {
+        lastRoundProgressAt = Date()
+        #if DEBUG
+        linkDebug("round progress: " + stage)
+        #endif
+    }
+
+ /// 起本轮看门狗（每个连接轮次一次；轮次出口按代次取消）。
+ ///
+ /// 返回本轮的看门狗代次：被取消/被顶替的旧轮次可能在新轮次之后才走到
+ /// `defer`，按代次取消才不会把新一轮的看门狗一起取消（那会让新一轮失去
+ /// 3s 上限）。任务句柄挂在实例上，新一轮起看门狗时会先取消旧任务。
+    @discardableResult
+    private func startRoundWatchdog() -> Int {
+        roundWatchdogGeneration += 1
+        let generation = roundWatchdogGeneration
+        roundWatchdogTask?.cancel()
+        roundWatchdogForced = false
+        lastRoundProgressAt = Date()
+        let threshold = roundProgressWatchdogSecondsForTesting ?? Self.roundProgressWatchdogSeconds
+ // 轮询粒度 ≤ threshold/8（3s → 250ms）：命中误差不超过 ~0.25s，卡死上限
+ // 仍是 3s 量级（不是 3s + 一个粗粒度轮询周期）。
+        let tick = min(0.25, max(0.02, threshold / 8))
+        roundWatchdogTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: UInt64(tick * 1_000_000_000))
+                guard let self, !Task.isCancelled,
+                      self.roundWatchdogGeneration == generation else { return }
+ // 每轮最多强制一次；轮次已结束/已被顶替则退出。
+                guard self.isConnecting, !self.roundWatchdogForced else { return }
+                let idle = Date().timeIntervalSince(self.lastRoundProgressAt ?? Date())
+                guard idle >= threshold else { continue }
+                self.forceRechallengeAfterStall(idleSeconds: idle)
+            }
+        }
+        return generation
+    }
+
+ /// 取消看门狗。`generation == nil` 表示无条件取消（disconnect/登出）。
+    private func cancelRoundWatchdog(generation: Int? = nil) {
+        if let generation, generation != roundWatchdogGeneration { return }
+        roundWatchdogTask?.cancel()
+        roundWatchdogTask = nil
+    }
+
+ /// DD-08 命中：强制一次「并行发现 + 重新挑战」并写审计日志。
+ ///
+ /// 只**中断当前这次卡住的拨号**，不取消轮次（取消轮次会引入并发拨号与状态
+ /// 互相覆盖）：关掉在飞的 socket/通道让挂起的 await 立刻失败，轮次随后按
+ /// 既有候选队列继续——首拨失败后会先消费后台并行发现/探测的结果，再对剩余
+ /// 候选重新挑战；如果这是最后一个候选，轮次出口按现有退避起下一轮（端点已
+ /// 置脏 → 重新 mDNS 发现 + 并行探测）。这样任何卡死路径都有 ~3s 上限，且不
+ /// 改变退避公式（BASIS-10）。
+    private func forceRechallengeAfterStall(idleSeconds: TimeInterval) {
+        guard isConnecting, !roundWatchdogForced else { return }
+        roundWatchdogForced = true
+        let idleMs = max(0, Int(idleSeconds * 1000))
+        let origin = credentials?.origin ?? "-"
+ // 审计日志：复用 App 现有日志通道（`--console` / E2E 采集可见）。
+        NSLog(
+            "[CONNWATCHDOG] no progress %ldms origin=%@ → force parallel discovery + rechallenge",
+            idleMs,
+            origin
+        )
+        linkDebug("watchdog: no progress \(idleMs)ms origin=\(origin) → interrupt stuck dial")
+ // 中断卡住的拨号：legacy 关 socket；P1 只在 hello 尚未成功（`.connecting`）
+ // 时关通道 socket（流表保留，下一轮仍可 resume）。
+        ws?.close()
+        if let channel = p1Resume.channel, channel.state == .connecting {
+            channel.disconnect(reason: "watchdog")
+        }
+ // 端点大概率已过期：本轮候选耗尽后下一轮必须重新发现/探测。
+        endpointsDirty = true
+ // 中断本身算一次进展，避免同一轮内重复命中。
+        noteRoundProgress("watchdog-interrupt")
+    }
+
+ // MARK: - DD-14 关闭后的补轮
+
+ /// 轮次出口的补轮（`handleP1Close` 取消在飞轮次时置位）。
+ ///
+ /// 按现有退避（`scheduleReconnect`，含重启窗口的短退避）补一轮；0.3s 内重复
+ /// 的补轮请求合并成一轮，不放大抖动。
+    private func consumeFollowUpRoundAtRoundExit() {
+        guard needsFollowUpRound else { return }
+        needsFollowUpRound = false
+        if let last = lastFollowUpRoundAt, Date().timeIntervalSince(last) < 0.3 {
+            linkDebug("follow-up round debounced (<0.3s)")
+            return
+        }
+        lastFollowUpRoundAt = Date()
+        linkDebug("follow-up round after cancelled P1 close")
         scheduleReconnect()
     }
 
@@ -2254,6 +2473,8 @@ final class LinkService: ObservableObject {
         )
         self.ws = ws
         let wsPrepare = Task { try await ws.prepareConnection(timeout: timeout) }
+ // DD-08：TCP/TLS 开始（看门狗进展点）。
+        noteRoundProgress("legacy:dial")
 
  // Cold-start critical path: the unary api token and the mux
  // token are two independent 2-RTT challenge/verify rounds. Mint them
@@ -2285,6 +2506,8 @@ final class LinkService: ObservableObject {
             return .failed(reason)
         }
         ConnectionMetrics.markAuth()
+ // DD-08：鉴权完成（challenge+verify 往返）。
+        noteRoundProgress("legacy:auth")
         if Task.isCancelled {
             apiTokenPrefetch.cancel()
             wsPrepare.cancel()
@@ -2304,6 +2527,8 @@ final class LinkService: ObservableObject {
             if failureClass.isFastReject { return .fastRejected(reason, failureClass) }
             return .failed(reason)
         }
+ // DD-08：TCP+TLS 建立完成。
+        noteRoundProgress("legacy:tls")
         ws.setUpgradeHeaders(["authorization": "Bearer \(muxToken)"])
         do {
             try await ws.upgrade(timeout: timeout)
@@ -2319,6 +2544,8 @@ final class LinkService: ObservableObject {
             return .failed(reason)
         }
         ConnectionMetrics.markWS()
+ // DD-08：HTTP upgrade（101）完成。
+        noteRoundProgress("legacy:upgrade")
         guard self.ws === ws else {
             apiTokenPrefetch.cancel()
             return .failed(L10n.t("连接被取消"))
@@ -2371,20 +2598,48 @@ final class LinkService: ObservableObject {
         let port = UInt16(origin.port ?? 443)
         let resume = p1ResumeCursor()
 
+ // DD-12：票据本地 exp 预检 + ECDSA token 与 hello 并行预取。
+ //
+ // 票据格式见插件 `mintResumeTicket`（`base64url(payloadJSON).base64url(HMAC)`，
+ // payload 的 `exp` 是毫秒）。过期票据发 hello 只会换来 4401
+ // `auth/invalid-ticket` + 再走一次 ECDSA（1+2 RTT）；这里先在本地判定，
+ // 过期/未知按「未知保持现行为」区分：过期直接用 ECDSA，解析失败仍发票。
+        let tickets = credentials?.connectTickets
+        let now = Date()
+        if let first = tickets?.first, !first.isEmpty,
+           P1ResumeTickets.isExpired(ticket: first, now: now) == true {
+            linkDebug("p1 ticket expired locally → skip hello{ticket}, use ECDSA")
+        }
+        var usedTickets = Set<String>()
+        let firstTicket = P1ResumeTickets.nextUsableTicket(tickets, used: usedTickets, now: now)
+
+ // ECDSA token 预取：与 `hello{ticket}` / 首轮 TLS 并行（legacy 路径同款，
+ // 见 `attemptLegacyConnection` 的 `apiTokenPrefetch`）。票据被拒（4401）
+ // 或被 1011 重连淘汰时直接取用预取结果，不再多付一次 challenge+verify。
+ // 预取的 mux token 是**一次性**的：只允许消费一次（用第二次会被插件判
+ // 无效凭据），所以下面每次使用前先取走并置 nil。
+        var ecdsaPrefetch: Task<String?, Never>? = firstTicket == nil
+            ? nil
+            : Task { [weak self] in
+                guard let self else { return nil }
+                return try? await self.authenticateToken(purpose: "mux", timeout: timeout)
+            }
+
         var auth: P1Auth
         var authMode: String
-        if let ticket = credentials?.connectTickets?.first, !ticket.isEmpty {
+        if let ticket = firstTicket {
             auth = P1Auth(ticket: ticket)
             authMode = "ticket"
  // No extra round trip: tickets are minted at pair/redeem + welcome.
             ConnectionMetrics.markAuth()
         } else {
-            do {
-                let muxToken = try await authenticateToken(purpose: "mux", timeout: timeout)
-                auth = P1Auth(muxToken: muxToken)
+            switch await p1ECDSAAuth(prefetched: ecdsaPrefetch, timeout: timeout) {
+            case .success(let tokenAuth):
+                auth = tokenAuth
                 authMode = "muxToken"
                 ConnectionMetrics.markAuth()
-            } catch {
+                noteRoundProgress("p1:auth")
+            case .failure(let error):
                 let reason = NetworkErrorInterpreter.message(for: error)
                 if isCredentialRejection(error) { return .credentialRejected(reason) }
                 return .failed(reason)
@@ -2425,8 +2680,12 @@ final class LinkService: ObservableObject {
                         self.connectionMetricsValue = self.connectionMetricsSummary()
                     }
                 }
+ // DD-08：P1 拨号（TCP+TLS+hello）开始。
+                noteRoundProgress("p1:dial")
                 let welcome = try await channel.connect(auth: auth, resume: resume)
                 ConnectionMetrics.markWS()
+ // DD-08：welcome 到达（鉴权 + hello 往返完成）。
+                noteRoundProgress("p1:welcome")
                 p1Channel = channel
                 channel.onClose = { [weak self] failure in
                     self?.handleP1Close(failure)
@@ -2436,9 +2695,15 @@ final class LinkService: ObservableObject {
                 let plan = p1Resume.apply(welcome: welcome)
                 let recoverMs = p1LostAt.map { max(0, Int(Date().timeIntervalSince($0) * 1000)) }
                 p1LostAt = nil
+ // DD-12：本轮发送过/被拒的票据全部作废（含 1011 前用过的那张），
+ // 再按 `welcome.ticket` 轮换；否则旧票会留在队列里被下一轮重发。
+                var consumedTickets = usedTickets
+                if authMode == "ticket", let current = auth.ticket {
+                    consumedTickets.insert(current)
+                }
                 applyP1Welcome(
                     welcome,
-                    usedTicket: authMode == "ticket" ? auth.ticket : nil,
+                    usedTickets: Array(consumedTickets),
                     rejectedTicket: rejectedTicket
                 )
                 adoptP1WelcomeBasics(welcome)
@@ -2462,6 +2727,8 @@ final class LinkService: ObservableObject {
                 linkDebug("p1 welcome: gzip=" + (channel.welcome?.caps.gzip == true ? "1" : "0"))
                 ConnectionMetrics.markP1(authMode: authMode, resumeMode: welcome.resume.mode.rawValue)
                 ConnectionMetrics.markReady()
+ // DD-08：本候选握手成功，看门狗不需要再介入。
+                noteRoundProgress("p1:connected")
                 return .connected(bumpGeneration: plan.bumpGeneration)
             } catch let failure as P1Failure {
                 let reason = failure.userMessage
@@ -2473,14 +2740,21 @@ final class LinkService: ObservableObject {
                         return .useLegacy(reason)
                     }
                     retriedTicket = true
-                    rejectedTicket = auth.ticket
-                    do {
-                        let muxToken = try await authenticateToken(purpose: "mux", timeout: timeout)
-                        auth = P1Auth(muxToken: muxToken)
+ // DD-12：这张票已被服务端拒绝（jti 已被记账），本轮不得再发。
+                    if let rejected = auth.ticket {
+                        usedTickets.insert(rejected)
+                        rejectedTicket = rejected
+                    }
+                    let prefetched = ecdsaPrefetch
+                    ecdsaPrefetch = nil
+                    switch await p1ECDSAAuth(prefetched: prefetched, timeout: timeout) {
+                    case .success(let tokenAuth):
+                        auth = tokenAuth
                         authMode = "muxToken"
                         ConnectionMetrics.markAuth()
+                        noteRoundProgress("p1:auth-ecdsa")
                         continue
-                    } catch {
+                    case .failure(let error):
                         let authReason = NetworkErrorInterpreter.message(for: error)
                         if isCredentialRejection(error) { return .credentialRejected(authReason) }
                         return .useLegacy(authReason)
@@ -2501,7 +2775,35 @@ final class LinkService: ObservableObject {
                 case .reconnect:
                     guard !retriedReconnect else { return .failed(reason) }
                     retriedReconnect = true
-                    continue
+ // DD-12：1011/1013 的重试**不得复用同一张票**——同一 jti 在
+ // 一轮里被用两次会烧掉「10s 内 1 次」的重放额度，下一轮必
+ // `auth/ticket-replayed`。换队列里的下一张（未用过且本地未
+ // 过期）；队列空则直接走 ECDSA（优先用并行预取的 token）。
+                    if let current = auth.ticket { usedTickets.insert(current) }
+                    if let next = P1ResumeTickets.nextUsableTicket(
+                        credentials?.connectTickets,
+                        used: usedTickets,
+                        now: Date()
+                    ) {
+                        auth = P1Auth(ticket: next)
+                        authMode = "ticket"
+                        linkDebug("p1 reconnect retry: rotate to next ticket")
+                        continue
+                    }
+                    let prefetched = ecdsaPrefetch
+                    ecdsaPrefetch = nil
+                    switch await p1ECDSAAuth(prefetched: prefetched, timeout: timeout) {
+                    case .success(let tokenAuth):
+                        auth = tokenAuth
+                        authMode = "muxToken"
+                        ConnectionMetrics.markAuth()
+                        noteRoundProgress("p1:auth-ecdsa")
+                        continue
+                    case .failure(let error):
+                        let authReason = NetworkErrorInterpreter.message(for: error)
+                        if isCredentialRejection(error) { return .credentialRejected(authReason) }
+                        return .failed(authReason)
+                    }
                 case .fallbackLegacy, .requestFailed, .none:
                     return .failed(reason)
                 }
@@ -2544,12 +2846,25 @@ final class LinkService: ObservableObject {
  /// The persisted `sid` is the channel's *applied* cursor (0 on reset/fresh,
  /// resume sid on replay); `teardownP1Channel` refreshes it once the replay
  /// frames have been applied, so a later drop never skips unapplied frames.
-    private func applyP1Welcome(_ welcome: P1Welcome, usedTicket: String?, rejectedTicket: String?) {
+ ///
+ /// DD-12：`usedTickets` 是本轮 hello 实际发送过/被服务端拒绝的全部票据
+ /// （1101/1011 重试可能用过多张）——全部从缓存移除后再提升 `welcome.ticket`，
+ /// 避免旧票留队被下一轮重发（`ticket-replayed` 循环）。
+    private func applyP1Welcome(
+        _ welcome: P1Welcome,
+        usedTickets: [String],
+        rejectedTicket: String?
+    ) {
         guard var credentials else { return }
+        var cached = credentials.connectTickets
+        let stale = Set(usedTickets + [rejectedTicket].compactMap { $0 })
+        if !stale.isEmpty {
+            cached?.removeAll { stale.contains($0) }
+        }
         credentials.connectTickets = P1ResumeTickets.rotate(
-            credentials.connectTickets,
-            used: usedTicket,
-            rejected: rejectedTicket,
+            cached,
+            used: nil,
+            rejected: nil,
             rotated: welcome.ticket
         )
         credentials.p1Epoch = welcome.epoch
@@ -2557,6 +2872,26 @@ final class LinkService: ObservableObject {
         credentials.supportsMuxRPC = true
         self.credentials = credentials
         try? store.save(credentials)
+    }
+
+ /// DD-12：把本次尝试的凭据切成 ECDSA mux token。
+ ///
+ /// 优先用与 `hello{ticket}` 并行预取的结果（票据过期/被拒时省掉一次
+ /// challenge+verify 往返）；预取失败或没有预取时再发一次。返回 `.failure`
+ /// 时由调用方区分「凭据被拒」与普通失败。
+    private func p1ECDSAAuth(
+        prefetched: Task<String?, Never>?,
+        timeout: TimeInterval
+    ) async -> Result<P1Auth, Error> {
+        if let prefetched, let token = await prefetched.value, !token.isEmpty {
+            return .success(P1Auth(muxToken: token))
+        }
+        do {
+            let muxToken = try await authenticateToken(purpose: "mux", timeout: timeout)
+            return .success(P1Auth(muxToken: muxToken))
+        } catch {
+            return .failure(error)
+        }
     }
 
  /// `welcome` bookkeeping that is needed on both handshake branches: replay
@@ -2658,6 +2993,8 @@ final class LinkService: ObservableObject {
             failReady(LinkError.transport(L10n.f("连接中断: %@", failure.userMessage)))
             p1Resume.discard()
             teardownTransport()
+ // 已按完整重连语义重新排程，不再叠加补轮（DD-14）。
+            needsFollowUpRound = false
             if !Task.isCancelled {
                 _ = rotateOriginIfPossible(reason: failure.userMessage)
                 scheduleReconnect()
@@ -2672,6 +3009,18 @@ final class LinkService: ObservableObject {
         p1SilentResume = phase.isConnected
         guard !Task.isCancelled else { return }
         connectTask?.cancel()
+        if isConnecting {
+ // DD-14：有连接轮在飞时，直接起的新 Task 会被 `connectOnce` 的
+ // `!isConnecting` 守卫静默挡掉——旧实现因此出现「关闭后没有任何
+ // 轮次在跑」的静默停摆（BASIS-24）。置补轮标志，由被取消轮次的
+ // 出口按现有退避补一轮（0.3s 去抖）。
+            needsFollowUpRound = true
+            linkDebug("p1 close with in-flight round → follow-up round armed")
+            return
+        }
+ // 没有在飞轮次：直接起一轮静默 resume（旧行为）；历史补轮请求作废，
+ // 由本轮的出口负责后续（DD-14）。
+        needsFollowUpRound = false
         connectTask = Task { [weak self] in
             await self?.connectOnce()
         }
@@ -2739,8 +3088,41 @@ final class LinkService: ObservableObject {
     func clearPendingWaterfalls() {
         pendingApprovals.removeAll()
         pendingUserQuestions.removeAll()
+ // DD-04：真断开的「已答/已撤销」屏蔽一并清空（overlay 不跨断开保留）。
+        dismissedQuestionCallIds.removeAll()
  // 真断开的 live 运行态一并作废：重连后以新的 `session/list` 快照为准。
         clearLiveSessionRunning()
+    }
+
+ /// DD-04：已答/已撤销问题 callId 的屏蔽 TTL（列表侧只在这个窗口内扣除快照
+ /// 里残留的 active；之后以新的 `session/list` 快照为准）。
+    nonisolated static let dismissedQuestionCallTTLSeconds: TimeInterval = 60
+
+ /// DD-04：登记一条「已答 / 已在他处作答 / 已撤销」的实时问题 callId。
+ ///
+ /// 写方：回答成功（`answerUserQuestions` / `answerUserQuestionsLive`）与
+ /// `$events` cancel 帧；读方：列表卡片等待计数。`nil`/空 callId 直接忽略
+ /// （快照侧只有 callId，没有可登记的标识就无法去重）。每次写入顺手清理
+ /// 超过 TTL 的旧条目，字典本身即内存态、不持久化。
+    func markQuestionDismissed(_ key: String?) {
+        guard let key, !key.isEmpty else { return }
+        let now = Date()
+        var next = dismissedQuestionCallIds
+        if !next.isEmpty {
+            next = next.filter { now.timeIntervalSince($0.value) < Self.dismissedQuestionCallTTLSeconds }
+        }
+        next[key] = now
+        dismissedQuestionCallIds = next
+    }
+
+ /// 登记一条瀑布的屏蔽键：问题 id 指纹（与快照/实时共用）+ callId（有则一起记，
+ /// 兼容只带 callId 的快照条目）。
+    func markQuestionDismissed(waterfall: UserQuestionWaterfall?) {
+        guard let waterfall else { return }
+        markQuestionDismissed(waterfall.questionKey)
+        if let callId = waterfall.callId, !callId.isEmpty {
+            markQuestionDismissed("c:" + callId)
+        }
     }
 
  /// Applies one live `api-session/status` emit (`session/list` 之外的实时运行态源)。
@@ -3221,9 +3603,10 @@ extension LinkService {
  /// ~100–300ms，立即拨号但只给 1.2s 紧上限（陈旧地址最多烧这么多就转
  /// 后台收敛结果）。真实 5G→WiFi 切换、WiFi 侧重连都走这条路径，从
  /// 「先发现 1.5–2s 再拨」变成 ~0.3–0.5s 直连。
- /// - `.none`：首候选是跨网段陈旧 LAN（lanOther）或本轮没有发现/探测要做——
- /// 保持先发现再拨：lanOther 的拨号大概率超时（白烧 2.5s），发现先行真有
- /// 选路价值；无发现需求时本来就直拨。
+ /// - `.none`：首候选是跨网段陈旧 LAN（lanOther）或本轮没有发现/探测要做。
+ /// **DD-13 起该策略同样立即拨号**，不再串行等发现/探测（发现只服务后续
+ /// 候选；`connectOnce` 里已无 discovery-first 分支）。紧上限由
+ /// `dialFirstStaleLANCap` 单独给（有其它候选可切换时 1.2s）。
     enum DialFirstPolicy: Equatable, CustomStringConvertible {
         case none
         case fullBudget
@@ -3231,7 +3614,7 @@ extension LinkService {
 
         var description: String {
             switch self {
-            case .none: return "none(discovery-first)"
+            case .none: return "none(dial-first)"
             case .fullBudget: return "fullBudget"
             case .speculative(let cap): return "speculative(\(String(format: "%.1f", cap))s)"
             }
@@ -3320,6 +3703,25 @@ extension LinkService {
             return speculativeLANDialCapSeconds
         }
         return nil
+    }
+
+ /// DD-13：`.none` 轮次首候选的投机紧上限（纯函数，可单测）。
+ ///
+ /// `.none` 只可能来自两种路径：跨网段陈旧 LAN 首候选（`shouldDiscover ==
+ /// true`，最坏白烧 2.2s 的发现+探测已挪到后台），或本轮没有发现/探测要做
+ /// （`shouldDiscover == false`，首候选角色可能是 relay）。**只有前者**值得
+ /// 1.2s 紧上限：跨网段 LAN 大概率不可达，最多烧 1.2s 就转后台收敛结果/下一
+ /// 候选。后者（尤其单 relay 候选，健康拨号本身可达 ~1.6s）保留整档预算。
+    nonisolated static func dialFirstStaleLANCap(
+        attemptIndex: Int,
+        policy: DialFirstPolicy,
+        origin: URL,
+        local: LocalIPv4Network?,
+        shouldDiscover: Bool
+    ) -> TimeInterval? {
+        guard attemptIndex == 0, policy == .none, shouldDiscover else { return nil }
+        guard candidateRole(host: origin.host, local: local) == .lanOther else { return nil }
+        return speculativeLANDialCapSeconds
     }
 
  /// 并行健康探测的目标集合（纯函数，可单测）。蜂窝（`prefersRelay && 无本地

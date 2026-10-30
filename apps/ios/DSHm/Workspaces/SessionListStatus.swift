@@ -1,13 +1,15 @@
 import SwiftUI
 
-/// Session-list status (v6 status pass).
+/// Session-list status (v6 status pass; DD-04 live question sources).
 ///
 /// Priority: offline > waiting-for-approval (amber) > waiting-for-answer (green)
 /// > in-progress (orange-amber) > not-started (info blue) > idle (neutral gray).
 /// Both waiting sources are live: tool approvals ($events ->
-/// LinkService.pendingApprovals) and active user-question waterfalls carried by
-/// session/list projections (projections.values.userQuestions.active). Approval
-/// wins when both are pending; the displayed count folds both sources.
+/// LinkService.pendingApprovals) and user questions from the `session/list`
+/// snapshot (`projections.values.userQuestions.active`) ∪ the live `$events`
+/// waterfalls (`LinkService.pendingUserQuestions`), deduped by callId and minus
+/// the answered/cancelled callIds. Approval wins when both are pending; the
+/// displayed count folds both sources.
 enum SessionListStatus: Equatable {
     case waitingForApproval(count: Int)
     case waitingForAnswer(count: Int)
@@ -87,28 +89,84 @@ enum SessionListStatus: Equatable {
     }
 }
 
-/// Maps one session/list row + live approval count to the list status.
+/// Maps one session/list row + live overlay to the list status (DD-04).
 ///
 /// Priority: offline > approval > answer > running > not-started > idle. The
 /// waiting count folds both sources; when both exist the approval case wins and
-/// its count = approvals + active question calls (everything needing a human).
+/// its count = approvals + active question calls (requirement §6.1).
+///
+/// User questions come from two sources keyed by `callId`: the `session/list`
+/// snapshot (`projections.values.userQuestions.active[].callId`) and the live
+/// `$events` waterfalls (`LinkService.pendingUserQuestions[].callId`). The card
+/// passes `(snapshot ∪ live)` already minus the answered/cancelled callIds
+/// (`LinkService.dismissedQuestionCallIds`, 60 s TTL), so an `open` waterfall the
+/// snapshot already lists is counted once. A waterfall without an `agentId` is
+/// not attributed to any card, and one without a `callId` cannot be deduped or
+/// dismissed, so neither is counted (DD-04).
 enum SessionListStatusResolver {
+ /// DD-04 primary entry: both callId sets supplied, dismissed callIds already
+ /// removed by the caller.
+    static func status(
+        for session: SessionListItem,
+        pendingApprovals: Int,
+        liveQuestionKeys: Set<String>,
+        snapshotQuestionKeys: Set<String>,
+        isConnected: Bool
+    ) -> SessionListStatus {
+ // A disconnected link cannot receive answers; show the offline state.
+        if !isConnected { return .offline }
+        let questionCount = liveQuestionKeys.union(snapshotQuestionKeys).count
+        if pendingApprovals > 0 {
+            return .waitingForApproval(count: pendingApprovals + questionCount)
+        }
+        if questionCount > 0 {
+            return .waitingForAnswer(count: questionCount)
+        }
+ // DD-11: `running` is the live emit overlay applied by the view model; it
+ // never writes back to the snapshot, so the row remains the fallback truth.
+        if session.isRunning { return .running }
+        if session.blank == true { return .notStarted }
+        return .idle
+    }
+
+ /// Snapshot-only entry (rows without a live question overlay, and existing
+ /// call sites/tests). Derives the callId set from the projection.
     static func status(
         for session: SessionListItem,
         pendingApprovals: Int,
         isConnected: Bool
     ) -> SessionListStatus {
- // A disconnected link cannot receive answers; show the offline state.
-        if !isConnected { return .offline }
-        let questionCalls = session.userQuestionsActive.count
-        if pendingApprovals > 0 {
-            return .waitingForApproval(count: pendingApprovals + questionCalls)
+        status(
+            for: session,
+            pendingApprovals: pendingApprovals,
+            liveQuestionKeys: [],
+            snapshotQuestionKeys: snapshotQuestionKeys(for: session),
+            isConnected: isConnected
+        )
+    }
+
+ /// Active callIds from `projections.values.userQuestions.active[].callId`.
+ /// An entry without a callId cannot be deduped against a live waterfall nor
+ /// dismissed, so it is not counted (DD-04); answering still works in detail.
+ /// 快照侧去重键：与实时瀑布同一套「问题 id 指纹优先」规则，旧 Host 不带
+ /// callId 时也能与实时事件去重（同一条问题只计一次）。
+    static func snapshotQuestionKeys(for session: SessionListItem) -> Set<String> {
+        var keys = Set<String>()
+        for entry in session.userQuestionsActive {
+            if let ids = entry["questions"]?.arrayValue?.compactMap({ $0["id"]?.stringValue }),
+               !ids.isEmpty {
+                keys.insert("q:" + ids.sorted().joined(separator: "|"))
+                continue
+            }
+            if let callId = entry["callId"]?.stringValue, !callId.isEmpty {
+                keys.insert("c:" + callId)
+            }
         }
-        if questionCalls > 0 {
-            return .waitingForAnswer(count: questionCalls)
-        }
-        if session.isRunning { return .running }
-        if session.blank == true { return .notStarted }
-        return .idle
+        return keys
+    }
+
+ /// 兼容旧名（单测引用）。
+    static func snapshotQuestionCallIds(for session: SessionListItem) -> Set<String> {
+        snapshotQuestionKeys(for: session)
     }
 }

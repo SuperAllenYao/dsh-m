@@ -170,6 +170,8 @@ struct SessionMessageUIKitListView: View {
     let onOpenFileChanges: (TurnFileChanges) -> Void
     let onNearBottomChange: (Bool) -> Void
     let onUserScrolled: () -> Void
+ /// DD-02: 滚动交互开始/结束（手指拖拽/惯性），供详情页冻结流式尾部发布。
+    var onInteractionChange: (Bool) -> Void = { _ in }
     let onFirstContent: () -> Void
     let onRetry: () -> Void
  /// 历史补齐进行中（VM `historyFillProgress!= nil`；上层进度条用）。
@@ -205,6 +207,7 @@ struct SessionMessageUIKitListView: View {
          onOpenFileChanges: @escaping (TurnFileChanges) -> Void,
          onNearBottomChange: @escaping (Bool) -> Void,
          onUserScrolled: @escaping () -> Void,
+         onInteractionChange: @escaping (Bool) -> Void = { _ in },
          onFirstContent: @escaping () -> Void,
          onRetry: @escaping () -> Void) {
         self.items = items
@@ -226,6 +229,7 @@ struct SessionMessageUIKitListView: View {
         self.onOpenFileChanges = onOpenFileChanges
         self.onNearBottomChange = onNearBottomChange
         self.onUserScrolled = onUserScrolled
+        self.onInteractionChange = onInteractionChange
         self.onFirstContent = onFirstContent
         self.onRetry = onRetry
         _lastScrollToBottomToken = State(initialValue: scrollToBottomToken)
@@ -252,6 +256,7 @@ struct SessionMessageUIKitListView: View {
             onOpenFileChanges: onOpenFileChanges,
             onNearBottomChange: onNearBottomChange,
             onUserScrolled: onUserScrolled,
+            onInteractionChange: onInteractionChange,
             onFirstContent: onFirstContent,
             onRetry: onRetry,
             shared: shared,
@@ -457,6 +462,8 @@ private struct MessageTableRepresentable: UIViewRepresentable {
     let onOpenFileChanges: (TurnFileChanges) -> Void
     let onNearBottomChange: (Bool) -> Void
     let onUserScrolled: () -> Void
+ /// DD-02: 拖拽/惯性开始（true）与结束（false），供详情页冻结流式尾部发布。
+    var onInteractionChange: (Bool) -> Void = { _ in }
     let onFirstContent: () -> Void
     let onRetry: () -> Void
     let shared: UILListSharedModel
@@ -824,6 +831,20 @@ private struct MessageTableRepresentable: UIViewRepresentable {
         private var lastRunningFlag = false
  /// 窗口扩展防重入。
         private var isExpandingWindow = false
+ /// DD-01：分段扩窗的延后 apply 尚未落地。`isExpandingWindow` 要一直保持到
+ /// 那次 apply 真正执行完（`heightForRowAt` 对远端的估算让路依赖它）。
+        private var windowExpansionPendingApply = false
+ /// DD-01：`apply` 重入守卫。diffable data source 的批次更新进行中再 apply 一次
+ /// 快照会触发 `BUG_IN_CLIENT_OF_DIFFABLE_DATA_SOURCE` abort(设备
+ /// 崩溃日志：`scrollViewDidScroll → maybeExpandWindow → apply`）。守卫为真时
+ /// 新请求只落进 `pendingApply`（后到覆盖先到），本次应用结束后延后一拍续跑。
+        private var isApplying = false
+ /// DD-01：应用进行中收到的最后一拍请求（后到覆盖先到；内容不丢）。
+        private var pendingApply: (items: [SessionMessageItem], batchToken: Int, skipModeChange: Bool)?
+ /// DD-01：滚动回调/扩窗的「同一拍合并」请求槽（`requestApply` 用）。
+        private var pendingRequestedApply: (items: [SessionMessageItem], batchToken: Int, skipModeChange: Bool)?
+ /// 本拍是否已排期一次延后 apply（同一拍多次 requestApply 只跑一次）。
+        private var isApplyRequestScheduled = false
  /// 上次窗口扩展时刻（扩展冷却，抑制扩展/回落振荡）。
         private var lastWindowExpandAt: CFTimeInterval = 0
  /// 本次 apply 是否跳过锚定修正（动画刚结束的收敛窗口）。
@@ -971,6 +992,12 @@ private struct MessageTableRepresentable: UIViewRepresentable {
             heightAnimator?.stopAnimation(true)
             heightAnimator = nil
             heightAnimationActive = false
+ // DD-01: 视图已拆除——丢弃已排期的延后 apply（主队列闭包自查空槽退出）。
+            pendingApply = nil
+            pendingRequestedApply = nil
+            isApplyRequestScheduled = false
+            windowExpansionPendingApply = false
+            isExpandingWindow = false
             animatedTargetHeight = nil
             groupToggleOverride.removeAll()
             pendingModeOverride.removeAll()
@@ -2278,7 +2305,62 @@ private struct MessageTableRepresentable: UIViewRepresentable {
             return MessageListWindowPolicy.initialWindow(items: incoming)
         }
 
+ /// DD-01：唯一 apply 入口。重入时（滚动回调/扩窗在同一同步栈里再次进入）
+ /// 不嵌套执行，只记录最后一拍请求，本次应用结束后由主队列下一拍续跑。
         func apply(items: [SessionMessageItem], batchToken: Int, skipModeChange: Bool = false) {
+            if isApplying {
+                pendingApply = (items, batchToken, skipModeChange)
+                return
+            }
+            guard tableView != nil, dataSource != nil else { return }
+            isApplying = true
+            defer {
+                isApplying = false
+                if let pending = pendingApply {
+                    pendingApply = nil
+                    DispatchQueue.main.async { [weak self] in
+                        guard let self else { return }
+                        self.apply(
+                            items: pending.items,
+                            batchToken: pending.batchToken,
+                            skipModeChange: pending.skipModeChange
+                        )
+                    }
+                }
+            }
+            applyCore(items: items, batchToken: batchToken, skipModeChange: skipModeChange)
+        }
+
+ /// DD-01：滚动回调/扩窗专用入口——同一拍内的多次请求合并为最后一拍，
+ /// 由 `DispatchQueue.main.async` 延后一拍执行，不在滚动/批次更新的同步栈里
+ /// 改数据源（崩溃与掉帧的共同来源）。
+        func requestApply(items: [SessionMessageItem], batchToken: Int, skipModeChange: Bool = false) {
+            pendingRequestedApply = (items, batchToken, skipModeChange)
+            guard !isApplyRequestScheduled else { return }
+            isApplyRequestScheduled = true
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.isApplyRequestScheduled = false
+                guard let request = self.pendingRequestedApply else { return }
+                self.pendingRequestedApply = nil
+                self.apply(
+                    items: request.items,
+                    batchToken: request.batchToken,
+                    skipModeChange: request.skipModeChange
+                )
+            }
+        }
+
+        private func applyCore(items: [SessionMessageItem], batchToken: Int, skipModeChange: Bool) {
+            defer {
+ // 还有延后 apply 在排队时保持让路标志，等那次真正应用完再收口。
+                if windowExpansionPendingApply,
+                   pendingApply == nil,
+                   pendingRequestedApply == nil {
+                    windowExpansionPendingApply = false
+                    isExpandingWindow = false
+                }
+            }
             guard let tableView, let dataSource else { return }
             #if DEBUG
             let applyStart = CACurrentMediaTime()
@@ -2912,9 +2994,11 @@ private struct MessageTableRepresentable: UIViewRepresentable {
                   parent.items.count > displayedItems.count else { return }
             didFullRangeApply = true
             isExpandingWindow = true
+ // DD-01: apply 在重入时会被延后一拍；让 `heightForRowAt` 的估算让路
+ // 跟随到那次 apply 真正执行完（由 applyCore 的 defer 收口）。
+            windowExpansionPendingApply = true
             windowStartItemID = parent.items.first?.id
             apply(items: parent.items, batchToken: parent.historyBatchToken)
-            isExpandingWindow = false
             ScrollHitchProbe.mark("windowExpandFull", [
                 "displayed": displayedItems.count,
                 "total": parent.items.count,
@@ -2968,10 +3052,13 @@ private struct MessageTableRepresentable: UIViewRepresentable {
             guard now - lastAnimationEndAt > 2.0 else { return }
             lastWindowExpandAt = now
             isExpandingWindow = true
+            windowExpansionPendingApply = true
             windowStartItemID = parent.items[newStart].id
             let expandStart = CACurrentMediaTime()
-            apply(items: parent.items, batchToken: parent.historyBatchToken)
-            isExpandingWindow = false
+ // DD-01: 扩窗不再在滚动回调的同步栈里直接 apply（重入 diffable 数据源 =
+ // 崩溃来源），交给 `requestApply` 合并并延后一拍；`isExpandingWindow`
+ // 保持到这次延后 apply 真正执行完（heightForRowAt 的估算让路依赖它）。
+            requestApply(items: parent.items, batchToken: parent.historyBatchToken)
             parent.shared.prependCount += 1
             ScrollHitchProbe.mark("windowExpand", [
                 "start": newStart,
@@ -2986,7 +3073,9 @@ private struct MessageTableRepresentable: UIViewRepresentable {
             )
             #endif
  // 向旧端扩展 = 马上要滚到的历史行：提前后台预解析这些文本行。
-            MarkdownPrewarm.prewarm(items: Array(displayedItems.prefix(120)))
+ // 延后 apply 生效前 `displayedItems` 还是旧窗口，直接按新窗口起点取。
+            let prewarmEnd = min(parent.items.count, newStart + 120)
+            MarkdownPrewarm.prewarm(items: Array(parent.items[newStart..<prewarmEnd]))
         }
 
  // MARK: - 步骤高度缓存 / 自动连续滚动
@@ -3062,6 +3151,8 @@ private struct MessageTableRepresentable: UIViewRepresentable {
 
         func scrollViewWillBeginDragging(_ scrollView: UIScrollView) {
             userIsScrolling = true
+ // DD-02: 手指开始拖动 → 详情页冻结尾部流式发布（数据仍在 journal 里）。
+            parent.onInteractionChange(true)
             parent.shared.isDragging = true
             parent.shared.interactingUntil = CACurrentMediaTime() + 0.12
             parent.shared.panSeen = true
@@ -3093,6 +3184,8 @@ private struct MessageTableRepresentable: UIViewRepresentable {
                 return
             }
             parent.shared.isDragging = false
+ // DD-02: 不再惯性滚动 → 交互结束（惯性滚动由 didEndDecelerating 收尾）。
+            parent.onInteractionChange(false)
             if let tableView = scrollView as? UILAnchoredTableView {
                 userIsScrolling = false
                 settleAfterGesture(tableView)
@@ -3100,6 +3193,8 @@ private struct MessageTableRepresentable: UIViewRepresentable {
         }
 
         func scrollViewDidEndDecelerating(_ scrollView: UIScrollView) {
+ // DD-02: 惯性滚动结束 → 交互结束。
+            parent.onInteractionChange(false)
             userIsScrolling = false
             parent.shared.isDragging = false
             feedProbePhase("idle")
@@ -3130,9 +3225,11 @@ private struct MessageTableRepresentable: UIViewRepresentable {
                     parent.shared.lastScrollCommand = "settle"
                     ScrollHitchProbe.mark("scrollCmd", ["source": "settle"])
                 }
-                if let frozen = pendingFrozenItems {
+                if pendingFrozenItems != nil {
                     pendingFrozenItems = nil
-                    apply(items: frozen, batchToken: parent.historyBatchToken)
+ // DD-01: 手势结束回调里同样延后合并（用最新数据真相，
+ // 不用冻结快照，避免与同一拍内更新互相覆盖）。
+                    requestApply(items: parent.items, batchToken: parent.historyBatchToken)
                 }
             }
             freezeAnchorFromCurrentViewport(tableView)
@@ -3147,6 +3244,10 @@ private struct MessageTableRepresentable: UIViewRepresentable {
  // 分析器按相位分类统计长帧（缺类会让帧被记成 idle）。
             if userIsScrolling {
                 feedProbePhase(tableView.isTracking ? "interacting" : "decelerating")
+ // DD-02: 每次滚动活动都给冻结上限续期，连续拖动期间尾部不补齐。
+                if tableView.isTracking || tableView.isDecelerating {
+                    parent.onInteractionChange(true)
+                }
             }
             traceGestureOffset(tableView)
             trackIdleBottomStability(tableView)
@@ -3159,14 +3260,16 @@ private struct MessageTableRepresentable: UIViewRepresentable {
             if pendingFrozenItems != nil,
                distanceFromBottom <= MessageListUpdatePolicy.nearBottomThreshold,
                CACurrentMediaTime() - lastAnimationEndAt > 1.2 {
-                let frozen = pendingFrozenItems
                 pendingFrozenItems = nil
                 if !pinned {
                     pinned = true
                     parent.shared.pinned = true
                     parent.onNearBottomChange(true)
                 }
-                apply(items: frozen ?? [], batchToken: parent.historyBatchToken)
+ // DD-01: 滚动回调里不直接 apply（重入 diffable 数据源 = 崩溃来源），
+ // 合并到下一拍执行。延后执行时用 `parent.items`（数据真相）而不是
+ // 冻结时的快照，避免同一拍内更新被旧数据覆盖。
+                requestApply(items: parent.items, batchToken: parent.historyBatchToken)
             }
             maybeExpandWindow()
         }
