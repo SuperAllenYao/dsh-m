@@ -40,11 +40,16 @@ final class WorkspaceViewModel: ObservableObject {
         var displayName: String
     }
 
-    @Published private(set) var groups: [WorkspaceGroup] = []
+ /// DD-03: the list content is published exactly once per update
+ /// via `publishListState()`. `groups` / `pinnedSessions` / both versions are
+ /// plain stored properties instead of `@Published`, so a pin change assigns
+ /// them all and then sends `objectWillChange` once (one List diff, no
+ /// two-pass flash) while `groupsVersion` still drives the view's `.onChange`.
+    private(set) var groups: [WorkspaceGroup] = []
  /// Pinned sessions rendered above the workspace groups.
  /// Derived from `followState.pinnedSessionIds`; the groups exclude them so
  /// a pinned session appears exactly once in the list.
-    @Published private(set) var pinnedSessions: [SessionListItem] = []
+    private(set) var pinnedSessions: [SessionListItem] = []
     @Published private(set) var isLoading = true
     @Published private(set) var errorText: String?
     @Published private(set) var lastLoadedAt: Date?
@@ -52,9 +57,11 @@ final class WorkspaceViewModel: ObservableObject {
     @Published private(set) var sessionCount = 0
  /// Increments whenever a fresh `session/list` snapshot is applied — the view
  /// forwards the full list to `AppModel.updateKnownSessions` for deep links.
-    @Published private(set) var sessionsSnapshotVersion = 0
+ /// Published together with the list state (DD-03).
+    private(set) var sessionsSnapshotVersion = 0
  /// Increments whenever `groups` is rebuilt (drives the env-gated auto-open).
-    @Published private(set) var groupsVersion = 0
+ /// Published together with the list state (DD-03).
+    private(set) var groupsVersion = 0
  /// M2b-2: the list currently on screen came from the on-disk cache. The next
  /// network refresh replaces it in place (diffed, no empty-state flash).
     @Published private(set) var loadedFromCache = false
@@ -335,6 +342,8 @@ final class WorkspaceViewModel: ObservableObject {
  // so its ~0.5s background decode never competes with the first paint.
             sessionsSnapshotVersion += 1
             needsDeferredRawRestore = true
+ // DD-03: one publish for the whole restored list + snapshot version.
+            publishListState()
             return
         }
  // Fallback: caches written before the compact snapshot existed.
@@ -366,7 +375,8 @@ final class WorkspaceViewModel: ObservableObject {
         cacheIsStale = cached.isStale
  // A cached list is good enough to resolve deep-link addresses immediately.
         sessionsSnapshotVersion += 1
-        rebuildGroups()
+        rebuildGroups(publish: false)
+        publishListState()
         maybeStartPrewarm()
     }
 
@@ -423,8 +433,10 @@ final class WorkspaceViewModel: ObservableObject {
             byId[item.sessionId] = item
         }
         sessionsById = byId
-        rebuildGroups()
+ // DD-03: version + rebuilt groups reach SwiftUI as one publish.
         sessionsSnapshotVersion += 1
+        rebuildGroups(publish: false)
+        publishListState()
         maybeStartPrewarm()
     }
 
@@ -544,6 +556,7 @@ final class WorkspaceViewModel: ObservableObject {
         if loadedFromCache && !didExposeCachedSessions {
             didExposeCachedSessions = true
             sessionsSnapshotVersion += 1
+            publishListState()
         }
         observeForegroundResume()
  // P0-4: the cached first frame is already on screen (or the empty chrome is);
@@ -771,6 +784,12 @@ final class WorkspaceViewModel: ObservableObject {
  /// Test seam：卸载宿主同步（否则异步任务会跨测试泄漏）。
     func endHostDrivenListSyncForTests() {
         endHostDrivenListSync()
+    }
+
+ /// 前台收到推送：立即并入宿主驱动补刷（去抖 0，带上 1.2s 在飞保护）。
+    func noteForegroundPushHint() {
+        guard isListPageActive else { return }
+        scheduleHostDrivenRefresh(reason: "push/foreground", delayMs: 0)
     }
 
  /// 把一次宿主信号/follow 缺行合并进同一条去抖补刷。
@@ -1024,6 +1043,33 @@ final class WorkspaceViewModel: ObservableObject {
     private func rollbackPin(_ previous: [String]) {
         followState.restorePins(previous)
         rebuildGroups()
+    }
+
+ /// 同步乐观置顶（在调用方的事务内执行，便于把这次更新的动画整体禁掉）。
+ /// 返回回滚所需的旧集合与目标状态。
+    @MainActor
+    func beginPinToggle(sessionId: String) -> (previous: [String], pinned: Bool) {
+        let pinned = !followState.pinnedSessionIds.contains(sessionId)
+        let previous = applyOptimisticPin(sessionId, pinned: pinned)
+        return (previous, pinned)
+    }
+
+ /// 与 Host 对账：成功后以返回值替换集合，失败回滚并给出行内错误。
+    @MainActor
+    func finishPinToggle(
+        sessionId: String,
+        pinned: Bool,
+        previous: [String],
+        link: LinkService
+    ) async {
+        do {
+            let result = try await link.pinSession(sessionId: sessionId, pinned: pinned)
+            followState.replacePins(result.pinnedSessionIds)
+            rebuildGroups()
+        } catch {
+            rollbackPin(previous)
+            errorText = NetworkErrorInterpreter.message(for: error)
+        }
     }
 
  /// Toggle one session's pin. No confirmation (design 3.2): optimistic
@@ -1572,8 +1618,10 @@ final class WorkspaceViewModel: ObservableObject {
         sessionsById = byId
         sessionsLoaded = true
         isLoading = false
+ // DD-03: one publish for the snapshot version + the rebuilt groups.
         sessionsSnapshotVersion += 1
-        rebuildGroups()
+        rebuildGroups(publish: false)
+        publishListState()
         maybeStartPrewarm()
     }
 
@@ -1649,7 +1697,10 @@ final class WorkspaceViewModel: ObservableObject {
         installSessions(merged)
     }
 
-    private func rebuildGroups() {
+ /// Rebuilds the pinned area + workspace groups from the current follow state
+ /// and session snapshot. `publish: false` lets a caller that also bumps
+ /// `sessionsSnapshotVersion` fold everything into one `publishListState()`.
+    private func rebuildGroups(publish: Bool = true) {
         let archived = followState.archivedSessionIds
         let pinnedRank = Dictionary(
             followState.pinnedSessionIds.enumerated().map { ($0.element, $0.offset) },
@@ -1710,15 +1761,49 @@ final class WorkspaceViewModel: ObservableObject {
 
  // Diff guard: a refresh that yields identical content must not publish a new
  // array (no list flash / scroll jump, and the auto-open hook stays silent).
+        var listStateChanged = false
         if pinned != pinnedSessions {
             pinnedSessions = pinned
             groupsVersion += 1
+            listStateChanged = true
         }
         if rebuilt != groups {
             groups = rebuilt
             groupsVersion += 1
+            listStateChanged = true
         }
         sessionCount = visibleAll.count
+        if publish, listStateChanged {
+            publishListState()
+        }
+    }
+
+ // MARK: - List-state publishing (DD-03)
+
+    #if DEBUG
+ /// DD-03 probe (`DSHM_LISTDBG=1`): every list-state publish logs one
+ /// `[LISTDBG] publish groups=… pinned=…` line so the verification stage can
+ /// count publishes per user action. Debug-only; Release compiles it out.
+    private static let listDebugEnabled =
+        ProcessInfo.processInfo.environment["DSHM_LISTDBG"] == "1"
+    #endif
+
+ /// Publishes the list state exactly once, after `pinnedSessions` / `groups` /
+ /// `groupsVersion` / `sessionsSnapshotVersion` are all assigned (DD-03): the
+ /// pin change then reaches SwiftUI as a single List diff instead of the old
+ /// two-pass publish (pinned first, then groups) that bounced the scroll.
+    private func publishListState() {
+        #if DEBUG
+        if Self.listDebugEnabled {
+            NSLog(
+                "[LISTDBG] publish groups=%ld pinned=%ld version=%ld",
+                groups.count,
+                pinnedSessions.count,
+                groupsVersion
+            )
+        }
+        #endif
+        objectWillChange.send()
     }
 
  // MARK: - Visibility & ordering (shared with unit tests)

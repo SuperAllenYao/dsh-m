@@ -49,6 +49,14 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         willPresent notification: UNNotification,
         withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
     ) {
+ // AC-13/AC-14：前台收到推送（提问/审批/状态变化）时广播一次
+ // 「列表可刷新」提示。`$events` 之外的这条通道保证用户**停在列表页**时，
+ // 卡片状态也能在推送到达后立即收敛，而不是等下一次 15s 兜底快照。
+        NotificationCenter.default.post(
+            name: .dshmPushPresentedInForeground,
+            object: nil,
+            userInfo: notification.request.content.userInfo
+        )
         completionHandler([.banner, .list, .sound])
     }
 
@@ -100,4 +108,9 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         )
         completionHandler(.newData)
     }
+}
+
+extension Notification.Name {
+ /// 前台展示了推送横幅：列表页据此静默刷新一次卡片状态（AC-13/AC-14）。
+    static let dshmPushPresentedInForeground = Notification.Name("dshmPushPresentedInForeground")
 }

@@ -8,6 +8,9 @@ struct ManualPairingView: View {
     var onPaired: () -> Void
 
     @State private var payloadText: String
+    #if DEBUG
+    @State private var didAutoConnect = false
+    #endif
     @State private var origin: String
     @State private var pairToken: String = ""
     @State private var pin: String = ""
@@ -88,6 +91,15 @@ struct ManualPairingView: View {
                 if payloadText.isEmpty, let envPayload = app.envPairingPayload {
                     payloadText = envPayload
                 }
+                #if DEBUG
+ // E2E 脚手架（仅 DEBUG）：`DSHM_PIN_AUTODEMO=1` 时自动点「连接」，
+ // 让 simctl launch 也能跑完整的置顶动效演示（无需 XCUITest 合成点击）。
+                if ProcessInfo.processInfo.environment["DSHM_PIN_AUTODEMO"] == "1",
+                   !didAutoConnect, !payloadText.isEmpty {
+                    didAutoConnect = true
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { connect() }
+                }
+                #endif
             }
             .navigationTitle("")
             .navigationBarTitleDisplayMode(.inline)

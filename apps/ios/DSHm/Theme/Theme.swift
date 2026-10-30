@@ -220,6 +220,19 @@ enum Theme {
  /// Workspace folder glyph morph: the front cover swings open/closed and
  /// the tint cross-fades (single icon, both directions;).
         static let folder = Animation.timingCurve(0.2, 0.8, 0.2, 1, duration: 0.24)
+ /// DEC-07 / DD-17置顶飞行：150ms「轻微回弹」
+ /// `cubic-bezier(.34,1.32,.46,1)`。曲线与时长是对外口径（AC-10/AC-12），
+ /// 不得替换成其它曲线、也不做可配置项；飞行卡的位移/高度/底色/描边与
+ /// 其它行的让位都用这一条曲线。
+ ///
+ /// 控制点/时长单独暴露：`Animation` 无法反解参数，飞行层逐帧显式插值
+ /// （`SessionPinFlightMath.flightProgress(elapsed:)`）必须引用同一份数值，
+ /// 否则「同一条曲线」只能靠注释约束。
+        static let pinCurve = (x1: 0.34, y1: 1.32, x2: 0.46, y2: 1.0)
+        static let pinDuration: TimeInterval = 0.15
+        static let pin = Animation.timingCurve(
+            pinCurve.x1, pinCurve.y1, pinCurve.x2, pinCurve.y2, duration: pinDuration
+        )
     }
 }
 

@@ -444,6 +444,11 @@ final class AppModel: ObservableObject {
  /// connect makes `.connected` meaningless — the socket was dialed on the old
  /// network and the OS has not reported it dead — so the resume must reconnect
  /// instead of reusing a stale mux.
+ ///
+ /// DD-08: 超过插件 P1 resume 窗口（30s）的长后台同理——插件已丢弃旧通道的
+ /// 流表，`.connected` 的 mux 即使 TCP 还活着也无法 `hello{resume}` 续传，
+ /// 直接 `.reconnect`（不走 500ms liveness 复用探针）。短时切后台保持原复用
+ /// 语义（控制中心/权限弹窗等不该产生额外流量或重开流）。
     nonisolated static func foregroundAction(
         phase: LinkService.Phase,
         backgroundedSeconds: TimeInterval?,
@@ -455,6 +460,10 @@ final class AppModel: ObservableObject {
  // A stale transport is never reusable, regardless of the interruption
  // length: the mux was dialed on the network we already left.
             if networkPathChanged { return .reconnect }
+ // 插件 `mux-rpc` 的 `resumeWindowMs` 是 30s：超过它旧通道已被回收，
+ // 续传必然 reset/rebuild，复用只会把「等待 500ms 首字节探针」的
+ // 失败路径拉长，直接重连更快。
+            if backgroundedSeconds >= pluginResumeWindowSeconds { return .reconnect }
  // A very short interruption (control center, permission alert…) does
  // not justify any extra traffic or a stream reopen; a real resume
  // reuses the existing TLS/mux.
@@ -472,6 +481,11 @@ final class AppModel: ObservableObject {
             return .none
         }
     }
+
+ /// 插件 P1 resume 窗口（`packages/dsh-m-link/lib/mux-rpc.js` 的
+ /// `P1_LIMITS.resumeWindowMs = 30_000`）：超过它旧通道被插件回收，长后台
+ /// 回前台必须直接重连而不是复用 mux。
+    nonisolated static let pluginResumeWindowSeconds: TimeInterval = 30
 
  /// Scene went to `.background` (P0-5): remember when, so the next activation
  /// can tell a real resume from a cold launch / control-center blip.
@@ -498,10 +512,19 @@ final class AppModel: ObservableObject {
             ReconnectMetrics.beginPageEnter(reason: "sceneActive")
             if networkPathChanged {
                 ReconnectMetrics.markInvalidate(reason: "sceneActive/pathChanged")
+            } else if link.phase.isConnected {
+ // DD-08：长后台回来（≥ 插件 resume 窗口）时 `.connected` 也必须
+ // 真重连——`handleForeground()` 对 `.connected` 只复用/续期 token，
+ // 不会重拨；这里直接 `reconnectNow()`（跳过退避、重建传输）。
+                ReconnectMetrics.markInvalidate(reason: "sceneActive/resumeWindow")
             }
             let ms = (backgroundedSeconds ?? 0) * 1000
             recordForegroundMetrics(action: "reconnect", backgroundedMs: ms, reused: false)
-            link.handleForeground()
+            if link.phase.isConnected, !networkPathChanged {
+                link.reconnectNow()
+            } else {
+                link.handleForeground()
+            }
         case .reuseMux:
  // A healthy mux on the current network: the chain only measures the
  // list refresh latency (connected is t0 itself).

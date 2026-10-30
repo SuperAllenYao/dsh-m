@@ -385,7 +385,8 @@ struct SessionDetailView: View {
         case .modelSelection:
             ModelSelectionSheet(
                 catalog: viewModel.modelCatalog,
-                current: viewModel.modelSelection,
+ // DD-05: 会话投影优先，新会话回退到部署默认（与会状态条同一个值）。
+                current: viewModel.effectiveModelSelection,
                 isLoading: viewModel.modelCatalogLoading,
                 isSelecting: viewModel.modelSelecting,
                 pending: viewModel.modelSelectionPending,
@@ -1045,6 +1046,10 @@ struct SessionDetailView: View {
                         userHasScrolled = true
                         isNearBottom = false
                         viewModel.setReadingHistory(true)
+                    },
+ // DD-02: 拖拽/惯性期间冻结流式尾部发布（结束时或 1s 上限补齐）。
+                    onInteractionChange: { interacting in
+                        viewModel.setUserInteracting(interacting)
                     },
                     onFirstContent: {
                         markFirstContentAfterLayout()

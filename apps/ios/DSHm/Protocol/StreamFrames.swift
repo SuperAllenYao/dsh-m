@@ -94,6 +94,7 @@ struct ApprovalWaterfall: Identifiable, Equatable {
 
     var id: String { eventId }
 
+
  /// Parses the `value` of an `$events` item when it is an approval waterfall.
     static func parse(_ value: JSONValue) -> ApprovalWaterfall? {
         guard value["type"]?.stringValue == "waterfall" else { return nil }
@@ -141,6 +142,14 @@ struct UserQuestionWaterfall: Identifiable, Equatable {
     var timed: Bool?
 
     var id: String { eventId }
+ /// 跨「快照投影」与「实时瀑布」的稳定去重键：问题 id 指纹优先（旧 Host 不
+ /// 带 `callId` 也能与快照里的同一条问题对上），其次 callId，最后 eventId。
+    var questionKey: String {
+        let ids = questions.map(\.id).sorted()
+        if !ids.isEmpty { return "q:" + ids.joined(separator: "|") }
+        if let callId, !callId.isEmpty { return "c:" + callId }
+        return "e:" + eventId
+    }
 
  /// Parses the `value` of an `$events` item when it is a user-question waterfall.
     static func parse(_ value: JSONValue) -> UserQuestionWaterfall? {

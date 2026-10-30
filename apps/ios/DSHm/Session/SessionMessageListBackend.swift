@@ -58,6 +58,9 @@ struct SessionMessageListView: View {
     let onOpenFileChanges: (TurnFileChanges) -> Void
     let onNearBottomChange: (Bool) -> Void
     let onUserScrolled: () -> Void
+ /// DD-02: 列表拖拽/惯性开始（true）与结束（false），用于冻结流式尾部发布。
+ /// 只有 UIKit 后端会回调；SwiftUI 回退后端保持现行为（DEBUG 回退用）。
+    var onInteractionChange: (Bool) -> Void = { _ in }
     let onFirstContent: () -> Void
     let onRetry: () -> Void
 
@@ -80,6 +83,7 @@ struct SessionMessageListView: View {
          onOpenFileChanges: @escaping (TurnFileChanges) -> Void,
          onNearBottomChange: @escaping (Bool) -> Void,
          onUserScrolled: @escaping () -> Void,
+         onInteractionChange: @escaping (Bool) -> Void = { _ in },
          onFirstContent: @escaping () -> Void,
          onRetry: @escaping () -> Void) {
         self.items = items
@@ -101,6 +105,7 @@ struct SessionMessageListView: View {
         self.onOpenFileChanges = onOpenFileChanges
         self.onNearBottomChange = onNearBottomChange
         self.onUserScrolled = onUserScrolled
+        self.onInteractionChange = onInteractionChange
         self.onFirstContent = onFirstContent
         self.onRetry = onRetry
     }
@@ -128,6 +133,7 @@ struct SessionMessageListView: View {
                     onOpenFileChanges: onOpenFileChanges,
                     onNearBottomChange: onNearBottomChange,
                     onUserScrolled: onUserScrolled,
+                    onInteractionChange: onInteractionChange,
                     onFirstContent: onFirstContent,
                     onRetry: onRetry
                 )
