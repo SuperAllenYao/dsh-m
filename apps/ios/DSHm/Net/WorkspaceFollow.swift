@@ -187,4 +187,16 @@ struct WorkspaceFollowState: Equatable {
         }
         workspaces = ranked.map(\.element)
     }
+
+    #if DEBUG
+ /// 自测脚手架（仅 DEBUG，`DSHM_PIN_DEMO=refresh-insert`）：把一条会话插进指定
+ /// workspace 的 sessionId 列表头部，模拟 Host 刷新带来「新增会话」。只用于验证段
+ /// 构造 TC-24（新增行造成可见布局变化），不进入生产构建。
+    mutating func debugInsertSession(_ sessionId: String, intoWorkspaceAt index: Int) {
+        guard workspaces.indices.contains(index) else { return }
+        if !workspaces[index].sessionIds.contains(sessionId) {
+            workspaces[index].sessionIds.insert(sessionId, at: 0)
+        }
+    }
+    #endif
 }
