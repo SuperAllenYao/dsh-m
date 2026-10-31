@@ -5,7 +5,7 @@
  * The M0 spike showed that the plugin's whole usefulness hinges on four
  * undocumented-but-stable behaviours: ctx.connection.authenticatedUrl() returns
  * a URL carrying the process token, GET /connect consumes it with
- * interactions=answer, answers 302, sets an API cookie and points at the mux.
+ * interactions=answer, answers a 3xx redirect, sets an API cookie and points at the mux.
  * If any of those drift after a DSH upgrade the plugin must say so loudly
  * instead of failing per-request.
  */
@@ -35,8 +35,8 @@ export async function probeConnectContract({ authenticatedUrl, loopbackOrigin, l
     } finally {
       clearTimeout(timer);
     }
-    if (response.status !== 302) {
-      return finish({ ok: false, error: '/connect returned HTTP ' + String(response.status) + ' instead of 302; the DSH Remote contract changed' });
+    if (response.status < 300 || response.status >= 400) {
+      return finish({ ok: false, error: '/connect returned HTTP ' + String(response.status) + ' instead of a 3xx redirect; the DSH Remote contract changed' });
     }
     const setCookie = response.headers.getSetCookie?.()[0] ?? response.headers.get('set-cookie') ?? undefined;
     if (typeof setCookie !== 'string' || setCookie.length === 0) {
@@ -52,7 +52,7 @@ export async function probeConnectContract({ authenticatedUrl, loopbackOrigin, l
     }
     const cookieName = setCookie.split('=', 1)[0];
     log('/connect contract probe OK (cookie ' + cookieName.slice(0, 12) + '…, mux ' + muxPath + ')');
-    return finish({ ok: true, status: 302, muxPath, cookieNamePreview: cookieName.slice(0, 16) });
+    return finish({ ok: true, status: response.status, muxPath, cookieNamePreview: cookieName.slice(0, 16) });
   } catch (error) {
     return finish({ ok: false, error: String(error?.message ?? error) });
   }
