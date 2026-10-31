@@ -9,7 +9,7 @@ import Foundation
 /// metadata (title/running/blank/updatedAt) still comes from `session/list` and is
 /// joined by session id.
 ///
-/// Live sync with the desktop (task-1): because membership and
+/// Live sync with the desktop : because membership and
 /// metadata come from two different sources, a desktop-side change is only
 /// visible after BOTH are fresh. The Host pushes membership on
 /// `workspace/follow` and session-list hints on `$events`
@@ -40,13 +40,13 @@ final class WorkspaceViewModel: ObservableObject {
         var displayName: String
     }
 
- /// DD-03: the list content is published exactly once per update
+ /// DD-03 : the list content is published exactly once per update
  /// via `publishListState()`. `groups` / `pinnedSessions` / both versions are
  /// plain stored properties instead of `@Published`, so a pin change assigns
  /// them all and then sends `objectWillChange` once (one List diff, no
  /// two-pass flash) while `groupsVersion` still drives the view's `.onChange`.
     private(set) var groups: [WorkspaceGroup] = []
- /// Pinned sessions rendered above the workspace groups.
+ /// Pinned sessions rendered above the workspace groups .
  /// Derived from `followState.pinnedSessionIds`; the groups exclude them so
  /// a pinned session appears exactly once in the list.
     private(set) var pinnedSessions: [SessionListItem] = []
@@ -62,6 +62,7 @@ final class WorkspaceViewModel: ObservableObject {
  /// Increments whenever `groups` is rebuilt (drives the env-gated auto-open).
  /// Published together with the list state (DD-03).
     private(set) var groupsVersion = 0
+
  /// M2b-2: the list currently on screen came from the on-disk cache. The next
  /// network refresh replaces it in place (diffed, no empty-state flash).
     @Published private(set) var loadedFromCache = false
@@ -84,7 +85,7 @@ final class WorkspaceViewModel: ObservableObject {
  /// line). Refreshed on list appear / draft flush; the cards read from it so
  /// SessionCardView stays equatable on value identity.
     @Published private(set) var phoneCreatedDraftPreviews: [String: String] = [:]
- /// Two-phase close-out guard: on returning from a
+ /// Two-phase close-out guard : on returning from a
  /// session page this list refreshes ~580 ms BEFORE the detail's onDisappear
  /// flush reaches DraftStore, so a pending 500 ms draft debounce reads as "no
  /// draft" and used to prune the blank for good. Missing-draft blanks are kept
@@ -97,6 +98,134 @@ final class WorkspaceViewModel: ObservableObject {
  /// exclusivity). Closed by tapping elsewhere, another swipe, a scroll, or a
  /// groups refresh (design 3.2).
     @Published var swipedSessionId: String?
+
+ // MARK: - DD-07 置顶/取消置顶过渡期间的刷新缓冲
+
+ /// 段内到达的列表刷新暂存快照（只保留最新一份）。
+    struct PendingPinRefresh {
+        var pinned: [SessionListItem]
+        var groups: [WorkspaceGroup]
+        var sessionCount: Int
+    }
+
+ /// 列表视图在过渡段开始时置真、段末（或 settle 时）置假。为真时 `rebuildGroups`
+ /// 不发布新布局，而是把最新快照存进 `pendingPinRefresh`。
+    var pinTransitionHoldsRefresh = false
+    private var pendingPinRefresh: PendingPinRefresh?
+
+    var hasPendingPinRefresh: Bool { pendingPinRefresh != nil }
+
+ /// 段末/连点 settle：取走缓冲的最新快照（调用方负责在同一次更新里应用）。
+    func takePendingPinRefresh() -> PendingPinRefresh? {
+        defer { pendingPinRefresh = nil }
+        return pendingPinRefresh
+    }
+
+    #if DEBUG
+ /// 自测脚手架（仅 DEBUG，`DSHM_PIN_DEMO=pin-refresh`）：模拟一次列表刷新带来的
+ /// 可见布局变化——把一个可见会话标记为 subagent，重建后该行从分组移除。走与真实
+ /// `session/list` 刷新**相同**的 `rebuildGroups` 缓冲/发布路径（验证段用真实刷新覆盖）。
+    @discardableResult
+    func debugSimulateRefreshDisappearance(
+        excluding: Set<String> = [],
+        preferVisible visible: Set<String> = []
+    ) -> String? {
+        func eligible(_ id: String) -> Bool {
+            guard let session = sessionsById[id] else { return false }
+            return !excluding.contains(id)
+                && !session.isSubagent
+                && session.blank != true
+                && !followState.pinnedSessionIds.contains(id)
+        }
+ // 优先「当前在分组布局里」的会话（去掉它一定改变可见布局），再优先视口内；
+ // 任意 workspace 里的离屏/空会话可能根本不在布局里，刷新后无可见变化。
+        let grouped = groups.flatMap { $0.sessions.map(\.sessionId) }
+        let victim = grouped.first { eligible($0) && visible.contains($0) }
+            ?? grouped.first(where: eligible)
+            ?? followState.workspaces.flatMap(\.sessionIds).first(where: eligible)
+        guard let victim, var session = sessionsById[victim] else { return nil }
+        session.origin = "subagent"
+        sessionsById[victim] = session
+        if let index = allSessions.firstIndex(where: { $0.sessionId == victim }) {
+            allSessions[index] = session
+        }
+        rebuildGroups()
+        return victim
+    }
+
+ /// 自测脚手架（仅 DEBUG，`DSHM_PIN_DEMO=refresh-invisible`，TC-23）：模拟一次只改
+ /// **不可见内容**、不改变列表布局的刷新（视口外会话的 agent 可用性翻转）。走与真实
+ /// `session/list` 刷新相同的 `rebuildGroups` 缓冲/发布路径；`visible` 由列表视图的
+ /// `listGeometry.visibleRowIds` 传入，保证被改的会话不在当前视口内。
+    @discardableResult
+    func debugSimulateRefreshInvisibleMutation(
+        visible: Set<String>,
+        excluding: Set<String> = []
+    ) -> String? {
+        let candidates = followState.workspaces.flatMap(\.sessionIds)
+        guard let victim = candidates.first(where: { id in
+            guard let session = sessionsById[id] else { return false }
+            return !excluding.contains(id)
+                && !visible.contains(id)
+                && !session.isSubagent
+                && session.blank != true
+                && !followState.pinnedSessionIds.contains(id)
+        }), var session = sessionsById[victim] else { return nil }
+ // 只改内容、不改排序键（running/lastPromptAt/updatedAt）与行高：
+ // `agentAvailable` 不影响 `sessionComparator`/`activity`，也不参与分组布局。
+        session.agentAvailable = !(session.agentAvailable ?? false)
+        sessionsById[victim] = session
+        if let index = allSessions.firstIndex(where: { $0.sessionId == victim }) {
+            allSessions[index] = session
+        }
+        rebuildGroups()
+        return victim
+    }
+
+ /// 自测脚手架（仅 DEBUG，`DSHM_PIN_DEMO=refresh-insert`，TC-24）：模拟刷新在段内
+ /// 新增一个会话（新行落在分组顶部 → 可见布局变化）。新会话 id 以
+ /// `debug-refresh-new-` 前缀标记，证据里可辨识为 DEBUG 注入快照；走与真实刷新相同
+ /// 的 `rebuildGroups` 缓冲/发布路径。
+    @discardableResult
+    func debugSimulateRefreshInsertion(excluding: Set<String> = []) -> String? {
+        guard let workspaceIndex = followState.workspaces.firstIndex(where: { !$0.sessionIds.isEmpty }),
+              let template = followState.workspaces[workspaceIndex].sessionIds
+                .compactMap({ sessionsById[$0] })
+                .first(where: { !$0.isSubagent && $0.blank != true && !excluding.contains($0.sessionId) }) else { return nil }
+        var session = template
+        session.sessionId = "debug-refresh-new-\(UUID().uuidString.prefix(8))"
+ // rank 0（running）保证新行落在分组顶部：既有可见行下移一个槽位，布局变化确定。
+        session.running = true
+        session.updatedAt = Int64(Date().timeIntervalSince1970 * 1000)
+        session.origin = nil
+        session.parentSessionId = nil
+ // 新会话不是空白草稿（否则 `isVisible` 会把它挡在布局外，刷新就无可见变化）。
+        session.blank = nil
+        session.projections = ProjectionValues(values: ["title": .string("DEBUG 新增会话")])
+        sessionsById[session.sessionId] = session
+        allSessions.append(session)
+        followState.debugInsertSession(session.sessionId, intoWorkspaceAt: workspaceIndex)
+        rebuildGroups()
+        return session.sessionId
+    }
+    #endif
+
+ /// 应用段末缓冲的快照：与数据变更同一次更新，随后由列表视图决定是否再播一段。
+    func applyPendingPinRefresh(_ snapshot: PendingPinRefresh) {
+        pinnedSessions = snapshot.pinned
+        groups = snapshot.groups
+        sessionCount = snapshot.sessionCount
+        groupsVersion += 1
+        publishListState()
+    }
+
+ /// 连点/滚动 settle 用：取出并应用全部缓冲（无动画）。返回是否应用过。
+    @discardableResult
+    func settlePendingPinRefresh() -> Bool {
+        guard let snapshot = takePendingPinRefresh() else { return false }
+        applyPendingPinRefresh(snapshot)
+        return true
+    }
 
  /// Every session from the last `session/list`, including subagent/blank/
  /// archived/ungrouped rows. Kept for deep-link address resolution only.
@@ -153,7 +282,7 @@ final class WorkspaceViewModel: ObservableObject {
  /// 只有真正变慢（如桌面端重启后首次启动）才显示「本地缓存 · 正在刷新…」。
     @Published private(set) var showCacheRefreshBanner = false
     private var cacheBannerDelayTask: Task<Void, Never>?
- /// 阈值：低于它完成的刷新不显示指示器（需求「连接 + 缓存刷新 <1s」，
+ /// 阈值：低于它完成的刷新不显示指示器（用户要求「连接 + 缓存刷新 <1s」，
  /// 1s 内完成的刷新不该闪一下文案）。
     static let cacheRefreshBannerDelayMs: Int = 800
  /// 缓存仍是首帧时对 live `session/list` 的有界重试节奏（ms）。真机现场：
@@ -205,7 +334,7 @@ final class WorkspaceViewModel: ObservableObject {
         return min(max(value, 500), 600_000)
     }
 
- /// DEBUG 冷启动埋点：连接/列表各阶段耗时用。
+ /// DEBUG 冷启动埋点（真机 console 可见）：连接/列表各阶段耗时用。
     private func coldStartDebug(_ message: String) {
         #if DEBUG
         NSLog("[COLDSTART] %@", message)
@@ -537,7 +666,7 @@ final class WorkspaceViewModel: ObservableObject {
  /// P0-4: `session/list` runs over the pinned unary transport (HTTPS + a
  /// short-lived api bearer token), which is independent of the mux/`$events`
  /// handshake. As long as the device is paired the request can therefore be
- /// issued *before* `phase ==.connected`; LinkService mints the api token in
+ /// issued *before* `phase == .connected`; LinkService mints the api token in
  /// parallel (per-purpose auth in-flight since P0), and the `.connected`
  /// handlers below still reload incrementally.
     nonisolated static func canLoadSessionsBeforeConnected(hasCredentials: Bool, isConnected: Bool) -> Bool {
@@ -560,7 +689,7 @@ final class WorkspaceViewModel: ObservableObject {
         }
         observeForegroundResume()
  // P0-4: the cached first frame is already on screen (or the empty chrome is);
- // do not wait for `phase ==.connected` to ask the Host for the live list.
+ // do not wait for `phase == .connected` to ask the Host for the live list.
  // The request is silent while the link is still busy, and a superseded
  // response can never overwrite the connected-path snapshot (request id).
  // P0-4 guard: never issue the early unary on a path where the stored origin
@@ -569,7 +698,7 @@ final class WorkspaceViewModel: ObservableObject {
         startEarlySnapshotDuringBringup()
  // if the first frame is still the cached one, keep retrying the
  // live list on a bounded schedule instead of waiting for the next phase flip
- // .
+ // (real device: desktop restart → 13s connect retries → 10s+ stale banner).
         armStaleListRetry()
         guard link.phase.isConnected else {
  // Show the list chrome + connection banner instead of a forever spinner;
@@ -1006,7 +1135,7 @@ final class WorkspaceViewModel: ObservableObject {
  /// E2E-only companion to `createSession`: the session id returned by the
  /// most recent phone-side create RPC (minted or reused). Write-capable UI
  /// tests address their targets strictly through this id — positional card
- /// lookups once archived a live session, never again.
+ /// lookups once archived a live session , never again.
     @Published private(set) var e2eCreatedSessionId = ""
 
  /// R2 (design 2.2): mint a session in one workspace through the plugin
@@ -1221,7 +1350,7 @@ final class WorkspaceViewModel: ObservableObject {
         applyDecodedSessionListResponse(value, list: list)
     }
 
- /// Off-main decode of a `session/list` payload.
+ /// Off-main decode of a `session/list` payload .
  /// `JSONValue.decode` encodes to JSON and decodes again; running it on the
  /// MainActor froze the whole list page for seconds on cold start.
     nonisolated static func decodeSessionListOffMain(_ value: JSONValue) async throws -> SessionListValue {
@@ -1706,7 +1835,7 @@ final class WorkspaceViewModel: ObservableObject {
             followState.pinnedSessionIds.enumerated().map { ($0.element, $0.offset) },
             uniquingKeysWith: { first, _ in first }
         )
- // v6.1: a phone-created draft card must sit at the
+ // v6.1 : a phone-created draft card must sit at the
  // top of its workspace group, exactly like the DSH desktop sidebar. The
  // Host reuses an existing empty session for "+" (so its server-side
  // updatedAt can be days old) — recency alone therefore ranks a brand-new
@@ -1746,7 +1875,7 @@ final class WorkspaceViewModel: ObservableObject {
             )
         }
  // Pinned sessions leave their workspace group and are rendered once,
- // above every group. Most recent pin first.
+ // above every group . Most recent pin first.
         let pinned = visibleAll
             .filter { pinnedRank[$0.sessionId] != nil }
             .sorted { lhs, rhs in
@@ -1758,6 +1887,23 @@ final class WorkspaceViewModel: ObservableObject {
                 if leftTime != rightTime { return leftTime > rightTime }
                 return lhs.sessionId < rhs.sessionId
             }
+
+ // DD-07 刷新缓冲：置顶/取消置顶的过渡段内到达的列表刷新不立即发布
+ // （否则布局跳变会打断当前段）。只保留最新一份快照，由列表视图在段末
+ // `takePendingPinRefresh()` 取走；段末应用与位移预测在同一次更新里完成。
+        if pinTransitionHoldsRefresh {
+            if pinned != pinnedSessions || rebuilt != groups {
+                pendingPinRefresh = PendingPinRefresh(
+                    pinned: pinned,
+                    groups: rebuilt,
+                    sessionCount: visibleAll.count
+                )
+            } else {
+ // 最新快照与当前发布内容一致：清掉旧缓冲，段末直接回 idle。
+                pendingPinRefresh = nil
+            }
+            return
+        }
 
  // Diff guard: a refresh that yields identical content must not publish a new
  // array (no list flash / scroll jump, and the auto-open hook stays silent).

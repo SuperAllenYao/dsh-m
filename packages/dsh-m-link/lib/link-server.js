@@ -76,7 +76,7 @@ import { detectListLiteRequest, isSessionListEndpoint, LIST_LITE_HEADER, trimSes
 import { buildProjectedPage } from './proj-encode.js';
 
 const PLUGIN_NAME = 'dsh-m-link';
-const PLUGIN_VERSION = '2.22.0';
+const PLUGIN_VERSION = '2.22.1';
 const MUX_PATH = '/api/remote.mux';
 
 /**
@@ -2722,7 +2722,7 @@ export class LinkServer {
     if (normalized.error !== undefined) {
       return sendJson(response, normalized.status, { ok: false, error: normalized.error, message: normalized.message });
     }
-    const result = applySessionPin({ ctx: this.ctx, sessionId: normalized.sessionId, pinned: normalized.pinned });
+    const result = await applySessionPin({ ctx: this.ctx, sessionId: normalized.sessionId, pinned: normalized.pinned });
     if (result.ok) {
       this.audit.record('session.pin', {
         deviceId: prelude.device.deviceId,
@@ -2752,7 +2752,7 @@ export class LinkServer {
     if (normalized.error !== undefined) {
       return sendJson(response, normalized.status, { ok: false, error: normalized.error, message: normalized.message });
     }
-    const result = applySessionArchive({ ctx: this.ctx, sessionId: normalized.sessionId, stopActivity: normalized.stopActivity });
+    const result = await applySessionArchive({ ctx: this.ctx, sessionId: normalized.sessionId, stopActivity: normalized.stopActivity });
     if (result.ok) {
       this.audit.record('session.archive', {
         deviceId: prelude.device.deviceId,

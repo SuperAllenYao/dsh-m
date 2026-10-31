@@ -58,6 +58,9 @@ struct SwipeableSessionCard<Content: View>: View {
     var sessionId: String
     var isPinned: Bool
     var open: Bool
+ /// DD-06：置顶/取消置顶的卡片缩放期间隐藏 rail（缩放只作用于卡片，不含按钮；
+ /// 卡片缩小后不能把背后的按钮露出来）。常规左滑（open/拖动）时恒为 false。
+    var railHidden: Bool = false
  /// 横向接管开始（`.began`）：父级把 `swipedSessionId` 改成本行。
     var onSwipeBegan: (String) -> Void
  /// 松手停靠结果（是否展开）：父级据此重写 `swipedSessionId`，并抑制尾随 tap。
@@ -165,5 +168,7 @@ struct SwipeableSessionCard<Content: View>: View {
             .accessibilityIdentifier("swipe-archive-" + sessionId)
         }
         .accessibilityHidden(!actionsRevealed)
+ // DD-06：自动动画（置顶/取消置顶）期间 rail 不参与缩放、也不可见。
+        .opacity(railHidden ? 0 : 1)
     }
 }

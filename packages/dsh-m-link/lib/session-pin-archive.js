@@ -129,16 +129,21 @@ function classifyRegistryError(error, prefix) {
 /**
  * Pin or unpin one session.
  *
+ * The host registry applies its writes asynchronously (queued operation plus a
+ * durable commit), so the complete set may only be read once the write has
+ * resolved — reading it synchronously returns the pre-write set and makes every
+ * reply one operation stale.
+ *
  * @param {{ctx: object, sessionId: string, pinned: boolean}} input
- * @returns {{ok: true, status: 200, pinnedSessionIds: string[]}
- * | {ok: false, status: number, error: string, message?: string, activity?: object[]}}
+ * @returns {Promise<{ok: true, status: 200, pinnedSessionIds: string[]}
+ * | {ok: false, status: number, error: string, message?: string, activity?: object[]}>}
  */
-export function applySessionPin({ ctx, sessionId, pinned }) {
+export async function applySessionPin({ ctx, sessionId, pinned }) {
   const registry = readWorkspaceRegistry(ctx);
   if (registry === undefined) return { ok: false, ...PIN_HOST_UNAVAILABLE };
   try {
-    if (pinned) registry.pinSession(sessionId);
-    else registry.unpinSession(sessionId);
+    if (pinned) await registry.pinSession(sessionId);
+    else await registry.unpinSession(sessionId);
   } catch (error) {
     return classifyRegistryError(error, 'pin');
   }
@@ -148,15 +153,19 @@ export function applySessionPin({ ctx, sessionId, pinned }) {
 /**
  * Archive one session, optionally stopping its running work first.
  *
+ * Same asynchronicity as {@link applySessionPin}: wait for the write before
+ * reading the complete set, and route asynchronous host rejections through the
+ * classifier instead of reporting success.
+ *
  * @param {{ctx: object, sessionId: string, stopActivity: boolean}} input
- * @returns {{ok: true, status: 200, archivedSessionIds: string[]}
- * | {ok: false, status: number, error: string, message?: string, activity?: object[]}}
+ * @returns {Promise<{ok: true, status: 200, archivedSessionIds: string[]}
+ * | {ok: false, status: number, error: string, message?: string, activity?: object[]}>}
  */
-export function applySessionArchive({ ctx, sessionId, stopActivity }) {
+export async function applySessionArchive({ ctx, sessionId, stopActivity }) {
   const registry = readWorkspaceRegistry(ctx);
   if (registry === undefined) return { ok: false, ...ARCHIVE_HOST_UNAVAILABLE };
   try {
-    registry.archiveSession(sessionId, stopActivity === true ? { stopActivity: true } : {});
+    await registry.archiveSession(sessionId, stopActivity === true ? { stopActivity: true } : {});
   } catch (error) {
     return classifyRegistryError(error, 'archive');
   }
