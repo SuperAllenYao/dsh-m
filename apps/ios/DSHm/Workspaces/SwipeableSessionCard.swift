@@ -111,6 +111,7 @@ struct SwipeableSessionCard<Content: View>: View {
             }
  // 非拖动时的外部收起（点卡片外 / 纵向滚动 / 列表清理）保持原行为。
             if !isOpen, offsetX != 0 {
+                beginSettleWindow()
                 withAnimation(Theme.Motion.quick) { offsetX = 0 }
             }
         }
@@ -119,6 +120,13 @@ struct SwipeableSessionCard<Content: View>: View {
  /// 停靠结果：进入短暂的停靠窗口，再由父级写 `swipedSessionId`（唯一真值）。
     private func settle(sessionId: String, isOpen: Bool) {
         settledOpen = isOpen
+        beginSettleWindow()
+        onSwipeSettled(sessionId, isOpen)
+    }
+
+    /// 停靠 / 收起动画窗口（`Theme.Motion.quick` = 160ms + 余量）。窗口内 rail 保持
+    /// 可见，随卡片滑回被自然盖住；窗口结束才隐藏（DEF-001，避免中途变透明露背景）。
+    private func beginSettleWindow() {
         isSettling = true
         settleGeneration &+= 1
         let generation = settleGeneration
@@ -126,7 +134,14 @@ struct SwipeableSessionCard<Content: View>: View {
             guard generation == settleGeneration else { return }
             isSettling = false
         }
-        onSwipeSettled(sessionId, isOpen)
+    }
+
+    /// DEF-001：rail 的可见性由「是否处于左滑交互」显式决定，而不是靠卡片遮挡。
+    /// 未左滑时必须完全隐藏——取消置顶归位卡缩放（`restoredCardScale`）与工作区
+    /// 展开新行首帧时卡片盖不住 rail，否则按钮会先闪出来（用户看到的 1~2 帧闪烁）。
+    /// 停靠 / 收起窗口内保持可见：卡片正滑回盖住 rail，此时隐藏会露出背景。
+    private var railVisible: Bool {
+        !railHidden && (open || isDragging || isSettling)
     }
 
  /// True while the actions are actually revealed (past ~1/4 of the rail).
@@ -167,8 +182,10 @@ struct SwipeableSessionCard<Content: View>: View {
             .buttonStyle(.plain)
             .accessibilityIdentifier("swipe-archive-" + sessionId)
         }
-        .accessibilityHidden(!actionsRevealed)
- // DD-06：自动动画（置顶/取消置顶）期间 rail 不参与缩放、也不可见。
-        .opacity(railHidden ? 0 : 1)
+        .accessibilityHidden(!railVisible || !actionsRevealed)
+ // DEF-001：未左滑时 rail 必须完全隐藏（不渲染可见、不可点、不进 a11y 树）；
+ // DD-06：自动动画（置顶/取消置顶）期间同样不可见。
+        .allowsHitTesting(railVisible)
+        .opacity(railVisible ? 1 : 0)
     }
 }
