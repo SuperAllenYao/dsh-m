@@ -6,9 +6,10 @@ DSH-m 通过自托管、TLS 证书钉扎的桥接，把 iPhone App **DSH-m** 连
 
 ## 状态
 
-当前版本 **v2.21.0**（2026-10-30）。已交付的能力：
+当前版本 **v2.22.0**（2026-10-31）。已交付的能力：
 
-- **本轮六项**：会话列表左滑重做为系统级手感（跟手、松手停住、右滑收起、点外/点卡片收起、整滑不误触）；点置顶按「按钮先消失 → 卡片轻微回弹飞入并形变」播放、取消置顶立即归位且不再整屏闪烁；新建会话显示桌面端默认模型；运行中会话（含子代理）详情不闪退、滚动更跟手；列表卡片状态实时跟随；Mac 锁屏回来后约 1 秒自动重连。
+- **本轮（v2.22.0）**：会话详情与子代理会话详情在实时思考输出时不再卡顿、不再出现滚动条与消息内容高频闪烁；滚动条恢复为系统原生一条，滚动中尾部流式文字暂停增长、停手即补齐，向上加载历史保持连续。
+- **上一轮六项**：会话列表左滑重做为系统级手感（跟手、松手停住、右滑收起、点外/点卡片收起、整滑不误触）；点置顶按「按钮先消失 → 卡片轻微回弹飞入并形变」播放、取消置顶立即归位且不再整屏闪烁；新建会话显示桌面端默认模型；运行中会话（含子代理）详情不闪退、滚动更跟手；列表卡片状态实时跟随；Mac 锁屏回来后约 1 秒自动重连。
 
 **导航**
 
@@ -78,9 +79,9 @@ DSH-m connects the iOS app **DSH-m** to your Mac's DSH desktop through a self-ho
 
 ## Status
 
-Current version **v2.21.0** (2026-10-30). What ships today:
+Current version **v2.22.0** (2026-10-31). What ships today:
 
-- **This release**: session-named push titles with state bodies; pinned sessions in a compact area under the Workspaces title; one-tap code-block copy (including long messages); a shared subagents/background-tasks entry with stop; corrected offline cloud icon and a stronger waiting-for-answer animation.
+- **This release**: smooth scrolling in session and subagent session details while reasoning streams — no scrollbar or message flicker; back to the single native scrollbar; the streaming tail pauses while you scroll and catches up within a second; older messages keep loading as you scroll up.
 
 **Connection and pairing**
 

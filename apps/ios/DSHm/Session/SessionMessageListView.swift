@@ -1678,7 +1678,8 @@ enum MessageListWindowPolicy {
  /// 每次向上扩展的行数。
     static let expandChunk = 100
  /// 距窗口顶部预留区（pt）：提前这么多开始向上扩展，避免用户撞到窗口顶。
-    static let expandMargin: CGFloat = 1200
+ /// DD-07：1200 → 2000（快速上滑时预留区更早触发，保持「滑动即加载」）。
+    static let expandMargin: CGFloat = 2000
 
  /// 默认显示窗口的起点下标：最近 N 行（不足 N 行时为 0）。
     static func initialStartIndex(itemCount: Int, window: Int = defaultWindow) -> Int {

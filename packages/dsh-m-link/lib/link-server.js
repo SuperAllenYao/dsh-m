@@ -76,7 +76,7 @@ import { detectListLiteRequest, isSessionListEndpoint, LIST_LITE_HEADER, trimSes
 import { buildProjectedPage } from './proj-encode.js';
 
 const PLUGIN_NAME = 'dsh-m-link';
-const PLUGIN_VERSION = '2.21.0';
+const PLUGIN_VERSION = '2.22.0';
 const MUX_PATH = '/api/remote.mux';
 
 /**
@@ -1552,10 +1552,19 @@ export class LinkServer {
     });
     this.contract = result;
     if (result.ok) {
+      // A later successful probe clears an earlier incompatibility marker.
+      if (this.startupError !== undefined && this.startupError.code === 'host/incompatible') this.startupError = undefined;
       this.audit.record('contract.ok', { muxPath: result.muxPath, durationMs: result.durationMs });
     } else {
       log('CONTRACT SELF-CHECK FAILED: this DSH build is incompatible with ' + PLUGIN_NAME + ' — ' + result.error);
       log('The desktop UI will show "当前 DSH 版本不兼容" and pairing is disabled until a compatible build is installed.');
+      // Surface the incompatibility in /health and request guards: a contract
+      // failure means the plugin cannot serve devices (design §5 failure 2).
+      this.startupError = {
+        code: 'host/incompatible',
+        message: String(result.error ?? 'DSH /connect contract self-check failed'),
+        at: new Date().toISOString(),
+      };
       this.audit.record('contract.failed', { error: result.error });
     }
     return result;

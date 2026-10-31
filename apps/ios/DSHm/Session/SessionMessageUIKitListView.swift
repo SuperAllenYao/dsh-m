@@ -265,10 +265,8 @@ struct SessionMessageUIKitListView: View {
             dynamicTypeSize: dynamicTypeSize,
             locale: locale
         )
- // 自绘滚动条（系统指示条被翻转错位；对标 UIKit 外观，语义贴底=最新）。
-        .overlay(alignment: .trailing) {
-            InvertedScrollIndicator(model: shared)
-        }
+ // DD-03：删除自绘 `InvertedScrollIndicator` overlay（含 20Hz TimelineView），
+ // 只保留 makeUIView 里的系统原生滚动条 `showsVerticalScrollIndicator = true`。
  // 骨架屏（无内容拉取中）：挂在 representable 外层不被翻转。
         .overlay {
             if items.isEmpty {
@@ -334,6 +332,9 @@ struct SessionMessageUIKitListView: View {
         let distance = shared.facts.distanceFromBottom
         let distanceText = distance.isFinite ? fmt(distance) : "-9999"
         return "o=\(fmt(shared.facts.offset)) d=\(distanceText) i=\(shared.displayedCount)/\(shared.incomingCount) ws=\(shared.windowStartIndex) pre=\(shared.prependCount) ch=\(fmt(shared.facts.contentHeight)) vh=\(fmt(shared.facts.viewportHeight)) pin=\(shared.pinned ? 1 : 0) ini=\(shared.isContentReady ? 1 : 0) gm=\(fmt(shared.gestureMaxFrameDelta)) ac=0 cs=0 sf=0 acg=0 fw=\(shared.followCount) rs=0.0 sy=0 lag=0 dr=\(shared.idleDriftCount) mx=\(fmt(shared.maxIdleDistance)) kvo=0 pan=\(shared.panSeen ? 1 : 0) ptrk=\(shared.panTrackingSeen ? 1 : 0) pdec=\(shared.panDecelSeen ? 1 : 0) it=\(isUserInteractingNow() ? 1 : 0) drag=\(shared.isDragging ? 1 : 0)"
+            // AC-11 验证字段（追加在末尾，既有 key 不变）：显式窗口起点 id + 历史补齐中标记。
+            + ";wsid=" + shared.windowStartSourceID
+            + ";fill=" + (isFillingHistory ? "1" : "0")
     }
 
     private func isUserInteractingNow() -> Bool {
@@ -427,6 +428,8 @@ struct SessionMessageUIKitListView: View {
             + ";ready=" + (shared.isContentReady ? "1" : "0")
             + ";wstart=" + String(shared.windowStartIndex)
             + ";win=" + String(MessageListWindowPolicy.defaultWindow)
+            + ";wsid=" + shared.windowStartSourceID
+            + ";fill=" + (isFillingHistory ? "1" : "0")
     }
 
     private func fmt(_ value: CGFloat) -> String {
@@ -509,7 +512,7 @@ private struct MessageTableRepresentable: UIViewRepresentable {
 
     func updateUIView(_ tableView: UITableView, context: Context) {
         context.coordinator.parent = self
-        context.coordinator.apply(items: items, batchToken: historyBatchToken)
+        context.coordinator.applyFromSwiftUI(items: items, batchToken: historyBatchToken)
     }
 
     static func dismantleUIView(_ tableView: UITableView, coordinator: Coordinator) {
@@ -841,8 +844,9 @@ private struct MessageTableRepresentable: UIViewRepresentable {
         private var isApplying = false
  /// DD-01：应用进行中收到的最后一拍请求（后到覆盖先到；内容不丢）。
         private var pendingApply: (items: [SessionMessageItem], batchToken: Int, skipModeChange: Bool)?
- /// DD-01：滚动回调/扩窗的「同一拍合并」请求槽（`requestApply` 用）。
-        private var pendingRequestedApply: (items: [SessionMessageItem], batchToken: Int, skipModeChange: Bool)?
+ /// DD-01：滚动回调/扩窗的「同一拍合并」请求槽（`requestApply` 用）——只保留
+ /// 最后一次的 `skipModeChange`；真正的 items/batchToken 在执行那一拍重取最新值。
+        private var pendingRequestedApply: Bool?
  /// 本拍是否已排期一次延后 apply（同一拍多次 requestApply 只跑一次）。
         private var isApplyRequestScheduled = false
  /// 上次窗口扩展时刻（扩展冷却，抑制扩展/回落振荡）。
@@ -856,6 +860,20 @@ private struct MessageTableRepresentable: UIViewRepresentable {
         private var lastAnimationEndAt: CFTimeInterval = 0
  /// 手势窗口 offset 采样（HUD gm/gf 字段）。
         private var lastTraceOffset: CGFloat = -1
+
+ /// DD-03：`facts` 的 @Published 只服务 DEBUG HUD / e2e 探针（自绘指示条已删除）。
+ /// 无读者时不发布——否则每帧一次 objectWillChange 会让 SwiftUI 持续重算。
+        private static let debugFactsReaderEnabled: Bool = {
+            #if DEBUG
+            let env = ProcessInfo.processInfo.environment
+            return env["DSHM_E2E_HUD"] == "1"
+                || env["DSHM_E2E"] == "1"
+                || env["DSHM_SCROLLDBG"] == "1"
+                || env["DSHM_DEBUG_STREAM"] == "1"
+            #else
+            return false
+            #endif
+        }()
 
  // MARK: - 行内容宿主缓存
  //
@@ -2293,6 +2311,197 @@ private struct MessageTableRepresentable: UIViewRepresentable {
             updateSharedFacts()
         }
 
+ // MARK: - DD-01 / DD-02 / DD-09：输入去重、滚动门闸、冻结尾部快照
+
+ /// DD-01：`updateUIView` 入口的输入键——覆盖 `applyCore` 实际读取的全部输入
+ /// （items 内容签名 + batchToken + scrollToBottomToken + processGroupModes +
+ /// isRunning + isFillingHistory + stepsLayoutSignature）。
+        private struct ApplyInputKey: Equatable {
+            var signature: MessageListSignature
+            var batchToken: Int
+            var scrollToBottomToken: Int
+            var modes: [String: ProcessGroupMode]
+            var fillingHistory: Bool
+            var stepsLayoutSignature: String
+        }
+
+ /// 上一次 `updateUIView` 的输入键：未变直接返回，不进入 apply。
+        private var lastUpdateViewKey: ApplyInputKey?
+ /// 上一次真正应用的数据特征（DD-02 判定「仅尾部流式变化」）。
+        private var lastAppliedBatchToken = Int.min
+        private var lastAppliedSourceIDs: [String] = []
+        private var lastAppliedLastItem: SessionMessageItem?
+ /// 上一次应用时**实际参与窗口计算**的窗口起点（扩窗请求未落地前不能提前记为已应用）。
+        private var lastAppliedWindowStartID: String?
+ /// DD-02：滚动/惯性（tracking/decelerating）期间为 true。
+        private var isScrollInteracting = false
+ /// DD-05：交互 deadline 续期节流时间戳（ViewModel 侧 O(1) 更新，不重建 Task）。
+        private var lastInteractionPingAt: CFTimeInterval = 0
+ /// DD-02：滚动期被挂起的纯尾部流式更新（结束滚动后应用一次；内容以 parent.items 为准）。
+        private var pendingTailApply: (items: [SessionMessageItem], batchToken: Int)?
+ /// DD-09：滚动开始时的实时步骤内容快照（step.id → 旧 kind）。
+        private var frozenStepKinds: [String: ProcessStep.Kind] = [:]
+ /// DD-09：滚动开始时的 liveText 行文本（nil = 无该行）。
+        private var frozenLiveTextRow: String?
+
+ /// DD-01：只在 `updateUIView` 入口按全量输入去重。
+ /// `apply` 还会被 `requestApply`（扩窗/settle）与重入续跑调用：它们的输入键可能
+ /// 相同但内部窗口状态（windowStartItemID/isExpandingWindow）已变，不能在这里短路。
+        func applyFromSwiftUI(items: [SessionMessageItem], batchToken: Int) {
+            let key = ApplyInputKey(
+                signature: messageListSignature(items: items),
+                batchToken: batchToken,
+                scrollToBottomToken: parent.scrollToBottomToken,
+                modes: parent.processGroupModes,
+                fillingHistory: parent.isFillingHistory,
+                stepsLayoutSignature: parent.stepsLayoutSignature
+            )
+            if key == lastUpdateViewKey { return }
+            lastUpdateViewKey = key
+            apply(items: items, batchToken: batchToken)
+        }
+
+ /// 与 SwiftUI 回退后端 `MessageListSignature` 同口径（O(1) + 尾部 16 行扫描）：
+ /// 只纳入真正影响渲染的内容，避免长会话每帧做 O(rows) 深比较。
+        private func messageListSignature(items: [SessionMessageItem]) -> MessageListSignature {
+            var newestStepCount = 0
+            var newestFingerprint = ""
+            if case .group(.process(let steps))? = items.last {
+                newestStepCount = steps.count
+                newestFingerprint = MessageListUpdatePolicy.processFingerprint(steps)
+            }
+            var liveText: String?
+            var liveScanned = 0
+            for item in items.reversed() {
+                if liveScanned >= 16 { break }
+                liveScanned += 1
+                if case .liveText(let text) = item { liveText = text; break }
+            }
+            var parts: [String] = []
+            var scanned = 0
+            for item in items.reversed() {
+                if scanned >= 16 || parts.count >= 8 { break }
+                scanned += 1
+                switch item {
+                case .group: break
+                case .liveText(let text): parts.append("lt:\(text.count)")
+                case .streamError(let message): parts.append("se:\(message)")
+                case .actionError(let message): parts.append("ae:\(message)")
+                case .fileChanges(let changes):
+                    parts.append("fc:\(changes.source)|\(changes.titleFileCount)|\(changes.files.count)|\(changes.added)|\(changes.deleted)")
+                }
+            }
+            return MessageListSignature(
+                count: items.count,
+                firstID: items.first?.id,
+                lastID: items.last?.id,
+                liveText: liveText,
+                running: parent.isRunning,
+                newestGroupStepCount: newestStepCount,
+                newestGroupFingerprint: newestFingerprint,
+                tailSignature: parts.joined(separator: "#")
+            )
+        }
+
+ /// DD-02：滚动/惯性期间，只有「批次不变、ids 不变、末项仍是同一过程组且步骤数不变、
+ /// 窗口/回底请求没变」的纯实时文本变化才挂起；工具行（步骤数增加）、历史批次
+ /// （batchToken 变化）、扩窗（窗口起点变化）等一律立即应用。
+        private func shouldSuspendTailApply(items: [SessionMessageItem], batchToken: Int, skipModeChange: Bool) -> Bool {
+            guard isScrollInteracting, !skipModeChange, !isExpandingWindow else { return false }
+            guard batchToken == lastAppliedBatchToken else { return false }
+            guard windowStartItemID == lastAppliedWindowStartID else { return false }
+            guard parent.scrollToBottomToken == lastScrollToBottomToken else { return false }
+            guard items.count == lastAppliedSourceIDs.count,
+                  items.map(\.id) == lastAppliedSourceIDs,
+                  let last = items.last,
+                  let oldLast = lastAppliedLastItem else { return false }
+            switch last {
+            case .group(.process(let steps)):
+                guard case .group(.process(let oldSteps)) = oldLast else { return false }
+                return steps.count == oldSteps.count
+            case .liveText:
+                guard case .liveText = oldLast else { return false }
+                return true
+            default:
+                return false
+            }
+        }
+
+ /// 滚动开始：冻结尾部实时文本（步骤 id 稳定，文本以滚动开始时为准）。
+        private func captureFrozenTailSnapshot() {
+            frozenStepKinds.removeAll(keepingCapacity: true)
+            frozenLiveTextRow = nil
+            for item in displayedItems.reversed() {
+                if case .group(.process(let steps)) = item {
+                    for step in steps {
+                        switch step.kind {
+                        case .reasoning, .preparing: frozenStepKinds[step.id] = step.kind
+                        default: break
+                        }
+                    }
+                    break
+                }
+            }
+            for item in displayedItems.reversed() {
+                if case .liveText(let text) = item {
+                    frozenLiveTextRow = text
+                    break
+                }
+            }
+        }
+
+ /// DD-09：头部/工具行取最新；末组实时思考文本与 liveText 行用滚动开始时的旧内容。
+        private func frozenTailInput(_ incoming: [SessionMessageItem]) -> [SessionMessageItem] {
+            guard !frozenStepKinds.isEmpty || frozenLiveTextRow != nil else { return incoming }
+            var result = incoming
+            var frozeGroup = false
+            var frozeLiveRow = false
+            for index in result.indices.reversed() {
+                if frozeGroup && frozeLiveRow { break }
+                switch result[index] {
+                case .group(.process(var steps)):
+                    if frozeGroup { continue }
+                    var replaced = false
+                    for i in steps.indices {
+                        guard let old = frozenStepKinds[steps[i].id] else { continue }
+                        if applyFrozenKind(old, to: &steps[i]) { replaced = true }
+                    }
+                    if replaced { result[index] = .group(.process(steps)) }
+                    frozeGroup = true
+                case .liveText:
+                    guard !frozeLiveRow, let old = frozenLiveTextRow else { continue }
+                    result[index] = .liveText(old)
+                    frozeLiveRow = true
+                case .group, .fileChanges, .streamError, .actionError:
+                    break
+                }
+            }
+            return result
+        }
+
+ /// 只回填同类步骤内容（实时思考文本 / 准备行参数）；工具行等结构性内容保留最新。
+        private func applyFrozenKind(_ old: ProcessStep.Kind, to step: inout ProcessStep) -> Bool {
+            switch (step.kind, old) {
+            case (.reasoning, .reasoning(let text)):
+                step.kind = .reasoning(text)
+                return true
+            case (.preparing(let name, _), .preparing(let oldName, let oldArgs)):
+                step.kind = .preparing(name: name ?? oldName, args: oldArgs)
+                return true
+            default:
+                return false
+            }
+        }
+
+ /// 记录「上一次真正与屏幕对齐」的输入，供 DD-02 判定尾部流式变化。
+ /// `windowStart` 必须是该次 apply 实际参与窗口计算的值（扩窗请求要等落地后才算数）。
+        private func commitAppliedInput(_ items: [SessionMessageItem], batchToken: Int, windowStart: String?) {
+            lastAppliedBatchToken = batchToken
+            lastAppliedSourceIDs = items.map(\.id)
+            lastAppliedLastItem = items.last
+            lastAppliedWindowStartID = windowStart
+        }
+
  // MARK: - apply（显示窗口 + 冻结尾部 + 锚定）
 
  /// 显示窗口：只渲染「最近 N 行」（默认 300，与本地缓存深度对齐）。
@@ -2308,8 +2517,17 @@ private struct MessageTableRepresentable: UIViewRepresentable {
  /// DD-01：唯一 apply 入口。重入时（滚动回调/扩窗在同一同步栈里再次进入）
  /// 不嵌套执行，只记录最后一拍请求，本次应用结束后由主队列下一拍续跑。
         func apply(items: [SessionMessageItem], batchToken: Int, skipModeChange: Bool = false) {
+ // DD-02：滚动/惯性期间「仅尾部流式文本变化」挂起，结束滚动后用真实数据收口一次；
+ // 历史批次/扩窗/工具行/运行态等其它输入必须立即应用。
+            if shouldSuspendTailApply(items: items, batchToken: batchToken, skipModeChange: skipModeChange) {
+                pendingTailApply = (items, batchToken)
+                return
+            }
+ // DD-09：滚动中执行其它 apply 时，尾部实时文本用滚动开始时的快照（工具行等结构性
+ // 变化立即出现）；滚动结束后用真实 items 追平。
+            let effectiveItems = isScrollInteracting ? frozenTailInput(items) : items
             if isApplying {
-                pendingApply = (items, batchToken, skipModeChange)
+                pendingApply = (effectiveItems, batchToken, skipModeChange)
                 return
             }
             guard tableView != nil, dataSource != nil else { return }
@@ -2328,25 +2546,29 @@ private struct MessageTableRepresentable: UIViewRepresentable {
                     }
                 }
             }
-            applyCore(items: items, batchToken: batchToken, skipModeChange: skipModeChange)
+            applyCore(items: effectiveItems, batchToken: batchToken, skipModeChange: skipModeChange)
         }
 
  /// DD-01：滚动回调/扩窗专用入口——同一拍内的多次请求合并为最后一拍，
  /// 由 `DispatchQueue.main.async` 延后一拍执行，不在滚动/批次更新的同步栈里
- /// 改数据源（崩溃与掉帧的共同来源）。
-        func requestApply(items: [SessionMessageItem], batchToken: Int, skipModeChange: Bool = false) {
-            pendingRequestedApply = (items, batchToken, skipModeChange)
+ /// 改数据源（崩溃与掉帧的共同来源）；执行那一拍取 coordinator 的最新输入。
+        func requestApply(skipModeChange: Bool = false) {
+            pendingRequestedApply = skipModeChange
             guard !isApplyRequestScheduled else { return }
             isApplyRequestScheduled = true
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 self.isApplyRequestScheduled = false
-                guard let request = self.pendingRequestedApply else { return }
+                guard let pendingSkipModeChange = self.pendingRequestedApply else { return }
                 self.pendingRequestedApply = nil
+ // DD-02：执行这一拍时重取 coordinator 的最新输入（`parent` 由 `updateUIView`
+ // 刷新）。交互结束的 ViewModel flush 与这一拍只差一个 runloop，沿用调用瞬间的
+ // 快照会让结束 apply 把刚 flush 的尾部文本盖回旧值，而同一 key 的后续
+ // `updateUIView` 已被 DD-01 去重、不会自动修复。
                 self.apply(
-                    items: request.items,
-                    batchToken: request.batchToken,
-                    skipModeChange: request.skipModeChange
+                    items: self.parent.items,
+                    batchToken: self.parent.historyBatchToken,
+                    skipModeChange: pendingSkipModeChange
                 )
             }
         }
@@ -2370,6 +2592,8 @@ private struct MessageTableRepresentable: UIViewRepresentable {
                 "incoming": items.count,
                 "pinned": pinned ? 1 : 0,
                 "filling": parent.isFillingHistory ? 1 : 0,
+                "wsid": windowStartItemID ?? "-",
+                "interacting": isScrollInteracting ? 1 : 0,
             ])
  // 展开/收起动画期间：数据批推迟到 completion（避免修正 offset 与动画竞争）。
             if heightAnimationActive {
@@ -2426,6 +2650,7 @@ private struct MessageTableRepresentable: UIViewRepresentable {
                 ])
                 #endif
             }
+            let windowStartAtApply = windowStartItemID
             var windowed = windowedItems(from: items)
             guard !windowed.isEmpty else {
  // 无内容（无缓存会话拉取中）：清空显示，骨架屏兜底。
@@ -2436,6 +2661,7 @@ private struct MessageTableRepresentable: UIViewRepresentable {
                     empty.appendSections(["main"])
                     dataSource.apply(empty, animatingDifferences: false)
                 }
+                commitAppliedInput(items, batchToken: batchToken, windowStart: windowStartAtApply)
                 updateSharedWindow(items: items)
                 ScrollHitchProbe.mark("applyItemsChangeEnd", ["displayed": 0, "incoming": items.count])
                 return
@@ -2486,6 +2712,44 @@ private struct MessageTableRepresentable: UIViewRepresentable {
             }
 
             let insertedIDs = newIDs.subtracting(previousIDs)
+            #if DEBUG
+ // apply 来源标记（尾部流式 / 历史批次 / 扩窗 / 工具行 / 其它）：验证段按来源归因
+ // 滚动相位内的 apply 成本；探针未开启时 `mark` 为 no-op（默认零开销）。
+            let previousLastGroupStepCount: Int = {
+                for item in displayedItems.reversed() {
+                    if case .group(.process(let steps)) = item { return steps.count }
+                }
+                return 0
+            }()
+            let currentLastGroupStepCount: Int = {
+                for item in windowed.reversed() {
+                    if case .group(.process(let steps)) = item { return steps.count }
+                }
+                return 0
+            }()
+            let applySource: String
+            if isExpandingWindow {
+                applySource = "windowExpand"
+            } else if batchToken != lastAppliedBatchToken {
+                applySource = "historyBatch"
+            } else if currentLastGroupStepCount > previousLastGroupStepCount {
+                applySource = "toolRow"
+            } else if items.last?.id != lastAppliedLastItem?.id {
+                applySource = "tailInsert"
+            } else if !insertedIDs.isEmpty {
+                applySource = "idsInsert"
+            } else {
+                applySource = isScrollInteracting ? "tailStreamFrozen" : "tailStream"
+            }
+            ScrollHitchProbe.mark("applySource", [
+                "src": applySource,
+                "batch": batchToken,
+                "disp": displayedItems.count,
+                "incoming": items.count,
+                "wsid": windowStartItemID ?? "-",
+                "fill": parent.isFillingHistory ? 1 : 0,
+            ])
+            #endif
  // 【滚动丝滑 v6】新到行**先预热解析再走 apply 的数据工作**：后台解析
  // 与主线程 apply/滚动并发，等滚动追上这些行时 Markdown 已解析缓存
  // （此前 prewarm 在 apply 之后才看到新行，回填期存在 100-300ms 竞速）。
@@ -2547,6 +2811,7 @@ private struct MessageTableRepresentable: UIViewRepresentable {
                 if wantsBottom { forceBottom(tableView) }
                 displayedItems = windowed
                 groupLookup = newGroupLookup
+                commitAppliedInput(items, batchToken: batchToken, windowStart: windowStartAtApply)
                 updateSharedWindow(items: items)
                 maybeExpandWindow()
                 applyFullRangeWindowIfPossible()
@@ -2647,6 +2912,7 @@ private struct MessageTableRepresentable: UIViewRepresentable {
  // 零 apply。同时把全量文本交给 Markdown 后台预解析。
                 scheduleFullRangeApply()
             }
+            commitAppliedInput(items, batchToken: batchToken, windowStart: windowStartAtApply)
             freezeAnchorFromCurrentViewport(tableView)
             updateSharedFacts()
             updateSharedWindow(items: items)
@@ -2857,10 +3123,11 @@ private struct MessageTableRepresentable: UIViewRepresentable {
                 overscroll: max(0, offset - maxOffset),
                 maxOffset: maxOffset
             )
- // 指示条 @Published 更新节流到 30Hz（或位移 >4pt）：每帧写会带来每帧的
- // SwiftUI 更新事务；指示条自身是 20Hz TimelineView，30Hz 输入足够顺滑。
+ // DD-03：自绘指示条已删除，`facts` 的 @Published 只在 DEBUG HUD/探针轮询时
+ // 按 30Hz（或位移 >4pt）写入；生产无观察者时不发布，避免每帧一次 SwiftUI 更新事务。
             let now = CACurrentMediaTime()
-            if now - parent.shared.lastIndicatorPublishAt >= 1.0 / 30.0
+            if Self.debugFactsReaderEnabled,
+               now - parent.shared.lastIndicatorPublishAt >= 1.0 / 30.0
                 || !(abs(facts.offset - parent.shared.facts.offset) <= 4) {
                 parent.shared.lastIndicatorPublishAt = now
                 parent.shared.facts = facts
@@ -2929,6 +3196,7 @@ private struct MessageTableRepresentable: UIViewRepresentable {
         private func updateSharedWindow(items: [SessionMessageItem]) {
             parent.shared.displayedCount = displayedItems.count
             parent.shared.displayedItems = displayedItems
+            parent.shared.windowStartSourceID = windowStartItemID ?? "-"
             if let first = displayedItems.first,
                let index = items.firstIndex(where: { $0.id == first.id }) {
                 parent.shared.windowStartIndex = index
@@ -3027,7 +3295,7 @@ private struct MessageTableRepresentable: UIViewRepresentable {
  // 旧 WIP 的 `!isTracking /!isDecelerating` 闸会让连续拖拽期间完全不扩窗
  // （松手后才一次扩 100 行 = 用户视角「滑的时候不加载」）。反转底座下扩窗是
  // 数据尾部 append：已有内容 content 坐标不变、零 offset 补偿，手势中执行也
- // 不推动视口；冷却（0.8s）保留以防数据批振荡。
+ // 不推动视口；冷却（0.15s，DD-07）保留以防数据批振荡。
             guard !heightAnimationActive else { return }
             guard let oldest = displayedItems.first else { return }
  // 【回填期自动扩窗闸门 】初始内容较短时 contentOffset 天然落在
@@ -3045,10 +3313,10 @@ private struct MessageTableRepresentable: UIViewRepresentable {
             guard let currentStart = parent.items.firstIndex(where: { $0.id == oldest.id }) else { return }
             let newStart = MessageListWindowPolicy.expandedStartIndex(currentStart: currentStart, itemCount: parent.items.count)
             guard newStart < currentStart else { return }
- // 冷却：距上次扩展 < 0.8s 不扩（数据批持续到达时扩展/回落振荡会让
- // 每次 apply 触发全量重排 + offset 修正 = 整页跳动）。
+ // 冷却：距上次扩展 < 0.15s 不扩（DD-07：原 0.8s 在快速上滑时会让预留区被
+ // 追平；数据批持续到达时扩展/回落振荡仍由「动画结束 2s 内不扩」兜底）。
             let now = CACurrentMediaTime()
-            guard now - lastWindowExpandAt > 0.8 else { return }
+            guard now - lastWindowExpandAt > 0.15 else { return }
             guard now - lastAnimationEndAt > 2.0 else { return }
             lastWindowExpandAt = now
             isExpandingWindow = true
@@ -3058,7 +3326,7 @@ private struct MessageTableRepresentable: UIViewRepresentable {
  // DD-01: 扩窗不再在滚动回调的同步栈里直接 apply（重入 diffable 数据源 =
  // 崩溃来源），交给 `requestApply` 合并并延后一拍；`isExpandingWindow`
  // 保持到这次延后 apply 真正执行完（heightForRowAt 的估算让路依赖它）。
-            requestApply(items: parent.items, batchToken: parent.historyBatchToken)
+            requestApply()
             parent.shared.prependCount += 1
             ScrollHitchProbe.mark("windowExpand", [
                 "start": newStart,
@@ -3151,8 +3419,9 @@ private struct MessageTableRepresentable: UIViewRepresentable {
 
         func scrollViewWillBeginDragging(_ scrollView: UIScrollView) {
             userIsScrolling = true
- // DD-02: 手指开始拖动 → 详情页冻结尾部流式发布（数据仍在 journal 里）。
-            parent.onInteractionChange(true)
+ // DD-05：交互态只在「未交互 → 交互」时切换一次；DD-02：手指开始拖动 → 详情页
+ // 冻结尾部流式发布（数据仍在 journal 里）；同时记下滚动开始时的尾部文本快照（DD-09）。
+            beginScrollInteractionIfNeeded()
             parent.shared.isDragging = true
             parent.shared.interactingUntil = CACurrentMediaTime() + 0.12
             parent.shared.panSeen = true
@@ -3184,8 +3453,8 @@ private struct MessageTableRepresentable: UIViewRepresentable {
                 return
             }
             parent.shared.isDragging = false
- // DD-02: 不再惯性滚动 → 交互结束（惯性滚动由 didEndDecelerating 收尾）。
-            parent.onInteractionChange(false)
+ // DD-02/DD-05: 不再惯性滚动 → 交互结束（惯性滚动由 didEndDecelerating 收尾）。
+            endScrollInteraction()
             if let tableView = scrollView as? UILAnchoredTableView {
                 userIsScrolling = false
                 settleAfterGesture(tableView)
@@ -3193,8 +3462,8 @@ private struct MessageTableRepresentable: UIViewRepresentable {
         }
 
         func scrollViewDidEndDecelerating(_ scrollView: UIScrollView) {
- // DD-02: 惯性滚动结束 → 交互结束。
-            parent.onInteractionChange(false)
+ // DD-02/DD-05: 惯性滚动结束 → 交互结束。
+            endScrollInteraction()
             userIsScrolling = false
             parent.shared.isDragging = false
             feedProbePhase("idle")
@@ -3203,6 +3472,30 @@ private struct MessageTableRepresentable: UIViewRepresentable {
             #endif
             if let tableView = scrollView as? UILAnchoredTableView {
                 settleAfterGesture(tableView)
+            }
+        }
+
+ /// DD-02/DD-05/DD-09：滚动交互开始（仅首次通知 + 冻结尾部实时文本快照）。
+        private func beginScrollInteractionIfNeeded() {
+            guard !isScrollInteracting else { return }
+            isScrollInteracting = true
+            captureFrozenTailSnapshot()
+            parent.onInteractionChange(true)
+        }
+
+ /// DD-02/DD-05：滚动交互结束。顺序：先让 ViewModel flush 尾部 live 值
+ /// （`onInteractionChange(false)`），再对滚动期挂起的尾部 apply 收口一次（用
+ /// `parent.items` 数据真相，不用冻结快照）；锚点恢复由 applyCore 统一处理。
+        private func endScrollInteraction() {
+            guard isScrollInteracting else { return }
+            let hadFrozenTail = !frozenStepKinds.isEmpty || frozenLiveTextRow != nil
+            isScrollInteracting = false
+            frozenStepKinds.removeAll(keepingCapacity: true)
+            frozenLiveTextRow = nil
+            parent.onInteractionChange(false)
+            if pendingTailApply != nil || hadFrozenTail {
+                pendingTailApply = nil
+                requestApply()
             }
         }
 
@@ -3229,7 +3522,7 @@ private struct MessageTableRepresentable: UIViewRepresentable {
                     pendingFrozenItems = nil
  // DD-01: 手势结束回调里同样延后合并（用最新数据真相，
  // 不用冻结快照，避免与同一拍内更新互相覆盖）。
-                    requestApply(items: parent.items, batchToken: parent.historyBatchToken)
+                    requestApply()
                 }
             }
             freezeAnchorFromCurrentViewport(tableView)
@@ -3244,9 +3537,17 @@ private struct MessageTableRepresentable: UIViewRepresentable {
  // 分析器按相位分类统计长帧（缺类会让帧被记成 idle）。
             if userIsScrolling {
                 feedProbePhase(tableView.isTracking ? "interacting" : "decelerating")
- // DD-02: 每次滚动活动都给冻结上限续期，连续拖动期间尾部不补齐。
+ // DD-05：状态化交互回调——只在「未交互 → 交互」时通知一次，didEnd* 回调负责
+ // 结束；不再每帧 cancel + 新建 Task（帧级堆分配）。
                 if tableView.isTracking || tableView.isDecelerating {
-                    parent.onInteractionChange(true)
+                    beginScrollInteractionIfNeeded()
+ // DD-05：续期 ViewModel 的交互 deadline（O(1)），避免手指按住不动超过
+ // 兜底窗口（0.6s）时提前解冻尾部；按 0.2s 节流，不重建 Task。
+                    let pingNow = CACurrentMediaTime()
+                    if pingNow - lastInteractionPingAt > 0.2 {
+                        lastInteractionPingAt = pingNow
+                        parent.onInteractionChange(true)
+                    }
                 }
             }
             traceGestureOffset(tableView)
@@ -3269,7 +3570,7 @@ private struct MessageTableRepresentable: UIViewRepresentable {
  // DD-01: 滚动回调里不直接 apply（重入 diffable 数据源 = 崩溃来源），
  // 合并到下一拍执行。延后执行时用 `parent.items`（数据真相）而不是
  // 冻结时的快照，避免同一拍内更新被旧数据覆盖。
-                requestApply(items: parent.items, batchToken: parent.historyBatchToken)
+                requestApply()
             }
             maybeExpandWindow()
         }
@@ -3337,82 +3638,9 @@ extension MessageTableRepresentable.MessageCell: JitterProbeIdentifiable {
 }
 #endif
 
-/// 自绘滚动条（UIKit 底座：系统指示条在翻转 table 上方向相反且位置错位），
-/// 在 representable 外层自绘，外观对标 UIKit 系统指示条：4.5pt 胶囊、右缘 2.5pt、
-/// primary 30%、最小 20pt；手势/惯性期间显示，停稳后淡出。
-/// TimelineView 轮询共享 model——重绘隔离在指示条自身，不触发列表更新。
-/// CGFloat→Int 的安全转换（HUD/探针/指示条读取滚动几何真值时使用）。
-/// 直接 Int(.infinity)/Int(.nan) 会 fatalError —— 真机在 SwiftUI unspecified
-/// proposal 下踩过一次 EXC_BREAKPOINT，所有浮点转整型都必须先判有限。
-private func uilSafeInt(_ value: CGFloat, fallback: Int = 0) -> Int {
-    guard value.isFinite else { return fallback }
-    let rounded = value.rounded()
-    guard rounded >= CGFloat(Int.min), rounded <= CGFloat(Int.max) else { return fallback }
-    return Int(rounded)
-}
-
-private struct InvertedScrollIndicator: View {
- /// @Published facts 变化直接驱动本视图重算。
-    @ObservedObject var model: UILListSharedModel
-
-    private static let width: CGFloat = 4.5
-    private static let trailingInset: CGFloat = 2.5
-    private static let fadeAfter: TimeInterval = 0.7
-
-    var body: some View {
-        TimelineView(.periodic(from: .now, by: 0.05)) { _ in
-            GeometryReader { geo in
-                let f = model.facts
-                let track = geo.size.height
- // 诊断探针（无条件存在）：输出显示条件真值，E2E 一次定位。
-                Text("scroll-indicator-diag")
-                    .font(.system(size: 1))
-                    .frame(width: 2, height: 2)
-                    .opacity(0.02)
-                    .allowsHitTesting(false)
-                    .accessibilityIdentifier("scroll-indicator-diag")
-                    .accessibilityValue("mid=\(model.uuid);maxOff=\(uilSafeInt(f.maxOffset));track=\(uilSafeInt(track));ch=\(uilSafeInt(f.contentHeight));calls=\(model.factsCalls);off=\(uilSafeInt(f.offset))")
-                if f.maxOffset > 1, track > 40, f.contentHeight > 1 {
-                    let base = ScrollIndicatorGeometry.thumbLength(track: track, contentHeight: f.contentHeight, viewportHeight: f.viewportHeight)
- // 常规（非翻转）底座：滑块位置 = offset / maxOffset（顶部起算）。
-                    let progress = min(1, max(0, f.offset / max(0, f.maxOffset)))
-                    let y = progress * max(0, track - base)
-                    let compression = max(
-                        ScrollIndicatorGeometry.rubberBandCompression(overscroll: max(0, -f.offset)),
-                        ScrollIndicatorGeometry.rubberBandCompression(overscroll: f.overscroll)
-                    )
-                    let now = CACurrentMediaTime()
-                    let visible = now < model.lastActiveAt + Self.fadeAfter
- // rubber band：滑块向对应边缘压短（简化：保持顶边，缩短长度）。
-                    let len = max(8, base * (1 - compression))
-                    Capsule()
-                        .fill(Color.primary.opacity(0.3))
-                        .frame(width: Self.width, height: len)
-                        .position(x: geo.size.width - Self.trailingInset - Self.width / 2,
-                                  y: y + len / 2)
-                        .opacity(visible ? 1 : 0)
-                        .animation(.easeOut(duration: 0.25), value: visible)
- // E2E 探针（Text 通道——Capsule 即使 accessibilityElement() 也
- // 不稳定进 AX 树，Text 手法已被 probe/diag 两轮真机验证）。
-                    Text("scroll-indicator")
-                        .font(.system(size: 1))
-                        .frame(width: 2, height: 2)
-                        .opacity(0.02)
-                        .allowsHitTesting(false)
-                        .position(x: geo.size.width - Self.trailingInset - 1,
-                                  y: geo.size.height - 1)
-                        .accessibilityIdentifier("scroll-indicator")
-                        .accessibilityValue("visible=\(visible ? 1 : 0);maxOff=\(uilSafeInt(f.maxOffset));off=\(uilSafeInt(f.offset));track=\(uilSafeInt(track));len=\(uilSafeInt(len))")
-                }
-            }
-        }
-        .allowsHitTesting(false)
-    }
-}
-
-/// UIKit Coordinator ↔ SwiftUI overlay（自绘滚动条/HUD/探针）共享状态：
-/// @Published facts 驱动指示条重算；其余字段由 TimelineView 轮询读，
-/// 均不触发消息列表 body 重算。
+/// UIKit Coordinator ↔ SwiftUI（HUD / e2e 探针）共享状态：
+/// `facts` 只在 DEBUG HUD/探针需要时由 `updateSharedFacts` 写入（DD-03：自绘
+/// 滚动条已删除）；其余字段为普通存储属性，不触发消息列表 body 重算。
 final class UILListSharedModel: ObservableObject {
     @Published var facts = ScrollFacts(contentHeight: 0, offset: 0, viewportHeight: 0, distanceFromBottom: .greatestFiniteMagnitude, overscroll: 0, maxOffset: 0)
  /// 实例指纹（诊断：双实例分叉取证）。
@@ -3429,8 +3657,10 @@ final class UILListSharedModel: ObservableObject {
     var lastActiveAt: CFTimeInterval = 0
  /// facts 更新计数（指示条诊断用）。
     var factsCalls = 0
- /// 指示条 @Published 更新节流（30Hz 或位移 >4pt）。
+ /// 指示条 facts 更新节流（30Hz 或位移 >4pt；仅 DEBUG HUD/探针开启时写入）。
     var lastIndicatorPublishAt: CFTimeInterval = 0
+ /// 显式窗口起点 id（nil = 默认窗口）：DEBUG 探针输出窗口真值，验证段读 AC-11。
+    var windowStartSourceID = "-"
 
  // HUD / e2e-scroll-probe 字段（E2E 契约，键名不变）。
     var displayedItems: [SessionMessageItem] = []
