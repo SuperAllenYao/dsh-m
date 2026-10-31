@@ -378,7 +378,10 @@ final class SessionViewModel: ObservableObject {
     @Published private(set) var permissionCatalogLoading = false
     @Published private(set) var sending = false
     @Published private(set) var actionErrorText: String?
-    @Published private(set) var lastEventAt: Date?
+ /// DD-01: relay 帧的到达时间（仅供诊断，全工程 0 读取点）。**不能**是
+ /// `@Published`：每个 relay 帧都写一次，会让 `SessionDetailView` 的 body
+ /// 逐帧全量重算（`messageItems` 重建 O(groups)）。
+    private(set) var lastEventAt: Date?
 
  /// v5.5 §14.5: context-window usage of this session. Seeded from the
  /// `session/follow` snapshot projections (first frame), then refreshed by the
@@ -3015,11 +3018,11 @@ final class SessionViewModel: ObservableObject {
 
  /// task-5: 三路实时预览（文本 / 思考 / 工具参数）共用 4Hz 节流发布；
  /// `flush` 用于 turn 结束/重建，立即同步到最新值。
- /// DD-02: 列表滚动交互期间冻结尾部（`force` = 1s 上限/交互结束的强制补齐）。
+ /// DD-02: 列表滚动交互期间冻结尾部（`force` = 0.6s 上限/交互结束的强制补齐）。
     private func publishLiveStreamText(flush: Bool = false, force: Bool = false) {
         if isUserInteracting, !force {
  // DD-02：手指在列表上（拖拽/惯性）时不发布尾部 —— 数据仍在 journal
- // 里增长，交互结束或 1s 上限到达时一次补齐。
+ // 里增长，交互结束或 0.6s 上限到达时一次补齐。
  // 例外：live 预览已被结算清空（持久 `assistant/message`/`turn/end` 落地）
  // 时放行这次 flush —— 不清掉旧预览会与持久行重复显示，且这不是尾部增长。
             let isSettlingLiveText = flush
@@ -3057,7 +3060,7 @@ final class SessionViewModel: ObservableObject {
             guard let self, !Task.isCancelled else { return }
             self.liveTextThrottleTask = nil
             guard !self.isUserInteracting else {
- // 节流窗口内开始了拖动/惯性：冻结，等交互结束或 1s 上限补齐。
+ // 节流窗口内开始了拖动/惯性：冻结，等交互结束或 0.6s 上限补齐。
                 self.deferredTailPublish = true
                 return
             }
@@ -3172,47 +3175,71 @@ final class SessionViewModel: ObservableObject {
     var livePublishIntervalNanoseconds: UInt64 = 250_000_000
 
  /// DD-02: 列表滚动交互态（手指拖拽 / 惯性）。为真时尾部 live 预览冻结
- /// （数据仍写 journal），交互结束或 1s 上限到达时一次补齐。
+ /// （数据仍写 journal），交互结束或 0.6s 兜底 deadline 到达时一次补齐。
     private var isUserInteracting = false
- /// DD-02: 交互冻结的 1s 上限兜底（交互结束回调丢失时仍能补齐）。
+ /// DD-04/DD-05: 交互冻结的兜底 deadline。滚动活动只把它往后推（O(1) 写时间戳），
+ /// 兜底任务只创建一个、按 deadline 判断（原实现每帧 cancel + 新建 1s Task）。
+    private var interactionDeadline: Date = .distantPast
+ /// DD-02: 交互冻结的 0.6s 上限兜底（交互结束回调丢失时仍能补齐）。
     private var interactionFlushDeadlineTask: Task<Void, Never>?
+
+ /// DD-04/DD-05: 交互冻结兜底时长。取 0.6s：AC-07 要求停手 ≤1s 追平，这里给
+ /// flush + 列表结束 apply 留 0.4s 余量。
+    private static let interactionFlushDelay: TimeInterval = 0.6
 
  /// DD-02: 列表交互开始/结束（来自列表的 `scrollViewWillBeginDragging` /
  /// `scrollViewDidEndDragging(willDecelerate:false)` / `scrollViewDidEndDecelerating`）。
  /// 只影响 UI 发布节奏，journal/历史补齐/网络加载完全不动。
     func setUserInteracting(_ value: Bool) {
         if value {
- // 每次收到滚动活动都续期：连续拖动期间不触发上限（尾部保持冻结），
- // 只有「交互结束回调丢失 + 1s 内没有任何滚动活动」才强制补齐。
+ // DD-05: 滚动活动帧只续期 deadline；兜底任务只在缺失时创建一次。
             isUserInteracting = true
-            interactionFlushDeadlineTask?.cancel()
-            interactionFlushDeadlineTask = Task { [weak self] in
-                try? await Task.sleep(nanoseconds: 1_000_000_000)
-                guard !Task.isCancelled, let self else { return }
-                self.interactionFlushDeadlineTask = nil
-                self.flushLiveTailAfterInteraction()
-            }
+            interactionDeadline = Date().addingTimeInterval(Self.interactionFlushDelay)
+            startInteractionFlushDeadlineTaskIfNeeded()
             return
         }
         guard isUserInteracting else { return }
         isUserInteracting = false
+        interactionDeadline = .distantPast
         interactionFlushDeadlineTask?.cancel()
         interactionFlushDeadlineTask = nil
         flushLiveTailAfterInteraction()
+    }
+
+ /// DD-05: 单任务按 `interactionDeadline` 判断是否到点；滚动活动只推 deadline，
+ /// 不重建任务。到点说明结束回调丢失 → 收尾交互态并强制 flush 一次。
+    private func startInteractionFlushDeadlineTaskIfNeeded() {
+        guard interactionFlushDeadlineTask == nil else { return }
+        interactionFlushDeadlineTask = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self else { return }
+                let remaining = self.interactionDeadline.timeIntervalSinceNow
+                if remaining <= 0 {
+                    self.interactionFlushDeadlineTask = nil
+                    self.isUserInteracting = false
+                    self.interactionDeadline = .distantPast
+                    self.flushLiveTailAfterInteraction()
+                    return
+                }
+                try? await Task.sleep(nanoseconds: UInt64(remaining * 1_000_000_000))
+                guard !Task.isCancelled else { return }
+            }
+        }
     }
 
  /// 页面销毁时清掉交互冻结态（手势中断不会再有结束回调）。
     private func resetUserInteractingState() {
         interactionFlushDeadlineTask?.cancel()
         interactionFlushDeadlineTask = nil
+        interactionDeadline = .distantPast
         isUserInteracting = false
     }
 
  /// 交互结束/上限到达：把交互期间冻结的尾部一次补齐。
- /// 读历史时保持冻结（回贴底由 `setReadingHistory` 补发），不白做整表重算。
+ /// DD-04: 读历史时同样追平——停手后尾部文本必须与 journal 一致（AC-07）；
+ /// 可见位置由列表侧结束 apply 的锚点补偿保持，此处不做整表重建。
     private func flushLiveTailAfterInteraction() {
         guard deferredTailPublish else { return }
-        guard !readingHistory else { return }
         publishLiveStreamText(flush: true, force: true)
     }
 
