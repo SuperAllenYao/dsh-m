@@ -3,7 +3,7 @@
  *
  * Mirrors <internal-doc> §1:
  * ctx.connection.authenticatedUrl(loopbackOrigin) -> process token
- * GET /connect?token=...&interactions=answer (redirect: manual) -> 302 + Set-Cookie
+ * GET /connect?token=...&interactions=answer (redirect: manual) -> 3xx + Set-Cookie
  * connect ws://127.0.0.1:<port>/api/remote.mux with that cookie
  *
  * The peer here is deliberately thin: the link plugin never parses or
@@ -64,14 +64,24 @@ export class UpstreamPeer {
     connectUrl.searchParams.set('interactions', interactions);
     const response = await fetch(connectUrl, { method: 'GET', redirect: 'manual' });
     const rawSetCookie = response.headers.getSetCookie?.()[0] ?? response.headers.get('set-cookie') ?? undefined;
-    if (response.status !== 302 || rawSetCookie === undefined) {
-      throw new Error('dsh-m-link: /connect failed: HTTP ' + response.status + (rawSetCookie === undefined ? ' (no set-cookie)' : ''));
+    if (response.status < 300 || response.status >= 400 || rawSetCookie === undefined) {
+      throw new Error('dsh-m-link: /connect failed: expected a 3xx redirect with set-cookie, got HTTP ' + response.status + (rawSetCookie === undefined ? ' (no set-cookie)' : ''));
     }
     const cookie = parseSetCookie(rawSetCookie);
     if (cookie === undefined) throw new Error('dsh-m-link: /connect returned an unparsable set-cookie');
     this.cookie = cookie;
-    const location = response.headers.get('location') ?? './api/remote.mux';
-    this.muxUrl = new URL(location, this.loopbackOrigin).href.replace(/^http/, 'ws');
+    const rawLocation = response.headers.get('location');
+    const location = typeof rawLocation === 'string' && rawLocation.length > 0 ? rawLocation : './api.remote.mux';
+    let muxTarget;
+    try {
+      muxTarget = new URL(location, this.loopbackOrigin);
+    } catch {
+      throw new Error('dsh-m-link: /connect failed: unparsable Location ' + JSON.stringify(location));
+    }
+    if (muxTarget.pathname.length === 0 || !muxTarget.pathname.startsWith('/')) {
+      throw new Error('dsh-m-link: /connect failed: mux path ' + JSON.stringify(muxTarget.pathname) + ' is not an absolute path');
+    }
+    this.muxUrl = muxTarget.href.replace(/^http/, 'ws');
     this.connectCount += 1;
     this.log('device ' + this.deviceId + ': /connect ok, mux target ' + this.muxUrl + ' (peer #' + String(this.connectCount) + ')');
     return { status: response.status, muxUrl: this.muxUrl, cookieName: cookie.name };
