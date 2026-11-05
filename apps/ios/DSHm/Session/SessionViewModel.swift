@@ -29,11 +29,15 @@ enum DeferredStreamOpenPolicy {
 
     static func action(
         phaseIsConnected: Bool,
-        isDeferred: Bool,
+        wantsStream: Bool,
         hasOpenStream: Bool,
         deadlineElapsed: Bool
     ) -> Action {
-        guard isDeferred else { return .idle }
+        // DEF-001 修复：`wantsStream` 表达「详情页在屏、应该有会话流」，不再用
+        // 「本次是否处于 defer 状态」表达。旧口径下 10s 截止会清掉 defer 标记，
+        // 之后链路恢复（P1 silent resume 不递增 generation）就再也不会补开会话流，
+        // 快照永远不来 → 进度条与历史消息永远不加载。
+        guard wantsStream else { return .idle }
  // A stream that is already open wins over any stale deferral: reopening it
  // would replace the live handle and drop frames.
         if hasOpenStream { return .idle }
@@ -1433,6 +1437,10 @@ final class SessionViewModel: ObservableObject {
                 onClose: { [weak self] _, _ in
  // Transport lost: LinkService reconnects and bumps generation,
  // the view calls handleGenerationChange then.
+ // DEF-001：句柄必须一起失效。旧实现只把 loading 置 false，`stream` 仍是一个
+ // 已死的句柄；P1 silent resume 不递增 generation，既不会走 reopenStream，
+ // `hasOpenStream` 又把补开挡住 → 会话流永远不重建，历史与进度条不加载。
+                    self?.stream = nil
                     self?.isLoading = false
                 }
             )
@@ -1459,7 +1467,7 @@ final class SessionViewModel: ObservableObject {
         lastFileChangeLinkConnected = phase.isConnected
         switch DeferredStreamOpenPolicy.action(
             phaseIsConnected: phase.isConnected,
-            isDeferred: streamOpenDeferred,
+            wantsStream: detailOnScreen,
             hasOpenStream: stream != nil,
             deadlineElapsed: false
         ) {
@@ -1505,7 +1513,7 @@ final class SessionViewModel: ObservableObject {
         }
         guard DeferredStreamOpenPolicy.action(
             phaseIsConnected: false,
-            isDeferred: streamOpenDeferred,
+            wantsStream: detailOnScreen,
             hasOpenStream: stream != nil,
             deadlineElapsed: true
         ) == .fail else { return }

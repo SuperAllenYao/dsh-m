@@ -249,6 +249,19 @@ final class LinkService: ObservableObject {
     var isConnecting = false
     var manuallyDisconnected = false
 
+ /// DEF-001：「同一网络」的确证证据。直连能否首拨**不能**由「Mac 的 LAN IP 落在
+ /// 手机当前子网」推断——不同 Wi-Fi 复用 192.168/10/172.16 私网段极常见，同 /24
+ /// 完全可能是两个互不相通的网络（例如手机在另一处 Wi-Fi 也拿到 192.168.1.x，
+ /// Mac 的持久化 LAN 地址恰好落在同一 /24，但两台设备并不在同一网络）。
+ /// 只信三类实测事实，并且全部绑定 `NetworkPathMonitor.changeGeneration`：
+ /// 1. mDNS 发现到的 Mac 端点已通过 `/health` + hostId 校验；
+ /// 2. 并行 `/health` 探测把该 LAN 端点判为 healthy；
+ /// 3. 本网络代际内直连该端点真的连上过。
+ /// 代际一变（换 Wi-Fi / 升降级蜂窝 / 断网恢复）旧证据全部作废：IP 会复用，
+ /// 路由器也会换。
+    private var verifiedLANOrigins: Set<String> = []
+    private var verifiedLANGeneration: Int?
+
  // MARK: - task-2 reconnect-chain state
 
  /// `NetworkPathMonitor.changeGeneration` at the last successful connect and at
@@ -1655,11 +1668,13 @@ final class LinkService: ObservableObject {
  // is what stops a cross-network reconnect from burning seconds on an
  // unreachable LAN origin (the reported relay-503 -> LAN-timeout chain).
         let localNetwork = NetworkPathMonitor.shared.currentLocalIPv4Network()
+        let verifiedLAN = lanVerificationSnapshot()
         let orderedCandidates = Self.orderedCandidatesForPath(
             candidates,
             prefersRelay: prefersRelay,
             local: localNetwork,
-            pathChanged: pathChanged
+            pathChanged: pathChanged,
+            verifiedLAN: verifiedLAN
         )
  // D 段（连接清理）：冷启 P1 能力探测不再串行挡在首次拨号之前。
  // 旧实现（v2.17）在本 App 周期首个连接轮次先 `await` 一次 ≤500ms 的
@@ -1718,9 +1733,11 @@ final class LinkService: ObservableObject {
         )
         let dialCandidates = orderedCandidates
         var convergenceConsumed = false
+        var keptConvergenceForVerification = false
         var convergenceTask: Task<(origins: [String], observations: [EndpointHealing.ProbeObservation]), Never>?
         if shouldDiscover {
             let convergenceStartedAt = Date()
+            let roundGeneration = pathGenerationAtRoundStart
             convergenceTask = Task { [weak self] in
                 guard let self else { return ([], []) }
                 let result = await self.discoverAndProbe(
@@ -1729,6 +1746,10 @@ final class LinkService: ObservableObject {
                     prefersRelay: prefersRelay,
                     credentials: credentials
                 )
+                // DEF-001：发现/探测本身就是「手机此刻能不能直连 Mac」的实测证据。
+                // 即便本轮首拨（relay）已经成功，也要把结果记成本网络代际的直连
+                // 证据——下一次重连才能立刻走已确证的 LAN，而不是永远 relay。
+                self.markVerifiedFromConvergence(result, local: localNetwork, generation: roundGeneration)
                 #if DEBUG
                 ScrollHitchProbe.mark("e2eConvergenceDone", [
                     "ms": Int(Date().timeIntervalSince(convergenceStartedAt) * 1000),
@@ -1739,10 +1760,8 @@ final class LinkService: ObservableObject {
             }
         }
         linkDebug("round: dial-first \(dialPolicy) (dial now, convergence in background)")
-        defer { convergenceTask?.cancel() }
-        let hasSameSubnetLAN = dialCandidates.contains {
-            Self.candidateRole(host: $0.host, local: localNetwork) == .lanSameSubnet
-        }
+        defer { if !keptConvergenceForVerification { convergenceTask?.cancel() } }
+        let hasVerifiedLANFirst = dialCandidates.first.map { verifiedLAN.contains(Self.originKey($0)) } ?? false
         let hasRelay = dialCandidates.contains {
             Self.candidateRole(host: $0.host, local: localNetwork) == .relay
         }
@@ -1752,7 +1771,7 @@ final class LinkService: ObservableObject {
  // candidate keeps the generous dial budget (nothing to switch to).
         let roundBudget = Self.roundBudgetSeconds(
             candidateCount: dialCandidates.count,
-            hasSameSubnetLAN: hasSameSubnetLAN,
+            hasVerifiedLANFirst: hasVerifiedLANFirst,
             hasRelay: hasRelay
         )
         let roundDeadline = Date().addingTimeInterval(roundBudget)
@@ -1817,10 +1836,11 @@ final class LinkService: ObservableObject {
  // LAN 兜底白烧 2679ms）。
             if let cap = Self.attemptTimeoutCap(
                 attemptIndex: attemptIndex,
+                candidateCount: attemptCount,
                 policy: dialPolicy,
                 origin: origin,
                 local: localNetwork,
-                prefersRelay: prefersRelay
+                verifiedLAN: verifiedLAN
             ) {
                 attemptTimeout = min(attemptTimeout, cap)
             }
@@ -1886,6 +1906,13 @@ final class LinkService: ObservableObject {
                 )
                 ReconnectMetrics.markPickedOrigin(host)
                 setCurrentOrigin(origin, persist: true)
+                if Self.candidateRole(host: origin.host, local: localNetwork) == .lanSameSubnet {
+                    // 直连真的连上了：这是「同一网络」最强的证据，下一次重连直接
+                    // 走它，不必再等 mDNS/探测（DEF-001）。
+                    markVerifiedLAN([origin], local: localNetwork)
+                }
+                // 首拨成功也要让后台发现/探测跑完：它负责把 LAN 直连证据落下来。
+                keptConvergenceForVerification = true
                 isConnecting = false
  // 连接成功：本轮的补轮请求作废（DD-14，避免下一次出口误补）。
                 needsFollowUpRound = false
@@ -2057,7 +2084,8 @@ final class LinkService: ObservableObject {
                     observations: discovery.observations,
                     fallback: orderedCandidates,
                     local: localNetwork,
-                    prefersRelay: prefersRelay
+                    prefersRelay: prefersRelay,
+                    verifiedLAN: lanVerificationSnapshot()
                 )
                 queue = reordered.filter {
                     !attemptedOriginKeys.contains(PairingOriginSelector.normalizedOriginString($0).lowercased())
@@ -3402,7 +3430,8 @@ final class LinkService: ObservableObject {
         observations: [EndpointHealing.ProbeObservation],
         fallback: [URL],
         local: LocalIPv4Network?,
-        prefersRelay: Bool
+        prefersRelay: Bool,
+        verifiedLAN: Set<String> = []
     ) -> [URL] {
         var result: [URL] = []
         var seen = Set<String>()
@@ -3425,17 +3454,22 @@ final class LinkService: ObservableObject {
  // 蜂窝/跨网段中继优先（LAN 只兜底）。组内保留 mDNS/探测得到的顺序。
         guard result.count > 1 else { return result }
         var relay: [URL] = []
-        var lanSame: [URL] = []
-        var lanOther: [URL] = []
+        var verified: [URL] = []
+        var lanUnverified: [URL] = []
         for url in result {
             switch candidateRole(host: url.host, local: local) {
-            case .relay: relay.append(url)
-            case .lanSameSubnet: lanSame.append(url)
-            case .lanOther: lanOther.append(url)
+            case .relay:
+                relay.append(url)
+            case .lanSameSubnet, .lanOther:
+                if verifiedLAN.contains(originKey(url)) {
+                    verified.append(url)
+                } else {
+                    lanUnverified.append(url)
+                }
             }
         }
-        if !prefersRelay, !lanSame.isEmpty { return lanSame + relay + lanOther }
-        if prefersRelay || local != nil { return relay + lanOther + lanSame }
+        if !prefersRelay, !verified.isEmpty { return verified + relay + lanUnverified }
+        if prefersRelay || local != nil { return relay + verified + lanUnverified }
         return result
     }
 
@@ -3557,38 +3591,92 @@ extension LinkService {
         return .lanSameSubnet
     }
 
- /// Path-aware candidate order for one reconnect round:
- /// - **same LAN** (Wi-Fi/wired and the LAN candidate is inside the phone's
- /// subnet): LAN first, relay as fallback — the Mac's LAN origin is the fastest;
- /// - **cellular / cross-network** (no LAN candidate on this subnet): relay first,
- /// LAN addresses last as a best-effort fallback — the old serial "try the
- /// stale LAN first and burn seconds" order is exactly the reported failure;
- /// - **unknown local network**: legacy order (current origin, then stored list).
+ /// 归一化 origin 键（与 `PairingOriginSelector` 的拨号去重口径一致）。
+    nonisolated static func originKey(_ url: URL) -> String {
+        PairingOriginSelector.normalizedOriginString(url).lowercased()
+    }
+
+ /// 把「实测可用」的 LAN 端点记为本网络代际的直连证据。
  ///
- /// Happy Eyeballs (parallel first dial) is deliberately **not** used:
- /// `authInFlightByPurpose` is purpose-scoped and two concurrent attempts would
- /// fight over `self.ws`/`self.mux` and multiply `/auth/challenge` requests
- /// (plugin rate limit). The serial walk is bounded by `roundBudgetSeconds`.
+ /// 只接受落在手机当前子网内的地址：`/health.deviceEndpoints` 会带上 Mac 全部
+ /// 网卡（虚拟机网桥、历史网段），跨网段的那些即使被 Mac 自己广播，也不代表
+ /// 手机拨得到。
+    func markVerifiedLAN(_ urls: [URL], local: LocalIPv4Network?, generation: Int? = nil) {
+        guard let local, !urls.isEmpty else { return }
+        let currentGeneration = generation ?? NetworkPathMonitor.shared.changeGeneration
+        // 迟到的发现结果不能记到新网络代际上：那会把旧网络的地址当成新网络的证据。
+        guard currentGeneration == NetworkPathMonitor.shared.changeGeneration else { return }
+        if verifiedLANGeneration != currentGeneration {
+            verifiedLANOrigins.removeAll()
+            verifiedLANGeneration = currentGeneration
+        }
+        for url in urls where Self.candidateRole(host: url.host, local: local) == .lanSameSubnet {
+            verifiedLANOrigins.insert(Self.originKey(url))
+        }
+    }
+
+ /// 当前网络代际确证可直连的 origin 集合（代际变化即为空）。
+    func lanVerificationSnapshot() -> Set<String> {
+        guard let generation = verifiedLANGeneration,
+              generation == NetworkPathMonitor.shared.changeGeneration else { return [] }
+        return verifiedLANOrigins
+    }
+
+    /// 把一次并行发现/探测的结论转成直连证据：mDNS 端点已经过 `/health`
+    /// 校验，探测 `healthy` 的 LAN 端点则证明此刻拨得通。跨网段/中继端点由
+    /// `markVerifiedLAN` 过滤掉。
+    private func markVerifiedFromConvergence(
+        _ result: (origins: [String], observations: [EndpointHealing.ProbeObservation]),
+        local: LocalIPv4Network?,
+        generation: Int
+    ) {
+        guard let local else { return }
+        var urls: [URL] = []
+        for text in result.origins {
+            if let url = URL(string: text) { urls.append(url) }
+        }
+        for observation in result.observations where observation.result == .healthy {
+            if let url = URL(string: observation.origin) { urls.append(url) }
+        }
+        markVerifiedLAN(urls, local: local, generation: generation)
+    }
+
+ /// Path-aware candidate order for one reconnect round:
+ /// - **已确证同网络**（本网络代际内 mDNS//health 或直连成功证明 Mac 就在当前
+ ///   局域网）：LAN 优先，relay 兜底——这是最快路径；
+ /// - **蜂窝 / 未确证**：relay 优先，LAN 只保留有界兜底（DEF-001：旧实现把
+ ///   「同 /24」当同网络，导致手机在别的 Wi-Fi 上首拨一个已经失效的家里地址，
+ ///   每轮白烧投机预算还挤掉 relay 的整档预算）；
+ /// - **未知本地网络**：沿用旧顺序（当前 origin，再按存储列表）。
+    ///
+    /// Happy Eyeballs（并行首拨）仍不采用：`authInFlightByPurpose` 是 purpose 级
+    /// 去重，两个并发尝试会抢 `self.ws`/`self.mux` 并放大 `/auth/challenge`
+    /// （插件有限流）。串行遍历由 `roundBudgetSeconds` 兜住。
     nonisolated static func orderedCandidatesForPath(
         _ candidates: [URL],
         prefersRelay: Bool,
         local: LocalIPv4Network?,
-        pathChanged: Bool
+        pathChanged: Bool,
+        verifiedLAN: Set<String> = []
     ) -> [URL] {
         guard candidates.count > 1 else { return candidates }
         var relay: [URL] = []
-        var lanSame: [URL] = []
-        var lanOther: [URL] = []
+        var verified: [URL] = []
+        var lanUnverified: [URL] = []
         for candidate in candidates {
             switch candidateRole(host: candidate.host, local: local) {
-            case .relay: relay.append(candidate)
-            case .lanSameSubnet: lanSame.append(candidate)
-            case .lanOther: lanOther.append(candidate)
+            case .relay:
+                relay.append(candidate)
+            case .lanSameSubnet, .lanOther:
+                if verifiedLAN.contains(originKey(candidate)) {
+                    verified.append(candidate)
+                } else {
+                    lanUnverified.append(candidate)
+                }
             }
         }
-        let sameLANPath = !prefersRelay && !lanSame.isEmpty
-        if sameLANPath { return lanSame + relay + lanOther }
-        if prefersRelay || pathChanged || local != nil { return relay + lanOther + lanSame }
+        if !prefersRelay, !verified.isEmpty { return verified + relay + lanUnverified }
+        if prefersRelay || pathChanged || local != nil { return relay + verified + lanUnverified }
         return candidates
     }
 
@@ -3692,14 +3780,19 @@ extension LinkService {
  /// roundBudgetExhausted）。这是配对策略「蜂窝不拨 LAN」的软化版。
     nonisolated static func attemptTimeoutCap(
         attemptIndex: Int,
+        candidateCount: Int,
         policy: DialFirstPolicy,
         origin: URL,
         local: LocalIPv4Network?,
-        prefersRelay: Bool
+        verifiedLAN: Set<String> = []
     ) -> TimeInterval? {
         if attemptIndex == 0, case .speculative(let cap) = policy { return cap }
-        if prefersRelay, local == nil,
-           candidateRole(host: origin.host, local: local) != .relay {
+        // DEF-001：未确证的 LAN 地址（含跨网段陈旧地址）在任何位置都只值一档
+        // 投机上限——它在别的网络上大概率不可达，烧满整档只会挤掉 relay 的
+        // 重试窗口。单候选没有可切换目标，保持整档预算，避免 LAN-only 部署被饿死。
+        guard candidateCount > 1 else { return nil }
+        if candidateRole(host: origin.host, local: local) != .relay,
+           !verifiedLAN.contains(originKey(origin)) {
             return speculativeLANDialCapSeconds
         }
         return nil
@@ -3767,11 +3860,14 @@ extension LinkService {
  /// cold-start storm. 5s covers the relay attempt plus one bounded LAN fallback.
     nonisolated static func roundBudgetSeconds(
         candidateCount: Int,
-        hasSameSubnetLAN: Bool,
+        hasVerifiedLANFirst: Bool,
         hasRelay: Bool
     ) -> TimeInterval {
         guard candidateCount > 1 else { return 8 }
-        if hasSameSubnetLAN { return 4 }
+        // 已确证同网络的 LAN 首拨健康时 100–300ms，投机上限 1.2s；之后必须给
+        // relay 留一整轮健康拨号（真机标定 3s），否则跨网络时每轮都被饿死
+        // （DEF-001：旧 4s 预算扣掉 LAN 投机只剩 2.8s）。
+        if hasVerifiedLANFirst { return 5 }
         guard hasRelay else { return 4 }
         return 5
     }
