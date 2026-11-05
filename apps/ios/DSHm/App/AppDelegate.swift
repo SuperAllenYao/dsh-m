@@ -77,12 +77,19 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
  // cold-launch path is not lost, then post it for the normal path.
             PushActionInbox.shared.store(route)
             NotificationCenter.default.post(name: .dshmPushApprovalAction, object: route)
-        case .deepLink(let sessionId):
- // Cold launch: AppModel may not exist yet, so park the id for
+        case .deepLink(let sessionId, let parentSessionId):
+ // Cold launch: AppModel may not exist yet, so park the tap for
  // `AppModel.init` to drain; the NotificationCenter post remains the
- // primary path when the app is already running.
-            PushDeepLinkInbox.shared.store(sessionId)
-            NotificationCenter.default.post(name: .dshmPushNotificationTapped, object: sessionId)
+ // primary path when the app is already running. The parent hint keeps a
+ // subagent child address resolvable before `session/list` loads (DEF-002).
+            if let sessionId, !sessionId.isEmpty {
+                let tap = PushDeepLinkTap(sessionId: sessionId, parentSessionId: parentSessionId)
+                PushDeepLinkInbox.shared.store(tap)
+                NotificationCenter.default.post(name: .dshmPushNotificationTapped, object: tap)
+            } else {
+                PushDeepLinkInbox.shared.store(nil)
+                NotificationCenter.default.post(name: .dshmPushNotificationTapped, object: nil)
+            }
         case .ignored:
             break
         }

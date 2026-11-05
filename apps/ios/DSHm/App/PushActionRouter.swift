@@ -69,9 +69,12 @@ enum PushApprovalRoute: Equatable {
  /// Allow/deny action whose payload cannot be answered (missing/empty eventId,
  /// or the notification is not an approval): toast + open the session so the
  /// user decides in the app. Never guess an approval.
-    case fallback(sessionId: String?)
+    case fallback(sessionId: String?, parentSessionId: String?)
  /// Default tap: keep the existing deep link to the session.
-    case deepLink(sessionId: String?)
+ /// `parentSessionId` rides along for subagent children (DEF-002: the App opens
+ /// the child through its durable parent address even when `session/list` is
+ /// not available yet).
+    case deepLink(sessionId: String?, parentSessionId: String?)
  /// Dismiss / unrelated action: nothing to do.
     case ignored
 }
@@ -122,7 +125,8 @@ enum PushActionRouter {
             return approvalRoute(userInfo: userInfo, outcome: outcome)
         }
         if actionIdentifier == UNNotificationDefaultActionIdentifier {
-            return .deepLink(sessionId: PushNotificationPayload(userInfo: userInfo).sessionId)
+            let payload = PushNotificationPayload(userInfo: userInfo)
+            return .deepLink(sessionId: payload.sessionId, parentSessionId: payload.parentSessionId)
         }
         return .ignored
     }
@@ -135,12 +139,12 @@ enum PushActionRouter {
  // Only approval notifications are answerable. Anything else is a stale or
  // malformed category: fall back instead of answering an event we never saw.
         guard payload.kind == .approval else {
-            return .fallback(sessionId: payload.sessionId)
+            return .fallback(sessionId: payload.sessionId, parentSessionId: payload.parentSessionId)
         }
  // Without an eventId the `$events/result` answer cannot address the
  // waterfall; treat it as invalid and fall back to the app (M4 §3.2).
         guard let eventId = payload.eventId, !eventId.isEmpty else {
-            return .fallback(sessionId: payload.sessionId)
+            return .fallback(sessionId: payload.sessionId, parentSessionId: payload.parentSessionId)
         }
         return .approval(PushApprovalDecision(
             eventId: eventId,
@@ -186,11 +190,22 @@ final class PushActionInbox {
 /// its default `.workspaces` route — the "tap lands on the workspace list"
 /// regression. The delegate stores the session id here before posting;
 /// `AppModel.init` drains it once the model exists and routes to the session.
+/// One default-tap deep link, including the subagent parent hint (DEF-002).
+///
+/// A notification for a subagent child only used to carry the child id; the App
+/// needed a `session/list` lookup to find its durable parent, which is not
+/// available on a cold launch. The plugin title cache now sends
+/// `parentSessionId`, so the tap can open the child address directly.
+struct PushDeepLinkTap: Equatable {
+    var sessionId: String
+    var parentSessionId: String?
+}
+
 final class PushDeepLinkInbox {
     static let shared = PushDeepLinkInbox()
 
     private let lock = NSLock()
-    private var pending: String?
+    private var pending: PushDeepLinkTap?
  /// Once AppModel is alive the live NotificationCenter path is authoritative;
  /// storing late taps would replay a stale session on the next cold launch.
     private var appModelIsLive = false
@@ -203,16 +218,16 @@ final class PushDeepLinkInbox {
 
  /// Stores a tap that arrives before AppModel exists; later taps are ignored
  /// here because the live publisher handles them.
-    func store(_ sessionId: String?) {
+    func store(_ tap: PushDeepLinkTap?) {
         lock.lock()
         defer { lock.unlock() }
         guard !appModelIsLive else { return }
-        guard let sessionId, !sessionId.isEmpty else { return }
-        pending = sessionId
+        guard let tap, !tap.sessionId.isEmpty else { return }
+        pending = tap
     }
 
- /// Returns the parked session id (if any) and clears the slot.
-    func drain() -> String? {
+ /// Returns the parked tap (if any) and clears the slot.
+    func drain() -> PushDeepLinkTap? {
         lock.lock()
         defer { lock.unlock() }
         let value = pending

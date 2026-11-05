@@ -292,6 +292,35 @@ export class Notifier {
     return pushTitleForSession(info, fallbackTitle);
   }
 
+ /**
+ * Resolve the alert title plus the subagent parent hint for one push.
+ *
+ * DEF-002: a subagent child id alone is not enough to open its detail — the
+ * App must use the durable parent address, and on a cold launch it has no
+ * `session/list` to look the child up. The title resolver already holds
+ * `parentSessionId` for subagent rows, so the alert payload carries it; the
+ * App opens the child directly when present.
+ */
+  async alertTitleInfo(titleSessionId, fallbackTitle) {
+    if (typeof titleSessionId !== 'string' || titleSessionId.length === 0) {
+      return { title: fallbackTitle };
+    }
+    let info;
+    try {
+      info = await this.resolveSessionTitle(titleSessionId);
+    } catch {
+      info = undefined;
+    }
+    const parentSessionId =
+      typeof info?.parentSessionId === 'string' && info.parentSessionId.length > 0
+        ? info.parentSessionId
+        : undefined;
+    return {
+      title: pushTitleForSession(info, fallbackTitle),
+      ...(parentSessionId === undefined ? {} : { parentSessionId }),
+    };
+  }
+
   notify(device, { kind, title, titleSessionId, body, threadId, data, category, collapseId }) {
     const delivery = this.apns.mode === 'ready' ? 'push' : this.apns.mode;
     this.audit.record('notify.' + kind, {
@@ -303,17 +332,24 @@ export class Notifier {
     });
     if (device.pushToken === undefined) return;
     this.queue = this.queue
-      .then(async () => this.apns.send({
-        deviceToken: device.pushToken,
-        environment: device.pushEnvironment,
-        topic: this.apns.topic,
-        title: await this.alertTitle(titleSessionId, title),
-        body,
-        threadId,
-        data,
-        category,
-        collapseId,
-      }))
+      .then(async () => {
+        const titleInfo = await this.alertTitleInfo(titleSessionId, title);
+        const payloadData =
+          titleInfo.parentSessionId === undefined || data === undefined || typeof data !== 'object'
+            ? data
+            : { ...data, parentSessionId: titleInfo.parentSessionId };
+        return this.apns.send({
+          deviceToken: device.pushToken,
+          environment: device.pushEnvironment,
+          topic: this.apns.topic,
+          title: titleInfo.title,
+          body,
+          threadId,
+          data: payloadData,
+          category,
+          collapseId,
+        });
+      })
       .then((result) => {
         if (result.ok === false) this.log('APNs send failed (' + kind + '): ' + String(result.error));
       })

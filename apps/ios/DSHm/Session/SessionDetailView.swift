@@ -183,6 +183,9 @@ struct SessionDetailView: View {
  // we come back so the capsule never animates for a stopped child.
             guard phase == .active else { return }
             refreshDerivedState()
+ // DEF-002：锁屏/后台恢复时链路可能没换过 phase（旧 socket 直接可用或已悄悄重连），
+ // 详情首帧失败的模型目录也要在这里补一次，否则状态条停在「请选择模型」。
+            viewModel.retryModelCatalogIfNeeded(reason: "foreground")
         }
         .onReceive(app.$silentPushRefreshVersion.dropFirst()) { _ in
  // M4 §4: refresh the open detail only when the silent push names this
