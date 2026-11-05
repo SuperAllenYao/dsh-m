@@ -26,6 +26,10 @@ struct PushNotificationPayload: Equatable {
 
     var kind: Kind
     var sessionId: String?
+ /// DEF-002: durable parent of a subagent child. The plugin sends it with the
+ /// alert so the App can open the child detail on a cold launch (no
+ /// `session/list` yet) instead of falling back to a plain session address.
+    var parentSessionId: String?
     var toolName: String?
     var eventId: String?
  /// `aps.category` — only approval pushes carry `dshm-approval` (M4 §2.1/§3).
@@ -38,6 +42,7 @@ struct PushNotificationPayload: Equatable {
         let rawType = pushPayloadValue("type", in: userInfo) as? String ?? ""
         kind = Kind(rawValue: rawType) ?? .unknown
         sessionId = pushPayloadValue("sessionId", in: userInfo) as? String
+        parentSessionId = pushPayloadValue("parentSessionId", in: userInfo) as? String
         toolName = pushPayloadValue("toolName", in: userInfo) as? String
         eventId = pushPayloadValue("eventId", in: userInfo) as? String
         questionCount = pushPayloadInt(pushPayloadValue("questionCount", in: userInfo))

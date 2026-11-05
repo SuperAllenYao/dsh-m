@@ -359,6 +359,10 @@ final class SessionViewModel: ObservableObject {
     @Published private(set) var modelSelection: ModelSelection?
     @Published private(set) var modelCatalogLoading = false
     @Published private(set) var modelCatalogErrorText: String?
+ /// DEF-002：通知进详情时首帧可能早于链路恢复，`session/modelCatalog` 会失败一次。
+ /// 记录「已经尝试过」，供链路恢复/回前台/首帧快照做补载；没有尝试过时不抢先发请求
+ /// （详情 `.task` 是正常入口）。
+    private var modelCatalogLoadAttempted = false
  /// A `session/selectModel` round trip is in flight (rows disabled).
     @Published private(set) var modelSelecting = false
  /// Selection submitted and awaiting the Host's answer (row spinner).
@@ -1483,6 +1487,8 @@ final class SessionViewModel: ObservableObject {
             checkHistoryFillWatchdog()
  // DD-05: 链路恢复后重新评估旧 Host 的模型跟随兜底。
             startModelRefollowIfNeeded()
+ // DEF-002：通知进详情时首帧目录加载可能早于链路恢复，恢复后补一次。
+            retryModelCatalogIfNeeded(reason: "link-connected")
         } else {
  // DD-05: 断开时停止兜底重读（重连后由上面的分支或 generation 变化重启）。
             stopModelRefollow()
@@ -2887,6 +2893,8 @@ final class SessionViewModel: ObservableObject {
                 isShowingCachedWindow = false
                 cachedWindowIsStale = false
                 scheduleCacheSave()
+ // DEF-002：首帧快照到达说明会话流已恢复；目录若在链路就绪前失败过，此刻补载。
+                retryModelCatalogIfNeeded(reason: "live-snapshot")
  // M2b-2c: live snapshot network cost (detail in-app metric).
                 markDetailNetworkApplied()
  // L3d/L3e：冷入口「进入即取」。
@@ -3815,6 +3823,7 @@ final class SessionViewModel: ObservableObject {
         guard !isSubagentSession else { return }
         if !force, modelCatalogLoaded { return }
         guard !modelCatalogLoading else { return }
+        modelCatalogLoadAttempted = true
         modelCatalogLoading = true
         defer { modelCatalogLoading = false }
         do {
@@ -3825,6 +3834,21 @@ final class SessionViewModel: ObservableObject {
         } catch {
             modelCatalogLoaded = false
             modelCatalogErrorText = NetworkErrorInterpreter.message(for: error)
+        }
+    }
+
+ /// DEF-002：通知进详情时详情首帧可能早于链路恢复（锁屏恢复 / 冷启动 / 切网），
+ /// 首载失败后没有重试，状态条只能显示「请选择模型」。链路恢复、回前台、首帧快照
+ /// 到达时各补一次；`modelCatalogLoadAttempted`/`modelCatalogLoaded`/
+ /// `modelCatalogLoading` 三重 guard 保证只补载失败过的目录，不会抢占正常入口。
+    func retryModelCatalogIfNeeded(reason: String) {
+        guard !isSubagentSession,
+              modelCatalogLoadAttempted,
+              !modelCatalogLoaded,
+              !modelCatalogLoading else { return }
+        dbg("model catalog retry: " + reason)
+        Task { [weak self] in
+            await self?.loadModelCatalogIfNeeded()
         }
     }
 

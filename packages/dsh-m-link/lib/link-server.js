@@ -76,7 +76,7 @@ import { detectListLiteRequest, isSessionListEndpoint, LIST_LITE_HEADER, trimSes
 import { buildProjectedPage } from './proj-encode.js';
 
 const PLUGIN_NAME = 'dsh-m-link';
-const PLUGIN_VERSION = '2.22.3';
+const PLUGIN_VERSION = '2.22.4';
 const MUX_PATH = '/api/remote.mux';
 
 /**
@@ -836,6 +836,10 @@ export class LinkServer {
     if (this.notifier === undefined || this.devices === undefined) return 0;
     const info = titleInfo ?? this.pushTitleInfoFor?.(sessionId);
     const title = pushTitleForSession(info, '未命名会话');
+    const parentSessionId =
+      typeof info?.parentSessionId === 'string' && info.parentSessionId.length > 0
+        ? info.parentSessionId
+        : undefined;
     let sent = 0;
     const targets = typeof this.pushTargets === 'function'
       ? this.pushTargets()
@@ -847,7 +851,11 @@ export class LinkServer {
         title,
         body: '回合结束',
         threadId: sessionId,
-        data: { type: 'turn-end', sessionId },
+        data: {
+          type: 'turn-end',
+          sessionId,
+          ...(parentSessionId === undefined ? {} : { parentSessionId }),
+        },
       });
       sent += 1;
     }
@@ -863,6 +871,10 @@ export class LinkServer {
     if (this.notifier === undefined || this.devices === undefined) return 0;
     const info = titleInfo ?? this.pushTitleInfoFor?.(sessionId);
     const title = pushTitleForSession(info, '未命名会话');
+    const parentSessionId =
+      typeof info?.parentSessionId === 'string' && info.parentSessionId.length > 0
+        ? info.parentSessionId
+        : undefined;
     let sent = 0;
     const targets = typeof this.pushTargets === 'function'
       ? this.pushTargets()
@@ -874,7 +886,11 @@ export class LinkServer {
         title,
         body: '回合失败',
         threadId: sessionId,
-        data: { type: 'failure', sessionId },
+        data: {
+          type: 'failure',
+          sessionId,
+          ...(parentSessionId === undefined ? {} : { parentSessionId }),
+        },
       });
       sent += 1;
     }
@@ -1119,16 +1135,25 @@ export class LinkServer {
     const shortId = sessionId.slice(0, 8);
  // Subagent: the App's list shows the parent catalog label; a catalog entry
  // with an empty label falls back to the 8-char id (displayLabel rules).
+    const cachedParent = () => {
+      const cached = this.pushTitleCache?.get(sessionId);
+      const parent = cached?.parentSessionId;
+      return typeof parent === 'string' && parent.length > 0 ? parent : undefined;
+    };
     if (this.pushSubagentLabels?.has(sessionId)) {
       const label = this.pushSubagentLabels.get(sessionId);
-      if (typeof label === 'string' && label.length > 0) return { title: label, blank: false };
-      return { title: shortId, blank: false };
+      const parentSessionId = cachedParent();
+      const withParent = parentSessionId === undefined ? {} : { parentSessionId };
+      if (typeof label === 'string' && label.length > 0) {
+        return { title: label, blank: false, ...withParent };
+      }
+      return { title: shortId, blank: false, ...withParent };
     }
     const info = this.pushTitleCache?.get(sessionId);
     if (info === undefined) return undefined;
     if (typeof info.parentSessionId === 'string' && info.parentSessionId.length > 0) {
       const title = typeof info.title === 'string' ? info.title : '';
-      return { title: title.length > 0 ? title : shortId, blank: false };
+      return { title: title.length > 0 ? title : shortId, blank: false, parentSessionId: info.parentSessionId };
     }
     return info;
   }
