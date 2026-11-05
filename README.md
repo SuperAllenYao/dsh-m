@@ -6,10 +6,11 @@ DSH-m 通过自托管、TLS 证书钉扎的桥接，把 iPhone App **DSH-m** 连
 
 ## 状态
 
-当前版本 **v2.22.2**（2026-11-01）。已交付的能力：
+当前版本 **v2.22.3**（2026-11-05）。已交付的能力：
 
-- **本轮（v2.22.2）**：会话列表左滑按钮不再误闪——取消置顶的卡片回到分组位置、展开或收起工作区列表时，「置顶 / 归档」按钮不会先闪出来再被卡片盖住；按钮只在左滑时出现，点完收回即隐藏。
-- **上一轮（v2.22.1）**：置顶 / 取消置顶动效重做——卡片沿同一条曲线连续让位，不再整屏弹跳或闪烁；列表底部置顶平滑下移、不留白；取消置顶的卡片回到分组位置；连续操作与动画中的列表刷新会立即让位给最新操作并接着播完。
+- **本轮（v2.22.3）**：非同网络不再误判直连——手机与 Mac 不在同一个 Wi-Fi 时，只走服务器中转，Wi-Fi 下连不上与反复重连的问题解决；锁屏通知点进会话详情，历史消息稳定自动补齐；Wi-Fi 与 5G 切换后通常约 1 秒内恢复在线。
+- **上一轮（v2.22.2）**：会话列表左滑按钮不再误闪——取消置顶的卡片回到分组位置、展开或收起工作区列表时，「置顶 / 归档」按钮不会先闪出来再被卡片盖住；按钮只在左滑时出现，点完收回即隐藏。
+- **v2.22.1**：置顶 / 取消置顶动效重做——卡片沿同一条曲线连续让位，不再整屏弹跳或闪烁；列表底部置顶平滑下移、不留白；取消置顶的卡片回到分组位置；连续操作与动画中的列表刷新会立即让位给最新操作并接着播完。
 - **v2.21.1**：Mac 端插件改为 DSH 标准插件安装（插件管理器安装、卸载、升级，重启不丢；安装包内置手机连接所需组件）；修复升级新版 DSH 后插件不可用、手机连不上的问题。
 - **v2.21.0 六项**：会话列表左滑重做为系统级手感（跟手、松手停住、右滑收起、点外/点卡片收起、整滑不误触）；点置顶按「按钮先消失 → 卡片轻微回弹飞入并形变」播放、取消置顶立即归位且不再整屏闪烁；新建会话显示桌面端默认模型；运行中会话（含子代理）详情不闪退、滚动更跟手；列表卡片状态实时跟随；Mac 锁屏回来后约 1 秒自动重连。
 
@@ -81,9 +82,9 @@ DSH-m connects the iOS app **DSH-m** to your Mac's DSH desktop through a self-ho
 
 ## Status
 
-Current version **v2.22.1** (2026-10-31). What ships today:
+Current version **v2.22.3** (2026-11-05). What ships today:
 
-- **This release**: smooth scrolling in session and subagent session details while reasoning streams — no scrollbar or message flicker; back to the single native scrollbar; the streaming tail pauses while you scroll and catches up within a second; older messages keep loading as you scroll up.
+- **This release**: no more false LAN attempts when the phone and the Mac are not on the same Wi-Fi — the app uses the relay instead, fixing Wi-Fi "cannot connect" and repeated reconnect loops; opening a session from a lock-screen notification now reliably fills in the history; switching between Wi-Fi and 5G recovers in about a second.
 
 **Connection and pairing**
 
