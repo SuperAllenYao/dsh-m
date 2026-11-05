@@ -66,6 +66,27 @@ function sessionIdFromOpenFrame(frame) {
   return undefined;
 }
 
+/**
+ * True when one session-follow open frame targets a **subagent/teammate child**
+ * address (`kind:"subagent"`, `parentSessionId`, or `childSessionId`).
+ *
+ * Subagent sessions never push (user requirement 2026-11-05; same policy the
+ * TurnWatcher applies to its `session/list` rows). The frame path must know this
+ * before it emits approval/question/turn-end alerts for a followed child stream.
+ */
+export function isSubagentFollowAddress(address) {
+  if (address === null || typeof address !== 'object') return false;
+  if (address.kind === 'subagent') return true;
+  if (typeof address.parentSessionId === 'string' && address.parentSessionId.length > 0) return true;
+  if (typeof address.childSessionId === 'string' && address.childSessionId.length > 0) return true;
+  return false;
+}
+
+function followAddressFromOpenFrame(frame) {
+  const args = frame.payload?.args;
+  return args?.request?.address ?? args?.address;
+}
+
 export class Notifier {
  /**
  * @param {{
@@ -130,6 +151,11 @@ export class Notifier {
  * turn/end 事件本身不带 sessionId，通知要深链到会话就必须从 follow 流映射出来。
  */
     this.streamSessions = new Map();
+ // deviceId|streamId -> true：该 follow 流指向子代理/teammate 子会话。
+ // 用户要求（2026-11-05）：**子代理会话永不推送**——与 TurnWatcher 的
+ // 「subagent/teammate children never push」同一口径；frame 路径（审批/提问/
+ // 回合结束/失败）也必须抑制，否则手机会收到子代理通知。
+    this.subagentStreams = new Set();
     this.queue = Promise.resolve();
   }
 
@@ -162,10 +188,14 @@ export class Notifier {
       const sessionId = sessionIdFromOpenFrame(frame);
       if (sessionId === undefined) this.streamSessions.delete(key);
       else this.streamSessions.set(key, sessionId);
+ // DEF-002: 记住这条 follow 流是否指向子代理会话；`observe` 用它抑制全部推送。
+      if (isSubagentFollowAddress(followAddressFromOpenFrame(frame))) this.subagentStreams.add(key);
+      else this.subagentStreams.delete(key);
       return;
     }
     if (frame.type === 'end' || frame.type === 'cancel' || frame.type === 'error') {
       this.streamSessions.delete(key);
+      this.subagentStreams.delete(key);
     }
   }
 
@@ -180,6 +210,16 @@ export class Notifier {
     }
     const value = frame?.type === 'item' ? frame.value : undefined;
     if (value === undefined || value === null) return;
+ // DEF-002 / 用户要求：子代理会话永不推送。open 帧记下的子代理流在这里统一
+ // 短路——审批、提问、回合结束、失败都不发 alert，也不发后台静默推送。
+    const streamId =
+      typeof frame.streamId === 'string'
+        ? frame.streamId
+        : (typeof value.streamId === 'string' ? value.streamId : undefined);
+    if (streamId !== undefined && this.subagentStreams.has(device.deviceId + '|' + streamId)) {
+      this.log('suppressed subagent push: ' + String(value.type ?? value.event ?? 'event') + ' stream=' + streamId);
+      return;
+    }
     if (value.type === 'waterfall' && value.event === 'approval/request') {
       if (!this.config.approval || !this.dedupe('approval|' + String(value.eventId))) return;
       const rawToolName = typeof value.request?.toolName === 'string' ? value.request.toolName.trim() : '';
@@ -274,32 +314,18 @@ export class Notifier {
   }
 
  /**
- * Resolve the alert title for one push.
+ * Resolve the alert title — and whether the session is a **subagent child** —
+ * for one push.
  *
  * `title` is the session-shaped fallback (callers pass "未命名会话"); `titleSessionId` is the
  * session the alert belongs to, resolved through `resolveSessionTitle`. The
  * resolver may be async (link-server refreshes its `session/list` title cache
  * on demand) — this runs inside the send queue, never on the bridge path.
- */
-  async alertTitle(titleSessionId, fallbackTitle) {
-    if (typeof titleSessionId !== 'string' || titleSessionId.length === 0) return fallbackTitle;
-    let info;
-    try {
-      info = await this.resolveSessionTitle(titleSessionId);
-    } catch {
-      info = undefined;
-    }
-    return pushTitleForSession(info, fallbackTitle);
-  }
-
- /**
- * Resolve the alert title plus the subagent parent hint for one push.
  *
- * DEF-002: a subagent child id alone is not enough to open its detail — the
- * App must use the durable parent address, and on a cold launch it has no
- * `session/list` to look the child up. The title resolver already holds
- * `parentSessionId` for subagent rows, so the alert payload carries it; the
- * App opens the child directly when present.
+ * A subagent row carries `parentSessionId`; the user requirement (2026-11-05) is
+ * that subagent sessions **never push**, so `notify` suppresses the alert and
+ * the silent push whenever this returns a parent (second line of defence when
+ * the open frame was not observed, e.g. the plugin restarted mid-stream).
  */
   async alertTitleInfo(titleSessionId, fallbackTitle) {
     if (typeof titleSessionId !== 'string' || titleSessionId.length === 0) {
@@ -334,27 +360,40 @@ export class Notifier {
     this.queue = this.queue
       .then(async () => {
         const titleInfo = await this.alertTitleInfo(titleSessionId, title);
-        const payloadData =
-          titleInfo.parentSessionId === undefined || data === undefined || typeof data !== 'object'
-            ? data
-            : { ...data, parentSessionId: titleInfo.parentSessionId };
-        return this.apns.send({
-          deviceToken: device.pushToken,
-          environment: device.pushEnvironment,
-          topic: this.apns.topic,
-          title: titleInfo.title,
-          body,
-          threadId,
-          data: payloadData,
-          category,
-          collapseId,
-        });
+        if (titleInfo.parentSessionId !== undefined) {
+ // 用户要求：子代理会话永不推送（alert 与后台静默推送都不发）。
+          this.log('suppressed subagent push: ' + kind + ' session=' + String(titleSessionId));
+          this.audit.record('notify.suppressed-subagent', {
+            deviceId: device.deviceId,
+            delivery,
+            kind,
+            ref: shortFingerprint(String(titleInfo.parentSessionId)),
+          });
+          return { suppressed: true };
+        }
+        let result;
+        try {
+          result = await this.apns.send({
+            deviceToken: device.pushToken,
+            environment: device.pushEnvironment,
+            topic: this.apns.topic,
+            title: titleInfo.title,
+            body,
+            threadId,
+            data,
+            category,
+            collapseId,
+          });
+        } finally {
+ // Only non-subagent events reach the silent (background refresh) push.
+          this.sendSilent(device, kind, data);
+        }
+        return result;
       })
       .then((result) => {
-        if (result.ok === false) this.log('APNs send failed (' + kind + '): ' + String(result.error));
+        if (result?.ok === false) this.log('APNs send failed (' + kind + '): ' + String(result.error));
       })
       .catch((error) => this.log('APNs send failed (' + kind + '): ' + String(error?.message ?? error)));
-    this.sendSilent(device, kind, data);
   }
 
  /**

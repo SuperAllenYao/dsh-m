@@ -156,7 +156,7 @@ final class AppModel: ObservableObject {
  /// Deep-link session lookup table, refreshed from every `session/list` load.
     private var deepLinkResolver = SessionDeepLinkResolver()
  /// 通知 tap 的 deep link 在未配对时就到达（冷启动/配对前）：先记住，配对完成再跳。
-    private var pendingDeepLink: PushDeepLinkTap?
+    private var pendingDeepLinkSessionId: String?
  /// task-9: in-flight `session/list` lookup for a notification deep link whose
  /// id is not in the cached table (see `resolveDeepLinkSession`).
     private var deepLinkResolveTask: Task<Void, Never>?
@@ -376,12 +376,7 @@ final class AppModel: ObservableObject {
             .receive(on: RunLoop.main)
             .sink { [weak self] notification in
                 guard let self else { return }
-                if let tap = notification.object as? PushDeepLinkTap {
-                    self.handlePushTap(sessionId: tap.sessionId, parentSessionId: tap.parentSessionId)
-                } else {
- // 兼容旧路径（单测/E2E 直接 post 一个 String）。
-                    self.handlePushTap(sessionId: notification.object as? String)
-                }
+                self.handlePushTap(sessionId: notification.object as? String)
             }
             .store(in: &cancellables)
 
@@ -415,11 +410,11 @@ final class AppModel: ObservableObject {
  // NotificationCenter post 会丢失，默认 `.workspaces` 路由就会覆盖掉它
  // （用户报障：点通知只进工作区列表）。这里领取 delegate 停放的 sessionId。
         PushDeepLinkInbox.shared.markLive()
-        if let parked = PushDeepLinkInbox.shared.drain() {
+        if let parkedSessionId = PushDeepLinkInbox.shared.drain() {
             if link.credentials == nil {
-                pendingDeepLink = parked
+                pendingDeepLinkSessionId = parkedSessionId
             } else {
-                handlePushTap(sessionId: parked.sessionId, parentSessionId: parked.parentSessionId)
+                handlePushTap(sessionId: parkedSessionId)
             }
         }
     }
@@ -587,7 +582,7 @@ final class AppModel: ObservableObject {
 
  /// 通知 tap 的统一入口（前台横幅点击、冷启动停放、审批 fallback 都走这里）：
  /// 同会话 no-op，空 payload 回工作区列表。
-    private func handlePushTap(sessionId rawSessionId: String?, parentSessionId: String? = nil) {
+    private func handlePushTap(sessionId rawSessionId: String?) {
         guard let sessionId = rawSessionId, !sessionId.isEmpty else {
             route = .workspaces
             return
@@ -599,7 +594,7 @@ final class AppModel: ObservableObject {
             pushDbg("push tap: already viewing session=" + sessionId + " (no-op)")
             return
         }
-        openSession(sessionId, parentSessionId: parentSessionId)
+        openSession(sessionId)
     }
 
  // MARK: - M4 notification-action approvals
@@ -610,14 +605,14 @@ final class AppModel: ObservableObject {
         switch route {
         case .approval(let decision):
             enqueueApprovalDecision(decision)
-        case .fallback(let sessionId, let parentSessionId):
+        case .fallback(let sessionId):
             showToast(L10n.t("审批信息不完整，请在 App 内处理"))
  // 没有可用深链时保持当前页面（旧行为）；有会话才走同会话 no-op 判定。
             if let sessionId, !sessionId.isEmpty {
-                handlePushTap(sessionId: sessionId, parentSessionId: parentSessionId)
+                handlePushTap(sessionId: sessionId)
             }
-        case .deepLink(let sessionId, let parentSessionId):
-            handlePushTap(sessionId: sessionId, parentSessionId: parentSessionId)
+        case .deepLink(let sessionId):
+            handlePushTap(sessionId: sessionId)
         case .ignored:
             break
         }
@@ -722,9 +717,9 @@ final class AppModel: ObservableObject {
     func didPair() {
         subagentRoute = nil
  // 配对前点过通知：配对完成后再补跳会话详情，而不是丢掉这次意图。
-        if let pending = pendingDeepLink {
-            pendingDeepLink = nil
-            openSession(pending.sessionId, parentSessionId: pending.parentSessionId)
+        if let pending = pendingDeepLinkSessionId {
+            pendingDeepLinkSessionId = nil
+            openSession(pending)
         } else {
             route = .workspaces
         }
@@ -739,16 +734,16 @@ final class AppModel: ObservableObject {
  /// `kind:"session"` address, which the Host rejects with
  /// `session/agent-busy` (blank detail + error banner) — or (b) opens the child
  /// as a normal session (wrong back navigation / composer).
-    func openSession(_ sessionId: String, parentSessionId: String? = nil) {
+    func openSession(_ sessionId: String) {
  // 未配对时没有会话可看：先停在这里，配对成功（didPair）后再跳，避免
  // 落到一个打不开的详情页或丢掉这次 deep link。
         guard link.credentials != nil else {
             subagentRoute = nil
-            pendingDeepLink = PushDeepLinkTap(sessionId: sessionId, parentSessionId: parentSessionId)
+            pendingDeepLinkSessionId = sessionId
             route = .pairing
             return
         }
-        openDeepLinkSession(sessionId, parentSessionId: parentSessionId)
+        openDeepLinkSession(sessionId)
     }
 
  /// Opens one notification deep link. A resolved subagent address (or a known
@@ -756,29 +751,20 @@ final class AppModel: ObservableObject {
  /// against a fresh `session/list` *before* the detail is created — the detail
  /// identity is the session id, so replacing the route afterwards would keep the
  /// existing (plain-address) view model and its Host rejection alive.
- ///
- /// DEF-002: the payload also carries `parentSessionId` for subagent children
- /// (plugin title cache). That hint is used when the local `session/list` table
- /// cannot resolve the child yet (cold launch / stale list), so the child still
- /// opens through the durable parent address instead of a plain detail.
-    private func openDeepLinkSession(_ sessionId: String, parentSessionId: String? = nil) {
+    private func openDeepLinkSession(_ sessionId: String) {
  // Every deep link supersedes a pending lookup: rapid notification taps must
  // end on the newest target, and a slow lookup of an older tap must not
  // override it.
         let navigationToken = UUID()
         deepLinkResolveToken = navigationToken
-        let navigation = Self.deepLinkNavigation(
-            sessionId: sessionId,
-            resolver: deepLinkResolver,
-            parentHint: parentSessionId
-        )
+        let navigation = Self.deepLinkNavigation(sessionId: sessionId, resolver: deepLinkResolver)
         if navigation.context != nil || knownSessionIds.contains(sessionId) {
             deepLinkResolveTask?.cancel()
             deepLinkResolveTask = nil
             applyDeepLinkNavigation(navigation)
             return
         }
-        resolveDeepLinkSession(sessionId, token: navigationToken, parentHint: parentSessionId)
+        resolveDeepLinkSession(sessionId, token: navigationToken)
     }
 
     private func applyDeepLinkNavigation(_ navigation: PushDeepLinkNavigation) {
@@ -802,28 +788,13 @@ final class AppModel: ObservableObject {
     }
 
  /// Pure decision seam (unit-tested): route + subagent context for one id.
- ///
- /// `parentHint` is the push payload's `parentSessionId` (plugin title cache).
- /// When the local table cannot resolve the id (cold launch / stale list), the
- /// hint still opens the child through its durable parent address — otherwise a
- /// subagent notification would create a plain detail (`session/agent-busy`).
     nonisolated static func deepLinkNavigation(
         sessionId: String,
-        resolver: SessionDeepLinkResolver,
-        parentHint: String? = nil
+        resolver: SessionDeepLinkResolver
     ) -> PushDeepLinkNavigation {
         let address = resolver.address(for: sessionId)
-        let hint = (parentHint ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        let effectiveAddress: SessionFollowAddress
-        if case .subagent = address {
-            effectiveAddress = address
-        } else if !hint.isEmpty, hint != sessionId {
-            effectiveAddress = .subagent(parentSessionId: hint, childSessionId: sessionId, mode: "unknown")
-        } else {
+        guard case .subagent(let parentSessionId, let childSessionId, let mode) = address else {
             return PushDeepLinkNavigation(address: address, parentAddress: nil, context: nil)
-        }
-        guard case .subagent(let parentSessionId, let childSessionId, let mode) = effectiveAddress else {
-            return PushDeepLinkNavigation(address: effectiveAddress, parentAddress: nil, context: nil)
         }
  // A subagent parent is a top-level session; if a (stale) row resolves the
  // parent to another subagent address, fall back to the plain parent id
@@ -838,7 +809,7 @@ final class AppModel: ObservableObject {
             modeRaw: mode
         )
         return PushDeepLinkNavigation(
-            address: effectiveAddress,
+            address: address,
             parentAddress: parentAddress,
             context: context
         )
@@ -849,7 +820,7 @@ final class AppModel: ObservableObject {
  /// table is only refreshed when the workspace list renders). A failed lookup
  /// falls back to the plain address after a bounded wait so an offline tap still
  /// navigates somewhere — the Host error then surfaces instead of a silent no-op.
-    private func resolveDeepLinkSession(_ sessionId: String, token resolveToken: UUID, parentHint: String? = nil) {
+    private func resolveDeepLinkSession(_ sessionId: String, token resolveToken: UUID) {
         deepLinkResolveTask?.cancel()
         deepLinkResolveTask = Task { [weak self] in
             guard let self else { return }
@@ -882,8 +853,7 @@ final class AppModel: ObservableObject {
             if let items { self.updateKnownSessions(items) }
             let navigation = Self.deepLinkNavigation(
                 sessionId: sessionId,
-                resolver: self.deepLinkResolver,
-                parentHint: parentHint
+                resolver: self.deepLinkResolver
             )
             pushDbg(
                 "deep link resolve session=" + sessionId
