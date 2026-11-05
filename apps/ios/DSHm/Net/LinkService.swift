@@ -251,8 +251,8 @@ final class LinkService: ObservableObject {
 
  /// DEF-001：「同一网络」的确证证据。直连能否首拨**不能**由「Mac 的 LAN IP 落在
  /// 手机当前子网」推断——不同 Wi-Fi 复用 192.168/10/172.16 私网段极常见，同 /24
- /// 完全可能是两个互不相通的网络（例如手机回家拿到 192.168.50.x，而 Mac 历史
- /// LAN 地址恰好也是 192.168.50.x，但 Mac 当晚在公司网）。
+ /// 完全可能是两个互不相通的网络（例如手机在另一处 Wi-Fi 也拿到 192.168.1.x，
+ /// Mac 的持久化 LAN 地址恰好落在同一 /24，但两台设备并不在同一网络）。
  /// 只信三类实测事实，并且全部绑定 `NetworkPathMonitor.changeGeneration`：
  /// 1. mDNS 发现到的 Mac 端点已通过 `/health` + hostId 校验；
  /// 2. 并行 `/health` 探测把该 LAN 端点判为 healthy；
