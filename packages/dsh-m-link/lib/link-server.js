@@ -77,7 +77,7 @@ import { detectListLiteRequest, isSessionListEndpoint, LIST_LITE_HEADER, trimSes
 import { buildProjectedPage } from './proj-encode.js';
 
 const PLUGIN_NAME = 'dsh-m-link';
-const PLUGIN_VERSION = '2.22.5';
+const PLUGIN_VERSION = '2.23.0';
 const MUX_PATH = '/api/remote.mux';
 
 /**
