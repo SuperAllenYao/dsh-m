@@ -190,11 +190,15 @@ export class ApnsProvider {
  * @param {{
  * config?: {keyFile?: string, keyId?: string, teamId?: string, topic?: string, environment?: string},
  * log?: (message: string) => void,
+ * http2Connect?: (authority: string) => import('node:http2').ClientHttp2Session,
  * }} options
  */
-  constructor({ config, log = () => {} } = {}) {
+  constructor({ config, log = () => {}, http2Connect } = {}) {
     this.config = config ?? {};
     this.log = log;
+ // Test seam: tests inject a fake session factory so APNs session failures can
+ // be exercised without opening a real connection (DEF-003 regression test).
+    this.http2Connect = http2Connect ?? http2.connect;
  /** @type {'stub'|'ready'|'error'} */
     this.mode = 'stub';
     this.reason = 'not configured';
@@ -309,20 +313,35 @@ export class ApnsProvider {
     const path = '/3/device/' + deviceToken;
     let client;
     try {
-      client = http2.connect(APNS_HOSTS[env]);
+      client = this.http2Connect(APNS_HOSTS[env]);
       const jwt = this.buildProviderToken();
       const status = await new Promise((resolve, reject) => {
         let settled = false;
+        let timer;
         const finish = (value) => {
           if (settled) return;
           settled = true;
           clearTimeout(timer);
           resolve(value);
         };
-        const timer = setTimeout(() => {
+        const fail = (error, stage) => {
           if (settled) return;
           settled = true;
-          reject(new Error('APNs request timed out'));
+          clearTimeout(timer);
+          const failure = new Error(String(error?.message ?? error));
+          failure.apnsStage = stage;
+          failure.cause = error;
+          reject(failure);
+        };
+ // The HTTP/2 session can fail on its own, e.g. when every APNs gateway IP
+ // times out and Node emits `AggregateError [ETIMEDOUT]`. That error fires on
+ // the session, not on the request; without a listener Node raises it as an
+ // uncaught exception and the DSH host exits (DEF-003). Attach it right after
+ // connect and before creating the request so no failure can slip through,
+ // and settle it through the same path as request errors and timeouts.
+        client.on('error', (error) => fail(error, 'connect'));
+        timer = setTimeout(() => {
+          fail(new Error('APNs request timed out'), 'request');
         }, SEND_TIMEOUT_MS);
         const request = client.request({
           ':method': 'POST',
@@ -352,12 +371,7 @@ export class ApnsProvider {
             finish({ status: Number(headers[':status']), apnsId: headers['apns-id'], reason });
           });
         });
-        request.on('error', (error) => {
-          if (settled) return;
-          settled = true;
-          clearTimeout(timer);
-          reject(error);
-        });
+        request.on('error', (error) => fail(error, 'request'));
         request.end(payload);
       });
       if (status.status === 200) {
@@ -375,7 +389,13 @@ export class ApnsProvider {
       };
     } catch (error) {
       this.failed += 1;
-      return { ok: false, error: String(error?.message ?? error) };
+      const message = String(error?.message ?? error);
+ // Session/connection failures are labelled `apns/connect-*`; request errors
+ // and timeouts keep their historical message so existing logs stay stable.
+      const errorCode = error?.apnsStage === 'connect' ? 'apns/connect-' + message : message;
+ // Never store token, key material or payload in the audit result.
+      this.lastResult = { ok: false, error: errorCode, at: new Date().toISOString() };
+      return { ok: false, error: errorCode };
     } finally {
       try {
         client?.close();

@@ -213,6 +213,12 @@ final class P1Channel {
  /// 通道对象（保留流表做 resume），所以本值必须可更新（见
  /// `applyWantsProjV1ForRemount`）；只在没有 hello 在飞时允许改。
     private(set) var wantsProjV1: Bool
+ /// netlog T-02：本轮连接的 traceId（随 hello 顶层与 unary 帧 headers 透传）。
+ /// 由 `LinkService` 在每次 `connect` 前写入；旧插件忽略未知字段。
+    var trace: String?
+ /// netlog T-02：拨号目标 host（只用于 `request.first-byte` 日志；主 init 的
+ /// socketFactory 不暴露 host，测试注入时为 nil）。
+    let logHost: String?
 
     private let socketFactory: SocketFactory
     private var socket: P1Socket?
@@ -275,7 +281,8 @@ final class P1Channel {
         helloTimeout: TimeInterval = P1ProtocolLimits.helloTimeout,
         maxFrameBytes: Int = P1ProtocolLimits.maxFrameBytes,
         inboundDecoding: P1InboundDecoding = .offMain,
-        wantsProjV1: Bool = true
+        wantsProjV1: Bool = true,
+        logHost: String? = nil
     ) {
         self.socketFactory = socketFactory
         self.clientInfo = clientInfo
@@ -283,6 +290,7 @@ final class P1Channel {
         self.maxFrameBytes = maxFrameBytes
         self.inboundDecoding = inboundDecoding
         self.wantsProjV1 = wantsProjV1
+        self.logHost = logHost
     }
 
  /// Production wiring: one pinned WSS to `host:port` per `connect`.
@@ -304,7 +312,8 @@ final class P1Channel {
             },
             clientInfo: clientInfo,
             helloTimeout: helloTimeout,
-            wantsProjV1: wantsProjV1
+            wantsProjV1: wantsProjV1,
+            logHost: host
         )
     }
 
@@ -358,7 +367,13 @@ final class P1Channel {
         }
  // Validate (and serialize) hello before touching the network.
         let helloText = try P1FrameCodec.encodeText(
-            .hello(P1Hello(client: clientInfo, auth: auth, resume: resume, wantsProjV1: wantsProjV1)),
+            .hello(P1Hello(
+                client: clientInfo,
+                auth: auth,
+                resume: resume,
+                wantsProjV1: wantsProjV1,
+                trace: trace
+            )),
             maxBytes: maxFrameBytes
         )
         if let resume {
@@ -571,36 +586,72 @@ final class P1Channel {
     func unary(
         endpoint: String,
         args: [String: JSONValue] = [:],
-        timeout: TimeInterval = 30
+        timeout: TimeInterval = 30,
+        headers: [String: String] = [:]
     ) async throws -> P1RPCResult {
         guard state == .ready, socket != nil else { throw P1Failure.notConnected }
+        let startedAt = Date()
+ // netlog T-02：抓发起时刻的 trace（请求跨轮完成时仍归到发起轮）。
+        let trace = RoundTrace.current
         let id = UUID().uuidString.lowercased()
         let text = try P1FrameCodec.encodeText(
-            .rpc(P1RPCCall(id: id, endpoint: endpoint, args: args)),
+            .rpc(P1RPCCall(id: id, endpoint: endpoint, args: args, headers: headers.isEmpty ? nil : headers)),
             maxBytes: maxFrameBytes
         )
-        return try await withTaskCancellationHandler(operation: {
-            try await withCheckedThrowingContinuation { continuation in
-                self.pendingRPC[id] = continuation
-                do {
-                    try self.sendText(text)
-                } catch {
-                    self.pendingRPC.removeValue(forKey: id)
-                    continuation.resume(throwing: P1Failure.notConnected)
-                    return
+        do {
+            let result = try await withTaskCancellationHandler(operation: {
+                try await withCheckedThrowingContinuation { continuation in
+                    self.pendingRPC[id] = continuation
+                    do {
+                        try self.sendText(text)
+                    } catch {
+                        self.pendingRPC.removeValue(forKey: id)
+                        continuation.resume(throwing: P1Failure.notConnected)
+                        return
+                    }
+                    let interval = max(0.001, timeout)
+                    self.rpcTimeoutTasks[id] = Task { [weak self] in
+                        try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
+                        guard !Task.isCancelled else { return }
+                        self?.timeOutRPC(id)
+                    }
                 }
-                let interval = max(0.001, timeout)
-                self.rpcTimeoutTasks[id] = Task { [weak self] in
-                    try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
-                    guard !Task.isCancelled else { return }
-                    self?.timeOutRPC(id)
+            }, onCancel: {
+                Task { @MainActor [weak self] in
+                    self?.cancelRPC(id)
                 }
-            }
-        }, onCancel: {
-            Task { @MainActor [weak self] in
-                self?.cancelRPC(id)
-            }
-        })
+            })
+ // netlog T-02：P1 的「首字节」= 首个结果帧（成功路径）。
+            recordFirstByte(endpoint: endpoint, startedAt: startedAt, ok: true, timeout: false, trace: trace)
+            return result
+        } catch {
+            var timedOut = false
+            if let failure = error as? P1Failure, case .timeout = failure { timedOut = true }
+            recordFirstByte(endpoint: endpoint, startedAt: startedAt, ok: false, timeout: timedOut, trace: trace)
+            throw error
+        }
+    }
+
+ /// netlog T-02：记录一次 P1 unary 的首个结果帧（成功或超时/失败）。
+    private func recordFirstByte(
+        endpoint: String,
+        startedAt: Date,
+        ok: Bool,
+        timeout: Bool,
+        trace: String?
+    ) {
+        var fields: [String: Any] = [
+            "endpoint": endpoint,
+            "proto": 2,
+ // P1 的 socket 在 unary 之前已由 hello/welcome 建立，语义上等同于复用连接。
+            "reused": true,
+            "ms": Int(Date().timeIntervalSince(startedAt) * 1000),
+            "ok": ok,
+            "timeout": timeout,
+        ]
+        if let logHost, !logHost.isEmpty { fields["host"] = logHost }
+        if let trace, !trace.isEmpty { fields["trace"] = trace }
+        record("request.first-byte", fields)
     }
 
  // MARK: - Projected page streaming（协议 v1，`0x02`）
@@ -626,7 +677,9 @@ final class P1Channel {
     func unaryProjected(
         endpoint: String,
         args: [String: JSONValue] = [:],
-        timeout: TimeInterval = 10
+        timeout: TimeInterval = 10,
+ /// netlog T-02：投影页请求同样带 `x-dshm-trace`（与普通 unary 同一出口）。
+        headers: [String: String] = [:]
     ) throws -> P1ProjectedStream {
         guard state == .ready, socket != nil else { throw P1Failure.notConnected }
         guard projV1Negotiated else {
@@ -634,7 +687,7 @@ final class P1Channel {
         }
         let id = UUID().uuidString.lowercased()
         let text = try P1FrameCodec.encodeText(
-            .rpc(P1RPCCall(id: id, endpoint: endpoint, args: args)),
+            .rpc(P1RPCCall(id: id, endpoint: endpoint, args: args, headers: headers.isEmpty ? nil : headers)),
             maxBytes: maxFrameBytes
         )
         var captured: AsyncThrowingStream<P1ProjectedStreamEvent, Error>.Continuation?

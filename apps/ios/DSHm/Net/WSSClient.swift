@@ -114,8 +114,15 @@ final class WSSClient: @unchecked Sendable {
     }
 
  /// Set the HTTP upgrade headers (e.g. the bearer mux token) after prepare.
+ ///
+ /// netlog T-02：升级头一律带上当前轮 `x-dshm-trace`（legacy mux 与 P1
+ /// upgrade 共用该出口）。旧插件忽略未知头；无在飞轮次时保持原样。
     func setUpgradeHeaders(_ headers: [String: String]) {
-        extraHeaders = headers
+        var merged = headers
+        if let trace = RoundTrace.current, !trace.isEmpty {
+            merged["x-dshm-trace"] = trace
+        }
+        extraHeaders = merged
     }
 
  /// Send the WebSocket upgrade on the prepared TLS connection and wait for 101.
@@ -179,7 +186,13 @@ final class WSSClient: @unchecked Sendable {
         lines.append("Connection: Upgrade")
         lines.append("Sec-WebSocket-Key: \(key)")
         lines.append("Sec-WebSocket-Version: 13")
-        for (name, value) in extraHeaders.sorted(by: { $0.key < $1.key }) {
+        var headers = extraHeaders
+ // netlog T-02：P1 的 upgrade 头在通道建立时给定（init `headers`），不经过
+ // `setUpgradeHeaders`；这里统一兜底补 trace，保证两条升级路径都携带。
+        if headers["x-dshm-trace"] == nil, let trace = RoundTrace.current, !trace.isEmpty {
+            headers["x-dshm-trace"] = trace
+        }
+        for (name, value) in headers.sorted(by: { $0.key < $1.key }) {
             lines.append("\(name): \(value)")
         }
         let request = Data((lines.joined(separator: "\r\n") + "\r\n\r\n").utf8)

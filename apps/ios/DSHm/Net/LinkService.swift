@@ -44,11 +44,38 @@ final class LinkService: ObservableObject {
             case .needsRepair: return L10n.t("需要重新配对")
             }
         }
+
+ /// netlog T-02：日志里的稳定 phase 取值（`phase.changed`/`app.lifecycle`/事件字段）。
+        var netlogName: String {
+            switch self {
+            case .unpaired: return "unpaired"
+            case .disconnected: return "disconnected"
+            case .connecting: return "connecting"
+            case .connected: return "connected"
+            case .reconnecting: return "reconnecting"
+            case .needsRepair: return "needsRepair"
+            }
+        }
     }
 
-    @Published private(set) var phase: Phase = .unpaired
+    @Published private(set) var phase: Phase = .unpaired {
+        didSet {
+ // netlog T-02：phase 每次变化写 `phase.changed`，并刷新 AppDelegate 侧
+ // `app.lifecycle` 用的无锁镜像（跨文件读不了 @MainActor 属性）。
+            NetlogLinkState.update(phase: phase.netlogName, generation: generation)
+            guard oldValue != phase else { return }
+            record("phase.changed", [
+                "from": oldValue.netlogName,
+                "to": phase.netlogName,
+                "reason": phaseChangeReason,
+                "generation": generation,
+            ])
+        }
+    }
     @Published private(set) var credentials: PairingCredentials?
-    @Published private(set) var generation: Int = 0
+    @Published private(set) var generation: Int = 0 {
+        didSet { NetlogLinkState.update(generation: generation) }
+    }
     @Published var clientId: String?
  /// 当前连接上是否收到过 **本连接** 的 `$events` ready 帧。
  /// Host 只接受来自"拥有该事件流"的 Peer 的 `$events/result`；重连后沿用旧
@@ -84,6 +111,22 @@ final class LinkService: ObservableObject {
     @Published private(set) var lastSwitchReconnectMs: Int?
  /// 上一个切换锚定链的起点；连接成功时结算成 `lastSwitchReconnectMs` 后清空。
     private var switchReconnectStartedAt: Date?
+ /// netlog T-02（DD-18 / AC-02）：本轮连接状态。trace 由 `connectOnce` 生成；
+ /// 失败明细与分段耗时在候选循环里累积，轮次出口写 `dial.result`/`round.end`。
+    private var roundTrace: String?
+ /// 本轮触发原因（pageEnter/sceneActive/pathChange/backoff/manual）。
+    private var pendingRoundReason = "manual"
+ /// 本轮失败候选明细（`round.end.failures`，字段 role/kind/errorClass/ms）。
+    private var roundFailureDetails: [[String: Any]] = []
+ /// 本轮失败过的不同候选（origin 键）；`multiCandidateFail` 按「候选数 ≥2」判定，
+ /// 同一候选的原地快重试不重复计数。
+    private var roundFailedCandidateKeys = Set<String>()
+ /// 当前候选拨号的分段耗时（`dial.result.stages`，按协议只填有值的键）。
+    private var dialStages: [String: Int] = [:]
+ /// 当前候选的协议 / 鉴权模式 / 续传模式（attemptConnection/attempt* 写入）。
+    private var dialProto = 1
+    private var dialAuthMode = "ecdsa"
+    private var dialResumeMode = "-"
  /// P0: E2E-gated `connect-metrics` summary of the last bring-up round.
     @Published private(set) var connectionMetricsValue: String?
  /// task-2 (reconnect): E2E-gated one-line `[RECONNECT]...` summary of the last
@@ -1023,7 +1066,9 @@ final class LinkService: ObservableObject {
             origin: origin,
             method: "POST",
             path: "/auth/challenge",
-            headers: ["authorization": "Bearer \(credentials.credential)"],
+ // netlog T-02：握手/鉴权也属于本轮连接，带当前 trace（旧插件忽略未知头）。
+            headers: ["authorization": "Bearer \(credentials.credential)"]
+                .merging(currentTraceHeaders()) { _, new in new },
             body: .object(["purpose": .string(purpose)]),
             leafPin: credentials.leafPin,
             caCertBase64: credentials.caCertBase64,
@@ -1049,6 +1094,7 @@ final class LinkService: ObservableObject {
             origin: origin,
             method: "POST",
             path: "/auth/verify",
+            headers: currentTraceHeaders(),
             body: .object([
                 "challengeId": .string(challengeId),
                 "signature": .string(signature),
@@ -1151,6 +1197,8 @@ final class LinkService: ObservableObject {
             phase = .unpaired
             return
         }
+ // netlog T-02：显式发起的连接轮次（配对完成/用户点重连）记为 manual。
+        pendingRoundReason = "manual"
  // T2(B2)：手动断开后重连时恢复本机持久化的 api token。
         restorePersistedAPIToken()
         retryTask?.cancel()
@@ -1166,8 +1214,11 @@ final class LinkService: ObservableObject {
         }
     }
 
-    func reconnectNow() {
+    func reconnectNow(reason: String = "manual") {
         guard credentials != nil else { return }
+ // netlog T-02：记录本轮触发原因（pageEnter/sceneActive/pathChange/manual），
+ // 由下一次 `connectOnce` 消费到 `round.start.reason`。
+        pendingRoundReason = reason
  // task-2: page enter + scenePhase + path change can all request a reconnect
  // in the same few milliseconds; restarting a just-started round would cancel
  // the candidate that is about to win. (An explicit user retry after a long
@@ -1327,8 +1378,8 @@ final class LinkService: ObservableObject {
  // invalidates it already; this is the scenePhase race window.
             if networkPathChangedSinceConnect {
                 ReconnectMetrics.markInvalidate(reason: "foreground/pathChanged")
-                teardownTransport()
-                reconnectNow()
+                teardownTransport(reason: "foreground/pathChanged")
+                reconnectNow(reason: "sceneActive")
             } else {
  // T2(B2)：前台恢复且链路可复用时按需续期 api token。
                 renewAPITokenIfNeededAfterConnect()
@@ -1339,7 +1390,7 @@ final class LinkService: ObservableObject {
  // the candidate that is about to succeed (foreground resume must not turn
  // a 1s connect into a full retry).
         guard !isConnecting else { return }
-        reconnectNow()
+        reconnectNow(reason: "sceneActive")
     }
 
  // MARK: - task-2 reconnect triggers
@@ -1399,15 +1450,15 @@ final class LinkService: ObservableObject {
             if networkPathChangedSinceConnect {
                 ReconnectMetrics.markInvalidate(reason: "pageEnter/pathChanged")
                 endpointsDirty = true
-                teardownTransport()
-                reconnectNow()
+                teardownTransport(reason: "pageEnter/pathChanged")
+                reconnectNow(reason: "pageEnter")
             } else {
                 ReconnectMetrics.markReuseDecision()
             }
         case .reconnecting, .disconnected:
  // The backoff wait exists to space out unattended retries; an explicit
  // page enter is a user-visible resume and must not wait for it.
-            reconnectNow()
+            reconnectNow(reason: "pageEnter")
         case .connecting, .unpaired, .needsRepair:
             break
         }
@@ -1422,6 +1473,8 @@ final class LinkService: ObservableObject {
         ScrollHitchProbe.mark("e2ePathChanged", ["phase": String(describing: phase)])
         #endif
         ReconnectMetrics.markPathChange()
+ // netlog T-02：网络路径有意义变化（from/to、本机网段、接口列表、VPN 标记）。
+        recordPathChanged()
  // 真机验收根因：池化 HTTPS 连接是旧网络上拨的——5G→WiFi 后
  // 蜂窝接口不立刻死（socket 仍 ESTABLISHED），但路由已切走：连接静默黑洞
  // 化。新拨号的鉴权复用它，烧满 1.5s 首字节看门狗（真机 4895ms 复盘：
@@ -1429,6 +1482,12 @@ final class LinkService: ObservableObject {
  // 断开时 socket 立刻报错、直接走新连接。路径一变就清池：新网络一律新
  // 连接（与 WSS 的 TLS 并行建立，不增长关键路径）。
         HTTPConnectionPool.shared.closeAll()
+ // netlog T-02：池关闭事件（原因固定为语义化 token，不带地址）。
+        record("pool.close", [
+            "reason": "pathChange",
+            "phase": phase.netlogName,
+            "generation": generation,
+        ])
  // 切换锚定链起点：后面所有退避重试都归到这条链，直到连接成功结算。
  // （手动真实切换验收时 e2ePathChanged → e2eSwitchReconnect 两个 mark 的
  // 差值就是 App 侧真实重连耗时，直接从 hitch jsonl 可读。）
@@ -1440,11 +1499,11 @@ final class LinkService: ObservableObject {
         case .connected:
             ReconnectMetrics.markInvalidate(reason: "pathChange")
             lastErrorText = L10n.t("网络已切换，正在重连…")
-            teardownTransport()
-            reconnectNow()
+            teardownTransport(reason: "pathChange")
+            reconnectNow(reason: "pathChange")
         case .reconnecting, .disconnected:
             ReconnectMetrics.markInvalidate(reason: "pathChange")
-            reconnectNow()
+            reconnectNow(reason: "pathChange")
         case .connecting:
  // Only restart a round that was dialed before the change; a round that
  // already started on the new path must be allowed to finish.
@@ -1453,7 +1512,7 @@ final class LinkService: ObservableObject {
                 pathGeneration: NetworkPathMonitor.shared.changeGeneration
             ) {
                 ReconnectMetrics.markInvalidate(reason: "pathChange/connecting")
-                reconnectNow()
+                reconnectNow(reason: "pathChange")
             }
         case .unpaired, .needsRepair:
             break
@@ -1589,6 +1648,8 @@ final class LinkService: ObservableObject {
 
     func scheduleReconnect() {
         guard credentials != nil, !manuallyDisconnected else { return }
+ // netlog T-02：退避触发的下一轮记为 backoff（`round.start.reason`）。
+        pendingRoundReason = "backoff"
         retryTask?.cancel()
         attempt += 1
  // Any scheduled round is visible: the silent resume window is over.
@@ -1597,10 +1658,17 @@ final class LinkService: ObservableObject {
  // 桌面端重启窗口：上一轮所有候选都是"服务端还没起来"（插件未就绪 / 网关 5xx /
  // 地址不可达 / 超时）时，用短固定退避（400ms 起、+200ms、上限 1.5s）快速探测；
  // 不要用指数退避滚到 10s（用户实测：重启桌面端后开 App 等了约 10 秒）。
-        let delayMs = Self.isBootWindow(classes: lastRoundFailureClasses)
+        let bootWindow = Self.isBootWindow(classes: lastRoundFailureClasses)
+        let delayMs = bootWindow
             ? Self.bootWindowDelayMs(attempt: attemptNumber)
  // Spec §3.8: base 500ms, factor 2, cap 10s, 50% jitter.
             : Self.reconnectDelayMs(attempt: attemptNumber, randomUnit: Double.random(in: 0...1))
+ // netlog T-02：`reconnect.scheduled`（退避调度：第几次/等待时长/是否启动窗口）。
+        record("reconnect.scheduled", [
+            "attempt": attemptNumber,
+            "delayMs": Int(delayMs * 1000),
+            "bootWindow": bootWindow,
+        ])
         phase = .reconnecting(attempt: attemptNumber)
         retryTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: UInt64(delayMs * 1_000_000))
@@ -1632,7 +1700,7 @@ final class LinkService: ObservableObject {
  // 一帧起算 ≈ 本时刻）。
         let roundStartedAt = Date()
         let silentResume = p1SilentResume
-        teardownTransport(keepP1Resume: silentResume)
+        teardownTransport(keepP1Resume: silentResume, reason: "roundStart")
  // A silent resume keeps `phase ==.connected` on purpose: no view model
  // observes a disconnect, so the replay can continue its streams.
         if !silentResume {
@@ -1656,6 +1724,15 @@ final class LinkService: ObservableObject {
             phase = .needsRepair(L10n.t("配对凭据没有可用的服务器地址，请重新配对"))
             return
         }
+ // netlog T-02：每轮连接生成一个 traceId（AC-11），并消费本轮触发原因。
+ // 之后本轮的握手/鉴权/upgrade/unary 都从这里取值透传给 Mac。
+        let roundReason = pendingRoundReason
+        pendingRoundReason = "manual"
+        let trace = RoundTrace.next()
+        roundTrace = trace
+        roundFailureDetails.removeAll()
+        roundFailedCandidateKeys.removeAll()
+        dialStages.removeAll()
  // link-perf L2（DEC-D + 设计变更二审）：本 App 运行周期首次
  // 连接轮次**无条件**先对主候选 origin 做一次有界 /health 探测再拨号
  // （每周期重读 takeoverWindowMs + 探测插件回退；supportsMuxRPC 写回后
@@ -1775,6 +1852,21 @@ final class LinkService: ObservableObject {
             hasRelay: hasRelay
         )
         let roundDeadline = Date().addingTimeInterval(roundBudget)
+ // netlog T-02：`round.start`（每轮重连开始，设计 §4.2）。放在候选顺序/预算
+ // 确定之后、首个 `candidate.start` 之前，字段含原因/偏好/候选/预算/在飞快照。
+        record("round.start", [
+            "trace": trace,
+            "reason": roundReason,
+            "prefersRelay": prefersRelay,
+            "verifiedLAN": !verifiedLAN.isEmpty,
+            "candidates": dialCandidates.enumerated().map { index, url in
+                NetlogCandidate.fields(url, local: localNetwork, index: index)
+            },
+            "budgetMs": Int(roundBudget * 1000),
+            "generation": generation,
+            "phase": phase.netlogName,
+            "inflight": inflightFields(),
+        ])
         var failures: [String] = []
         var failureClasses: [CandidateFailureClass] = []
         var roundBudgetExhausted = false
@@ -1815,6 +1907,7 @@ final class LinkService: ObservableObject {
                 isConnecting = false
  // DD-14：被取消的轮次（关闭/看门狗/新轮次顶替）从出口补一轮，
  // 否则「关掉在飞轮」之后可能没有任何轮次在跑。
+                recordRoundEnd(outcome: "cancelled", startedAt: roundStartedAt, trace: trace)
                 consumeFollowUpRoundAtRoundExit()
                 return
             }
@@ -1828,6 +1921,13 @@ final class LinkService: ObservableObject {
                 remainingRoundBudget: remaining
             ) else {
                 roundBudgetExhausted = true
+ // netlog T-02：预算耗尽（`round.budgetExhausted`）。remainingMs 取实际剩余
+ // （已 ≤0，记录 0）。
+                record("round.budgetExhausted", [
+                    "trace": trace,
+                    "elapsedMs": max(0, Int(Date().timeIntervalSince(roundStartedAt) * 1000)),
+                    "remainingMs": max(0, Int(remaining * 1000)),
+                ])
                 break
             }
  // dial-first 的首轮是「投机拨号」，蜂窝下的 LAN 候选跨网必然不可达：
@@ -1857,6 +1957,11 @@ final class LinkService: ObservableObject {
             }
  // DD-08：拨号开始即「有进展」，看门狗据此区分卡死与正常慢拨号。
             noteRoundProgress("candidate")
+ // netlog T-02：`candidate.start`（每个候选拨号开始，含 role/kind/port/超时）。
+            var candidateFields = NetlogCandidate.fields(origin, local: localNetwork, index: attemptIndex)
+            candidateFields["trace"] = trace
+            candidateFields["timeoutMs"] = Int(attemptTimeout * 1000)
+            record("candidate.start", candidateFields)
  // authenticateToken() reads `credentials.origin`, so point it at the
  // origin under test before every attempt.
             setCurrentOrigin(origin, persist: false)
@@ -1868,7 +1973,7 @@ final class LinkService: ObservableObject {
                     p1SilentResume = false
                     phase = .reconnecting(attempt: max(1, attempt))
                 }
-                teardownTransport(keepP1Resume: p1SilentResume)
+                teardownTransport(keepP1Resume: p1SilentResume, reason: "candidate")
             }
             let host = origin.host ?? origin.absoluteString
             if prefersRelay, localNetwork == nil,
@@ -1905,6 +2010,16 @@ final class LinkService: ObservableObject {
                     result: CandidateFailureClass.ok.rawValue
                 )
                 ReconnectMetrics.markPickedOrigin(host)
+ // netlog T-02：`dial.result`（成功）。stages 按协议只填本次真正走过的段。
+                recordDialResult(
+                    index: attemptIndex,
+                    origin: origin,
+                    local: localNetwork,
+                    ms: Int((ReconnectMetrics.clock() - candidateStartedAt) * 1000),
+                    result: "connected",
+                    errorClass: CandidateFailureClass.ok.rawValue,
+                    stages: dialStages
+                )
                 setCurrentOrigin(origin, persist: true)
                 if Self.candidateRole(host: origin.host, local: localNetwork) == .lanSameSubnet {
                     // 直连真的连上了：这是「同一网络」最强的证据，下一次重连直接
@@ -1927,6 +2042,15 @@ final class LinkService: ObservableObject {
                 #if DEBUG
                 ScrollHitchProbe.mark("e2eReconnected", ["bump": bumpGeneration, "generation": generation])
                 #endif
+ // netlog T-02：`connected`（AC-02/AC-11：proto/authMode/resumeMode/picked/总耗时）。
+                var connectedFields: [String: Any] = ["trace": trace]
+                connectedFields["proto"] = dialProto
+                connectedFields["authMode"] = dialAuthMode
+                connectedFields["resumeMode"] = dialResumeMode
+                connectedFields["picked"] = NetlogCandidate.fields(origin, local: localNetwork)
+                connectedFields["connectMs"] = max(0, Int(Date().timeIntervalSince(roundStartedAt) * 1000))
+                connectedFields["generation"] = generation
+                record("connected", connectedFields)
  // 切换锚定链结算：网络切换信号 → 此刻连接成功的真实耗时。
                 if let started = switchReconnectStartedAt {
                     switchReconnectStartedAt = nil
@@ -1936,6 +2060,19 @@ final class LinkService: ObservableObject {
                     ScrollHitchProbe.mark("e2eSwitchReconnect", ["ms": ms])
                     #endif
                     linkDebug("switch reconnect settled in \(ms)ms")
+ // netlog T-02：`switch.reconnect`（路径变化触发且已恢复）；>2000ms 视为
+ // 慢切换并触发异常快照（DD-13 slowSwitch）。
+                    let incident = ms > 2000
+                    record("switch.reconnect", [
+                        "trace": trace,
+                        "totalMs": ms,
+                        "picked": NetlogCandidate.fields(origin, local: localNetwork),
+                        "incident": incident,
+                    ])
+                    if incident {
+ // 异常快照由写者统一记录 `incident.trigger`（含 60s 窗口）。
+                        NetworkLog.triggerIncident(trace: trace, kind: "slowSwitch", totalMs: ms)
+                    }
                 }
                 ReconnectMetrics.markConnected()
                 ConnectionMetrics.markConnected()
@@ -1949,6 +2086,7 @@ final class LinkService: ObservableObject {
  // 连接成功即把 Mac 当前端点写回持久化候选（网络再变时手里是新地址）。
                 endpointsDirty = false
                 refreshEndpointsAfterConnect(origin: origin)
+                recordRoundEnd(outcome: "connected", startedAt: roundStartedAt, trace: trace)
                 return
             case .credentialRejected(let reason):
                 #if DEBUG
@@ -1964,6 +2102,22 @@ final class LinkService: ObservableObject {
                     result: CandidateFailureClass.credentialRejected.rawValue
                 )
                 credentialRejections.append(reason)
+                let rejectedMs = Int((ReconnectMetrics.clock() - candidateStartedAt) * 1000)
+                recordDialResult(
+                    index: attemptIndex,
+                    origin: origin,
+                    local: localNetwork,
+                    ms: rejectedMs,
+                    result: "failed",
+                    errorClass: CandidateFailureClass.credentialRejected.rawValue,
+                    stages: dialStages
+                )
+                appendRoundFailure(
+                    origin: origin,
+                    local: localNetwork,
+                    errorClass: CandidateFailureClass.credentialRejected.rawValue,
+                    ms: rejectedMs
+                )
                 failures.append(host + ": " + reason)
                 lastErrorText = reason
                 linkDebug("round: credentialRejected " + Self.originLabel(origin) + " " + reason)
@@ -1983,6 +2137,22 @@ final class LinkService: ObservableObject {
                     result: failureClass.rawValue
                 )
                 failureClasses.append(failureClass)
+                let fastRejectMs = Int((ReconnectMetrics.clock() - candidateStartedAt) * 1000)
+                recordDialResult(
+                    index: attemptIndex,
+                    origin: origin,
+                    local: localNetwork,
+                    ms: fastRejectMs,
+                    result: "failed",
+                    errorClass: failureClass.rawValue,
+                    stages: dialStages
+                )
+                appendRoundFailure(
+                    origin: origin,
+                    local: localNetwork,
+                    errorClass: failureClass.rawValue,
+                    ms: fastRejectMs
+                )
                 failures.append(host + ": " + reason)
  // Fast reject: the server answered, so switch candidates with no
  // timeout wait and no retry of this origin. Keep a clear interim
@@ -2008,6 +2178,22 @@ final class LinkService: ObservableObject {
                 )
                 failureClasses.append(failureClass)
                 failures.append(host + ": " + reason)
+                let failedMs = Int((ReconnectMetrics.clock() - candidateStartedAt) * 1000)
+                recordDialResult(
+                    index: attemptIndex,
+                    origin: origin,
+                    local: localNetwork,
+                    ms: failedMs,
+                    result: failureClass == .cancelled ? "cancelled" : "failed",
+                    errorClass: failureClass.rawValue,
+                    stages: dialStages
+                )
+                appendRoundFailure(
+                    origin: origin,
+                    local: localNetwork,
+                    errorClass: failureClass.rawValue,
+                    ms: failedMs
+                )
                 lastErrorText = reason
  // link-perf L1（设计变更二审兜底）：按已知窗口对齐的
  // 快重试仍收到 409 → 真实接管窗口比已知值宽（插件回退/配置变更）。
@@ -2037,6 +2223,13 @@ final class LinkService: ObservableObject {
                     let sinceRoundStart = Date().timeIntervalSince(roundStartedAt)
                     let align = muxConflictRetryAlignSeconds
                     let waitSeconds = max(isMuxConflict ? 0 : 0.35, align - sinceRoundStart)
+ // netlog T-02：`mux409.align`（409 对齐窗口：实际等待 + 插件接管窗口）。
+                    if isMuxConflict {
+                        record("mux409.align", [
+                            "ms": Int(waitSeconds * 1000),
+                            "windowMs": Int(align * 1000),
+                        ])
+                    }
  // 409 取证（设计变更三审，AC-01 验收）：首拨时长 / 409 收到
  // 时刻（轮起点起算）/ 重试预计发出时刻 / 对齐值。
                     let dialMs = Int((ReconnectMetrics.clock() - candidateStartedAt) * 1000)
@@ -2097,6 +2290,7 @@ final class LinkService: ObservableObject {
         isConnecting = false
         if Task.isCancelled {
  // DD-14：同上——轮次出口按现有退避补一轮（0.3s 去抖）。
+            recordRoundEnd(outcome: "cancelled", startedAt: roundStartedAt, trace: trace)
             consumeFollowUpRoundAtRoundExit()
             return
         }
@@ -2110,6 +2304,7 @@ final class LinkService: ObservableObject {
  // 需要重新配对：补轮不会成功，清掉标志（DD-14）。
             needsFollowUpRound = false
             phase = .needsRepair(credentialRejections.last ?? L10n.t("配对凭据被拒绝，请重新配对"))
+            recordRoundEnd(outcome: "allFailed", startedAt: roundStartedAt, trace: trace)
             return
         }
         if roundBudgetExhausted {
@@ -2129,6 +2324,11 @@ final class LinkService: ObservableObject {
         _ = rotateOriginIfPossible(reason: failures.last ?? L10n.t("连接失败"))
  // DD-14：本轮自己就会退避补一轮，清掉补轮标志避免出口再叠一轮。
         needsFollowUpRound = false
+        recordRoundEnd(
+            outcome: roundBudgetExhausted ? "budgetExhausted" : "allFailed",
+            startedAt: roundStartedAt,
+            trace: trace
+        )
         scheduleReconnect()
     }
 
@@ -2194,6 +2394,15 @@ final class LinkService: ObservableObject {
         roundWatchdogForced = true
         let idleMs = max(0, Int(idleSeconds * 1000))
         let origin = credentials?.origin ?? "-"
+ // netlog T-02：`round.watchdog`（轮次无进展看门狗；每轮最多强制一次 → forced=true）。
+        record("round.watchdog", [
+            "trace": roundTrace ?? RoundTrace.current ?? "",
+            "idleMs": idleMs,
+            "thresholdMs": Int((roundProgressWatchdogSecondsForTesting ?? Self.roundProgressWatchdogSeconds) * 1000),
+            "phase": phase.netlogName,
+            "generation": generation,
+            "forced": true,
+        ])
  // 审计日志：复用 App 现有日志通道（`--console` / E2E 采集可见）。
         NSLog(
             "[CONNWATCHDOG] no progress %ldms origin=%@ → force parallel discovery + rechallenge",
@@ -2419,6 +2628,11 @@ final class LinkService: ObservableObject {
         timeout: TimeInterval,
         coldStartOptimistic: Bool = false
     ) async -> ConnectAttemptOutcome {
+ // netlog T-02：每次候选尝试重置分段耗时与协议标记（`dial.result.stages`）。
+        dialStages = [:]
+        dialProto = 1
+        dialAuthMode = "ecdsa"
+        dialResumeMode = "-"
  // link-perf L2：flag 语义反转后 `AppSettings.remoteProtocolV2`
  // 默认 on（env/UserDefaults 显式覆盖优先）；能否走 P1 由 supportsMuxRPC
  // （配对/冷启动探测/welcome 缓存）与会话级回退状态把关。
@@ -2433,6 +2647,7 @@ final class LinkService: ObservableObject {
             fellBackToLegacy: p1FellBackToLegacy,
             coldStartOptimistic: coldStartOptimistic
         ) == .p1 {
+            dialProto = 2
             switch await attemptP1Connection(origin: origin, leafPin: leafPin, timeout: timeout) {
             case .connected(let bumpGeneration):
                 return .connected(bumpGeneration: bumpGeneration)
@@ -2450,8 +2665,12 @@ final class LinkService: ObservableObject {
                 teardownP1Channel()
                 ConnectionMetrics.markFallbackLegacy()
                 lastErrorText = reason
+ // netlog T-02：同一候选内回退 legacy，分段耗时重新计。
+                dialProto = 1
+                dialStages = [:]
             }
         }
+        dialProto = 1
         return await attemptLegacyConnection(origin: origin, leafPin: leafPin, timeout: timeout)
     }
 
@@ -2485,6 +2704,8 @@ final class LinkService: ObservableObject {
             return .failed(L10n.t("origin 缺少 host"))
         }
         let port = UInt16(origin.port ?? 443)
+ // netlog T-02：本候选的阶段计时基准（stages 记录各阶段完成时刻，相对拨号开始）。
+        let stageStart = Date()
 
  // cold start <1s（第二级）：TCP+TLS 建立与 mux token 的
  // challenge/verify 互不依赖。真机拆解显示 TLS 段 ~300ms、auth 段 ~100ms，
@@ -2536,6 +2757,9 @@ final class LinkService: ObservableObject {
         ConnectionMetrics.markAuth()
  // DD-08：鉴权完成（challenge+verify 往返）。
         noteRoundProgress("legacy:auth")
+        dialStages["authMs"] = max(0, Int(Date().timeIntervalSince(stageStart) * 1000))
+        dialAuthMode = "ecdsa"
+        dialResumeMode = "-"
         if Task.isCancelled {
             apiTokenPrefetch.cancel()
             wsPrepare.cancel()
@@ -2557,6 +2781,7 @@ final class LinkService: ObservableObject {
         }
  // DD-08：TCP+TLS 建立完成。
         noteRoundProgress("legacy:tls")
+        dialStages["tcpTlsMs"] = max(0, Int(Date().timeIntervalSince(stageStart) * 1000))
         ws.setUpgradeHeaders(["authorization": "Bearer \(muxToken)"])
         do {
             try await ws.upgrade(timeout: timeout)
@@ -2574,6 +2799,7 @@ final class LinkService: ObservableObject {
         ConnectionMetrics.markWS()
  // DD-08：HTTP upgrade（101）完成。
         noteRoundProgress("legacy:upgrade")
+        dialStages["upgradeMs"] = max(0, Int(Date().timeIntervalSince(stageStart) * 1000))
         guard self.ws === ws else {
             apiTokenPrefetch.cancel()
             return .failed(L10n.t("连接被取消"))
@@ -2583,6 +2809,7 @@ final class LinkService: ObservableObject {
             self?.handleTransportLost(error: error)
         }
         self.mux = mux
+        dialStages["muxMs"] = max(0, Int(Date().timeIntervalSince(stageStart) * 1000))
  // 冷启动 <1s（用户人工验收）：mux 一旦建立，unary 与 streams 都已可用；
  // `$events` ready 是连接路径上最后 ~150ms，而列表请求根本不依赖它。
  // 因此这里立即返回 connected，把 ready 握手放到后台完成：
@@ -2625,6 +2852,8 @@ final class LinkService: ObservableObject {
         }
         let port = UInt16(origin.port ?? 443)
         let resume = p1ResumeCursor()
+ // netlog T-02：本候选的阶段计时基准（stages 记录各阶段完成时刻，相对拨号开始）。
+        let stageStart = Date()
 
  // DD-12：票据本地 exp 预检 + ECDSA token 与 hello 并行预取。
  //
@@ -2674,6 +2903,9 @@ final class LinkService: ObservableObject {
             }
         }
         if Task.isCancelled { return .failed(L10n.t("已取消")) }
+ // netlog T-02：鉴权阶段完成（ticket 无额外往返 / ECDSA challenge+verify）。
+        dialAuthMode = authMode
+        dialStages["authMs"] = max(0, Int(Date().timeIntervalSince(stageStart) * 1000))
 
  // Reuse the retained channel after a socket loss (its stream table is the
  // resume state); a cold round builds a fresh one (design §5).
@@ -2688,6 +2920,9 @@ final class LinkService: ObservableObject {
  // 覆盖「通知丢失 / 在未连接状态下改开关 / 重挂轮次」三种情形——活连接
  // 立即生效的重挂见 `applyProjV1SettingChange`。
         channel.applyWantsProjV1ForRemount(AppSettings.projV1Enabled)
+ // netlog T-02：本轮 trace 随 hello 顶层与 upgrade 头带给 Mac（旧插件忽略未知
+ // 字段/头；不改协议版本）。
+        channel.trace = roundTrace ?? RoundTrace.current
         var rejectedTicket: String?
         var retriedTicket = false
         var retriedBackoff = false
@@ -2714,6 +2949,8 @@ final class LinkService: ObservableObject {
                 ConnectionMetrics.markWS()
  // DD-08：welcome 到达（鉴权 + hello 往返完成）。
                 noteRoundProgress("p1:welcome")
+                dialStages["welcomeMs"] = max(0, Int(Date().timeIntervalSince(stageStart) * 1000))
+                dialResumeMode = welcome.resume.mode.rawValue
                 p1Channel = channel
                 channel.onClose = { [weak self] failure in
                     self?.handleP1Close(failure)
@@ -3010,6 +3247,16 @@ final class LinkService: ObservableObject {
     func handleP1Close(_ failure: P1Failure) {
         guard phase.isConnected || phase.isBusy || readyContinuation != nil else { return }
         let disposition = P1ResumePolicy.disposition(for: failure)
+ // netlog T-02：`transport.lost`（P1：closeCode + 是否可 resume/回退 legacy）。
+        var lostFields: [String: Any] = [
+            "proto": 2,
+            "reason": failure.userMessage,
+            "resumeEligible": disposition == .retainForResume,
+            "fallback": disposition == .fallbackLegacy,
+        ]
+        if let closeCode = failure.closeCode { lostFields["closeCode"] = closeCode }
+        if let connectedMs = connectedMsSinceLastConnect() { lostFields["connectedMs"] = connectedMs }
+        record("transport.lost", lostFields)
         if disposition == .fallbackLegacy {
             p1FellBackToLegacy = true
             p1SilentResume = false
@@ -3079,6 +3326,15 @@ final class LinkService: ObservableObject {
     func handleTransportLost(error: Error?) {
         guard phase.isConnected || phase.isBusy || readyContinuation != nil else { return }
         let reason = error.map { NetworkErrorInterpreter.message(for: $0) } ?? L10n.t("未知原因")
+ // netlog T-02：`transport.lost`（legacy：proto=1；P1 在 `handleP1Close` 记）。
+        var lostFields: [String: Any] = [
+            "proto": 1,
+            "reason": reason,
+            "resumeEligible": false,
+            "fallback": false,
+        ]
+        if let connectedMs = connectedMsSinceLastConnect() { lostFields["connectedMs"] = connectedMs }
+        record("transport.lost", lostFields)
         lastErrorText = L10n.f("连接中断：%@", reason)
         failReady(LinkError.transport(L10n.f("连接中断: %@", reason)))
         teardownTransport()
@@ -3181,7 +3437,13 @@ final class LinkService: ObservableObject {
  /// streams and the `$events` subscription stay alive so `hello{resume}`
  /// can continue them (design §5 `RESUMING`). Every other caller does a
  /// full teardown.
-    func teardownTransport(keepP1Resume: Bool = false) {
+    func teardownTransport(keepP1Resume: Bool = false, reason: String = "teardown") {
+ // netlog T-02：断链收尾（`teardown`）：原因/phase/generation。
+        record("teardown", [
+            "reason": reason,
+            "phase": phase.netlogName,
+            "generation": generation,
+        ])
         readyTimeoutTask?.cancel()
         readyTimeoutTask = nil
  // the $events handshake now runs after `connected`; a teardown
@@ -3523,6 +3785,106 @@ final class LinkService: ObservableObject {
         #if DEBUG
         NSLog("[LINKHEAL] %@", message)
         #endif
+    }
+
+// MARK: - netlog T-02：事件挂点辅助（只读/只构造字段，不做 I/O）
+
+ /// 当前轮 trace 的请求头；未进入轮次时返回空字典（调用方不必判空）。
+    func currentTraceHeaders() -> [String: String] {
+        guard let trace = roundTrace ?? RoundTrace.current, !trace.isEmpty else { return [:] }
+        return ["x-dshm-trace": trace]
+    }
+
+ /// `round.start.inflight` 的在飞快照（DD-18）。
+    private func inflightFields() -> [String: Any] {
+        let snapshot = InflightTracker.shared.snapshot()
+        return [
+            "count": snapshot.count,
+            "endpoints": snapshot.endpoints,
+            "oldestMs": snapshot.oldestMs,
+        ]
+    }
+
+ /// `phase.changed.reason`：按目标状态给出稳定原因；轮次级 phase 用发起原因。
+    private var phaseChangeReason: String {
+        switch phase {
+        case .connected: return "connected"
+        case .connecting, .reconnecting: return pendingRoundReason
+        case .needsRepair: return "needsRepair"
+        case .disconnected: return "disconnect"
+        case .unpaired: return "unpaired"
+        }
+    }
+
+ /// `dial.result`：每个候选一次（瞬态快失败会原地重拨，因而会记录两次）。
+    private func recordDialResult(
+        index: Int,
+        origin: URL,
+        local: LocalIPv4Network?,
+        ms: Int,
+        result: String,
+        errorClass: String?,
+        stages: [String: Int]
+    ) {
+        var fields = NetlogCandidate.fields(origin, local: local, index: index)
+        fields["trace"] = roundTrace ?? RoundTrace.current ?? ""
+        fields["proto"] = dialProto
+        fields["ms"] = ms
+        fields["result"] = result
+        if let errorClass { fields["errorClass"] = errorClass }
+        if !stages.isEmpty { fields["stages"] = stages }
+        record("dial.result", fields)
+    }
+
+ /// `round.end.failures` 的一条失败明细（字段与设计 §4.2 一致：role/kind/errorClass/ms）。
+    private func appendRoundFailure(origin: URL, local: LocalIPv4Network?, errorClass: String, ms: Int) {
+        let role = Self.candidateRole(host: origin.host, local: local)
+        roundFailedCandidateKeys.insert(Self.originKey(origin))
+        roundFailureDetails.append([
+            "role": NetlogCandidate.roleName(role),
+            "kind": NetlogCandidate.kindName(host: origin.host, role: role),
+            "errorClass": errorClass,
+            "ms": ms,
+        ])
+    }
+
+ /// `round.end` + 异常快照触发（DD-13：allFailed/budgetExhausted 且失败候选 ≥2）。
+    private func recordRoundEnd(outcome: String, startedAt: Date, trace: String) {
+        let elapsedMs = max(0, Int(Date().timeIntervalSince(startedAt) * 1000))
+        record("round.end", [
+            "trace": trace,
+            "outcome": outcome,
+            "elapsedMs": elapsedMs,
+            "failures": roundFailureDetails,
+        ])
+        guard outcome == "allFailed" || outcome == "budgetExhausted",
+              roundFailedCandidateKeys.count >= 2 else { return }
+ // 异常快照由写者统一记录 `incident.trigger`（含 60s 窗口），这里只触发。
+        NetworkLog.triggerIncident(trace: trace, kind: "multiCandidateFail", totalMs: elapsedMs)
+    }
+
+ /// 距最近一次连接成功的毫秒数（`transport.lost.connectedMs`）。
+    private func connectedMsSinceLastConnect() -> Int? {
+        guard let lastConnectedAt else { return nil }
+        return max(0, Int(Date().timeIntervalSince(lastConnectedAt) * 1000))
+    }
+
+ /// `path.changed`：网络路径有意义变化的前后快照 + 本机网段 + 接口/VPN。
+    private func recordPathChanged() {
+        let monitor = NetworkPathMonitor.shared
+        let (interfaces, vpnHint) = NetworkPathMonitor.loggingInterfaceSnapshot()
+        var fields: [String: Any] = [
+            "from": NetlogPath.snapshotFields(monitor.previousSnapshot),
+            "to": NetlogPath.snapshotFields(monitor.snapshot),
+            "interfaces": interfaces,
+            "vpnHint": vpnHint,
+            "generation": generation,
+            "phase": phase.netlogName,
+        ]
+        if let localIPv4 = NetlogPath.localIPv4(monitor.currentLocalIPv4Network()) {
+            fields["localIPv4"] = localIPv4
+        }
+        record("path.changed", fields)
     }
 }
 

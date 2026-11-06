@@ -358,7 +358,9 @@ final class HTTPSClient {
         caCertBase64: String? = nil,
         timeout: TimeInterval = 20,
         pool: HTTPConnectionPool = .shared,
-        parameters: NWParameters? = nil
+        parameters: NWParameters? = nil,
+ /// netlog T-02：调用方附加的请求头（`x-dshm-trace`）；旧插件忽略未知头。
+        headers: [String: String] = [:]
     ) async throws -> JSONValue {
         guard let host = origin.host, !host.isEmpty else {
             throw LinkError.transport("origin 无可解析 host: \(origin.absoluteString)")
@@ -366,15 +368,17 @@ final class HTTPSClient {
         let port = UInt16(origin.port ?? 443)
         let envelope = ClientRequestEnvelope(method: endpoint, args: args)
         let body = try JSONEncoder().encode(envelope)
+        var allHeaders: [String: String] = [
+            "content-type": "application/json",
+            "authorization": "Bearer \(token)",
+            "accept": "application/json",
+            "accept-encoding": "gzip",
+        ]
+        for (name, value) in headers { allHeaders[name.lowercased()] = value }
         let request = HTTPRequest(
             method: "POST",
             path: "/api/\(endpoint)",
-            headers: [
-                "content-type": "application/json",
-                "authorization": "Bearer \(token)",
-                "accept": "application/json",
-                "accept-encoding": "gzip",
-            ],
+            headers: allHeaders,
             body: body
         )
         let response = try await HTTPSClient(host: host, port: port, leafPin: leafPin, caCertBase64: caCertBase64, pool: pool, parameters: parameters)
@@ -479,7 +483,9 @@ final class HTTPSClient {
         token: String,
         leafPin: String?,
         caCertBase64: String? = nil,
-        timeout: TimeInterval = 20
+        timeout: TimeInterval = 20,
+ /// netlog T-02：调用方附加的请求头（`x-dshm-trace`）。
+        headers: [String: String] = [:]
     ) async throws -> (status: Int, json: JSONValue?, body: String) {
         guard let host = origin.host, !host.isEmpty else {
             throw LinkError.transport("origin 无可解析 host: \(origin.absoluteString)")
@@ -497,14 +503,16 @@ final class HTTPSClient {
                 }
             pathWithQuery += "?" + pairs.joined(separator: "&")
         }
+        var allHeaders: [String: String] = [
+            "authorization": "Bearer \(token)",
+            "accept": "application/json",
+            "accept-encoding": "gzip",
+        ]
+        for (name, value) in headers { allHeaders[name.lowercased()] = value }
         let request = HTTPRequest(
             method: "GET",
             path: pathWithQuery,
-            headers: [
-                "authorization": "Bearer \(token)",
-                "accept": "application/json",
-                "accept-encoding": "gzip",
-            ],
+            headers: allHeaders,
             body: nil
         )
         let response = try await HTTPSClient(host: host, port: port, leafPin: leafPin, caCertBase64: caCertBase64).perform(request, timeout: timeout)

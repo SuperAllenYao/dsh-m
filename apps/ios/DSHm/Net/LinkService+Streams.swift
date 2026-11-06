@@ -76,19 +76,36 @@ extension LinkService {
  /// budget, so a single-candidate round could take ≈26s while the UI showed
  /// 「正在连接 Mac…」 (handoff §5.4-2). Cap: first wait ≤6s, reopen ≤2s.
     func openEventsAndWaitReady(mux: RemoteMux, timeout: TimeInterval) async throws {
+        let startedAt = Date()
+ // netlog T-02：抓发起时刻的 trace——connected 之后的异步握手可能跨到下一轮。
+        let trace = RoundTrace.current
         let firstWait = max(1.0, min(timeout, 6))
         let reopenWait = max(0.8, min(timeout, 2))
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            self.readyContinuation = continuation
-            self.readyHandshakeGeneration &+= 1
-            self.readyReopenUsed = false
-            self.openEventsStream(
-                mux: mux,
-                generation: self.readyHandshakeGeneration,
-                timeout: firstWait,
-                reopenTimeout: reopenWait
+        do {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                self.readyContinuation = continuation
+                self.readyHandshakeGeneration &+= 1
+                self.readyReopenUsed = false
+                self.openEventsStream(
+                    mux: mux,
+                    generation: self.readyHandshakeGeneration,
+                    timeout: firstWait,
+                    reopenTimeout: reopenWait
+                )
+            }
+        } catch {
+ // netlog T-02：`$events` ready 是 connected 之后才完成的异步阶段，
+ // 由 `stage.events` 记录（dial.result 已经返回，覆盖不到这一段）。
+            NetlogStage.record(
+                "events",
+                startedAt: startedAt,
+                ok: false,
+                errorClass: NetlogStage.errorClass(for: error),
+                trace: trace
             )
+            throw error
         }
+        NetlogStage.record("events", startedAt: startedAt, ok: true, trace: trace)
     }
 
  /// One `$events` open plus its `ready` wait (bounded first try, then the
@@ -184,6 +201,9 @@ extension LinkService {
  /// already the ready signal, so this only subscribes to `$events` (forwarded
  /// approvals/questions) and seeds `clientId`. No 15s wait, no continuation.
     func openEventsAndWaitReadyP1(channel: P1Channel) throws {
+        let startedAt = Date()
+ // netlog T-02：抓发起时刻的 trace（与 legacy 的 $events 握手同一口径）。
+        let trace = RoundTrace.current
         guard let welcome = channel.welcome else { throw LinkError.notConnected }
  // 新连接的 `$events` 还没 ready：在收到本连接的 ready 帧之前，不能用
  // `welcome.deviceId` 这个种子值去回答 waterfall（会被判成另一个 Peer）。
@@ -191,21 +211,35 @@ extension LinkService {
         clientId = welcome.deviceId
         readyTimeoutTask?.cancel()
         readyTimeoutTask = nil
-        eventsStream = try channel.openStream(
-            endpoint: "$events",
-            args: [:],
-            onItem: { [weak self] value in
-                self?.handleRemoteEventItem(value)
-            },
-            onEnd: { [weak self] in
+        do {
+            eventsStream = try channel.openStream(
+                endpoint: "$events",
+                args: [:],
+                onItem: { [weak self] value in
+                    self?.handleRemoteEventItem(value)
+                },
+                onEnd: { [weak self] in
  // The connection itself stays up (welcome already made it ready);
  // only the approval/question waterfall is affected.
-                self?.noteP1EventsStreamLoss(L10n.t("$events 流被服务端结束"))
-            },
-            onError: { [weak self] error in
-                self?.noteP1EventsStreamLoss(error.message)
-            }
-        )
+                    self?.noteP1EventsStreamLoss(L10n.t("$events 流被服务端结束"))
+                },
+                onError: { [weak self] error in
+                    self?.noteP1EventsStreamLoss(error.message)
+                }
+            )
+        } catch {
+ // netlog T-02：P1 的 `$events` 订阅在 welcome（connected）之后，由
+ // `stage.events` 记录这次异步阶段的成败。
+            NetlogStage.record(
+                "events",
+                startedAt: startedAt,
+                ok: false,
+                errorClass: NetlogStage.errorClass(for: error),
+                trace: trace
+            )
+            throw error
+        }
+        NetlogStage.record("events", startedAt: startedAt, ok: true, trace: trace)
     }
 
  // MARK: - Forwarded events (approval waterfall)
@@ -349,6 +383,12 @@ extension LinkService {
         timeout: TimeInterval = 20,
         originOverride: URL? = nil
     ) async throws -> JSONValue {
+ // netlog T-02：所有 unary 从这里统一登记在飞请求（DD-18 的 inflight 快照），
+ // 并把当前轮 trace 注入两个出口（legacy 请求头 / P1 帧 headers）。
+ // 登记/注销都是内存操作；编码与写盘由 NetworkLog 串行队列负责（AC-13）。
+        InflightTracker.shared.begin(endpoint)
+        defer { InflightTracker.shared.end(endpoint) }
+        let traceHeaders = currentTraceHeaders()
         if let p1 = p1Channel, p1.isReady {
  // 协议 v1：协商 projV1 后插件把 `session/page` 成功响应改为
  // `0x02` 分帧（契约 §5/§6）。普通 unary 调用方（首页/页间预取、lazy-fetch
@@ -357,7 +397,12 @@ extension LinkService {
  // `projectedSessionPageStream`。
             if endpoint == "session/page", p1.projV1Negotiated {
                 do {
-                    return try await Self.projectedPageValue(p1: p1, args: args, timeout: timeout)
+                    return try await Self.projectedPageValue(
+                        p1: p1,
+                        args: args,
+                        timeout: timeout,
+                        headers: traceHeaders
+                    )
                 } catch let failure as P1Failure {
                     throw P1UnaryMapping.linkError(from: failure)
                 } catch let protocolError as P1ProtocolError {
@@ -365,7 +410,12 @@ extension LinkService {
                 }
             }
             do {
-                let result = try await p1.unary(endpoint: endpoint, args: args, timeout: timeout)
+                let result = try await p1.unary(
+                    endpoint: endpoint,
+                    args: args,
+                    timeout: timeout,
+                    headers: traceHeaders
+                )
                 return try P1UnaryMapping.jsonValue(from: result)
             } catch let failure as P1Failure {
                 throw P1UnaryMapping.linkError(from: failure)
@@ -384,7 +434,8 @@ extension LinkService {
                 token: token,
                 leafPin: credentials.leafPin,
                 caCertBase64: credentials.caCertBase64,
-                timeout: timeout
+                timeout: timeout,
+                headers: traceHeaders
             )
         } catch let error as LinkError {
             if case .httpStatus(let status, let body) = error,
@@ -398,7 +449,8 @@ extension LinkService {
                     token: token,
                     leafPin: credentials.leafPin,
                     caCertBase64: credentials.caCertBase64,
-                    timeout: timeout
+                    timeout: timeout,
+                    headers: traceHeaders
                 )
             }
             throw error
@@ -421,18 +473,45 @@ extension LinkService {
         onError: @escaping (RemoteError) -> Void,
         onClose: @escaping (Int, String) -> Void
     ) throws -> RemoteStreamHandle {
-        if let p1 = p1Channel, p1.isReady {
-            return try p1.openStream(
+ // netlog T-02：流式请求也登记进 inflight（打开→结束/关闭/错误时注销）。
+ // 只包一层回调，不改变原有回调顺序或线程语义。
+        InflightTracker.shared.begin(endpoint)
+        let trackedEnd = {
+            InflightTracker.shared.end(endpoint)
+            onEnd()
+        }
+        let trackedError: (RemoteError) -> Void = { error in
+            InflightTracker.shared.end(endpoint)
+            onError(error)
+        }
+        let trackedClose: (Int, String) -> Void = { code, reason in
+            InflightTracker.shared.end(endpoint)
+            onClose(code, reason)
+        }
+        do {
+            if let p1 = p1Channel, p1.isReady {
+                return try p1.openStream(
+                    endpoint: endpoint,
+                    args: args,
+                    onItem: onItem,
+                    onEnd: trackedEnd,
+                    onError: trackedError,
+                    onClose: trackedClose
+                )
+            }
+            guard phase.isConnected, let mux else { throw LinkError.notConnected }
+            return try mux.openStream(
                 endpoint: endpoint,
                 args: args,
                 onItem: onItem,
-                onEnd: onEnd,
-                onError: onError,
-                onClose: onClose
+                onEnd: trackedEnd,
+                onError: trackedError,
+                onClose: trackedClose
             )
+        } catch {
+            InflightTracker.shared.end(endpoint)
+            throw error
         }
-        guard phase.isConnected, let mux else { throw LinkError.notConnected }
-        return try mux.openStream(endpoint: endpoint, args: args, onItem: onItem, onEnd: onEnd, onError: onError, onClose: onClose)
     }
 
  // MARK: - APNs device token registration (plugin PAIRING §5.3)
@@ -652,6 +731,9 @@ extension LinkService {
  /// one line per attempt behind `DSHM_CHANGESDBG=1`.
     func exactFetchJSON(path: String, query: [String: String], timeout: TimeInterval = 20) async throws -> JSONValue? {
         guard let credentials else { throw LinkError.notPaired }
+ // netlog T-02：精确取数也是 unary 请求：登记在飞 + trace 透传（legacy GET）。
+        InflightTracker.shared.begin(path)
+        defer { InflightTracker.shared.end(path) }
         let origins = exactFetchOrigins()
         guard let primary = origins.first else { throw LinkError.transport(L10n.t("配对 origin 非法")) }
         let seq = query["seq"] ?? "-"
@@ -710,14 +792,19 @@ extension LinkService {
         credentials: PairingCredentials,
         timeout: TimeInterval
     ) async throws -> (status: Int, json: JSONValue?, body: String) {
-        try await HTTPSClient.exactGETJSON(
+        var traceHeaders: [String: String] = [:]
+        if let trace = RoundTrace.current, !trace.isEmpty {
+            traceHeaders["x-dshm-trace"] = trace
+        }
+        return try await HTTPSClient.exactGETJSON(
             origin: origin,
             path: path,
             query: query,
             token: token,
             leafPin: credentials.leafPin,
             caCertBase64: credentials.caCertBase64,
-            timeout: timeout
+            timeout: timeout,
+            headers: traceHeaders
         )
     }
 
@@ -836,7 +923,12 @@ extension LinkService {
         timeout: TimeInterval = 10
     ) throws -> P1ProjectedStream? {
         guard let p1 = p1Channel, p1.isReady, p1.projV1Negotiated else { return nil }
-        return try p1.unaryProjected(endpoint: "session/page", args: args, timeout: timeout)
+        return try p1.unaryProjected(
+            endpoint: "session/page",
+            args: args,
+            timeout: timeout,
+            headers: currentTraceHeaders()
+        )
     }
 
  /// 消费一整页投影帧 → 旧 JSON 页信封（`{records:[{type:"event",event,seq}], hasMore}`）。
@@ -847,14 +939,16 @@ extension LinkService {
     private static func projectedPageValue(
         p1: P1Channel,
         args: [String: JSONValue],
-        timeout: TimeInterval
+        timeout: TimeInterval,
+        headers: [String: String] = [:]
     ) async throws -> JSONValue {
  // 契约 DD-11：投影页帧间空闲超时 = `min(10s, unary 超时)`。这里的通用 unary
  // 调用方（lazy-fetch 窄页 timeout 15s、默认 20s）不得把帧间等待放宽到 >10s。
         let stream = try p1.unaryProjected(
             endpoint: "session/page",
             args: args,
-            timeout: min(timeout, Self.maxProjectedFrameIdleSeconds)
+            timeout: min(timeout, Self.maxProjectedFrameIdleSeconds),
+            headers: headers
         )
         var rows: [JSONValue] = []
         var hasMore = false
