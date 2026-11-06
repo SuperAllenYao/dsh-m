@@ -67,7 +67,10 @@ export function buildNetlogZip({ dir, status = {}, now = Date.now() }) {
   if (segments.length === 0) throw new Error('netlog/empty');
 
   const parsed = [];
-  for (const segment of segments) {
+  // Segments are listed newest-first (audit.log, then audit.log.1). Feed the
+  // parsed index oldest-first so "最近 N 条" is genuinely the tail in time
+  // order; otherwise the tail would come from the previous segment.
+  for (const segment of [...segments].reverse()) {
     for (const line of segment.lines) {
       try {
         const entry = JSON.parse(line);

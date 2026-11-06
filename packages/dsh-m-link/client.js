@@ -1241,7 +1241,7 @@ window.__ModuleLoader__.load({
 								exportState === "error"
 									? "导出失败：无法读取审计日志，请重试。"
 									: exportState === "done"
-										? "已生成并下载；可在下载文件夹中找到。"
+										? "已生成并下载；可在「下载」文件夹中找到。"
 										: auditEmpty === true
 											? "暂无审计记录，暂时没有可导出的内容。"
 											: "导出为 zip：插件审计日志 + 版本与系统信息；仅本机生成，不上传。",
