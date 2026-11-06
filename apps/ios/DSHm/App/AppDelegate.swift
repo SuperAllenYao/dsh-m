@@ -20,12 +20,26 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         _ application: UIApplication,
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
     ) -> Bool {
+ // netlog T-02：常开网络日志从进程启动即开始写；`env` 每次启动只写一次
+ //（schema/app/os/model/interfaces/vpnHint，AC-02/AC-12）。
+        NetworkLog.start()
+        NetworkLog.record("env", NetlogEnv.fields())
+        NetlogLifecycle.record("launch")
         UNUserNotificationCenter.current().delegate = self
  // M4 §3: register the approval category before any notification arrives.
  // Both actions require the device to be unlocked before iOS hands the
  // response to the app.
         UNUserNotificationCenter.current().setNotificationCategories([PushActionRouter.makeApprovalCategory()])
         return true
+    }
+
+ /// netlog T-02（DD-02）：进后台用一次短后台任务把写者队列排空后立即结束。
+ /// `NetworkLog.flush()` 在写者串行队列上同步执行（阻塞到已入队事件写盘），
+ /// 因此 begin/endBackgroundTask 成对且不需要额外等待。
+    func applicationDidEnterBackground(_ application: UIApplication) {
+        let task = application.beginBackgroundTask(withName: "com.dshm.netlog.flush") {}
+        NetworkLog.flush()
+        application.endBackgroundTask(task)
     }
 
     func application(_ application: UIApplication, didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data) {

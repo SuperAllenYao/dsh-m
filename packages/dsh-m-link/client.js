@@ -203,6 +203,19 @@ window.__ModuleLoader__.load({
 				background: "color-mix(in srgb, #30a46c 8%, transparent)",
 				fontSize: "12px",
 			},
+			toast: {
+				position: "fixed",
+				right: "20px",
+				bottom: "20px",
+				zIndex: 60,
+				padding: "10px 14px",
+				borderRadius: "9px",
+				border: "1px solid rgba(255, 255, 255, 0.14)",
+				background: "#23262b",
+				color: "#eef1f5",
+				fontSize: "12px",
+				boxShadow: "0 14px 34px rgba(0, 0, 0, 0.5)",
+			},
 			linkButton: { font: "inherit", fontSize: "12px", color: "inherit", background: "none", border: "none", padding: 0, cursor: "pointer", textDecoration: "underline", opacity: 0.7 },
 		};
 
@@ -721,11 +734,54 @@ window.__ModuleLoader__.load({
  // P3/D6: fullscreen enlarged QR (the 186px inline code is too dense for
  // some phone cameras to resolve — see D6).
 			const [qrZoom, setQrZoom] = React.useState(false);
+ // AC-08/09/10: "导出网络日志" row state + bottom-right download toast.
+			const [exportState, setExportState] = React.useState("idle");
+			const [exportToast, setExportToast] = React.useState(undefined);
+			const exportToastTimer = React.useRef(undefined);
 			const lastAutoRefresh = React.useRef(0);
  // M5: a revoked phone is a terminal record — kept in devices.json and the
  // audit log (and blocked by auth/revoked), but not rendered in the settings
  // list, so revoked history cannot crowd the active devices.
 			const activeDevices = devices.filter((device) => device.revoked !== true);
+
+ // AC-09: `status.audit.bytes` (refreshed by the 5s status poll) drives the
+ // empty/disabled state; `undefined` before the first poll keeps the normal
+ // hint so the row never flashes "暂无审计记录".
+			const auditBytes = typeof status?.audit?.bytes === "number" ? status.audit.bytes : undefined;
+			const auditEmpty = auditBytes === 0;
+			const exportDisabled = status === undefined || auditEmpty === true || busy || exportState === "generating";
+
+ // AC-08: ask the host for the base64 zip, then hand it to the browser as a
+ // plain download (Blob + temporary <a download>); nothing is uploaded.
+			const exportNetlog = async () => {
+				if (exportDisabled === true) return;
+				setExportState("generating");
+				try {
+					const data = await admin("netlog.export");
+					const binary = atob(String(data?.bytesBase64 ?? ""));
+					const bytes = new Uint8Array(binary.length);
+					for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+					const blob = new Blob([bytes], { type: "application/zip" });
+					const url = URL.createObjectURL(blob);
+					const anchor = document.createElement("a");
+					anchor.href = url;
+					anchor.download = String(data?.name ?? "dshm-link-log.zip");
+					anchor.style.display = "none";
+					document.body.appendChild(anchor);
+					anchor.click();
+					anchor.remove();
+					setTimeout(() => URL.revokeObjectURL(url), 2000);
+					setExportState("done");
+					setExportToast("已下载 " + anchor.download);
+					clearTimeout(exportToastTimer.current);
+					exportToastTimer.current = setTimeout(() => setExportToast(undefined), 4000);
+				} catch {
+ // AC-10: keep the row clickable so the user can retry.
+					setExportState("error");
+				}
+			};
+
+			React.useEffect(() => () => clearTimeout(exportToastTimer.current), []);
 
 			const refreshStatus = React.useCallback(async (options) => {
 				const quiet = options?.quiet === true;
@@ -1169,6 +1225,26 @@ window.__ModuleLoader__.load({
 								h(Button, { onClick: rotateLeaf, disabled: busy, title: "同一 CA 重签叶证书，CA pin 不变" }, "重签叶证书"),
 								h(Button, { onClick: rotateCa, disabled: busy, variant: "danger", title: "归档 CA 并撤销全部设备，需要所有手机重新配对" }, "轮换 CA"),
 								h(Button, { onClick: sendTestNotification, disabled: busy, title: "通过 APNs 或 stub 发送一条测试通知" }, "发送测试通知"),
+								h(Button, {
+									variant: "primary",
+									onClick: exportNetlog,
+									disabled: exportDisabled,
+									title: auditEmpty === true ? "暂无审计记录" : "导出插件审计日志（zip，仅本机生成）",
+								}, exportState === "generating" ? "正在生成…" : "导出网络日志"),
+							),
+							h(
+								"div",
+								{
+									style: exportState === "error" ? styles.logError : { ...styles.sub, margin: 0, padding: "0 0 2px" },
+									"data-dshm-netlog-note": String(exportState) + (auditEmpty === true ? "-empty" : ""),
+								},
+								exportState === "error"
+									? "导出失败：无法读取审计日志，请重试。"
+									: exportState === "done"
+										? "已生成并下载；可在「下载」文件夹中找到。"
+										: auditEmpty === true
+											? "暂无审计记录，暂时没有可导出的内容。"
+											: "导出为 zip：插件审计日志 + 版本与系统信息；仅本机生成，不上传。",
 							),
 							showAudit
 								? h(
@@ -1212,6 +1288,9 @@ window.__ModuleLoader__.load({
 					{ style: styles.footer },
 					"安全提示：手机配对后等同于本机 owner 权限（可执行命令）。手机丢失时请立即撤销设备。配对令牌仅在本页显示，不写入日志与磁盘" + (status?.debugEnabled ? "（当前实例开启了 debug 通道，仅用于联调）" : "") + "。",
 				),
+				exportToast !== undefined
+					? h("div", { style: styles.toast, role: "status", "aria-live": "polite", "data-dshm-netlog-toast": "" }, exportToast)
+					: null,
 			);
 		}
 

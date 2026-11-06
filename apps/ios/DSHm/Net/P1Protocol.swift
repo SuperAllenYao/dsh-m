@@ -115,13 +115,17 @@ struct P1Hello: Equatable {
  /// `features.projV1TruncateLongText=true` **且** 本 caps 为 true 才截断
  /// 长文本（否则整页全量，展开入口零网络）。
     var wantsProjV1Lazy: Bool
+ /// netlog T-02：本轮连接的 traceId（16 位小写十六进制）。顶层可选字段，旧插件
+ /// 忽略未知键（BASIS-21）；缺失时编码结果与旧版本逐字节一致。
+    var trace: String?
 
     init(
         client: P1ClientInfo,
         auth: P1Auth,
         resume: P1ResumeCursor? = nil,
         wantsProjV1: Bool = true,
-        wantsProjV1Lazy: Bool = true
+        wantsProjV1Lazy: Bool = true,
+        trace: String? = nil
     ) {
         self.v = P1Proto.version
         self.client = client
@@ -129,6 +133,7 @@ struct P1Hello: Equatable {
         self.resume = resume
         self.wantsProjV1 = wantsProjV1
         self.wantsProjV1Lazy = wantsProjV1Lazy
+        self.trace = trace
     }
 }
 
@@ -240,6 +245,10 @@ enum P1ClientFrame: Equatable {
                 "logEpoch": .string(resume.logEpoch),
                 "sid": .int(resume.sid),
             ])
+        }
+ // netlog T-02：trace 可选；没有值时**不写该键**（旧插件零感知）。
+        if let trace = hello.trace, !trace.isEmpty {
+            object["trace"] = .string(trace)
         }
         return .object(object)
     }

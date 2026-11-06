@@ -143,6 +143,8 @@ final class NetworkPathMonitor {
     private(set) var currentPath: NWPath?
  /// Latest pure projection of `currentPath` (nil until the first callback).
     private(set) var snapshot: NetworkPathSnapshot?
+ /// 上一个投影快照（仅用于 netlog 的 `path.changed.from`；首次回调前为 nil）。
+    private(set) var previousSnapshot: NetworkPathSnapshot?
  /// Increments once per meaningful change; `LinkService` stamps it on every
  /// successful connect and compares on page enter / foreground resume.
     private(set) var changeGeneration = 0
@@ -214,6 +216,7 @@ final class NetworkPathMonitor {
     func apply(_ snapshot: NetworkPathSnapshot) {
         let previous = self.snapshot
         self.snapshot = snapshot
+        self.previousSnapshot = previous
         guard Self.isMeaningfulChange(from: previous, to: snapshot) else { return }
         changeGeneration += 1
         onMeaningfulChange?()
@@ -288,5 +291,62 @@ final class NetworkPathMonitor {
             }
         }
         return nil
+    }
+
+ // MARK: - netlog：仅用于日志的接口/VPN 探测（不改选路语义）
+
+ /// getifaddrs 枚举当前接口名/类型/IPv4，并按接口名前缀判断 VPN/隧道存在。
+ ///
+ /// 只服务 `env` / `path.changed` 日志字段；**不参与** `prefersRelay`、候选排序、
+ /// `currentLocalIPv4Network()` 的任何判定（T-02 约束：只加日志面，不改连接行为）。
+    nonisolated static func loggingInterfaceSnapshot() -> (interfaces: [[String: String]], vpnHint: Bool) {
+        var interfaces: [[String: String]] = []
+        var vpnHint = false
+        var head: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&head) == 0, let first = head else { return ([], false) }
+        defer { freeifaddrs(head) }
+        var cursor: UnsafeMutablePointer<ifaddrs>? = first
+        while let entry = cursor {
+            defer { cursor = entry.pointee.ifa_next }
+            guard let rawName = entry.pointee.ifa_name else { continue }
+            let name = String(cString: rawName)
+            let isTunnel = isLoggingTunnelInterface(name)
+            if isTunnel { vpnHint = true }
+            var ipv4 = ""
+            if let address = entry.pointee.ifa_addr,
+               address.pointee.sa_family == UInt8(AF_INET) {
+                var buffer = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+                if getnameinfo(
+                    address, socklen_t(address.pointee.sa_len),
+                    &buffer, socklen_t(NI_MAXHOST), nil, 0, NI_NUMERICHOST
+                ) == 0 {
+                    ipv4 = String(cString: buffer)
+                }
+            }
+ // 无地址的普通接口是系统噪声，不记；隧道接口即使没有 IPv4 也记，作为
+ // vpnHint 的现场证据。
+            guard !ipv4.isEmpty || isTunnel else { continue }
+            interfaces.append([
+                "name": name,
+                "kind": loggingInterfaceKind(name),
+                "ipv4": ipv4,
+            ])
+        }
+        return (interfaces, vpnHint)
+    }
+
+    nonisolated static func isLoggingTunnelInterface(_ name: String) -> Bool {
+        name.hasPrefix("utun") || name.hasPrefix("ipsec") || name.hasPrefix("ppp")
+    }
+
+    nonisolated static func loggingInterfaceKind(_ name: String) -> String {
+        if name.hasPrefix("lo") { return "loopback" }
+        if name.hasPrefix("en") { return "wifi" }
+        if name.hasPrefix("pdp_ip") { return "cellular" }
+        if isLoggingTunnelInterface(name) { return "vpn" }
+        if name.hasPrefix("awdl") || name.hasPrefix("llw") { return "awdl" }
+        if name.hasPrefix("bridge") { return "bridge" }
+        if name.hasPrefix("ap") { return "hotspot" }
+        return "other"
     }
 }

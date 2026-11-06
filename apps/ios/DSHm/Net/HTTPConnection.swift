@@ -173,6 +173,10 @@ final class HTTPConnection {
         let request: HTTPRequest
         let bytes: Data
         let continuation: CheckedContinuation<HTTPResponse, Error>
+ /// netlog T-02：请求发出时刻（`request.first-byte` 的 ms 基准）。
+        let startedAt: Date
+ /// netlog T-02：发起请求时的轮次 trace（请求跨轮完成时仍归到发起轮）。
+        let trace: String?
         var timeoutItem: DispatchWorkItem?
  /// task-2 (reconnect): first-byte watchdog state. Only reused keep-alive
  /// connections are watched (see `scheduleFirstByteWatchdog`).
@@ -379,7 +383,14 @@ final class HTTPConnection {
         nextRequestId += 1
         let requestId = nextRequestId
         let bytes = HTTPSClient.serialize(request: request, host: host, port: port, keepAlive: true)
-        var item = PendingRequest(id: requestId, request: request, bytes: bytes, continuation: continuation)
+        var item = PendingRequest(
+            id: requestId,
+            request: request,
+            bytes: bytes,
+            continuation: continuation,
+            startedAt: Date(),
+            trace: RoundTrace.current
+        )
         let timeoutItem = DispatchWorkItem { [weak self] in
             self?.handleTimeout(requestId: requestId)
         }
@@ -437,6 +448,21 @@ final class HTTPConnection {
  // task-2: any response byte satisfies the reused-socket watchdog —
  // including the case where the TCP migration kept a half-stale
  // connection alive but slow.
+            if let pending, !pending.firstByteSeen {
+ // netlog T-02：每个 unary 请求的首个响应数据（成功路径）。legacy 的
+ // 「首字节」就是这里；P1 的对应点在 `P1Channel.unary` 的结果帧。
+                var fields: [String: Any] = [
+                    "endpoint": pending.request.path,
+                    "host": host,
+                    "proto": 1,
+                    "reused": wasReused,
+                    "ms": Int(Date().timeIntervalSince(pending.startedAt) * 1000),
+                    "ok": true,
+                    "timeout": false,
+                ]
+                if let trace = pending.trace { fields["trace"] = trace }
+                record("request.first-byte", fields)
+            }
             self.pending?.firstByteSeen = true
             self.pending?.firstByteItem?.cancel()
             self.pending?.firstByteItem = nil
@@ -544,6 +570,19 @@ final class HTTPConnection {
         guard let pending, pending.id == requestId, !pending.firstByteSeen, wasReused else { return }
         let endpoint = pending.request.path
         let waitedMs = Self.firstByteTimeout * 1000
+ // netlog T-02：复用连接 1.5s 首字节看门狗超时（ok=false、timeout=true）。
+ // 这是「复用连接」专属的判定，新连接不进入这里（不混用语义）。
+        var logFields: [String: Any] = [
+            "endpoint": endpoint,
+            "host": host,
+            "proto": 1,
+            "reused": true,
+            "ms": Int(waitedMs),
+            "ok": false,
+            "timeout": true,
+        ]
+        if let trace = pending.trace { logFields["trace"] = trace }
+        record("request.first-byte", logFields)
         NSLog("[RECONNECT] firstByteTimeout endpoint=%@;waitedMs=%.0f", endpoint, waitedMs)
         NotificationCenter.default.post(
             name: .dshmHTTPFirstByteTimeout,

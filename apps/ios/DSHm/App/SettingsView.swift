@@ -28,6 +28,7 @@ struct SettingsView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: Theme.Spacing.xl) {
                     connectionSection
+                    networkLogSection
                     relaySection
                     pushSection
                     cacheSection
@@ -135,6 +136,15 @@ struct SettingsView: View {
 
             diagnosticsBlock
         }
+    }
+
+ // MARK: - Network log export (v1 design, screen ①)
+
+ /// Always-on connection log export row. State machine + copy live in the component
+ /// (`Support/NetworkLog/NetworkLogSettingsSection.swift`); this page only places it
+ /// after the connection section.
+    private var networkLogSection: some View {
+        NetworkLogSettingsSection()
     }
 
  /// Connection diagnostics (inline expand, no sheet): the four summary rows are

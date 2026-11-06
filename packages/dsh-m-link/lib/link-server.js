@@ -54,6 +54,7 @@ import { probeWithRetries } from './contract.js';
 import { DeviceStore, keyFingerprint256, normalizeDevicePublicKey } from './devices.js';
 import { FrameAudit } from './frame-audit.js';
 import { ensureHostIdentity } from './host-identity.js';
+import { auditFilesStatus, buildNetlogZip } from './netlog-export.js';
 import { APPROVAL_CATEGORY, Notifier, pushTitleForSession } from './notifier.js';
 import { createHostTurnEventHandler, TurnWatcher } from './session-watcher.js';
 import { buildEndpoints, PairCodeService, PairingService, selectDeviceEndpoints, trimDeviceName } from './pairing.js';
@@ -76,7 +77,7 @@ import { detectListLiteRequest, isSessionListEndpoint, LIST_LITE_HEADER, trimSes
 import { buildProjectedPage } from './proj-encode.js';
 
 const PLUGIN_NAME = 'dsh-m-link';
-const PLUGIN_VERSION = '2.22.5';
+const PLUGIN_VERSION = '2.23.0';
 const MUX_PATH = '/api/remote.mux';
 
 /**
@@ -467,6 +468,24 @@ function parseBearer(header) {
   if (typeof header !== 'string' || !header.startsWith('Bearer ')) return undefined;
   const value = header.slice('Bearer '.length).trim();
   return value.length === 0 ? undefined : value;
+}
+
+// AC-11 / DD-05: optional cross-end correlation id. iOS sends 16 hex digits on
+// the legacy upgrade request, the P1 hello top-level `trace` and/or P1 unary
+// frame headers; old App versions send nothing, so every trace field is
+// additive and omitted when absent.
+const TRACE_HEADER = 'x-dshm-trace';
+
+function readTrace(value) {
+  const raw = Array.isArray(value) ? value[0] : value;
+  if (typeof raw !== 'string') return undefined;
+  const trace = raw.trim();
+  return /^[0-9a-fA-F]{16}$/.test(trace) ? trace : undefined;
+}
+
+/** Spread `traceId` into an audit event only when the phone actually sent one. */
+function withTrace(fields, traceId) {
+  return traceId === undefined ? fields : { ...fields, traceId };
 }
 
 /**
@@ -2786,11 +2805,11 @@ export class LinkServer {
   }
 
  /** Counters + audit for one trimmed `session/list` response (metadata only). */
-  recordListLite(device, endpoint, transport, plan, stats) {
+  recordListLite(device, endpoint, transport, plan, stats, traceId) {
     this.counters.listLiteResponses += 1;
     this.counters.listLiteFullBytes += stats.fullBytes;
     this.counters.listLiteBytes += stats.liteBytes;
-    this.audit.record('unary.list-lite', {
+    this.audit.record('unary.list-lite', withTrace({
       deviceId: device.deviceId,
       endpoint,
       transport,
@@ -2799,17 +2818,17 @@ export class LinkServer {
       fullBytes: stats.fullBytes,
       liteBytes: stats.liteBytes,
       savedRatio: stats.savedRatio,
-    });
+    }, traceId));
   }
 
  /** Trim one response body when the request opted in; otherwise pass through. */
-  applyListLite(device, endpoint, transport, plan, bytes) {
+  applyListLite(device, endpoint, transport, plan, bytes, traceId) {
     if (plan.lite !== true) return { bytes, stats: undefined };
     const trimmed = trimSessionListResponse(bytes);
  // Not a successful `session/list` envelope: never rewrite it, so an upstream
  // error body or a future protocol change reaches the phone untouched.
     if (trimmed === undefined) return { bytes, stats: undefined };
-    this.recordListLite(device, endpoint, transport, plan, trimmed.stats);
+    this.recordListLite(device, endpoint, transport, plan, trimmed.stats, traceId);
     return { bytes: trimmed.bytes, stats: trimmed.stats };
   }
 
@@ -2823,6 +2842,7 @@ export class LinkServer {
  * the upstream request and response bytes are exactly the legacy bytes.
  */
   async proxyUnary(device, request, response, url, ip) {
+    const traceId = readTrace(request.headers[TRACE_HEADER]);
     let peer;
     try {
       peer = this.ensurePeer(device);
@@ -2835,7 +2855,7 @@ export class LinkServer {
         await peer.connect('answer');
       } catch (error) {
         this.counters.proxyErrors += 1;
-        this.audit.record('unary.upstream-failed', { deviceId: device.deviceId, endpoint: url.pathname, message: String(error?.message ?? error) });
+        this.audit.record('unary.upstream-failed', withTrace({ deviceId: device.deviceId, endpoint: url.pathname, message: String(error?.message ?? error) }, traceId));
         return sendJson(response, 502, { ok: false, error: 'upstream-connect-failed', message: String(error?.message ?? error) });
       }
     }
@@ -2858,13 +2878,13 @@ export class LinkServer {
       upstream = await fetch(target, { method: 'POST', headers, body: upstreamBody, redirect: 'manual' });
     } catch (error) {
       this.counters.proxyErrors += 1;
-      this.audit.record('unary.upstream-failed', { deviceId: device.deviceId, endpoint: url.pathname, message: String(error?.message ?? error) });
+      this.audit.record('unary.upstream-failed', withTrace({ deviceId: device.deviceId, endpoint: url.pathname, message: String(error?.message ?? error) }, traceId));
       return sendJson(response, 502, { ok: false, error: 'upstream-unreachable', message: String(error?.message ?? error) });
     }
     const fullBytes = Buffer.from(await upstream.arrayBuffer());
     if (isSessionListEndpoint(url.pathname)) this.seedPushTitlesFromBytes(fullBytes);
     this.counters.proxiedUnary += 1;
-    const listLite = this.applyListLite(device, url.pathname, 'legacy', listLitePlan, fullBytes);
+    const listLite = this.applyListLite(device, url.pathname, 'legacy', listLitePlan, fullBytes, traceId);
     const bytes = listLite.bytes;
     const outHeaders = {
       'content-type': upstream.headers.get('content-type') ?? 'application/octet-stream',
@@ -2890,12 +2910,12 @@ export class LinkServer {
         const compressed = gzipSync(bytes, { level: 6 });
         outHeaders['content-encoding'] = 'gzip';
         outHeaders['content-length'] = String(compressed.length);
-        this.audit.record('unary.compressed', {
+        this.audit.record('unary.compressed', withTrace({
           deviceId: device.deviceId,
           endpoint: url.pathname,
           bytes: bytes.length,
           compressedBytes: compressed.length,
-        });
+        }, traceId));
         response.writeHead(upstream.status, outHeaders);
         response.end(compressed);
         return undefined;
@@ -2943,6 +2963,8 @@ export class LinkServer {
   }
 
   handleUpgrade(request, socket, head) {
+    // DD-05: connection-scoped trace for the legacy byte bridge (optional).
+    const traceId = readTrace(request.headers[TRACE_HEADER]);
     let url;
     try {
       url = new URL(request.url ?? '/', 'https://link.invalid');
@@ -2974,7 +2996,7 @@ export class LinkServer {
       log('device ' + device.deviceId + ': second downstream mux rejected with 409 (one socket per device)');
       return rejectUpgrade(socket, 409, 'Conflict', { 'x-dshm-error': 'conn/conflict' });
     }
-    return this.wss.handleUpgrade(request, socket, head, (ws) => this.attachDownstream(device, ws));
+    return this.wss.handleUpgrade(request, socket, head, (ws) => this.attachDownstream(device, ws, traceId));
   }
 
  /**
@@ -2985,6 +3007,8 @@ export class LinkServer {
  * the hello verifies.
  */
   handleP1Upgrade(request, socket, head) {
+    // DD-05: upgrade-header trace as the first source; hello.trace overrides it.
+    const traceId = readTrace(request.headers[TRACE_HEADER]);
     const token = parseBearer(request.headers.authorization);
     if (token === undefined) {
       if (this.p1Pending.size >= this.config.features.muxRpcMaxPendingUpgrades) {
@@ -2992,7 +3016,7 @@ export class LinkServer {
         return rejectUpgrade(socket, 503, 'Busy', { 'x-dshm-error': 'p1/too-many-pending' });
       }
       this.counters.p1Upgrades += 1;
-      return this.wss.handleUpgrade(request, socket, head, (ws) => this.attachP1Downstream(undefined, ws));
+      return this.wss.handleUpgrade(request, socket, head, (ws) => this.attachP1Downstream(undefined, ws, traceId));
     }
     const consumed = this.auth.consumeMuxToken(token);
     if (consumed.error !== undefined) {
@@ -3009,7 +3033,7 @@ export class LinkServer {
       return rejectUpgrade(socket, 409, 'Conflict', { 'x-dshm-error': 'conn/conflict' });
     }
     this.counters.p1Upgrades += 1;
-    return this.wss.handleUpgrade(request, socket, head, (ws) => this.attachP1Downstream(device, ws));
+    return this.wss.handleUpgrade(request, socket, head, (ws) => this.attachP1Downstream(device, ws, traceId));
   }
 
  /**
@@ -3021,7 +3045,8 @@ export class LinkServer {
  * dropping them would silently lose the first stream (M0 architectural fix,
  * kept regression-tested by test/m1-sim.mjs).
  */
-  attachDownstream(device, downstream) {
+  attachDownstream(device, downstream, traceHint) {
+    const traceId = readTrace(traceHint);
     clearTimeout(device.idleTimer);
     device.idleTimer = undefined;
  // 静默判定基线（takeover 依赖它）：从 attach 起算，之后每条来自手机的帧刷新。
@@ -3086,7 +3111,7 @@ export class LinkServer {
         upstream.off('close', onUpstreamClose);
         upstream.off('error', onUpstreamError);
       }
-      this.audit.record('conn.closed', { deviceId: device.deviceId });
+      this.audit.record('conn.closed', withTrace({ deviceId: device.deviceId }, traceId));
       this.scheduleUpstreamIdle(device);
     });
     (async () => {
@@ -3107,7 +3132,7 @@ export class LinkServer {
       upstream.on('error', onUpstreamError);
       device.downstream = downstream;
       this.counters.muxOpened += 1;
-      this.audit.record('conn.open', { deviceId: device.deviceId });
+      this.audit.record('conn.open', withTrace({ deviceId: device.deviceId }, traceId));
       log('device ' + device.deviceId + ': downstream mux bridged');
       bridged = true;
       if (downstream.readyState === 1) {
@@ -3143,9 +3168,14 @@ export class LinkServer {
  * The phone may pipeline `open`/`rpc` frames right behind `hello`; they are
  * buffered by the channel until the upstream mux is attached.
  */
-  attachP1Downstream(deviceHint, downstream) {
+  attachP1Downstream(deviceHint, downstream, traceHint) {
     let device = deviceHint;
     let channel;
+ // DD-05: the upgrade-header trace is replaced by `hello.trace` as soon as the
+ // in-band hello arrives; both are optional (old App versions send neither).
+    let traceId = readTrace(traceHint);
+    let helloMs;
+    const attachedAt = Date.now();
  // DD-06: transport generation captured when THIS socket attached the channel.
  // A take-over re-attaches the channel in the same stack as close(4409), so
  // this socket's late close event must not detach/dispose the replacement.
@@ -3234,6 +3264,11 @@ export class LinkServer {
         return;
       }
       helloSeen = true;
+ // DD-05: hello top-level `trace` wins over the upgrade header. `helloMs`
+ // rides on the next `p1.channel-open` so the panel export shows handshake
+ // latency inside the connection event stream.
+      traceId = readTrace(hello.trace) ?? traceId;
+      helloMs = Math.max(0, Date.now() - attachedAt);
       const beginHello = () => {
         if (device === undefined) {
           const resolved = this.resolveP1HelloAuth(hello);
@@ -3257,7 +3292,7 @@ export class LinkServer {
           }
         }
         try {
-          channel = this.openP1Channel(device, downstream, send, sendBinary, close);
+          channel = this.openP1Channel(device, downstream, send, sendBinary, close, { traceId, helloMs });
         } catch (error) {
  // A racing reconnect/duplicate hello must not escape the socket handler
  // (EventEmitter would treat it as an uncaught exception); fail closed.
@@ -3309,7 +3344,7 @@ export class LinkServer {
       if (channel !== undefined) this.scheduleP1Disposal(device, channel, channelTransportGen);
  // task-11: the close code/reason is what tells an E2E drop (4000) apart
  // from a transport failure; metadata only (no frame payloads).
-      this.audit.record('conn.closed', { deviceId: device?.deviceId, proto: 'dsh-m/2', code, reason: String(reason ?? '') });
+      this.audit.record('conn.closed', withTrace({ deviceId: device?.deviceId, proto: 'dsh-m/2', code, reason: String(reason ?? '') }, traceId));
     });
   }
 
@@ -3435,7 +3470,8 @@ export class LinkServer {
  * replay log and epoch) without touching the upstream peer; otherwise a new
  * channel/epoch is created and the phone's `resume` is answered with a reset.
  */
-  openP1Channel(device, downstream, send, sendBinary, close) {
+  openP1Channel(device, downstream, send, sendBinary, close, trace = {}) {
+    const { traceId, helloMs } = trace;
     if (!this.ctxActive()) return undefined;
     const existing = this.p1Channels.get(device.deviceId);
     if (existing !== undefined && existing.disposed !== true) {
@@ -3445,7 +3481,7 @@ export class LinkServer {
       device.downstream = downstream;
       device.lastDownstreamActivityAt = Date.now();
       device.p1Channel = existing;
-      this.audit.record('p1.channel-reattached', { deviceId: device.deviceId, epoch: existing.epoch });
+      this.audit.record('p1.channel-reattached', withTrace({ deviceId: device.deviceId, epoch: existing.epoch }, traceId));
       log('device ' + device.deviceId + ': P1 channel reattached (epoch ' + existing.epoch.slice(0, 8) + '…)');
       return existing;
     }
@@ -3491,7 +3527,9 @@ export class LinkServer {
     channel.attachTransport({ send, sendBinary, close });
     this.counters.p1Channels += 1;
     log('device ' + device.deviceId + ': P1 channel opened (epoch ' + channel.epoch.slice(0, 8) + '…)');
-    this.audit.record('p1.channel-open', { deviceId: device.deviceId, epoch: channel.epoch });
+    const channelOpenFields = { deviceId: device.deviceId, epoch: channel.epoch };
+    if (helloMs !== undefined) channelOpenFields.helloMs = helloMs;
+    this.audit.record('p1.channel-open', withTrace(channelOpenFields, traceId));
     (async () => {
       try {
         const upstream = await peer.ensureMux();
@@ -3523,7 +3561,7 @@ export class LinkServer {
           },
         });
         this.counters.muxOpened += 1;
-        this.audit.record('conn.open', { deviceId: device.deviceId, proto: 'dsh-m/2' });
+        this.audit.record('conn.open', withTrace({ deviceId: device.deviceId, proto: 'dsh-m/2' }, traceId));
         log('device ' + device.deviceId + ': P1 upstream mux attached');
       } catch (error) {
         log('device ' + device.deviceId + ': cannot open P1 upstream mux: ' + String(error?.message ?? error));
@@ -3776,6 +3814,8 @@ export class LinkServer {
  * it returns exactly the event the App is fetching the full text of.
  */
   async forwardP1Unary(device, { endpoint, bodyText, headers, projV1, rpcId, truncateLongText } = {}) {
+    // DD-05: P1 unary trace comes from the frame headers (mux-rpc forwards them).
+    const traceId = readTrace(headers !== null && typeof headers === 'object' ? headers[TRACE_HEADER] : undefined);
     const peer = this.ensurePeer(device);
     if (peer.cookie === undefined) await peer.connect('answer');
     const body = Buffer.from(String(bodyText ?? ''), 'utf8');
@@ -3803,8 +3843,8 @@ export class LinkServer {
     const fullBytes = Buffer.from(await upstream.arrayBuffer());
     if (endpoint === 'session/list') this.seedPushTitlesFromBytes(fullBytes);
     this.counters.proxiedUnary += 1;
-    this.audit.record('p1.rpc', { deviceId: device.deviceId, endpoint, status: upstream.status, bytes: fullBytes.length });
-    const listLite = this.applyListLite(device, endpoint, 'p1', listLitePlan, fullBytes);
+    this.audit.record('p1.rpc', withTrace({ deviceId: device.deviceId, endpoint, status: upstream.status, bytes: fullBytes.length }, traceId));
+    const listLite = this.applyListLite(device, endpoint, 'p1', listLitePlan, fullBytes, traceId);
  // B (protocol v1): only a negotiated `session/page` success leaves the text
  // path; every other response keeps `listLite.bytes` (== the upstream bytes)
  // byte-for-byte. The projection is built from `fullBytes` (the raw upstream
@@ -3882,6 +3922,8 @@ export class LinkServer {
       deviceEndpoints: this.deviceEndpoints,
       fetchRoutes: this.config.fetchRoutes.enabled === false ? [] : this.config.fetchRoutes.allow,
       devices: { total: this.devices?.size() ?? 0, active: this.devices?.active().length ?? 0 },
+ // DD-10/16: audit size (stat only) drives the panel's export button state.
+      audit: auditFilesStatus(this.dataDir),
       apns: this.apns?.info(),
  // Desktop panel: M2a tunnel status + LAN discovery state (no secrets).
       tunnel: this.config.tunnel.enabled === true
@@ -4269,6 +4311,28 @@ export class LinkServer {
         if (dropped.length > 0) this.p1NextHelloHoldMs = holdHelloMs;
         this.audit.record('debug.p1-drop', { dropped: dropped.length, deviceId: wanted, holdHelloMs });
         return { ok: true, data: { dropped, channels: this.p1Channels.size, holdHelloMs } };
+      }
+      case 'netlog.export': {
+ // DD-07: current + previous audit segment byte-for-byte (user decision
+ // DEC-12: no filtering), plus metadata.json/summary.txt, as a base64 zip.
+ // Nothing leaves this Mac and no new state is persisted.
+        const auditFiles = auditFilesStatus(this.dataDir);
+        if (auditFiles.bytes === 0) return { ok: false, error: 'netlog/empty' };
+        try {
+          const payload = this.statusPayload();
+          const data = buildNetlogZip({
+            dir: this.dataDir,
+            status: {
+              pluginVersion: payload.version,
+              hostId: payload.hostId,
+              hostName: payload.hostName,
+              devices: { total: payload.devices.total, active: payload.devices.active, list: this.listDevices() },
+            },
+          });
+          return { ok: true, data };
+        } catch (error) {
+          return { ok: false, error: 'netlog/failed', message: String(error?.message ?? error) };
+        }
       }
       case 'audit.tail':
         return { ok: true, data: { lines: this.auditTail(Number(body.limit) || 50) } };
