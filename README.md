@@ -6,11 +6,12 @@ DSH-m 通过自托管、TLS 证书钉扎的桥接，把 iPhone App **DSH-m** 连
 
 ## 状态
 
-当前版本 **v2.24.0**（2026-11-11）。已交付的能力：
+当前版本 **v2.24.1**（2026-11-11）。已交付的能力：
 
-- **本轮（v2.24.0）**：桌面端升级到 0.2.2 后，手机端查看历史会话与翻页改用桌面端的新接口，加载更稳；桌面端若退回旧版本，插件会自动回退到旧接口，手机端无需重新配对或升级。会话详情页的 Markdown 表格恢复列对齐显示，单元格不再挤成一行文字，表格比屏幕宽时可在表格内左右滑动查看。
-- **本轮（v2.23.0）**：手机与 Mac 两端一键导出网络日志——手机在设置页「网络日志」段导出并直接分享，Mac 在「DSH-m 手机连接 › 本地数据」卡片下载；连接、切网、重连过程自动记录（无需开关），手机保留最近 72 小时、上限 20MB，Mac 导出完整审计日志；重连超过 2 秒或多个候选全部失败时自动保留前后各 60 秒的异常快照 7 天；同一次连接在两端使用同一标识，便于跨端对账；修复 Mac 端推送服务连接超时时导致桌面端整体退出的问题。
-- **上一轮（v2.22.5）**：子代理会话不再产生任何通知——子代理任务结束、等待审批或提问都不会再打扰通知中心与锁屏；从锁屏通知直接进入会话详情，状态条自动显示该会话原本选好的模型；更正 v2.22.4 说明中「子代理通知打开子代理详情」的误实现。
+- **本轮（v2.24.1）**：旧版桌面端上手机打开会话历史会失败的问题修复——插件会自动改用旧接口适配，手机端无需重新配对，也不需要升级 App，看历史不再偶发失败。
+- **上一轮（v2.24.0）**：桌面端升级到 0.2.2 后，手机端查看历史会话与翻页改用桌面端的新接口，加载更稳；桌面端若退回旧版本，插件会自动回退到旧接口，手机端无需重新配对或升级。会话详情页的 Markdown 表格恢复列对齐显示，单元格不再挤成一行文字，表格比屏幕宽时可在表格内左右滑动查看。
+- **v2.23.0**：手机与 Mac 两端一键导出网络日志——手机在设置页「网络日志」段导出并直接分享，Mac 在「DSH-m 手机连接 › 本地数据」卡片下载；连接、切网、重连过程自动记录（无需开关），手机保留最近 72 小时、上限 20MB，Mac 导出完整审计日志；重连超过 2 秒或多个候选全部失败时自动保留前后各 60 秒的异常快照 7 天；同一次连接在两端使用同一标识，便于跨端对账；修复 Mac 端推送服务连接超时时导致桌面端整体退出的问题。
+- **v2.22.5**：子代理会话不再产生任何通知——子代理任务结束、等待审批或提问都不会再打扰通知中心与锁屏；从锁屏通知直接进入会话详情，状态条自动显示该会话原本选好的模型；更正 v2.22.4 说明中「子代理通知打开子代理详情」的误实现。
 - **v2.22.3**：非同网络不再误判直连——手机与 Mac 不在同一个 Wi-Fi 时，只走服务器中转，Wi-Fi 下连不上与反复重连的问题解决；锁屏通知点进会话详情，历史消息稳定自动补齐；Wi-Fi 与 5G 切换后通常约 1 秒内恢复在线。
 - **v2.22.2**：会话列表左滑按钮不再误闪——取消置顶的卡片回到分组位置、展开或收起工作区列表时，「置顶 / 归档」按钮不会先闪出来再被卡片盖住；按钮只在左滑时出现，点完收回即隐藏。
 - **v2.22.1**：置顶 / 取消置顶动效重做——卡片沿同一条曲线连续让位，不再整屏弹跳或闪烁；列表底部置顶平滑下移、不留白；取消置顶的卡片回到分组位置；连续操作与动画中的列表刷新会立即让位给最新操作并接着播完。
@@ -85,10 +86,11 @@ DSH-m connects the iOS app **DSH-m** to your Mac's DSH desktop through a self-ho
 
 ## Status
 
-Current version **v2.22.5** (2026-11-05). What ships today:
+Current version **v2.24.1** (2026-11-11). What ships today:
 
-- **This release**: subagent sessions never produce notifications — a subagent finishing, waiting for approval or asking a question no longer interrupts the notification center or the lock screen; opening a session from a lock-screen notification shows its chosen model right away; corrects the wrong "subagent notification opens the subagent detail" claim in the v2.22.4 notes.
-- **Previous release (v2.22.4)**: the chosen model now loads automatically when opening a session from a notification; background silent push is allowed again so background/locked refreshes arrive sooner; the system local-network service declaration is in place for same-Wi-Fi Mac discovery.
+- **This release**: opening session history no longer fails when the desktop app is on an older version — the plugin adapts to the earlier interface automatically, so no re-pairing or app update is needed.
+- **v2.22.5**: subagent sessions never produce notifications — a subagent finishing, waiting for approval or asking a question no longer interrupts the notification center or the lock screen; opening a session from a lock-screen notification shows its chosen model right away; corrects the wrong "subagent notification opens the subagent detail" claim in the v2.22.4 notes.
+- **v2.22.4**: the chosen model now loads automatically when opening a session from a notification; background silent push is allowed again so background/locked refreshes arrive sooner; the system local-network service declaration is in place for same-Wi-Fi Mac discovery.
 - **v2.22.3**: no more false LAN attempts when the phone and the Mac are not on the same Wi-Fi — the app uses the relay instead, fixing Wi-Fi "cannot connect" and repeated reconnect loops; opening a session from a lock-screen notification now reliably fills in the history; switching between Wi-Fi and 5G recovers in about a second.
 
 **Connection and pairing**
