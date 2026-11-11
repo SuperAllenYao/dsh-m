@@ -63,7 +63,6 @@ import { QrRenderer } from './qr.js';
 import { applySessionPermission, normalizePermissionRequest, SESSION_PERMISSION_PATH } from './session-permission.js';
 import { applySessionCreate, loopbackCall, normalizeCreateRequest, SESSION_CREATE_PATH } from './session-create.js';
 import {
-  isEndpointMissing,
   isEndpointMissingOutcome,
   isMappedEndpoint,
   outcomeOfBody,
@@ -3908,11 +3907,12 @@ export class LinkServer {
     let status = upstream.status;
     let fullBytes = Buffer.from(await upstream.arrayBuffer());
     let outcome = mapped ? outcomeOfBody(status, fullBytes) : undefined;
- // DD-02: a legacy host answers the new name with the fixed "endpoint missing"
- // code; retry the deprecated name inside the same request so the phone never
- // sees the probe. The rejected probe is audited first (capability evidence),
- // then the final reply below.
-    if (mapped && isEndpointMissing(outcome) && this.sessionEventsSupport !== false) {
+ // DD-02/DEF-006: same two legacy signals as the HTTP path (0.2.2 host: JSON
+ // "endpoint missing" code; <=0.2.1 host: HTTP 404 + plain text). Both mean the
+ // endpoint is absent, so retry the deprecated name inside the same request and
+ // the phone never sees the probe. The rejected probe is audited first
+ // (capability evidence), then the final reply below.
+    if (mapped && isEndpointMissingOutcome(outcome, status, fullBytes) && this.sessionEventsSupport !== false) {
       this.audit.record('p1.rpc', withTrace({ deviceId: device.deviceId, upstream: upstreamEndpoint, outcome, status, bytes: fullBytes.length }, traceId));
       this.sessionEventsSupport = false;
       upstreamEndpoint = SESSION_CONTENT_ENDPOINT;
