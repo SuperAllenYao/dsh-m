@@ -64,6 +64,7 @@ import { applySessionPermission, normalizePermissionRequest, SESSION_PERMISSION_
 import { applySessionCreate, loopbackCall, normalizeCreateRequest, SESSION_CREATE_PATH } from './session-create.js';
 import {
   isEndpointMissing,
+  isEndpointMissingOutcome,
   isMappedEndpoint,
   outcomeOfBody,
   rewriteRequestMethod,
@@ -86,7 +87,7 @@ import { detectListLiteRequest, isSessionListEndpoint, LIST_LITE_HEADER, trimSes
 import { buildProjectedPage } from './proj-encode.js';
 
 const PLUGIN_NAME = 'dsh-m-link';
-const PLUGIN_VERSION = '2.24.0';
+const PLUGIN_VERSION = '2.24.1';
 const MUX_PATH = '/api/remote.mux';
 
 /**
@@ -2911,11 +2912,13 @@ export class LinkServer {
     let status = upstream.status;
     let fullBytes = Buffer.from(await upstream.arrayBuffer());
     let outcome = mapped ? outcomeOfBody(status, fullBytes) : undefined;
- // DD-02: a legacy host answers the new name with the fixed "endpoint missing"
- // code; retry the deprecated name inside the same request so the phone never
- // sees the probe. The rejected probe is audited first (it is the evidence the
- // capability detection happened), then the final reply is audited below.
-    if (mapped && isEndpointMissing(outcome) && this.sessionEventsSupport !== false) {
+ // DD-02/DEF-006: a 0.2.2 host answers the new name with the fixed "endpoint
+ // missing" code; a <=0.2.1 host has no route for it and answers HTTP 404
+ // with a plain-text body. Both mean the same thing, so retry the deprecated
+ // name inside the same request and the phone never sees the probe. The
+ // rejected probe is audited first (it is the evidence the capability
+ // detection happened), then the final reply is audited below.
+    if (mapped && isEndpointMissingOutcome(outcome, status, fullBytes) && this.sessionEventsSupport !== false) {
       this.audit.record('unary.proxied', withTrace({ deviceId: device.deviceId, upstream: upstreamEndpoint, outcome, status, bytes: fullBytes.length }, traceId));
       this.sessionEventsSupport = false;
       upstreamEndpoint = SESSION_CONTENT_ENDPOINT;

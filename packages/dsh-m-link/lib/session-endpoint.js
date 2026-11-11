@@ -123,3 +123,39 @@ export function outcomeOfBody(status, bodyBytesOrText) {
 export function isEndpointMissing(outcome) {
   return outcome === ENDPOINT_MISSING_CODE;
 }
+
+/**
+ * True when a full reply (status + body) says the host does not expose the
+ * upstream endpoint. Two host generations say it differently:
+ *
+ *  - desktop 0.2.2+ answers HTTP 200 with the `gateway/invocation-unavailable`
+ *    error code (what `isEndpointMissing` recognizes);
+ *  - desktop 0.2.1 and older have no route for the new path at all, so their
+ *    HTTP layer answers `404` with a plain-text body (`not found`). That is a
+ *    routing miss, not a business error: `outcomeOfBody` only keeps the status
+ *    for a non-200 reply, so the body is the only discriminator left.
+ *
+ * A 404 whose body is a JSON envelope is a business error (unknown session…)
+ * and must stay untouched, as must 401/403, 5xx, timeouts and unreadable
+ * envelopes — none of those prove the endpoint is absent.
+ * @param {string} outcome
+ * @param {number} status
+ * @param {string | Uint8Array} bodyBytesOrText
+ * @returns {boolean}
+ */
+export function isEndpointMissingOutcome(outcome, status, bodyBytesOrText) {
+  if (isEndpointMissing(outcome)) return true;
+  if (status !== 404) return false;
+  const text = decodeBody(bodyBytesOrText);
+  if (text === null) return false;
+  const trimmed = text.trim();
+  // An empty body is not the legacy router's plain-text reply; keep it out of
+  // the fallback rule so the predicate stays tied to the observed shape.
+  if (trimmed.length === 0) return false;
+  try {
+    JSON.parse(trimmed);
+    return false;
+  } catch {
+    return true;
+  }
+}
