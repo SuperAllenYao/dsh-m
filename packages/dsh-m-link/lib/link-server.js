@@ -63,6 +63,15 @@ import { QrRenderer } from './qr.js';
 import { applySessionPermission, normalizePermissionRequest, SESSION_PERMISSION_PATH } from './session-permission.js';
 import { applySessionCreate, loopbackCall, normalizeCreateRequest, SESSION_CREATE_PATH } from './session-create.js';
 import {
+  isEndpointMissing,
+  isMappedEndpoint,
+  outcomeOfBody,
+  rewriteRequestMethod,
+  SESSION_CONTENT_ENDPOINT,
+  SESSION_CONTENT_HOST_ENDPOINT,
+  upstreamEndpointFor,
+} from './session-endpoint.js';
+import {
   applySessionArchive,
   applySessionPin,
   normalizeArchiveRequest,
@@ -77,7 +86,7 @@ import { detectListLiteRequest, isSessionListEndpoint, LIST_LITE_HEADER, trimSes
 import { buildProjectedPage } from './proj-encode.js';
 
 const PLUGIN_NAME = 'dsh-m-link';
-const PLUGIN_VERSION = '2.23.0';
+const PLUGIN_VERSION = '2.24.0';
 const MUX_PATH = '/api/remote.mux';
 
 /**
@@ -662,6 +671,17 @@ export class LinkServer {
     this.deviceEndpoints = [];
     this.contract = undefined;
     this.contractPending = undefined;
+ /**
+  * Host capability state: does the running DSH desktop expose the new
+  * `session/events` content endpoint? `undefined` = not decided yet (try the
+  * new name first), `true` = supported, `false` = legacy host (send the
+  * deprecated name). Sticky once decided so an old host is not probed on
+  * every request; a desktop restart resets it to `undefined`, which is also
+  * how a rolled-back host is picked up again.
+  * Shared by both forwarding legs (P1 `forwardP1Unary` and HTTP `proxyUnary`).
+  * @type {boolean | undefined}
+  */
+    this.sessionEventsSupport = undefined;
     this.adminDisposer = undefined;
     this.sweepTimer = undefined;
  /** Set synchronously by dispose(); all later async continuations must bail out. */
@@ -2869,19 +2889,55 @@ export class LinkServer {
  // upstream DSH request is byte-identical to the pre-lite request.
     const listLitePlan = this.planListLite(url.pathname, request.headers, body.toString('utf8'));
     const upstreamBody = listLitePlan.bodyText === undefined ? body : Buffer.from(listLitePlan.bodyText, 'utf8');
-    const target = this.loopbackOrigin + url.pathname + url.search;
+ // DD-02: the phone keeps calling the deprecated content endpoint; only the
+ // host-facing leg is renamed (`session/events` on a new host, `session/page`
+ // on a host already known to be legacy). The body `method` is rewritten with
+ // the same name because the host rejects a path/body mismatch.
+    const mapped = url.pathname === '/api/' + SESSION_CONTENT_ENDPOINT;
+    let upstreamEndpoint = mapped ? upstreamEndpointFor(SESSION_CONTENT_ENDPOINT, this.sessionEventsSupport) : undefined;
+    let target = this.loopbackOrigin + (mapped ? '/api/' + upstreamEndpoint : url.pathname) + url.search;
+    let sendBody = mapped ? Buffer.from(rewriteRequestMethod(upstreamBody.toString('utf8'), upstreamEndpoint), 'utf8') : upstreamBody;
     const headers = { 'content-type': contentType, cookie: peer.cookie.name + '=' + peer.cookie.value };
     const accept = request.headers.accept;
     if (typeof accept === 'string' && accept.length > 0) headers.accept = accept;
     let upstream;
     try {
-      upstream = await fetch(target, { method: 'POST', headers, body: upstreamBody, redirect: 'manual' });
+      upstream = await fetch(target, { method: 'POST', headers, body: sendBody, redirect: 'manual' });
     } catch (error) {
       this.counters.proxyErrors += 1;
       this.audit.record('unary.upstream-failed', withTrace({ deviceId: device.deviceId, endpoint: url.pathname, message: String(error?.message ?? error) }, traceId));
       return sendJson(response, 502, { ok: false, error: 'upstream-unreachable', message: String(error?.message ?? error) });
     }
-    const fullBytes = Buffer.from(await upstream.arrayBuffer());
+    let status = upstream.status;
+    let fullBytes = Buffer.from(await upstream.arrayBuffer());
+    let outcome = mapped ? outcomeOfBody(status, fullBytes) : undefined;
+ // DD-02: a legacy host answers the new name with the fixed "endpoint missing"
+ // code; retry the deprecated name inside the same request so the phone never
+ // sees the probe. The rejected probe is audited first (it is the evidence the
+ // capability detection happened), then the final reply is audited below.
+    if (mapped && isEndpointMissing(outcome) && this.sessionEventsSupport !== false) {
+      this.audit.record('unary.proxied', withTrace({ deviceId: device.deviceId, upstream: upstreamEndpoint, outcome, status, bytes: fullBytes.length }, traceId));
+      this.sessionEventsSupport = false;
+      upstreamEndpoint = SESSION_CONTENT_ENDPOINT;
+      target = this.loopbackOrigin + '/api/' + upstreamEndpoint + url.search;
+      sendBody = Buffer.from(rewriteRequestMethod(upstreamBody.toString('utf8'), upstreamEndpoint), 'utf8');
+      try {
+        upstream = await fetch(target, { method: 'POST', headers, body: sendBody, redirect: 'manual' });
+      } catch (error) {
+        this.counters.proxyErrors += 1;
+        this.audit.record('unary.upstream-failed', withTrace({ deviceId: device.deviceId, endpoint: url.pathname, message: String(error?.message ?? error) }, traceId));
+        return sendJson(response, 502, { ok: false, error: 'upstream-unreachable', message: String(error?.message ?? error) });
+      }
+      status = upstream.status;
+      fullBytes = Buffer.from(await upstream.arrayBuffer());
+      outcome = outcomeOfBody(status, fullBytes);
+    }
+ // DD-02 stickiness: only a success from the new name confirms support; a
+ // legacy retry must never flip the state back to "supported".
+    if (mapped) {
+      if (outcome === 'ok' && upstreamEndpoint === SESSION_CONTENT_HOST_ENDPOINT) this.sessionEventsSupport = true;
+      this.audit.record('unary.proxied', withTrace({ deviceId: device.deviceId, upstream: upstreamEndpoint, outcome, status, bytes: fullBytes.length }, traceId));
+    }
     if (isSessionListEndpoint(url.pathname)) this.seedPushTitlesFromBytes(fullBytes);
     this.counters.proxiedUnary += 1;
     const listLite = this.applyListLite(device, url.pathname, 'legacy', listLitePlan, fullBytes, traceId);
@@ -3829,21 +3885,60 @@ export class LinkServer {
     if (request?.type !== 'client-request' || request?.method !== endpoint) {
       throw new Error('rpc body does not match the declared endpoint');
     }
+ // DD-02: map the deprecated content endpoint on the host-facing leg only; the
+ // rest of this method (list-lite, projection, downstream bytes) keeps using
+ // the phone-side `endpoint`.
+    const mapped = isMappedEndpoint(endpoint);
+    let upstreamEndpoint = mapped ? upstreamEndpointFor(endpoint, this.sessionEventsSupport) : endpoint;
     const listLitePlan = this.planListLite(endpoint, headers, body.toString('utf8'));
     const upstreamBody = listLitePlan.bodyText === undefined ? body : Buffer.from(listLitePlan.bodyText, 'utf8');
-    const upstream = await fetch(this.loopbackOrigin + '/api/' + endpoint, {
+    let sendBody = mapped ? Buffer.from(rewriteRequestMethod(upstreamBody.toString('utf8'), upstreamEndpoint), 'utf8') : upstreamBody;
+    let upstream = await fetch(this.loopbackOrigin + '/api/' + upstreamEndpoint, {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
         cookie: peer.cookie.name + '=' + peer.cookie.value,
       },
-      body: upstreamBody,
+      body: sendBody,
       redirect: 'manual',
     });
-    const fullBytes = Buffer.from(await upstream.arrayBuffer());
+    let status = upstream.status;
+    let fullBytes = Buffer.from(await upstream.arrayBuffer());
+    let outcome = mapped ? outcomeOfBody(status, fullBytes) : undefined;
+ // DD-02: a legacy host answers the new name with the fixed "endpoint missing"
+ // code; retry the deprecated name inside the same request so the phone never
+ // sees the probe. The rejected probe is audited first (capability evidence),
+ // then the final reply below.
+    if (mapped && isEndpointMissing(outcome) && this.sessionEventsSupport !== false) {
+      this.audit.record('p1.rpc', withTrace({ deviceId: device.deviceId, upstream: upstreamEndpoint, outcome, status, bytes: fullBytes.length }, traceId));
+      this.sessionEventsSupport = false;
+      upstreamEndpoint = SESSION_CONTENT_ENDPOINT;
+      sendBody = Buffer.from(rewriteRequestMethod(upstreamBody.toString('utf8'), upstreamEndpoint), 'utf8');
+      upstream = await fetch(this.loopbackOrigin + '/api/' + upstreamEndpoint, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          cookie: peer.cookie.name + '=' + peer.cookie.value,
+        },
+        body: sendBody,
+        redirect: 'manual',
+      });
+      status = upstream.status;
+      fullBytes = Buffer.from(await upstream.arrayBuffer());
+      outcome = outcomeOfBody(status, fullBytes);
+    }
+ // DD-02 stickiness: only a success from the new name confirms support; a
+ // legacy retry must never flip the state back to "supported".
+    if (mapped && outcome === 'ok' && upstreamEndpoint === SESSION_CONTENT_HOST_ENDPOINT) this.sessionEventsSupport = true;
     if (endpoint === 'session/list') this.seedPushTitlesFromBytes(fullBytes);
     this.counters.proxiedUnary += 1;
-    this.audit.record('p1.rpc', withTrace({ deviceId: device.deviceId, endpoint, status: upstream.status, bytes: fullBytes.length }, traceId));
+    if (mapped) {
+ // AC-04/DD-05: record only the endpoint actually sent upstream; the phone-side
+ // name would make the audit ambiguous for acceptance.
+      this.audit.record('p1.rpc', withTrace({ deviceId: device.deviceId, upstream: upstreamEndpoint, outcome, status, bytes: fullBytes.length }, traceId));
+    } else {
+      this.audit.record('p1.rpc', withTrace({ deviceId: device.deviceId, endpoint, status, bytes: fullBytes.length }, traceId));
+    }
     const listLite = this.applyListLite(device, endpoint, 'p1', listLitePlan, fullBytes, traceId);
  // B (protocol v1): only a negotiated `session/page` success leaves the text
  // path; every other response keeps `listLite.bytes` (== the upstream bytes)
