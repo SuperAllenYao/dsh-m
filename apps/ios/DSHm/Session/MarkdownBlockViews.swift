@@ -528,6 +528,8 @@ struct MarkdownInlineFlowView: View {
     var lineSpacing: CGFloat
  /// 布局缓存签名：文本 + 字体/字号/动态字号（尺寸相关；颜色不影响布局）。
     var layoutCacheKey: String = ""
+ /// 是否撑满可用宽度。默认 true；表格单元格等「按内容取自然宽度」的位置传 false。
+    var fillsWidth: Bool = true
 
     var body: some View {
         MarkdownInlineFlowLayout(lineSpacing: lineSpacing, cacheKey: layoutCacheKey) {
@@ -537,7 +539,7 @@ struct MarkdownInlineFlowView: View {
                     .layoutValue(key: MarkdownInlineNoBreakBeforeKey.self, value: token.noBreakBefore)
             }
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .frame(maxWidth: fillsWidth ? .infinity : nil, alignment: .leading)
  // 自定义 Layout 的 token 是并列 Text；合并成一个无障碍元素，读屏按整段朗读。
         .accessibilityElement(children: .combine)
     }
@@ -573,6 +575,9 @@ struct MarkdownInlineText: View {
     var font: Font? = nil
     var codeFontSize: CGFloat? = nil
     var lineSpacing: CGFloat? = nil
+ /// 是否撑满可用宽度。默认 true（现有块级文本不变）；表格单元格传 false，
+ /// 让列宽由内容自然宽度决定（单元格单行、不按可用宽度折行）。
+    var fillsWidth: Bool = true
 
     @Environment(\.markdownRenderVariant) private var variant
  /// 动态字号参与布局缓存签名（字号变化后行宽/换行会变）。
@@ -592,7 +597,8 @@ struct MarkdownInlineText: View {
  // 布局缓存签名：只含影响尺寸的输入（文本内容 + 字体标识 + 字号 +
  // 行距 + 渲染变体 + 动态字号）；颜色/主题不影响换行与尺寸。
                 layoutCacheKey: "\(text.hashValue)|\(String(describing: resolvedFont))"
-                    + "|\(resolvedCodeFontSize)|\(resolvedLineSpacing)|\(variant)|\(dynamicTypeSize)"
+                    + "|\(resolvedCodeFontSize)|\(resolvedLineSpacing)|\(variant)|\(dynamicTypeSize)",
+                fillsWidth: fillsWidth
             )
             .contextMenu {
                 Button(L10n.t("复制文本")) {
@@ -606,7 +612,7 @@ struct MarkdownInlineText: View {
                 .lineSpacing(resolvedLineSpacing)
                 .textSelection(.enabled)
                 .fixedSize(horizontal: false, vertical: true)
-                .frame(maxWidth: .infinity, alignment: .leading)
+                .frame(maxWidth: fillsWidth ? .infinity : nil, alignment: .leading)
         }
     }
 }
@@ -687,20 +693,18 @@ struct MarkdownDocumentView: View {
     }
 
  /// 单视图富文本（方案①）：整条消息一个 Text；选择/长按复制/链接点击全保留。
- /// 含代码块时按代码块切段（prose 仍单 Text，代码段用换行版代码视图 + 复制），
- /// 这样长消息的每个代码块也有一键复制入口（v7）。
+ /// 含代码块/表格时按段渲染（prose 仍单 Text，代码段用换行版代码视图 + 复制，
+ /// 表格段用真实表格视图）：长消息的代码块保留一键复制入口，表格保持列对齐、
+ /// 单元格不折行。
     @ViewBuilder
     private func flattenedTextView(blocks: [MarkdownBlock]) -> some View {
         let blockCount = blocks.count
  // code review P2: decide from the parsed blocks, not from a
- // freshly-built segment array — code-free long messages keep the single
+ // freshly-built segment array — code/table-free long messages keep the single
  // attributed-string path with no extra construction/cache entry.
-        let hasCode = blocks.contains { block in
-            if case .codeBlock = block { return true }
-            return false
-        }
+        let usesSegments = MarkdownRenderPolicy.hasSegmentedBlocks(blocks)
         Group {
-            if hasCode && MarkdownRenderPolicy.isFlattenSegmentsEnabled {
+            if usesSegments && MarkdownRenderPolicy.isFlattenSegmentsEnabled {
                 let segments = MarkdownFlattenCache.shared.segments(for: text, variant: variant)
                 VStack(alignment: .leading, spacing: Theme.Spacing.xs) {
                     ForEach(Array(segments.enumerated()), id: \.offset) { _, segment in
@@ -715,6 +719,8 @@ struct MarkdownDocumentView: View {
                                 .frame(maxWidth: .infinity, alignment: .leading)
                         case .code(let language, let code):
                             MarkdownCodeBlockView(language: language, code: code, wrap: true)
+                        case .table(let table):
+                            MarkdownTableView(table: table, color: color)
                         }
                     }
                 }
@@ -1052,8 +1058,11 @@ struct MarkdownHorizontalRuleView: View {
 
 // MARK: - Table
 
-/// Pipe table: bold header + hairline separator, left-aligned cells, adaptive
-/// column widths, horizontal scrolling when wider than the bubble.
+/// Pipe table: bold header + hairline separator, left-aligned cells.
+///
+/// 列宽取「该列最宽单元格的自然宽度」（表头与数据行共用同一 `Grid` 列），
+/// 单元格 `fixedSize(horizontal:)` 保证单行不折行；整表宽于气泡时外层
+/// 横向 ScrollView 滚动查看，不裁切内容。
 struct MarkdownTableView: View {
     let table: MarkdownTable
     let color: Color
@@ -1061,118 +1070,64 @@ struct MarkdownTableView: View {
     @Environment(\.markdownRenderVariant) private var variant
 
     var body: some View {
-        let widths = MarkdownTableMetrics.columnWidths(for: table)
-        let spacing = Theme.Spacing.s
-        let totalWidth = widths.reduce(0, +) + spacing * CGFloat(max(0, widths.count - 1))
-        ScrollView(.horizontal, showsIndicators: false) {
-            VStack(alignment: .leading, spacing: 0) {
-                row(
-                    table.header,
-                    widths: widths,
-                    spacing: spacing,
-                    font: MarkdownTypography.tableHeaderFont(variant),
-                    textColor: color
-                )
-                .padding(.vertical, Theme.Spacing.xs)
-                Rectangle()
-                    .fill(Theme.Palette.border)
-                    .frame(width: totalWidth, height: 1)
-                ForEach(Array(table.rows.enumerated()), id: \.offset) { _, cells in
-                    row(
-                        cells,
-                        widths: widths,
-                        spacing: spacing,
-                        font: MarkdownTypography.tableBodyFont(variant),
-                        textColor: color
-                    )
-                    .padding(.vertical, Theme.Spacing.xs)
+        let columnCount = max(table.header.count, table.rows.map(\.count).max() ?? 0)
+        if columnCount == 0 {
+            EmptyView()
+        } else {
+            ScrollView(.horizontal, showsIndicators: false) {
+                Grid(
+                    alignment: .leading,
+                    horizontalSpacing: Theme.Spacing.s,
+                    verticalSpacing: 0
+                ) {
+                    GridRow(alignment: .firstTextBaseline) {
+                        ForEach(0..<columnCount, id: \.self) { index in
+                            cell(
+                                headerCell(at: index),
+                                font: MarkdownTypography.tableHeaderFont(variant)
+                            )
+                        }
+                    }
+                    GridRow {
+                        Rectangle()
+                            .fill(Theme.Palette.border)
+                            .frame(height: 1)
+                            .gridCellColumns(columnCount)
+                    }
+                    ForEach(Array(table.rows.enumerated()), id: \.offset) { _, cells in
+                        GridRow(alignment: .firstTextBaseline) {
+                            ForEach(0..<columnCount, id: \.self) { index in
+                                cell(
+                                    bodyCell(cells, at: index),
+                                    font: MarkdownTypography.tableBodyFont(variant)
+                                )
+                            }
+                        }
+                    }
                 }
+                .fixedSize(horizontal: true, vertical: false)
             }
-            .frame(width: totalWidth, alignment: .leading)
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    private func row(
-        _ cells: [String],
-        widths: [CGFloat],
-        spacing: CGFloat,
-        font: Font,
-        textColor: Color
-    ) -> some View {
-        HStack(alignment: .top, spacing: spacing) {
-            ForEach(Array(widths.enumerated()), id: \.offset) { index, width in
-                let cell = index < cells.count ? cells[index] : ""
-                MarkdownInlineText(text: cell.isEmpty ? " " : cell, color: textColor, font: font)
-                    .frame(width: width, alignment: .leading)
-            }
-        }
-    }
-}
-
-/// Approximate intrinsic column widths (UIKit measurement of the plain-text
-/// projection). Caps keep a single wordy cell from stretching the table too far;
-/// anything wider than the viewport scrolls horizontally.
-enum MarkdownTableMetrics {
-    static let minColumnWidth: CGFloat = 44
-    static let maxColumnWidth: CGFloat = 280
-    private static let cellSlack: CGFloat = 4
-
-    static func columnWidths(for table: MarkdownTable) -> [CGFloat] {
-        let columns = table.header.count
-        guard columns > 0 else { return [] }
-        var widths = [CGFloat](repeating: minColumnWidth, count: columns)
-        let bodyFont = UIFont.systemFont(ofSize: 14)
-        let headerFont = UIFont.systemFont(ofSize: 14, weight: .semibold)
-        for (index, cell) in table.header.enumerated() {
-            widths[index] = max(widths[index], measure(cell, font: headerFont))
-        }
-        for row in table.rows {
-            for (index, cell) in row.enumerated() where index < columns {
-                widths[index] = max(widths[index], measure(cell, font: bodyFont))
-            }
-        }
-        return widths.map { min(maxColumnWidth, max(minColumnWidth, $0)) }
+    /// 单元格：自然宽度 + 单行（空单元格补一个空格，保持行高与列对齐）。
+    private func cell(_ text: String, font: Font) -> some View {
+        MarkdownInlineText(
+            text: text.isEmpty ? " " : text,
+            color: color,
+            font: font,
+            fillsWidth: false
+        )
+        .fixedSize(horizontal: true, vertical: false)
+        .padding(.vertical, Theme.Spacing.xs)
     }
 
-    private static func measure(_ markdown: String, font: UIFont) -> CGFloat {
-        let plain = plainText(markdown)
-        guard !plain.isEmpty else { return 0 }
-        let width = (plain as NSString).size(withAttributes: [.font: font]).width
-        return ceil(width) + cellSlack
+    private func headerCell(at index: Int) -> String {
+        index < table.header.count ? table.header[index] : ""
     }
 
- /// Rough plain-text projection: strips inline markers so measurement is not
- /// inflated by `**`, backticks or link destinations.
-    private static func plainText(_ markdown: String) -> String {
-        var result = stripLinkDestinations(markdown)
-        for token in ["**", "__", "~~", "`"] {
-            result = result.replacingOccurrences(of: token, with: "")
-        }
-        result = result.replacingOccurrences(of: "*", with: "")
-        result = result.replacingOccurrences(of: "_", with: "")
-        return result
-    }
-
-    private static func stripLinkDestinations(_ text: String) -> String {
-        guard text.contains("](") else { return text }
-        var result = ""
-        var cursor = text.startIndex
-        while cursor < text.endIndex {
-            guard let closeBracket = text[cursor...].firstIndex(of: "]") else {
-                result += text[cursor...]
-                break
-            }
-            let afterBracket = text.index(after: closeBracket)
-            if afterBracket < text.endIndex, text[afterBracket] == "(",
-               let closeParen = text[afterBracket...].firstIndex(of: ")") {
-                result += text[cursor..<closeBracket]
-                cursor = text.index(after: closeParen)
-            } else {
-                result += text[cursor...afterBracket]
-                cursor = afterBracket
-            }
-        }
-        return result
+    private func bodyCell(_ cells: [String], at index: Int) -> String {
+        index < cells.count ? cells[index] : ""
     }
 }

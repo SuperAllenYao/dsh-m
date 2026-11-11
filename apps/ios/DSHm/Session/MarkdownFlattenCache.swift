@@ -17,8 +17,11 @@ import SwiftUI
 /// - 行内代码 chip 从「真圆角 + 0.5px 描边」变底色高亮（MarkdownInline.attributed
 /// 的既有形态）；选择能力反而更好（整行连续选择）。
 /// - 代码块扁平化：语言横幅与内容变等宽字体 + 底色 run，横向滚动消失。
-/// - 表格扁平化：单元格以分隔符拼成连续文本。
 /// - 引用竖线变「▎」字符前缀；分隔线变「─」字符行。
+///
+/// 表格不再是代价：`segments` 把 `.table` 切成独立段，由 `MarkdownTableView`
+/// 真实渲染（列对齐、单元格不折行、超宽横向滚动）；只有全文本回退路径
+/// （`attributedString`）仍按「单元格 + 分隔符」拼装。
 /// 选择 / 长按复制 / 链接点击全保留（单 Text + textSelection）。
 enum MarkdownFlattener {
 
@@ -34,8 +37,8 @@ enum MarkdownFlattener {
         return result
     }
 
- /// blocks → segments（纯函数；不含缓存）。连续的非代码块合成一个文本段，
- /// 代码块单独成段；段间距由调用方 VStack 负责，段内不加首尾空行。
+ /// blocks → segments（纯函数；不含缓存）。连续的非代码/表格块合成一个文本段，
+ /// 代码块与表格单独成段；段间距由调用方 VStack 负责，段内不加首尾空行。
     static func segments(blocks: [MarkdownBlock], variant: MarkdownRenderVariant) -> [MarkdownFlattenSegment] {
         var out: [MarkdownFlattenSegment] = []
         var current = AttributedString()
@@ -52,6 +55,11 @@ enum MarkdownFlattener {
             if case .codeBlock(let language, let code) = block {
                 flush()
                 out.append(.code(language: language, code: code))
+                continue
+            }
+            if case .table(let table) = block {
+                flush()
+                out.append(.table(table))
                 continue
             }
             if hasContent { current.append(blockSpacer) }
@@ -231,10 +239,13 @@ enum MarkdownFlattener {
 /// One renderable slice of a flattened long message (v7).
 ///
 /// Prose blocks stay one `AttributedString` run; fenced code blocks become a
-/// real `MarkdownCodeBlockView` so long messages keep the one-tap copy entry.
+/// real `MarkdownCodeBlockView` so long messages keep the one-tap copy entry;
+/// pipe tables become a real `MarkdownTableView` so columns stay aligned and
+/// cells never wrap.
 enum MarkdownFlattenSegment {
     case text(AttributedString)
     case code(language: String?, code: String)
+    case table(MarkdownTable)
 }
 
 // MARK: - Cache
