@@ -47,12 +47,10 @@ enum MarkdownPrewarm {
  // Text 布局；走单视图的行不再需要 inline token 预热。
                 if MarkdownRenderPolicy.shouldFlatten(text: text, blockCount: blocks.count) {
                     _ = MarkdownFlattenCache.shared.attributedString(for: text, variant: .body)
- // v7：含代码块的长消息首现走 segments 切段渲染，
+ // v7：含代码块/表格的长消息首现走 segments 切段渲染，
  // 这里同步预热，避免首次在主线程构造分段数组（审查 P3）。
-                    if blocks.contains(where: { block in
-                        if case .codeBlock = block { return true }
-                        return false
-                    }) {
+ // 判定必须与视图路径共用 hasSegmentedBlocks（表格也独立成段）。
+                    if MarkdownRenderPolicy.hasSegmentedBlocks(blocks) {
                         _ = MarkdownFlattenCache.shared.segments(for: text, variant: .body)
                     }
                     continue

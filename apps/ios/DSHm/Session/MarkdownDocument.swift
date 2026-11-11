@@ -89,6 +89,20 @@ enum MarkdownRenderPolicy {
         guard isFlattenEnabled, !text.isEmpty, shouldParse(text) else { return false }
         return text.count > flattenCharThreshold || blockCount >= flattenBlockThreshold
     }
+
+    /// flatten 文档里需要独立 SwiftUI 视图渲染的块（代码块 / 表格）。
+    ///
+    /// 视图路径（`MarkdownDocumentView.flattenedTextView`）与后台预热
+    /// （`MarkdownPrewarm`）共用这一判定：两边对「是否走 segments」的结论必须
+    /// 一致，否则首现会在主线程临时构造分段数组（表格也要独立成段）。
+    static func hasSegmentedBlocks(_ blocks: [MarkdownBlock]) -> Bool {
+        blocks.contains { block in
+            switch block {
+            case .codeBlock, .table: return true
+            default: return false
+            }
+        }
+    }
 }
 
 // MARK: - Parser
