@@ -73,6 +73,9 @@ struct SessionDetailView: View {
  /// `.sheet` modifiers on the same view can race on iOS (the tool detail sheet
  /// stopped presenting after a fourth sheet was added), so they share a slot.
     @State private var detailSheet: SessionDetailSheet?
+ /// 图片全屏预览的当前请求（DD-07 / AC-14）：nil = 无预览；由 `.fullScreenCover(item:)`
+ /// 呈现，关闭时系统把本状态置回 nil（AC-19：关闭即清预览状态）。
+    @State private var imagePreviewRequest: ImagePreviewRequest?
  /// v5.6 user questions: per-call in-flight/error state. The answer batch and
  /// the projection refresh live in SessionViewModel; on success the call is
  /// removed from activeUserQuestions, which is what dismisses the card.
@@ -204,6 +207,11 @@ struct SessionDetailView: View {
     private var detailBase: some View {
         sessionContent
             .modifier(JobRosterLifecycle(sessionId: sessionId, jobModel: jobModel, link: app.link, phase: app.link.phase))
+            // 文件打开动作的唯一注入点（DD-06）：正文链接、工具行、工具详情标题、
+            // 变更列表都读这个环境值，由本视图决定承载（面板 / 预览）。
+            .environment(\.fileOpenAction, fileOpenActionValue)
+            // 图片预览入口（DD-05）：三处缩略图（用户气泡、接力卡、工具结果）读这个环境值。
+            .environment(\.imagePreviewAction, imagePreviewActionValue)
             .background(Theme.Palette.background.ignoresSafeArea())
             .overlay {
                 pendingInteractionOverlay
@@ -317,6 +325,17 @@ struct SessionDetailView: View {
                 markFirstContentAfterLayout()
             }
         }
+        // 图片全屏预览（DD-07）：工程首个 `.fullScreenCover`。item 绑定在关闭时由系统置
+        // nil，因此「关闭按钮 / 下滑关闭」都回到同一状态出口（AC-19）；作为模态层它盖住
+        // 本页全部弹层与导航容器，呈现期间系统边缘返回不会 pop 下层。
+        .fullScreenCover(item: $imagePreviewRequest) { request in
+            ImagePreviewView(
+                request: request,
+                sessionId: sessionId,
+                attachments: attachments,
+                link: app.link
+            )
+        }
     }
 
  // MARK: - v0.2.0 bottom popups
@@ -331,6 +350,11 @@ struct SessionDetailView: View {
             BottomSheetLayer(onDismiss: dismissSheet) {
                 sheetBody(sheet)
             }
+            // 弹层在 `detailBase` 之外的 overlay 上，同一环境值要再注入一次：
+            // 工具详情里的文件标题（AC-05）就挂在这层里，否则 `fileOpenAction` 为 nil。
+            .environment(\.fileOpenAction, fileOpenActionValue)
+            // 同理：工具详情里的图片缩略图（read_image 结果）也在这层，需要预览入口。
+            .environment(\.imagePreviewAction, imagePreviewActionValue)
             .transition(.move(edge: .bottom).combined(with: .opacity))
         }
     }
@@ -341,6 +365,33 @@ struct SessionDetailView: View {
 
     private func dismissSheet() {
         withAnimation(Theme.Motion.standard) { detailSheet = nil }
+    }
+
+ /// 统一文件打开动作（DD-06 / AC-07）：所有入口（工具行、工具详情标题、变更列表、
+ /// 正文链接）都经 `fileOpenAction` 汇聚到这里，由会话详情补 sessionId 后承载。
+    private func handleFileOpen(_ target: FileOpenTarget) {
+        switch target {
+        case .filePanel(let path):
+            // 已有弹层（工具详情等）被替换，不是叠加：detailSheet 是唯一弹层槽位。
+            present(.file(path: path))
+        case .imagePreview(let path):
+            // 图片不进文件面板（AC-15）：同一入口进全屏预览。
+            // 文件图天然只有一张，组内起点固定 0；文件字节每次打开重新取（AC-16）。
+            imagePreviewRequest = ImagePreviewRequest(items: [.file(path: path)], startIndex: 0)
+        }
+    }
+
+ /// 注入给 `fileOpenAction` 的具体值；显式 Optional 化，环境值为 `nil` 时代表没人承载。
+    private var fileOpenActionValue: ((FileOpenTarget) -> Void)? {
+        Optional({ target in handleFileOpen(target) })
+    }
+
+ /// 注入给 `imagePreviewAction` 的具体值：缩略图点按只上报「哪一组、从第几张开始」，
+ /// 呈现与退出由本视图的 `.fullScreenCover` 负责（DD-05 / DD-07）。
+    private var imagePreviewActionValue: ((ImagePreviewRequest) -> Void)? {
+        Optional({ request in
+            imagePreviewRequest = request
+        })
     }
 
     @ViewBuilder
@@ -402,6 +453,10 @@ struct SessionDetailView: View {
                 },
                 onDismiss: dismissSheet
             )
+        case .file(let path):
+            // DD-03：面板替换当前弹层（同一槽位），`.id(path)` 保证换文件时重建读取状态。
+            FileContentPanelView(sessionId: sessionId, path: path, link: app.link)
+                .id(path)
         }
     }
 
@@ -1698,6 +1753,8 @@ enum SessionDetailSheet: Identifiable {
     case backgroundTasks(initialTab: BackgroundTasksTab)
  /// v0.2.0: composer model selection panel.
     case modelSelection
+ /// DD-03：文件内容面板（文本文件的唯一承载；图片走全屏预览，不落本 case）。
+    case file(path: String)
 
     var id: String {
         switch self {
@@ -1707,6 +1764,7 @@ enum SessionDetailSheet: Identifiable {
         case .permission: return "permission"
         case .backgroundTasks(let tab): return "background-tasks-\(tab.rawValue)"
         case .modelSelection: return "model-selection"
+        case .file(let path): return "file-\(path)"
         }
     }
 }

@@ -112,6 +112,22 @@ enum PopupHeight {
         min(max(fittedHeight, bounds.floor), bounds.ceiling)
     }
 
+ /// Opt-in initial height taken as a fraction of the screen height (DD-04).
+ ///
+ /// The fraction is clamped into the same resize bounds as every other height, so
+ /// the popup stays draggable in both directions and the existing auto-expand
+ /// band is unaffected. Only used when the content declared
+ /// `sheetInitialHeightFraction`; otherwise `initialHeight(fittedHeight:)` applies.
+    static func initialFractionHeight(
+        fraction: CGFloat,
+        screenHeight: CGFloat,
+        bounds: ResizeBounds
+    ) -> CGFloat {
+        let screen = max(screenHeight, minResizeFloor)
+        let target = screen * min(max(fraction, 0), 1)
+        return min(max(target, bounds.floor), bounds.ceiling)
+    }
+
  /// Resolves the laid-out height of a resizable popup: the user's height when
  /// they resized it, otherwise the content-fitted default. Both are clamped to
  /// the fixed resize bounds, so a tall diff can always be dragged back down.
@@ -192,6 +208,27 @@ extension View {
  /// Asks the enclosing resizable popup to auto-expand (see SheetExpandKey).
     func sheetExpandRequest(_ request: Int) -> some View {
         preference(key: SheetExpandKey.self, value: request)
+    }
+}
+
+/// Opt-in initial height fraction of a popup (DD-04).
+///
+/// `nil` (the default, i.e. no declaration) keeps the v0.2.x behaviour exactly:
+/// the height is fitted to the measured content. Only the file content panel
+/// declares `0.6`, so the six existing popups, the file-changes popup's
+/// resizable/auto-expand behaviour and the grabber drag thresholds stay untouched.
+struct SheetInitialHeightFractionKey: PreferenceKey {
+    static var defaultValue: CGFloat? = nil
+    static func reduce(value: inout CGFloat?, nextValue: () -> CGFloat?) {
+        value = value ?? nextValue()
+    }
+}
+
+extension View {
+ /// Declares the initial height of the enclosing popup as a fraction of the screen
+ /// height (`0...1`). Opt-in: without it the popup keeps the content-fitted height.
+    func sheetInitialHeightFraction(_ fraction: CGFloat) -> some View {
+        preference(key: SheetInitialHeightFractionKey.self, value: fraction)
     }
 }
 
@@ -319,6 +356,9 @@ struct BottomSheetPopup<Content: View>: View {
     var isResizable: Bool = false
  /// Auto-expand request counter from the content (see SheetExpandKey).
     var expandRequest: Int = 0
+ /// Opt-in initial height fraction (0...1) from the content (see
+ /// SheetInitialHeightFractionKey). nil = content-fitted height (v0.2.x behaviour).
+    var initialHeightFraction: CGFloat? = nil
     @ViewBuilder var content: () -> Content
 
  /// Full-width hit area for the grabber; the bar itself sits 20pt from the top.
@@ -357,11 +397,21 @@ struct BottomSheetPopup<Content: View>: View {
         )
     }
 
- /// Height actually laid out: active drag > user-chosen > content-fitted.
+ /// Height actually laid out: active drag > user-chosen > declared initial
+ /// fraction (opt-in, DD-04) > content-fitted.
  /// Non-resizable popups keep the v0.2.0 content-fitted height untouched.
     private var laidOutHeight: CGFloat {
         if let dragHeight { return dragHeight }
         guard isResizable else { return fittedHeight }
+        if userHeight == nil, let initialHeightFraction {
+            // 文件内容面板：初始 60% 屏高。只在用户还没拖过时生效，拖拽 / 自动抬高
+            // 之后沿用 userHeight，行为与其它可调高度弹层一致。
+            return PopupHeight.initialFractionHeight(
+                fraction: initialHeightFraction,
+                screenHeight: screenHeight,
+                bounds: resizeBounds
+            )
+        }
         return PopupHeight.resolvedHeight(
             userHeight: userHeight,
             fittedHeight: fittedHeight,
@@ -492,6 +542,7 @@ struct BottomSheetLayer<Content: View>: View {
     @State private var contentHeight: CGFloat = 0
     @State private var isResizable = false
     @State private var expandRequest = 0
+    @State private var initialHeightFraction: CGFloat?
     @State private var hasMeasuredContent = false
 
     var body: some View {
@@ -506,6 +557,7 @@ struct BottomSheetLayer<Content: View>: View {
                 contentHeight: contentHeight,
                 isResizable: isResizable,
                 expandRequest: expandRequest,
+                initialHeightFraction: initialHeightFraction,
                 content: content
             )
         }
@@ -523,5 +575,6 @@ struct BottomSheetLayer<Content: View>: View {
         }
         .onPreferenceChange(SheetResizableKey.self) { isResizable = $0 }
         .onPreferenceChange(SheetExpandKey.self) { expandRequest = $0 }
+        .onPreferenceChange(SheetInitialHeightFractionKey.self) { initialHeightFraction = $0 }
     }
 }

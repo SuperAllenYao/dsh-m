@@ -15,6 +15,19 @@ struct SubagentListView: View {
     var showsHeader: Bool = true
     var onSelect: (SubagentCatalogEntry) -> Void
 
+ /// DD-08 / AC-01: the merged catalog keeps its merge order; the rows are
+ /// ordered here — `firstSeen ?? createdAt` descending, ties by `id`. A
+ /// live-discovered row is stamped on its first paint, so a later status or
+ /// activity change cannot move it (AC-03).
+    private var orderedEntries: [SubagentCatalogEntry] {
+        let store = SubagentCatalogFirstSeenStore.shared
+        store.noteDisplayed(entries)
+        return SubagentCatalogOrder.ordered(
+            entries,
+            firstSeen: { store.firstSeen(for: $0) }
+        )
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             if showsHeader {
@@ -31,7 +44,7 @@ struct SubagentListView: View {
                         )
                         .accessibilityIdentifier("subagent-list-empty")
                     }
-                    ForEach(entries) { entry in
+                    ForEach(orderedEntries) { entry in
                         Button {
                             onSelect(entry)
                         } label: {

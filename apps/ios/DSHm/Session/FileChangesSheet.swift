@@ -163,6 +163,10 @@ struct FileChangesSheet: View {
     @ObservedObject var viewModel: SessionViewModel
     var changes: TurnFileChanges
 
+    /// DD-03 / AC-06：文件路径入口的唯一接线点（由会话详情注入；nil = 没人承载，
+    /// 行体维持改造前的形状）。
+    @Environment(\.fileOpenAction) private var fileOpenAction
+
  /// Per-file diff state keyed by summary index.
     @State private var diffStates: [Int: FileDiffState] = [:]
  /// Indexes of the file rows currently expanded.
@@ -261,9 +265,21 @@ struct FileChangesSheet: View {
         )
     }
 
+    /// AC-06：行内的**文件路径**是独立命中区（打开文件面板或图片预览），行体其余
+    /// 部分仍展开/收起 diff；`file-change-row-<index>` 保持在行体上。
+    ///
+    /// 命中区互不重叠、全是同级 Button（没有嵌套按钮、也不靠手势优先级仲裁），所以
+    /// 一次点击不可能既开面板又展开 diff。`fileOpenAction == nil`（没人承载）或路径
+    /// 不可分类时，整行维持改造前的形状，不会出现点了没反应的死按钮。
     @ViewBuilder
     private func fileRow(index: Int, file: ChangesSummaryValue.File, isExpanded: Bool) -> some View {
-        if canOpenDiffs {
+        if let target = pathOpenTarget(for: file), let open = fileOpenAction {
+            if canOpenDiffs {
+                expandableRow(index: index, file: file, isExpanded: isExpanded, pathTarget: target, open: open)
+            } else {
+                inertRow(index: index, file: file, pathTarget: target, open: open)
+            }
+        } else if canOpenDiffs {
             Button {
                 toggle(index: index)
             } label: {
@@ -280,35 +296,171 @@ struct FileChangesSheet: View {
         }
     }
 
-    private func fileRowContent(file: ChangesSummaryValue.File, isExpanded: Bool) -> some View {
-        HStack(spacing: Theme.Spacing.xs) {
-            Group {
-                if canOpenDiffs {
-                    Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
-                        .font(.system(size: 9, weight: .semibold))
-                        .foregroundStyle(Theme.Diff.muted)
-                } else {
-                    Color.clear
+    /// 行内路径的打开目标；没有承载方（`fileOpenAction == nil`）或空路径时 nil
+    /// （调用方保持改造前的行形状）。
+    private func pathOpenTarget(for file: ChangesSummaryValue.File) -> FileOpenTarget? {
+        guard fileOpenAction != nil else { return nil }
+        return FileEntryTarget.resolve(file.path)
+    }
+
+    /// 可展开行：路径行是独立按钮，箭头 / 文件名 / 统计三处仍切换展开。
+    ///
+    /// 纵向 9pt、横向 12pt 的内边距，以及区域之间的 8pt 间距，都分摊进各命中区的
+    /// label：整行可点面积与改造前一致，没有点不动的边条。
+    private func expandableRow(
+        index: Int,
+        file: ChangesSummaryValue.File,
+        isExpanded: Bool,
+        pathTarget: FileOpenTarget,
+        open: @escaping (FileOpenTarget) -> Void
+    ) -> some View {
+        // 区域间距由各命中区的内边距承担：视觉与改造前一致，但行内没有点不动的空隙
+        // （横向整行都被某个按钮覆盖）。
+        HStack(spacing: 0) {
+            Button {
+                toggle(index: index)
+            } label: {
+                HStack(spacing: Theme.Spacing.xs) {
+                    rowChevron(isExpanded: isExpanded, expandable: true)
+                        .frame(width: 12)
+                    rowGlyph(file)
                 }
+                .padding(.leading, Theme.Spacing.s)
+                .padding(.trailing, Theme.Spacing.xs)
+                .padding(.vertical, 9)
+                .frame(maxHeight: .infinity)
+                .contentShape(Rectangle())
             }
-            .frame(width: 12)
-            Image(systemName: fileIcon(for: file.path))
-                .font(.system(size: 12, weight: .medium))
-                .foregroundStyle(Theme.Diff.muted)
-                .frame(width: 16)
+            .buttonStyle(.plain)
+            // 与文件名行同义（展开/收起）：隐藏，避免 VoiceOver 重复播报。
+            .accessibilityHidden(true)
+
             VStack(alignment: .leading, spacing: 1) {
-                Text(fileName(file))
-                    .font(Theme.Typography.captionMedium)
-                    .foregroundStyle(Theme.Diff.text)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                Text(file.path)
-                    .font(Theme.Typography.monoSmall)
-                    .foregroundStyle(Theme.Diff.muted)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
+                Button {
+                    toggle(index: index)
+                } label: {
+                    rowFileName(file)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.leading, Theme.Spacing.xs)
+                        .padding(.top, 9)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("file-change-row-" + String(index))
+                .accessibilityLabel(rowAccessibilityLabel(for: file))
+
+                Button {
+                    open(pathTarget)
+                } label: {
+                    rowFilePath(file, tappable: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.leading, Theme.Spacing.xs)
+                        .padding(.bottom, 9)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("file-change-path-" + String(index))
+            }
+
+            Button {
+                toggle(index: index)
+            } label: {
+                rowStats(file)
+                    .padding(.leading, Theme.Spacing.xs)
+                    .padding(.trailing, Theme.Spacing.s)
+                    .padding(.vertical, 9)
+                    .frame(maxHeight: .infinity)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityHidden(true)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Theme.Diff.surface)
+    }
+
+    /// 兜底行（meta.diffs 聚合、没有 hunk 数据、不可展开）：路径仍可点开文件面板，
+    /// 其余保持惰性。
+    ///
+    /// 这里不能沿用 `.combine`——它会把路径按钮从元素树里吞掉，入口就点不到（需求要求
+    /// 可点元素能被 UI 自动化命中）；用 `.contain` 保留行标识，同时让子元素各自可达。
+    private func inertRow(
+        index: Int,
+        file: ChangesSummaryValue.File,
+        pathTarget: FileOpenTarget,
+        open: @escaping (FileOpenTarget) -> Void
+    ) -> some View {
+        HStack(spacing: Theme.Spacing.xs) {
+            rowChevron(isExpanded: false, expandable: false)
+                .frame(width: 12)
+            rowGlyph(file)
+            VStack(alignment: .leading, spacing: 1) {
+                rowFileName(file)
+                Button {
+                    open(pathTarget)
+                } label: {
+                    rowFilePath(file, tappable: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("file-change-path-" + String(index))
             }
             Spacer(minLength: Theme.Spacing.xs)
+            rowStats(file)
+        }
+        .padding(.horizontal, Theme.Spacing.s)
+        .padding(.vertical, 9)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Theme.Diff.surface)
+        .contentShape(Rectangle())
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("file-change-row-" + String(index))
+    }
+
+ // MARK: 行内元素（四种行形状共用，保证视觉一致）
+
+    /// 展开箭头（兜底行留出同宽空位）。
+    @ViewBuilder
+    private func rowChevron(isExpanded: Bool, expandable: Bool) -> some View {
+        if expandable {
+            Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                .font(.system(size: 9, weight: .semibold))
+                .foregroundStyle(Theme.Diff.muted)
+        } else {
+            Color.clear
+        }
+    }
+
+    private func rowGlyph(_ file: ChangesSummaryValue.File) -> some View {
+        Image(systemName: fileIcon(for: file.path))
+            .font(.system(size: 12, weight: .medium))
+            .foregroundStyle(Theme.Diff.muted)
+            .frame(width: 16)
+    }
+
+    private func rowFileName(_ file: ChangesSummaryValue.File) -> some View {
+        Text(fileName(file))
+            .font(Theme.Typography.captionMedium)
+            .foregroundStyle(Theme.Diff.text)
+            .lineLimit(1)
+            .truncationMode(.middle)
+    }
+
+    /// 文件路径文字（设计稿 `.chpath`：虚线底示意可点）；`tappable` 时补虚线下划线。
+    private func rowFilePath(_ file: ChangesSummaryValue.File, tappable: Bool) -> some View {
+        Text(file.path)
+            .underline(tappable, pattern: .dash, color: Theme.Diff.border)
+            .font(Theme.Typography.monoSmall)
+            .foregroundStyle(Theme.Diff.muted)
+            .lineLimit(1)
+            .truncationMode(.middle)
+    }
+
+    /// GitHub 增减比例条 + 增删行数（原样搬进一个 HStack，间距仍是 8pt）。
+    @ViewBuilder
+    private func rowStats(_ file: ChangesSummaryValue.File) -> some View {
+        HStack(spacing: Theme.Spacing.xs) {
             changeBar(added: file.added ?? 0, deleted: file.deleted ?? 0)
             if let added = file.added, added > 0 {
                 Text("+" + String(added))
@@ -320,6 +472,28 @@ struct FileChangesSheet: View {
                     .font(Theme.Typography.label)
                     .foregroundStyle(Theme.Diff.delMark)
             }
+        }
+    }
+
+    /// 行体按钮的朗读内容：文件名 + 增删行数（复用现有文案，不新增可本地化字符串）。
+    private func rowAccessibilityLabel(for file: ChangesSummaryValue.File) -> String {
+        var parts = [fileName(file)]
+        if let added = file.added, added > 0 { parts.append("+" + String(added)) }
+        if let deleted = file.deleted, deleted > 0 { parts.append("-" + String(deleted)) }
+        return parts.joined(separator: " ")
+    }
+
+    private func fileRowContent(file: ChangesSummaryValue.File, isExpanded: Bool) -> some View {
+        HStack(spacing: Theme.Spacing.xs) {
+            rowChevron(isExpanded: isExpanded, expandable: canOpenDiffs)
+                .frame(width: 12)
+            rowGlyph(file)
+            VStack(alignment: .leading, spacing: 1) {
+                rowFileName(file)
+                rowFilePath(file, tappable: false)
+            }
+            Spacer(minLength: Theme.Spacing.xs)
+            rowStats(file)
         }
         .padding(.horizontal, Theme.Spacing.s)
         .padding(.vertical, 9)

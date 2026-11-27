@@ -531,17 +531,21 @@ struct MarkdownInlineFlowView: View {
  /// 是否撑满可用宽度。默认 true；表格单元格等「按内容取自然宽度」的位置传 false。
     var fillsWidth: Bool = true
 
+    @Environment(\.fileOpenAction) private var fileOpenAction
+
     var body: some View {
-        MarkdownInlineFlowLayout(lineSpacing: lineSpacing, cacheKey: layoutCacheKey) {
-            ForEach(Array(tokens.enumerated()), id: \.offset) { _, token in
-                tokenView(token)
-                    .layoutValue(key: MarkdownInlineTokenKindKey.self, value: token.kind)
-                    .layoutValue(key: MarkdownInlineNoBreakBeforeKey.self, value: token.noBreakBefore)
+        withFileLinkAccessibilityAction(
+            MarkdownInlineFlowLayout(lineSpacing: lineSpacing, cacheKey: layoutCacheKey) {
+                ForEach(Array(tokens.enumerated()), id: \.offset) { _, token in
+                    tokenView(token)
+                        .layoutValue(key: MarkdownInlineTokenKindKey.self, value: token.kind)
+                        .layoutValue(key: MarkdownInlineNoBreakBeforeKey.self, value: token.noBreakBefore)
+                }
             }
-        }
-        .frame(maxWidth: fillsWidth ? .infinity : nil, alignment: .leading)
+            .frame(maxWidth: fillsWidth ? .infinity : nil, alignment: .leading)
  // 自定义 Layout 的 token 是并列 Text；合并成一个无障碍元素，读屏按整段朗读。
-        .accessibilityElement(children: .combine)
+            .accessibilityElement(children: .combine)
+        )
     }
 
     @ViewBuilder
@@ -554,12 +558,48 @@ struct MarkdownInlineFlowView: View {
         case .text:
             let boldFont = token.bold ? font.bold() : font
             let styledFont = token.italic ? boldFont.italic() : boldFont
-            Text(token.text)
+            let textView = Text(token.text)
                 .font(styledFont)
                 .foregroundStyle(token.link == nil ? color : Theme.Palette.accent)
                 .strikethrough(token.strikethrough)
                 .underline(token.link != nil)
+ // 只有「分类为文件路径」的带 link token 可点；非文件链接保持无响应（DD-06 / DEC-03）。
+            if let link = token.link,
+               let open = fileOpenAction,
+               let target = FileOpenRouter.target(forLinkTarget: link.absoluteString) {
+                textView.onTapGesture { open(target) }
+            } else {
+                textView
+            }
         }
+    }
+
+ /// token 合并成一个无障碍元素后，带 link 的 token 不再是独立元素：给整段补一个自定义动作。
+ /// 一段里出现多个不同文件链接时只暴露第一个（罕见；优先保证能打开）。
+    @ViewBuilder
+    private func withFileLinkAccessibilityAction<V: View>(_ content: V) -> some View {
+        if let open = fileOpenAction, let action = fileLinkAccessibilityAction {
+            content.accessibilityAction(named: Text(action.name)) { open(action.target) }
+        } else {
+            content
+        }
+    }
+
+ /// 段落里第一个文件链接（按 token 顺序、路径去重）；名称用链接可见文字，兜底文件名。
+    private var fileLinkAccessibilityAction: (name: String, target: FileOpenTarget)? {
+        var order: [FileOpenTarget] = []
+        var seen = Set<String>()
+        var labels: [String: String] = [:]
+        for token in tokens {
+            guard let link = token.link,
+                  let target = FileOpenRouter.target(forLinkTarget: link.absoluteString) else { continue }
+            if seen.insert(target.path).inserted { order.append(target) }
+            labels[target.path, default: ""] += token.text
+        }
+        guard let first = order.first else { return nil }
+        let visible = (labels[first.path] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let name = visible.isEmpty ? (first.path as NSString).lastPathComponent : visible
+        return (name, first)
     }
 }
 
@@ -582,6 +622,7 @@ struct MarkdownInlineText: View {
     @Environment(\.markdownRenderVariant) private var variant
  /// 动态字号参与布局缓存签名（字号变化后行宽/换行会变）。
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @Environment(\.fileOpenAction) private var fileOpenAction
 
     var body: some View {
         let resolvedFont = font ?? MarkdownTypography.bodyFont(variant)
@@ -613,6 +654,8 @@ struct MarkdownInlineText: View {
                 .textSelection(.enabled)
                 .fixedSize(horizontal: false, vertical: true)
                 .frame(maxWidth: fillsWidth ? .infinity : nil, alignment: .leading)
+ // `Text(attributed)` 的 link 点按走 openURL：分类为文件的进 App 内，其余保持系统行为。
+                .environment(\.openURL, FileOpenRouter.openURLAction(fileOpenAction: fileOpenAction))
         }
     }
 }
@@ -667,6 +710,7 @@ struct MarkdownDocumentView: View {
 
  /// 分帧渲染时已追加的 block 数（0 = 只有首屏 initialBlocks）。
     @State private var appendedBlocks: Int = 0
+    @Environment(\.fileOpenAction) private var fileOpenAction
 
     var body: some View {
         Group {
@@ -746,6 +790,8 @@ struct MarkdownDocumentView: View {
                     }
             }
         }
+ // 扁平化正文同样是 `Text(attributed)`：link 点按走 openURL，文件链接要回 App 内（DD-06）。
+        .environment(\.openURL, FileOpenRouter.openURLAction(fileOpenAction: fileOpenAction))
     }
 
     private func blockListView(blocks: [MarkdownBlock]) -> some View {

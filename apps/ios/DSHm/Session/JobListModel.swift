@@ -68,13 +68,19 @@ enum JobStatus: Equatable {
         case .unknown: return Theme.Palette.textTertiary
         }
     }
+}
 
- /// 0 running / 1 stopping / 2 terminal — the sheet's row order.
-    var sortRank: Int {
-        switch self {
-        case .running: return 0
-        case .stopping: return 1
-        default: return 2
+/// The roster's row order (DD-09 / AC-02 / AC-03): `startedAt` descending,
+/// ties by `id` ascending. Status never participates, so a running→completed
+/// flip cannot reorder the roster. Internal and pure so the order is unit
+/// testable without driving a live `job/list` stream through `JobListModel`.
+enum JobRosterOrder {
+    static func ordered(_ rows: [JobRow]) -> [JobRow] {
+        rows.sorted { lhs, rhs in
+            let leftTime = lhs.startedAt ?? 0
+            let rightTime = rhs.startedAt ?? 0
+            if leftTime != rightTime { return leftTime > rightTime }
+            return lhs.id < rhs.id
         }
     }
 }
@@ -163,23 +169,15 @@ final class JobListModel: ObservableObject {
     private func apply(_ value: JSONValue?) {
         guard let value,
               let array = value["jobs"]?.arrayValue else { return }
-        let rows = array
-            .compactMap { JobRow(json: $0) }
-            .filter { row in
+        let parsed: [JobRow] = array.compactMap { JobRow(json: $0) }
+        let rows = JobRosterOrder.ordered(
+            parsed.filter { row in
  // `registry.list(sessionId)` returns own + unowned jobs; the
  // sheet only shows this session's own work (DEC-03).
                 guard let owner = row.owner else { return false }
                 return owner == sessionId
             }
-            .sorted { lhs, rhs in
-                if lhs.status.sortRank != rhs.status.sortRank {
-                    return lhs.status.sortRank < rhs.status.sortRank
-                }
-                let leftTime = lhs.startedAt ?? 0
-                let rightTime = rhs.startedAt ?? 0
-                if leftTime != rightTime { return leftTime > rightTime }
-                return lhs.id < rhs.id
-            }
+        )
         jobs = rows
         state = .available
     }

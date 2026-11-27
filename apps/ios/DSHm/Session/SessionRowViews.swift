@@ -28,7 +28,7 @@ struct FlowRowView: View {
     var body: some View {
         switch row.content {
         case .user(let bubble):
-            UserBubbleView(bubble: bubble, sessionId: sessionId, attachments: attachments)
+            UserBubbleView(bubble: bubble, sessionId: sessionId, seq: row.seq, attachments: attachments)
         case .relay(let card):
             RelayCardView(
                 card: card,
@@ -75,12 +75,32 @@ struct FlowRowView: View {
     }
 }
 
+// MARK: - 图片预览入口接线（DD-05 / AC-14）
+
+/// 用户气泡与接力卡共用的缩略图点按接线：该行整组附件图 + 起始下标 → 上层预览层。
+///
+/// 只负责「哪一组、从第几张开始」；`nil` = 没有承载方（非详情页/预览宿主），
+/// 此时缩略图保持不可点，行为与改造前一致。
+private func deliverImagePreview(
+    images: [ImageRef],
+    startIndex: Int,
+    to action: ((ImagePreviewRequest) -> Void)?
+) {
+    guard let action,
+          let request = ImagePreviewRequest(attachments: images, startIndex: startIndex) else { return }
+    action(request)
+}
+
 // MARK: - User bubble (right aligned; §3: user -> right bubble)
 
 struct UserBubbleView: View {
     var bubble: UserBubble
     var sessionId: String
+    /// 本行的 `user/message` 事件 seq（E2E/无障碍可寻址：`user-image-<seq>-<index>`）。
+    var seq: Int
     @ObservedObject var attachments: AttachmentStore
+    /// 图片预览入口（DD-05）：由 `SessionDetailView` 注入；nil 时缩略图不可点。
+    @Environment(\.imagePreviewAction) private var imagePreviewAction
 
     var body: some View {
         HStack {
@@ -91,8 +111,21 @@ struct UserBubbleView: View {
                 }
                 if !bubble.images.isEmpty {
                     HStack(spacing: Theme.Spacing.xs) {
-                        ForEach(bubble.images, id: \.self) { ref in
-                            AttachmentThumbnail(ref: ref, attachments: attachments, maxHeight: 140)
+                        ForEach(Array(bubble.images.enumerated()), id: \.offset) { index, ref in
+                            AttachmentThumbnail(
+                                ref: ref,
+                                attachments: attachments,
+                                maxHeight: 140,
+                                onTap: {
+                                    deliverImagePreview(
+                                        images: bubble.images,
+                                        startIndex: index,
+                                        to: imagePreviewAction
+                                    )
+                                },
+                                // E2E/无障碍可寻址：`user-image-<消息 seq>-<下标>`。
+                                a11yIdentifier: "user-image-\(seq)-\(index)"
+                            )
                         }
                     }
                 }
@@ -103,6 +136,9 @@ struct UserBubbleView: View {
                 RoundedRectangle(cornerRadius: Theme.Radius.lg, style: .continuous)
                     .strokeBorder(Theme.Palette.borderStrong, lineWidth: 1)
             )
+            // 先声明容器再命名：标识落在气泡自身，消息正文/每张缩略图保留自己的标识
+            // （DEF-007：容器级 identifier 会下发覆盖子元素标识）。
+            .accessibilityElement(children: .contain)
             .accessibilityIdentifier("user-bubble")
         }
     }
@@ -122,6 +158,8 @@ struct RelayCardView: View {
     @State private var isExpanded = false
  /// UIKit 列表后端：由列表层逐帧驱动行高动画（用户点击上报）。
     @Environment(\.userToggleReporter) private var userToggleReporter
+ /// 图片预览入口（DD-05）：由 `SessionDetailView` 注入；nil 时缩略图不可点。
+    @Environment(\.imagePreviewAction) private var imagePreviewAction
 
     private var senderLabel: String {
         if let agentLabel, !agentLabel.isEmpty { return agentLabel }
@@ -176,8 +214,19 @@ struct RelayCardView: View {
                 }
                 if !card.images.isEmpty {
                     HStack(spacing: Theme.Spacing.xs) {
-                        ForEach(card.images, id: \.self) { ref in
-                            AttachmentThumbnail(ref: ref, attachments: attachments, maxHeight: 120)
+                        ForEach(Array(card.images.enumerated()), id: \.offset) { index, ref in
+                            AttachmentThumbnail(
+                                ref: ref,
+                                attachments: attachments,
+                                maxHeight: 120,
+                                onTap: {
+                                    deliverImagePreview(
+                                        images: card.images,
+                                        startIndex: index,
+                                        to: imagePreviewAction
+                                    )
+                                }
+                            )
                         }
                     }
                 }
