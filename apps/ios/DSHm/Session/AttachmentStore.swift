@@ -36,7 +36,7 @@ final class AttachmentStore: ObservableObject {
         Task { [weak self] in
             guard let self else { return }
             do {
-                let result = try await link.attachmentData(sessionId: self.sessionId, attachmentId: attachmentId)
+                let result = try await link.attachmentData(sessionId: self.sessionId, ref: ref)
                 if let image = UIImage(data: result.data) {
                     self.images[attachmentId] = image
                 } else {
@@ -47,5 +47,16 @@ final class AttachmentStore: ObservableObject {
             }
             self.loading.remove(attachmentId)
         }
+    }
+
+    /// Clears the failure record for this attachment and re-runs `ensureLoaded`.
+    ///
+    /// DD-10 / AC-20: a retry must clear the `failed` marker first, otherwise
+    /// `ensureLoaded` keeps skipping the attachment. Cache semantics are
+    /// unchanged — an already loaded image is still never re-fetched.
+    func retry(_ ref: ImageRef) {
+        guard let attachmentId = ref.attachmentId else { return }
+        failed.remove(attachmentId)
+        ensureLoaded(ref)
     }
 }

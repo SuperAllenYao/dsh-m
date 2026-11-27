@@ -1,3 +1,4 @@
+import Foundation
 import SwiftUI
 
 // MARK: - Subagent catalog / session models (v5.4 §1-§3, task-13)
@@ -202,7 +203,10 @@ enum SubagentCatalogMerge {
         sessions: [SessionListItem],
         parentSessionId: String
     ) -> [SubagentCatalogEntry] {
-        sessions.compactMap { item in
+ // Explicit result type: `compactMap`'s generic result can no longer be
+ // inferred once the multi-statement closure stops being the `return`
+ // expression of this function.
+        let entries: [SubagentCatalogEntry] = sessions.compactMap { item in
             guard item.parentSessionId == parentSessionId, item.isSubagent else { return nil }
             return SubagentCatalogEntry(
                 id: item.sessionId,
@@ -211,6 +215,15 @@ enum SubagentCatalogMerge {
                 label: item.title
             )
         }
+ // DD-08: this batch is what `merge` appends (in this order), so the display
+ // key is stamped here, right before the merge. The merge output order is not
+ // touched. Stamping is first-sight only and idempotent (`AC-03`).
+        SubagentCatalogFirstSeenStore.shared.recordDiscoveredBatch(
+            parentSessionId: parentSessionId,
+            childIds: entries.map(\.id),
+            now: Int64(Date().timeIntervalSince1970 * 1000)
+        )
+        return entries
     }
 
  /// Projection entries win (they carry the host's mode/label); discovered
@@ -226,6 +239,115 @@ enum SubagentCatalogMerge {
             merged.append(entry)
         }
         return merged
+    }
+}
+
+// MARK: - Catalog display ordering (DD-08 / AC-01 / AC-03)
+
+/// Where one merged catalog entry came from. The projection carries the host's
+/// real creation time; a live-discovered child is built from `session/list`
+/// with the child's last activity time filled into `createdAt`, so that value
+/// must never become its display sort key.
+enum SubagentCatalogEntrySource: Equatable {
+    case projected
+    case discovered
+}
+
+extension SubagentCatalogEntry {
+ /// The projection entry format always carries `mode` (`FlowModels.swift`,
+ /// `init?(json:)`), and `SubagentCatalogMerge.merge` keeps the projection
+ /// entry when ids collide. An entry that still has no mode after merging is
+ /// therefore one appended by `SubagentCatalogMerge.discovered` — the source
+ /// marker for the sort key, without a second stored field.
+    var catalogSource: SubagentCatalogEntrySource {
+        mode == nil ? .discovered : .projected
+    }
+}
+
+/// App-lifecycle store of the "first discovered" timestamps live-discovered
+/// subagents are sorted by (DD-08). Keyed by parent session id + child session
+/// id: leaving the session detail keeps the values, a child that leaves the
+/// parent's catalog is pruned, and App termination releases everything. Memory
+/// only — nothing is persisted.
+final class SubagentCatalogFirstSeenStore {
+    static let shared = SubagentCatalogFirstSeenStore()
+
+    private let lock = NSLock()
+    private var firstSeenByChild: [String: Int64] = [:]
+    private var parentByChild: [String: String] = [:]
+    private var shownAsDiscovered: Set<String> = []
+
+ /// Records the children `session/list` reports for one parent. A child is
+ /// stamped on its first sighting only, so its key never moves afterwards
+ /// (AC-03); inside one batch the values decrease with the batch order, which
+ /// is the order `merge` appends them in, so a batch keeps its relative order.
+ /// Children no longer in the catalog are pruned here.
+    func recordDiscoveredBatch(parentSessionId: String, childIds: [String], now: Int64) {
+        lock.lock()
+        defer { lock.unlock() }
+        let alive = Set(childIds)
+        for (childId, childParent) in parentByChild
+        where childParent == parentSessionId && !alive.contains(childId) {
+            firstSeenByChild[childId] = nil
+            parentByChild[childId] = nil
+            shownAsDiscovered.remove(childId)
+        }
+        for (offset, childId) in childIds.enumerated() where firstSeenByChild[childId] == nil {
+            firstSeenByChild[childId] = now - Int64(offset)
+            parentByChild[childId] = parentSessionId
+        }
+    }
+
+ /// Marks the entries painted as live-discovered. A projection entry that
+ /// later replaces one keeps its recorded first-seen key, so the row does not
+ /// jump when the snapshot catches up.
+    func noteDisplayed(_ entries: [SubagentCatalogEntry]) {
+        lock.lock()
+        defer { lock.unlock() }
+        for entry in entries where entry.catalogSource == .discovered {
+            shownAsDiscovered.insert(entry.id)
+        }
+    }
+
+ /// First-seen lookup for the display key: a live-discovered entry always uses
+ /// the recorded batch value; a projection entry prefers it only when it
+ /// replaced a live-discovered one, otherwise `createdAt` stays authoritative.
+    func firstSeen(for entry: SubagentCatalogEntry) -> Int64? {
+        lock.lock()
+        defer { lock.unlock() }
+        switch entry.catalogSource {
+        case .discovered:
+            return firstSeenByChild[entry.id]
+        case .projected:
+            return shownAsDiscovered.contains(entry.id) ? firstSeenByChild[entry.id] : nil
+        }
+    }
+
+ /// Test hook: the store is App-lifetime state, so tests start from reset.
+    func resetAll() {
+        lock.lock()
+        defer { lock.unlock() }
+        firstSeenByChild.removeAll()
+        parentByChild.removeAll()
+        shownAsDiscovered.removeAll()
+    }
+}
+
+/// Display ordering of the subagent half-sheet (DD-08 / AC-01): descending by
+/// `firstSeen ?? createdAt`, ties by `id` ascending. Status and last activity
+/// never participate, so a status flip cannot move a row (AC-03). Pure: the
+/// caller supplies the first-seen lookup.
+enum SubagentCatalogOrder {
+    static func ordered(
+        _ entries: [SubagentCatalogEntry],
+        firstSeen: (SubagentCatalogEntry) -> Int64?
+    ) -> [SubagentCatalogEntry] {
+        entries.sorted { lhs, rhs in
+            let lhsKey = firstSeen(lhs) ?? lhs.createdAt ?? .min
+            let rhsKey = firstSeen(rhs) ?? rhs.createdAt ?? .min
+            if lhsKey != rhsKey { return lhsKey > rhsKey }
+            return lhs.id < rhs.id
+        }
     }
 }
 

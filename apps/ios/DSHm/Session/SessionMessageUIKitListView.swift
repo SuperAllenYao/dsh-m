@@ -186,6 +186,11 @@ struct SessionMessageUIKitListView: View {
  /// 动态字号 / 语言：步骤高度缓存按「宽度 + 字号 + 语言」失效（行高会变）。
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @Environment(\.locale) private var locale
+ /// 文件打开 / 图片预览动作（DD-05 / DD-06）：行内容是独立 `UIHostingController`
+ /// 宿主的 SwiftUI 树，**不继承**本视图的 SwiftUI 环境；必须在这里抓取，经
+ /// `MessageTableRepresentable` 显式透传进 `RowContent`（同 dynamicTypeSize/locale 口径）。
+    @Environment(\.fileOpenAction) private var fileOpenAction
+    @Environment(\.imagePreviewAction) private var imagePreviewAction
     @State private var lastScrollToBottomToken: Int = 0
 
     init(items: [SessionMessageItem],
@@ -263,7 +268,9 @@ struct SessionMessageUIKitListView: View {
             reduceMotion: reduceMotion,
             stepsLayoutSignature: "\(dynamicTypeSize)|\(locale.identifier)",
             dynamicTypeSize: dynamicTypeSize,
-            locale: locale
+            locale: locale,
+            fileOpenAction: fileOpenAction,
+            imagePreviewAction: imagePreviewAction
         )
  // DD-03：删除自绘 `InvertedScrollIndicator` overlay（含 20Hz TimelineView），
  // 只保留 makeUIView 里的系统原生滚动条 `showsVerticalScrollIndicator = true`。
@@ -478,6 +485,11 @@ private struct MessageTableRepresentable: UIViewRepresentable {
  /// 否则按默认 traits 测得的高度与大字号用户的真实显示高度不一致。
     var dynamicTypeSize: DynamicTypeSize = .large
     var locale: Locale = .current
+ /// 行内容宿主的文件打开 / 图片预览动作（见 RowContent 的环境注入）。
+ ///
+ /// `nil` = 没人承载（非详情页 / 预览测试宿主），行内入口保持不可点，行为不变。
+    var fileOpenAction: ((FileOpenTarget) -> Void)? = nil
+    var imagePreviewAction: ((ImagePreviewRequest) -> Void)? = nil
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
 
@@ -746,6 +758,11 @@ private struct MessageTableRepresentable: UIViewRepresentable {
  // 与真实显示高度不一致（大字号用户会一律偏矮）。
             .environment(\.dynamicTypeSize, parent.dynamicTypeSize)
             .environment(\.locale, parent.locale)
+            // 文件打开 / 图片预览动作（DD-05 / DD-06）：行里的正文文件链接、工具行
+            // 文件名、用户气泡与接力卡缩略图都从这两个环境值取承载方。UIKit 行宿主
+            // 是独立 `UIHostingController`，不继承外层 SwiftUI 环境，必须在这里注入。
+            .environment(\.fileOpenAction, parent.fileOpenAction)
+            .environment(\.imagePreviewAction, parent.imagePreviewAction)
             .background(
                 GeometryReader { geo in
                     Color.clear.preference(key: UILRowContentHeightKey.self, value: geo.size.height)
@@ -854,6 +871,39 @@ private struct MessageTableRepresentable: UIViewRepresentable {
  /// 本次 apply 是否跳过锚定修正（动画刚结束的收敛窗口）。
         private var settleSkipAnchorApply = false
 
+        #if DEBUG
+ /// E2E-only 定位 seam（`DSHM_E2E_SCROLL_TO_SEQ=<seq>`）：把包含该事件 seq 的
+ /// 展示行滚到视口中部，供按「消息 seq」定位的用例免手势扫描。
+ /// 仅 DEBUG + 环境变量双门控；未设置时这些状态恒为空/零，普通滚动与跟随
+ /// 逻辑（pinned/userIsScrolling/锚定）的行为完全不变。
+        private var e2eScrollTargetSeq: Int?
+        private var e2eScrollAttempts = 0
+        private var e2eScrollSettled = false
+        private var e2eScrollWork: DispatchWorkItem?
+ /// 命中定位后到该时刻为止暂停「贴底跟随」伺服（防跟随逻辑把定位顶走）。
+        private var e2eFollowHoldUntil: CFTimeInterval = 0
+ /// 命中后保持时长：默认 2s；E2E 可用 `DSHM_E2E_SCROLL_HOLD_SECONDS` 覆盖
+ /// （模拟器上 `app.launch()` 返回时定位早已命中，需要更长的保持窗口取证）。
+        private var e2eHoldDuration: TimeInterval = 2.0
+ /// 首次命中后的「等行高/内容收敛再最终定位」状态：
+ /// 流式加载期间 contentSize 持续增长，第一次 scrollToRow 的估算位置会漂移，
+ /// 必须等内容稳定后再滚一次，否则目标行会落在视口外（E2E 实测 seq=3608）。
+        private var e2ePendingTargetItemID: String?
+        private var e2eSettleChecks = 0
+        private var e2eSettleLastContentHeight: CGFloat = -1
+        private var e2eSettleStableTicks = 0
+        #endif
+
+    /// E2E seam：命中定位后 2s 内暂停贴底跟随，避免「跟随到底部」把测试定位
+    /// 顶走。RELEASE / 未设置 seam 时恒 false，生产滚动与跟随行为零变化。
+        private var e2eFollowHoldActive: Bool {
+            #if DEBUG
+            return CACurrentMediaTime() < e2eFollowHoldUntil
+            #else
+            return false
+            #endif
+        }
+
  /// 上次展开/收起动画结束时刻：动画结束后 2s 内禁止扩窗——扩窗的
  /// 全窗重排会打断刚完成的锚定(逐帧数据：收起后数据批
  /// 触发的扩窗使 off 2030→1598，终态漂移 216pt）。
@@ -947,6 +997,7 @@ private struct MessageTableRepresentable: UIViewRepresentable {
             }
             self.dataSource = dataSource
             #if DEBUG
+            startE2EScrollToSeqIfNeeded()
             if ProcessInfo.processInfo.environment["DSHM_UIL_DUMP"] == "1" {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 4.0) { [weak self] in
                     self?.dumpLayout("t+4s")
@@ -1216,6 +1267,201 @@ private struct MessageTableRepresentable: UIViewRepresentable {
             }
             guard !parts.isEmpty else { return }
             print("[procdbg] \(reason) " + parts.joined(separator: " | "))
+        }
+
+ // MARK: - E2E 定位 seam（DSHM_E2E_SCROLL_TO_SEQ）
+
+ /// 把包含目标事件 seq 的展示行滚到视口中部。
+ ///
+ /// 用途：按「消息 seq」定位的 E2E 用例（图片缩略图 / 工具行 chip）不再依赖
+ /// 粗粒度 swipe 扫描。仅 DEBUG + `DSHM_E2E_SCROLL_TO_SEQ` 双门控启动；命中后
+ /// 落一条 `[E2E] scroll-to-seq seq=… ok=1 attempts=…` 日志（设备日志可 grep），
+ /// 并保持 2s 不执行贴底跟随（`e2eFollowHoldUntil`）。未命中（数据未到 / 行未
+ /// 进显示窗口）按 200ms 重试，最多 25 次；命中后等内容收敛再最终定位一次
+ /// （流式加载期间行高增长会让首次 scrollToRow 的位置漂移）。从未设置环境变量
+ /// 时整段不执行。
+        private func startE2EScrollToSeqIfNeeded() {
+            guard e2eScrollTargetSeq == nil, e2eScrollWork == nil else { return }
+            guard let raw = ProcessInfo.processInfo.environment["DSHM_E2E_SCROLL_TO_SEQ"],
+                  let seq = Int(raw.trimmingCharacters(in: .whitespacesAndNewlines)),
+                  seq > 0 else { return }
+            e2eScrollTargetSeq = seq
+            if let rawHold = ProcessInfo.processInfo.environment["DSHM_E2E_SCROLL_HOLD_SECONDS"],
+               let hold = TimeInterval(rawHold.trimmingCharacters(in: .whitespacesAndNewlines)),
+               hold > 0 {
+                // 仅 DEBUG E2E 生效；默认（不设该变量）仍是 2s。
+                e2eHoldDuration = min(hold, 300)
+            }
+            scheduleE2EScrollAttempt(after: 0.2)
+        }
+
+        private func scheduleE2EScrollAttempt(after delay: TimeInterval) {
+            let work = DispatchWorkItem { [weak self] in self?.runE2EScrollAttempt() }
+            e2eScrollWork = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+        }
+
+        private func runE2EScrollAttempt() {
+            e2eScrollWork = nil
+            guard let seq = e2eScrollTargetSeq, !e2eScrollSettled,
+                  let tableView, let dataSource else { return }
+            e2eScrollAttempts += 1
+
+ // 目标行在数据里但不在显示窗口（最近 300 行）内：把窗口起点前移到它。
+            if e2eTargetItem(for: seq, in: displayedItems) == nil,
+               let fullTarget = e2eTargetItem(for: seq, in: parent.items),
+               !isApplying {
+                windowStartItemID = fullTarget.id
+                apply(items: parent.items, batchToken: parent.historyBatchToken)
+                tableView.layoutIfNeeded()
+            }
+
+            if scrollE2ETarget(seq: seq) {
+ // 命中后先等内容高度收敛再最终定位（流式历史补齐会持续推进偏移）。
+                e2eSettleChecks = 0
+                e2eSettleLastContentHeight = -1
+                e2eSettleStableTicks = 0
+                scheduleE2EScrollSettle(after: 0.35)
+            } else if e2eScrollAttempts >= 25 {
+                e2eScrollSettled = true
+                let line = String(format: "[E2E] scroll-to-seq seq=%d ok=0 attempts=%d", seq, e2eScrollAttempts)
+                NSLog("%@", line)
+                pinLog(line)
+            } else {
+                scheduleE2EScrollAttempt(after: 0.2)
+            }
+        }
+
+ /// 单次定位：把目标行滚到视口中部并冻结锚点。
+        @discardableResult
+        private func scrollE2ETarget(seq: Int) -> Bool {
+            guard let tableView, let dataSource,
+                  let target = e2eTargetItem(for: seq, in: displayedItems),
+                  let indexPath = dataSource.indexPath(for: target.id) else { return false }
+            e2ePendingTargetItemID = target.id
+ // 与巨型组钉位同一套 scrollToRow 路径；滚动 + 布局 + 重冻结放在
+ // isAdjustingOffset 里，避免 stabilizeAfterLayout 按旧锚点把 offset 拉回。
+            isAdjustingOffset = true
+            tableView.scrollToRow(at: indexPath, at: .middle, animated: false)
+            tableView.layoutIfNeeded()
+            freezeAnchorFromCurrentViewport(tableView)
+            isAdjustingOffset = false
+            return true
+        }
+
+        private func scheduleE2EScrollSettle(after delay: TimeInterval) {
+            let work = DispatchWorkItem { [weak self] in self?.runE2EScrollSettle() }
+            e2eScrollWork = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+        }
+
+ /// 目标行当前是否落在消息列表的可视区域内（错误/漂移判定用）。
+        private func e2eTargetIsVisible() -> Bool {
+            guard let tableView, let dataSource,
+                  let id = e2ePendingTargetItemID,
+                  let indexPath = dataSource.indexPath(for: id),
+                  let cell = tableView.cellForRow(at: indexPath) else { return false }
+            let window = tableView.window ?? tableView
+            let rowFrame = cell.convert(cell.bounds, to: window)
+            let tableFrame = tableView.convert(tableView.bounds, to: window)
+            // 行必须完整落在表格可视区内，避免「行顶被导航栏/表头上沿裁掉」后 chip 不可点。
+            return rowFrame.minY >= tableFrame.minY + 6
+                && rowFrame.maxY <= tableFrame.maxY - 6
+        }
+
+ /// 等目标行真正可见且内容高度稳定（最多 ~8s）→ 再居中一次 + 冻结锚点 +
+ /// 开始 hold 并落完成日志。流式补齐会让行高/位置持续变化，单次 scrollToRow
+ /// 的估算位置会漂移（E2E 实测 seq=3608 首次定位后行落在视口外 1600pt）。
+        private func runE2EScrollSettle() {
+            e2eScrollWork = nil
+            guard let seq = e2eScrollTargetSeq, !e2eScrollSettled, let tableView else { return }
+            e2eSettleChecks += 1
+            let height = tableView.contentSize.height
+            if abs(height - e2eSettleLastContentHeight) < 1 {
+                e2eSettleStableTicks += 1
+            } else {
+                e2eSettleStableTicks = 0
+            }
+            e2eSettleLastContentHeight = height
+            let visible = e2eTargetIsVisible()
+
+            if visible, e2eSettleStableTicks >= 2, scrollE2ETarget(seq: seq) {
+                finishE2EScrollSettle(seq: seq, height: height, ok: true)
+                return
+            }
+            if e2eSettleChecks >= 20 {
+                if scrollE2ETarget(seq: seq) {
+                    finishE2EScrollSettle(seq: seq, height: height, ok: true)
+                } else {
+                    finishE2EScrollSettle(seq: seq, height: height, ok: false)
+                }
+                return
+            }
+            if !visible {
+                // 内容增长把目标行推走：按新几何重新居中，下一拍继续验证。
+                _ = scrollE2ETarget(seq: seq)
+            }
+            scheduleE2EScrollSettle(after: 0.4)
+        }
+
+        private func finishE2EScrollSettle(seq: Int, height: CGFloat, ok: Bool) {
+            e2eScrollSettled = true
+            if ok {
+                e2eFollowHoldUntil = CACurrentMediaTime() + e2eHoldDuration
+                let line = String(format: "[E2E] scroll-to-seq seq=%d ok=1 attempts=%d", seq, e2eScrollAttempts)
+                NSLog("%@", line)
+                pinLog(line + String(format: " settleChecks=%d contentH=%.0f target=%@", e2eSettleChecks, height, e2ePendingTargetItemID ?? "-"))
+            } else {
+                let line = String(format: "[E2E] scroll-to-seq seq=%d ok=0 attempts=%d", seq, e2eScrollAttempts)
+                NSLog("%@", line)
+                pinLog(line + String(format: " settleChecks=%d contentH=%.0f", e2eSettleChecks, height))
+            }
+        }
+
+ /// 展示项匹配：先精确命中「行/组内步骤的 seq」；再退回「最后一条首 seq ≤
+ /// 目标」的展示项——tool/result 事件可能合并进更早的调用行，组内步骤也不
+ /// 保证每个 seq 都有独立展示行。数据还没加载到目标 seq 时返回 nil（走重试）。
+        private func e2eTargetItem(for seq: Int, in items: [SessionMessageItem]) -> SessionMessageItem? {
+            for item in items {
+                switch item {
+                case .group(.single(let row)) where row.seq == seq:
+                    return item
+                case .group(.process(let steps)) where steps.contains(where: { $0.seq == seq }):
+                    return item
+                default:
+                    continue
+                }
+            }
+            var covering: SessionMessageItem?
+            for item in items {
+                let firstSeq: Int
+                switch item {
+                case .group(let group):
+                    firstSeq = group.firstSeq
+                case .fileChanges, .liveText, .streamError, .actionError:
+                    continue
+                }
+                if firstSeq <= seq {
+                    covering = item
+                } else {
+                    break
+                }
+            }
+ // 只有「目标 seq 落在组内最后一步之后极短距离」才当作 tool/result 合并进
+ // 调用行；更早的覆盖行只是说明数据还没加载到目标 seq（必须继续重试，不能
+ // 把视图定位到一个不相干的行——E2E 实测 seq=3608 曾误命中 3190 的行）。
+            if let covering,
+               let maxStepSeq = e2eMaxStepSeq(of: covering),
+               seq <= maxStepSeq + 2 {
+                return covering
+            }
+            return nil
+        }
+
+ /// 过程组内最大的步骤 seq（用于判断目标事件是否落在组的区间内）。
+        private func e2eMaxStepSeq(of item: SessionMessageItem) -> Int? {
+            guard case .group(.process(let steps)) = item else { return nil }
+            return steps.map(\.seq).max()
         }
         #endif
 
@@ -3017,7 +3263,7 @@ private struct MessageTableRepresentable: UIViewRepresentable {
  // 形成「钉→布局→再测量→再钉」的物化风暴；完全不钉则 contentSize 随行高
  // 实测增长、offset 落后 → 视口在内容里向上滑动 → 离屏历史行被大批物化
  // 。
-                if pinned, !userIsScrolling, !isAdjustingOffset,
+                if pinned, !e2eFollowHoldActive, !userIsScrolling, !isAdjustingOffset,
                    !tableView.isTracking, !tableView.isDecelerating,
                    CACurrentMediaTime() - lastAnimationEndAt > 1.2 {
                     let target = bottomOffset(tableView)
@@ -3036,7 +3282,7 @@ private struct MessageTableRepresentable: UIViewRepresentable {
  // 贴底跟随（常规底座）：pinned 且用户不在拖拽/惯性/动画中时，把视口
  // 钉在内容底部（新消息、行高收敛、宿主重测都会让底部下移）。
  // 这是「贴底跟随」的唯一执行点；不贴底时走下面的锚定伺服（保可见内容不动）。
-            if pinned, !userIsScrolling, !isAdjustingOffset,
+            if pinned, !e2eFollowHoldActive, !userIsScrolling, !isAdjustingOffset,
                !tableView.isTracking, !tableView.isDecelerating,
                CACurrentMediaTime() - lastAnimationEndAt > 1.2 {
                 let target = bottomOffset(tableView)

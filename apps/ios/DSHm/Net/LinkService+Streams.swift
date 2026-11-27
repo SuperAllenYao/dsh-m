@@ -886,12 +886,19 @@ extension LinkService {
     }
 
  /// Fetches image bytes as described in §8.2 / §6:
- /// unary session/attachment {request:{sessionId, attachmentId}} -> {attachment, data(base64)}.
-    func attachmentData(sessionId: String, attachmentId: String) async throws -> (data: Data, mediaType: String?) {
+ /// unary session/attachment {request:{sessionId, attachment:{…}}} -> {attachment, data(base64)}.
+ ///
+ /// The host (0.2.2-rc.5) validates `request` against `SessionAttachmentRequest`:
+ /// the `attachment` object is mandatory and carries the full image reference
+ /// (`attachmentId`, `mediaType`, `bytes`, `width`, `height`; `name` optional).
+ /// A bare `attachmentId` at the request level fails boundary validation with
+ /// `gateway/input-invalid` (200 + error envelope, no `data`) — every thumbnail
+ /// then falls back to the failure placeholder.
+    func attachmentData(sessionId: String, ref: ImageRef) async throws -> (data: Data, mediaType: String?) {
         let value = try await unary("session/attachment", args: [
             "request": .object([
                 "sessionId": .string(sessionId),
-                "attachmentId": .string(attachmentId),
+                "attachment": Self.attachmentRequestObject(ref),
             ]),
         ])
         let decoded = try value.decode(AttachmentValue.self)
@@ -899,6 +906,23 @@ extension LinkService {
             throw LinkError.malformedEnvelope(L10n.t("session/attachment 缺少 base64 data"))
         }
         return (data, decoded.attachment?.mediaType)
+    }
+
+ /// `attachment` wire object for `session/attachment` (protocol §8.2): the full
+ /// image reference as carried by the event / projection, never bytes. Only the
+ /// fields the reference actually has are sent; `name` is the only optional one
+ /// in the host schema, so a reference missing a required field is rejected by
+ /// the host exactly like a malformed one.
+    private static func attachmentRequestObject(_ ref: ImageRef) -> JSONValue {
+        var object: [String: JSONValue] = [
+            "attachmentId": .string(ref.attachmentId ?? ""),
+        ]
+        if let mediaType = ref.mediaType { object["mediaType"] = .string(mediaType) }
+        if let bytes = ref.bytes { object["bytes"] = .int(Int64(bytes)) }
+        if let width = ref.width { object["width"] = .int(Int64(width)) }
+        if let height = ref.height { object["height"] = .int(Int64(height)) }
+        if let name = ref.name { object["name"] = .string(name) }
+        return .object(object)
     }
 
  // MARK: - Projected session/page streaming（协议 v1，契约 §4）

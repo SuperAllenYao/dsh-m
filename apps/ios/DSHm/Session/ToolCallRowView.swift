@@ -8,6 +8,8 @@ struct ToolResultContentView: View {
     @ObservedObject var attachments: AttachmentStore
  /// 协议 v1 lazy-fetch（契约 §7）：由 `SessionDetailView` 注入（详情页才有）。
     @Environment(\.lazyFullFetch) private var lazyFullFetch
+ /// 图片预览入口（DD-05）：由 `SessionDetailView` 注入；nil 时缩略图不可点。
+    @Environment(\.imagePreviewAction) private var imagePreviewAction
     @State private var isFetchingFull = false
 
  /// 被截断的字段名（`text`/`lines`/`diffs`）；默认模式为空。
@@ -33,10 +35,31 @@ struct ToolResultContentView: View {
         }
     }
 
+    /// 工具结果图点按：整行图片组 + 起始下标交上层预览（AC-14 / AC-18）。
+    private func openImagePreview(images: [ImageRef], startIndex: Int) {
+        guard let imagePreviewAction,
+              let request = ImagePreviewRequest(attachments: images, startIndex: startIndex) else { return }
+        imagePreviewAction(request)
+    }
+
+    /// 工具结果图的可寻址标识：`attachment-image-<tool/result 事件 seq>-<下标>`。
+    private func e2eImageIdentifier(index: Int) -> String {
+        guard let seq = result.sourceSeq else { return "attachment-image" }
+        return "attachment-image-\(seq)-\(index)"
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: Theme.Spacing.xs) {
-            ForEach(result.images, id: \.self) { ref in
-                AttachmentThumbnail(ref: ref, attachments: attachments, maxHeight: 220)
+            ForEach(Array(result.images.enumerated()), id: \.offset) { index, ref in
+                AttachmentThumbnail(
+                    ref: ref,
+                    attachments: attachments,
+                    maxHeight: 220,
+                    onTap: { openImagePreview(images: result.images, startIndex: index) },
+                    // E2E/无障碍可寻址：结果图 → `attachment-image-<结果事件 seq>-<下标>`；
+                    // 不知道 seq 时退回 `attachment-image`（老查询按前缀仍命中）。
+                    a11yIdentifier: e2eImageIdentifier(index: index)
+                )
             }
             if let meta = result.meta {
                 metaRendering(meta: meta)
@@ -80,6 +103,10 @@ struct ToolResultContentView: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        // 先声明容器再命名：结果区的图片/文本保留自己的标识（结果图 =
+        // `attachment-image-<tool/result seq>-<index>`）。DEF-007：容器级
+        // identifier 会下发覆盖子元素标识，导致缩略图的标识在真机树里恒为 0。
+        .accessibilityElement(children: .contain)
         .accessibilityIdentifier("tool-result-content")
     }
 
